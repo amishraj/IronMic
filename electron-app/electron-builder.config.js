@@ -17,17 +17,19 @@ module.exports = {
     {
       from: '../rust-core/ironmic-core.node',
       to: 'ironmic-core.node',
+      filter: ['**/*'],
     },
     {
       from: '../rust-core/models/',
       to: 'models/',
-      filter: ['*.bin', '*.gguf'],
+      filter: ['*.bin', '*.gguf', '*.onnx', 'voices/*.bin'],
     },
   ],
+  // electron-builder auto-converts icon.png to .icns (mac) and .ico (win)
   mac: {
     target: ['dmg'],
     category: 'public.app-category.productivity',
-    icon: 'resources/icon.icns',
+    icon: 'resources/icon.png',
     hardenedRuntime: true,
     gatekeeperAssess: false,
     entitlements: 'resources/entitlements.mac.plist',
@@ -38,7 +40,7 @@ module.exports = {
   },
   win: {
     target: ['nsis'],
-    icon: 'resources/icon.ico',
+    icon: 'resources/icon.png',
   },
   nsis: {
     oneClick: false,
