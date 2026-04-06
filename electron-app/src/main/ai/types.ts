@@ -34,6 +34,15 @@ export interface ICLIAdapter {
   isAuthenticated(): Promise<boolean>;
   getVersion(): Promise<string | null>;
   getBinaryPath(): Promise<string | null>;
-  buildArgs(prompt: string, continueSession: boolean): string[];
+  buildArgs(prompt: string, continueSession: boolean, model?: string): string[];
   parseOutput(data: string): ParsedOutput;
+  availableModels(): AIModel[];
+}
+
+export interface AIModel {
+  id: string;
+  label: string;
+  provider: AIProvider;
+  free: boolean;
+  description: string;
 }

@@ -76,6 +76,15 @@ export function AIChat() {
     try {
       const state = await window.ironmic.aiGetAuthState();
       setAuthState(state);
+      // Use saved provider preference, fall back to auto-pick
+      const savedProvider = await window.ironmic.getSetting('ai_provider');
+      if (savedProvider && (savedProvider === 'claude' || savedProvider === 'copilot')) {
+        const auth = savedProvider === 'claude' ? state.claude : state.copilot;
+        if (auth?.authenticated) {
+          setProvider(savedProvider);
+          return;
+        }
+      }
       const best = await window.ironmic.aiPickProvider();
       setProvider(best);
     } catch (err) {
@@ -116,7 +125,8 @@ export function AIChat() {
     setStreaming('');
 
     try {
-      const response = await window.ironmic.aiSendMessage(fullPrompt, provider);
+      const savedModel = await window.ironmic.getSetting('ai_model');
+      const response = await window.ironmic.aiSendMessage(fullPrompt, provider, savedModel || undefined);
 
       const assistantMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),

@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "ironmic-core"
-version = "1.0.6"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "arboard",

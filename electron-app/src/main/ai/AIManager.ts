@@ -7,7 +7,7 @@ import { spawn, ChildProcess } from 'child_process';
 import { BrowserWindow } from 'electron';
 import { CopilotAdapter } from './CopilotAdapter';
 import { ClaudeAdapter } from './ClaudeAdapter';
-import type { AIProvider, AuthStatus, AIAuthState, ChatMessage, ICLIAdapter } from './types';
+import type { AIProvider, AuthStatus, AIAuthState, ChatMessage, ICLIAdapter, AIModel } from './types';
 
 const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
@@ -69,6 +69,16 @@ export class AIManager {
     return status;
   }
 
+  /** Get available models for a provider. */
+  getModels(provider: AIProvider): AIModel[] {
+    return this.getAdapter(provider).availableModels();
+  }
+
+  /** Get all available models across all providers. */
+  getAllModels(): AIModel[] {
+    return [...this.copilot.availableModels(), ...this.claude.availableModels()];
+  }
+
   /** Pick the best available provider. Prefers Claude, falls back to Copilot. */
   async pickProvider(): Promise<AIProvider | null> {
     const state = await this.getAuthState();
@@ -85,6 +95,7 @@ export class AIManager {
     prompt: string,
     provider: AIProvider,
     window: BrowserWindow | null,
+    model?: string,
   ): Promise<string> {
     const adapter = this.getAdapter(provider);
     const auth = await this.checkAuth(provider);
@@ -98,7 +109,7 @@ export class AIManager {
 
     const binary = auth.binaryPath!;
     const continueSession = this.turnCount > 0;
-    const args = adapter.buildArgs(prompt, continueSession);
+    const args = adapter.buildArgs(prompt, continueSession, model);
 
     if (process.env.NODE_ENV === 'development') {
       console.log(`[ai] Sending to ${provider}: ${binary} [${args.length} args, prompt_length=${prompt.length}]`);

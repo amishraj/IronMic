@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import type { ICLIAdapter, ParsedOutput, AIProvider } from './types';
+import type { ICLIAdapter, ParsedOutput, AIProvider, AIModel } from './types';
 
 export class ClaudeAdapter implements ICLIAdapter {
   name: AIProvider = 'claude';
@@ -66,10 +66,20 @@ export class ClaudeAdapter implements ICLIAdapter {
     }
   }
 
-  buildArgs(prompt: string, continueSession: boolean): string[] {
-    const args = ['--print', prompt];
-    if (continueSession) args.unshift('--continue');
+  buildArgs(prompt: string, continueSession: boolean, model?: string): string[] {
+    const args: string[] = [];
+    if (model) args.push('--model', model);
+    if (continueSession) args.push('--continue');
+    args.push('--print', prompt);
     return args;
+  }
+
+  availableModels(): AIModel[] {
+    return [
+      { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4', provider: 'claude', free: false, description: 'Best balance of speed and capability' },
+      { id: 'claude-opus-4-20250514', label: 'Claude Opus 4', provider: 'claude', free: false, description: 'Most capable, slower' },
+      { id: 'claude-haiku-3-5-20241022', label: 'Claude Haiku 3.5', provider: 'claude', free: false, description: 'Fastest and most affordable' },
+    ];
   }
 
   parseOutput(data: string): ParsedOutput {

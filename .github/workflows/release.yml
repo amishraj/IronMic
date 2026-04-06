@@ -49,11 +49,16 @@ jobs:
         working-directory: electron-app
         run: npx electron-builder --config electron-builder.config.js --publish never
 
+      # Only upload the actual installers — not blockmaps, debug files, or unpacked dirs
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ironmic-${{ matrix.os }}
-          path: electron-app/release/*
+          path: |
+            electron-app/release/*.dmg
+            electron-app/release/*.exe
+            electron-app/release/*.AppImage
+            electron-app/release/*.deb
 
   release:
     name: Create GitHub Release
@@ -84,7 +89,7 @@ jobs:
             |----------|------|
             | macOS (Apple Silicon) | `.dmg` |
             | Windows | `.exe` installer |
-            | Linux | `.AppImage` |
+            | Linux | `.AppImage` / `.deb` |
 
             ### First Launch
 
@@ -95,4 +100,7 @@ jobs:
 
             See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
           files: |
-            artifacts/**/*
+            artifacts/**/*.dmg
+            artifacts/**/*.exe
+            artifacts/**/*.AppImage
+            artifacts/**/*.deb
