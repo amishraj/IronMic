@@ -1,0 +1,50 @@
+[package]
+name = "ironmic-core"
+version = "1.0.0"
+edition = "2021"
+description = "IronMic – fully-local voice transcription and text-to-speech, Rust native core"
+authors = ["IronMic Contributors"]
+license = "MIT"
+repository = "https://github.com/greenpioneersolutions/IronMic"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["napi-export"]
+napi-export = []
+whisper = ["dep:whisper-rs"]
+metal = ["whisper", "whisper-rs/metal"]
+llm = ["dep:llama_cpp_rs"]
+tts = ["dep:ort", "dep:ndarray"]
+
+[dependencies]
+napi = { version = "2", features = ["napi9", "async"] }
+napi-derive = "2"
+cpal = "0.15"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rubato = "0.16"
+rusqlite = { version = "0.31", features = ["bundled"] }
+arboard = "3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+whisper-rs = { version = "0.13", optional = true }
+llama_cpp_rs = { version = "0.3", optional = true }
+ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
+ndarray = { version = "0.17", optional = true }
+
+[build-dependencies]
+napi-build = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }
+
+[profile.release]
+lto = true
+strip = true
