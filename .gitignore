@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+
+# Rust build artifacts
+rust-core/target/
+
+# Electron build output
+electron-app/dist/
+electron-app/release/
+
+# Native addon build artifacts
+*.node
+!electron-app/src/**/*.ts
+
+# Model files (large, downloaded separately)
+rust-core/models/*.bin
+rust-core/models/*.onnx
+rust-core/models/*.gguf
+rust-core/models/voices/*.bin
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.*
+
+# Claude Code local settings (contains developer-specific paths)
+.claude/settings.local.json
+
+# Build temp
+*.downloading
