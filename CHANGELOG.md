@@ -2,16 +2,24 @@
 
 All notable changes to IronMic will be documented in this file.
 
-## [1.0.1] - 2026-04-06
+## [1.0.6] - 2026-04-06
 
 ### Fixed
-- Fix 9 `cargo clippy` warnings that broke CI (`--no-default-features -- -D warnings`)
-  - Gate TTS-only code behind `#[cfg(feature = "tts")]` (build_vocab, phonemize_and_tokenize, phonemize_with_espeak, vocab field, HashMap import)
+- Fix `cargo clippy --no-default-features -- -D warnings` (9 warnings)
+  - Gate TTS-only code behind `#[cfg(feature = "tts")]`
   - Add `Default` impls for AudioRingBuffer, CaptureEngine, PlaybackEngine
-  - Remove unused imports (WordTimestamp, warn in playback.rs)
-  - Fix `let_and_return` in format_accelerator
-- Add GitHub Releases to release.yml workflow (artifacts now published to Releases page)
-- Add download/install section to README with link to Releases
+  - Remove unused imports across lib.rs, kokoro.rs, playback.rs
+- Fix `cargo test --no-default-features` (gate vocab test behind tts feature)
+- Fix electron-builder packaging: 1024x1024 icon (was 256, below 512 minimum)
+- Fix CI/release: run full `npm run build` (main + preload + renderer), not just vite
+- Fix electron-builder auto-publish demanding GH_TOKEN (`--publish never`)
+- Fix Linux .deb build: add author email for maintainer field
+- Add macOS entitlements.mac.plist for hardened runtime (mic access, JIT)
+
+### Added
+- GitHub Releases workflow via `softprops/action-gh-release`
+- Download section in README with link to Releases page
+- `scripts/release.sh` — automated release script with version bumps, security scan, build verification, and git tag/push
 
 ---
 
