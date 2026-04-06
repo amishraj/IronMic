@@ -1,3 +1,4 @@
+#[cfg(feature = "tts")]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -5,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
 use crate::error::IronMicError;
-use crate::tts::timestamps::{estimate_timestamps, WordTimestamp};
+use crate::tts::timestamps::estimate_timestamps;
 use crate::tts::{SynthesisResult, TtsConfig, TtsEngine, TtsVoice};
 
 /// Model file names / directories.
@@ -15,6 +16,7 @@ const DEFAULT_VOICE: &str = "af_heart";
 
 /// Kokoro phoneme vocabulary — exact mapping from tokenizer.json.
 /// IDs are NOT sequential; there are gaps. PAD = 0.
+#[cfg(feature = "tts")]
 fn build_vocab() -> HashMap<char, i64> {
     let entries: &[(char, i64)] = &[
         // Punctuation & special
@@ -117,6 +119,7 @@ fn build_vocab() -> HashMap<char, i64> {
 /// Convert text to IPA phonemes using espeak-ng, then map to Kokoro token IDs.
 /// Adds PAD (0) at start and end as required by the model.
 /// Returns (padded_tokens, unpadded_length).
+#[cfg(feature = "tts")]
 fn phonemize_and_tokenize(text: &str, vocab: &HashMap<char, i64>) -> Result<(Vec<i64>, usize), IronMicError> {
     let phonemes = phonemize_with_espeak(text)?;
     info!(phonemes = %phonemes, "Phonemized text");
@@ -144,6 +147,7 @@ fn phonemize_and_tokenize(text: &str, vocab: &HashMap<char, i64>) -> Result<(Vec
 }
 
 /// Call espeak-ng to convert English text to IPA phonemes.
+#[cfg(feature = "tts")]
 fn phonemize_with_espeak(text: &str) -> Result<String, IronMicError> {
     use std::process::Command;
 
@@ -198,6 +202,7 @@ fn kokoro_voices() -> Vec<TtsVoice> {
 /// The Kokoro 82M TTS engine using ort (ONNX Runtime) directly.
 pub struct KokoroEngine {
     config: TtsConfig,
+    #[cfg(feature = "tts")]
     vocab: HashMap<char, i64>,
     #[cfg(feature = "tts")]
     session: Option<Mutex<ort::session::Session>>,
@@ -211,6 +216,7 @@ impl KokoroEngine {
     pub fn new(config: TtsConfig) -> Self {
         Self {
             config,
+            #[cfg(feature = "tts")]
             vocab: build_vocab(),
             #[cfg(feature = "tts")]
             session: None,

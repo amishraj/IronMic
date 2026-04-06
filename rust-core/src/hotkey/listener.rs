@@ -110,12 +110,11 @@ impl Default for PipelineStateMachine {
 /// Parse a hotkey accelerator string into a human-readable description.
 /// Examples: "CommandOrControl+Shift+V" → "⌘+Shift+V" (macOS) or "Ctrl+Shift+V" (other)
 pub fn format_accelerator(accelerator: &str) -> String {
-    let formatted = if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") {
         accelerator.replace("CommandOrControl", "⌘").replace("Command", "⌘")
     } else {
         accelerator.replace("CommandOrControl", "Ctrl")
-    };
-    formatted
+    }
 }
 
 #[cfg(test)]

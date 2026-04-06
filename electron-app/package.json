@@ -1,6 +1,6 @@
 {
   "name": "ironmic",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "IronMic – fully-local voice transcription and text-to-speech, built for privacy",
   "main": "dist/main/index.js",
   "author": "IronMic Contributors",

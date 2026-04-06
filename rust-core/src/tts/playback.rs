@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::error::IronMicError;
 
@@ -108,6 +108,12 @@ pub struct PlaybackEngine {
 
 // Safety: same pattern as CaptureEngine — accessed behind Mutex, stream used on single thread.
 unsafe impl Send for PlaybackEngine {}
+
+impl Default for PlaybackEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl PlaybackEngine {
     pub fn new() -> Self {

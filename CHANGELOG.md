@@ -2,6 +2,19 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.0.1] - 2026-04-06
+
+### Fixed
+- Fix 9 `cargo clippy` warnings that broke CI (`--no-default-features -- -D warnings`)
+  - Gate TTS-only code behind `#[cfg(feature = "tts")]` (build_vocab, phonemize_and_tokenize, phonemize_with_espeak, vocab field, HashMap import)
+  - Add `Default` impls for AudioRingBuffer, CaptureEngine, PlaybackEngine
+  - Remove unused imports (WordTimestamp, warn in playback.rs)
+  - Fix `let_and_return` in format_accelerator
+- Add GitHub Releases to release.yml workflow (artifacts now published to Releases page)
+- Add download/install section to README with link to Releases
+
+---
+
 ## [1.0.0] - 2026-04-06
 
 ### Core Features

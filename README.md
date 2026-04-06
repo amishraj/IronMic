@@ -9,10 +9,11 @@
 </p>
 
 <p align="center">
-  <a href="SECURITY.md">Security</a> &middot;
-  <a href="AUDIT.md">Security Audit</a> &middot;
+  <a href="https://github.com/greenpioneersolutions/IronMic/releases/latest">Download</a> &middot;
   <a href="#features">Features</a> &middot;
   <a href="#quick-start">Quick Start</a> &middot;
+  <a href="SECURITY.md">Security</a> &middot;
+  <a href="AUDIT.md">Audit</a> &middot;
   <a href="LICENSE">MIT License</a>
 </p>
 
@@ -104,7 +105,23 @@ Electron UI ← IPC (contextBridge) → Rust Core (napi-rs)
   - **Windows**: Visual Studio Build Tools (C++ workload)
   - **Linux**: `build-essential`, `libasound2-dev`, `libsqlite3-dev`
 
-## Quick Start
+## Download
+
+Pre-built packages are available on the **[Releases page](https://github.com/greenpioneersolutions/IronMic/releases/latest)**.
+
+| Platform | Artifact |
+|----------|----------|
+| macOS (Apple Silicon) | `.dmg` |
+| Windows | `.exe` installer |
+| Linux | `.AppImage` |
+
+After installing, open IronMic and go to **Settings > Models** to download the speech recognition model (~1.5 GB). The app will walk you through setup on first launch.
+
+> Models run entirely on your machine. Nothing is sent externally.
+
+---
+
+## Quick Start (from source)
 
 ```bash
 # Clone

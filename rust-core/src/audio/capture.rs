@@ -15,6 +15,12 @@ pub struct AudioRingBuffer {
     channels: u16,
 }
 
+impl Default for AudioRingBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AudioRingBuffer {
     pub fn new() -> Self {
         Self {
@@ -103,6 +109,12 @@ pub struct CaptureEngine {
 // The cpal::Stream is !Send due to platform internals, but we ensure it is only
 // created and dropped on the N-API main thread (single-threaded access pattern).
 unsafe impl Send for CaptureEngine {}
+
+impl Default for CaptureEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl CaptureEngine {
     pub fn new() -> Self {
