@@ -2,6 +2,22 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.0.8] - 2026-04-06
+
+### Added
+- **Dictate page read-back** — new "Read Back" button reads editor content aloud via TTS, with pause/resume/stop controls
+- **Dictate page persistence** — editor content survives navigation; drafts saved to localStorage automatically and restored on return
+- **AI Assist settings tab** — new dedicated settings section for AI assistant configuration
+- **AI model selection** — choose your model per provider (GPT-4.1 Mini default/free, GPT-4o, o3-mini, Claude Sonnet 4, Claude Opus 4, Claude Haiku 3.5, and more)
+- **AI provider picker** — visual cards for GitHub Copilot and Claude Code CLI with live auth status and refresh
+- **AI model passthrough** — selected model sent as `--model` flag to CLI adapters
+
+### Changed
+- AI enable toggle moved from General settings to dedicated AI Assist tab
+- AI chat uses saved provider/model preferences instead of always auto-picking
+
+---
+
 ## [1.0.6] - 2026-04-06
 
 ### Fixed

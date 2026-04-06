@@ -12,9 +12,27 @@ import {
   Heading1, Heading2, Heading3, List, ListOrdered,
   Quote, Code, Minus, Link as LinkIcon, Highlighter, Undo2, Redo2,
   AlignLeft, AlignCenter, AlignRight, Mic, Info, FileText,
+  Volume2, Square, Pause, Play,
 } from 'lucide-react';
 import { useRecordingStore } from '../stores/useRecordingStore';
+import { useTtsStore } from '../stores/useTtsStore';
 import { Card } from './ui';
+
+const STORAGE_KEY = 'ironmic-dictate-draft';
+
+function loadDraft(): { html: string; entryId: string | null } | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function saveDraft(html: string, entryId: string | null) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ html, entryId }));
+  } catch { /* quota exceeded — ignore */ }
+}
 
 export function DictatePage() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -23,6 +41,20 @@ export function DictatePage() {
   const [charCount, setCharCount] = useState(0);
   const [saved, setSaved] = useState(true);
   const { handleHotkeyPress, state: recordingState } = useRecordingStore();
+  const { state: ttsState, synthesizeAndPlay, stop: ttsStop, toggle: ttsToggle } = useTtsStore();
+
+  const handleReadBack = useCallback(() => {
+    if (!editor) return;
+    if (ttsState === 'playing' || ttsState === 'paused') {
+      ttsStop();
+      return;
+    }
+    const text = editor.getText().trim();
+    if (text) synthesizeAndPlay(text, currentEntryId.current ?? undefined);
+  }, [editor, ttsState, synthesizeAndPlay, ttsStop]);
+
+  // Restore draft on mount
+  const draft = useRef(loadDraft());
 
   const editor = useEditor({
     extensions: [
@@ -34,9 +66,15 @@ export function DictatePage() {
       Link.configure({ openOnClick: false, HTMLAttributes: { class: '' } }),
       Typography,
     ],
-    content: '',
+    content: draft.current?.html || '',
     editorProps: {
       attributes: { class: 'focus:outline-none' },
+    },
+    onCreate: ({ editor }) => {
+      if (draft.current?.entryId) currentEntryId.current = draft.current.entryId;
+      const text = editor.getText();
+      setCharCount(text.length);
+      setWordCount(text.trim() ? text.trim().split(/\s+/).length : 0);
     },
     onUpdate: ({ editor }) => {
       setSaved(false);
@@ -46,7 +84,9 @@ export function DictatePage() {
 
       if (debounceRef.current) clearTimeout(debounceRef.current);
       debounceRef.current = setTimeout(() => {
-        saveContent(editor.getHTML());
+        const html = editor.getHTML();
+        saveContent(html);
+        saveDraft(html, currentEntryId.current);
         setSaved(true);
       }, 1000);
     },
@@ -77,9 +117,10 @@ export function DictatePage() {
     const handler = (e: Event) => {
       const { text, entryId } = (e as CustomEvent).detail;
       if (text && !text.startsWith('[stub')) {
-        // Track the entry so auto-save updates it instead of creating a duplicate
         if (entryId) currentEntryId.current = entryId;
         editor.commands.insertContent(text + ' ');
+        // Persist immediately so navigating away doesn't lose it
+        saveDraft(editor.getHTML(), currentEntryId.current);
       }
     };
     window.addEventListener('ironmic:dictation-complete', handler);
@@ -99,6 +140,7 @@ export function DictatePage() {
     if (!editor) return;
     editor.commands.clearContent();
     currentEntryId.current = null;
+    localStorage.removeItem(STORAGE_KEY);
     setWordCount(0);
     setCharCount(0);
     setSaved(true);
@@ -136,6 +178,38 @@ export function DictatePage() {
               <Mic className="w-3.5 h-3.5" />
               {recordingState === 'recording' ? 'Stop' : recordingState === 'processing' ? 'Processing...' : 'Dictate'}
             </button>
+
+            {/* Read back button */}
+            <button
+              onClick={ttsState === 'playing' || ttsState === 'paused' ? () => ttsToggle() : handleReadBack}
+              disabled={ttsState === 'synthesizing' || (!editor?.getText().trim() && ttsState === 'idle')}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-medium transition-all ${
+                ttsState === 'playing'
+                  ? 'bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25'
+                  : ttsState === 'paused'
+                  ? 'bg-yellow-500/15 text-yellow-400 hover:bg-yellow-500/25'
+                  : ttsState === 'synthesizing'
+                  ? 'text-iron-text-muted opacity-50 cursor-wait'
+                  : 'text-iron-text-muted hover:text-iron-text-secondary hover:bg-iron-surface-hover'
+              } disabled:opacity-30 disabled:cursor-not-allowed`}
+              title={ttsState === 'playing' ? 'Pause read-back' : ttsState === 'paused' ? 'Resume read-back' : 'Read back aloud'}
+            >
+              {ttsState === 'playing' ? <Pause className="w-3.5 h-3.5" /> :
+               ttsState === 'paused' ? <Play className="w-3.5 h-3.5" /> :
+               <Volume2 className="w-3.5 h-3.5" />}
+              {ttsState === 'playing' ? 'Pause' : ttsState === 'paused' ? 'Resume' : ttsState === 'synthesizing' ? 'Loading...' : 'Read Back'}
+            </button>
+
+            {/* Stop button (only when playing/paused) */}
+            {(ttsState === 'playing' || ttsState === 'paused') && (
+              <button
+                onClick={handleReadBack}
+                className="flex items-center gap-1.5 px-2 py-2 rounded-xl text-xs font-medium text-iron-text-muted hover:text-red-400 hover:bg-red-500/10 transition-all"
+                title="Stop read-back"
+              >
+                <Square className="w-3 h-3" />
+              </button>
+            )}
 
             <button
               onClick={handleNewDocument}

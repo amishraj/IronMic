@@ -9,14 +9,15 @@ import {
   Settings, Bot, Volume2, Monitor, Sun, Moon, Shield, Keyboard,
   Cpu, Database, BookOpen, Lock, ClipboardCheck, Eye, EyeOff,
   Clock, AlertTriangle, CheckCircle, Info, Wifi, WifiOff, FileWarning,
-  Trash2, HardDrive,
+  Trash2, HardDrive, Sparkles, RefreshCw,
 } from 'lucide-react';
 
-type SettingsTab = 'general' | 'speech' | 'models' | 'data' | 'security';
+type SettingsTab = 'general' | 'speech' | 'ai' | 'models' | 'data' | 'security';
 
 const TABS: { id: SettingsTab; label: string; icon: typeof Settings }[] = [
   { id: 'general', label: 'General', icon: Settings },
   { id: 'speech', label: 'Speech', icon: Volume2 },
+  { id: 'ai', label: 'AI Assist', icon: Sparkles },
   { id: 'models', label: 'Models', icon: Cpu },
   { id: 'data', label: 'Data', icon: Database },
   { id: 'security', label: 'Security', icon: Shield },
@@ -55,6 +56,7 @@ export function SettingsPanel() {
         <div className="p-6 max-w-lg mx-auto space-y-6 pb-16">
           {tab === 'general' && <GeneralSettings />}
           {tab === 'speech' && <SpeechSettings />}
+          {tab === 'ai' && <AIAssistSettings />}
           {tab === 'models' && <ModelManager />}
           {tab === 'data' && <DataSettings />}
           {tab === 'security' && <SecuritySettings />}
@@ -69,7 +71,7 @@ export function SettingsPanel() {
 // ═══════════════════════════════════════════
 
 function GeneralSettings() {
-  const { hotkey, llmCleanupEnabled, aiEnabled, theme, setHotkey, setLlmCleanup, setAiEnabled, setTheme } =
+  const { hotkey, llmCleanupEnabled, theme, setHotkey, setLlmCleanup, setTheme } =
     useSettingsStore();
 
   return (
@@ -108,14 +110,184 @@ function GeneralSettings() {
         </div>
       </div>
 
+      <DictionaryManager />
+    </>
+  );
+}
+
+// ═══════════════════════════════════════════
+// AI Assist
+// ═══════════════════════════════════════════
+
+interface AIModelOption {
+  id: string;
+  label: string;
+  provider: string;
+  free: boolean;
+  description: string;
+}
+
+function AIAssistSettings() {
+  const { aiEnabled, setAiEnabled } = useSettingsStore();
+  const [provider, setProvider] = useState<string>('copilot');
+  const [model, setModel] = useState<string>('gpt-4.1-mini');
+  const [models, setModels] = useState<AIModelOption[]>([]);
+  const [authState, setAuthState] = useState<any>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  useEffect(() => {
+    loadAiSettings();
+  }, []);
+
+  async function loadAiSettings() {
+    const api = window.ironmic;
+    const [prov, mod, auth, allModels] = await Promise.all([
+      api.getSetting('ai_provider'),
+      api.getSetting('ai_model'),
+      api.aiGetAuthState(),
+      api.aiGetModels(),
+    ]);
+    if (prov) setProvider(prov);
+    if (mod) setModel(mod);
+    setAuthState(auth);
+    setModels(allModels || []);
+  }
+
+  async function handleProviderChange(p: string) {
+    setProvider(p);
+    await window.ironmic.setSetting('ai_provider', p);
+    // Set default model for new provider
+    const providerModels = models.filter((m) => m.provider === p);
+    const defaultModel = providerModels.find((m) => m.free) || providerModels[0];
+    if (defaultModel) {
+      setModel(defaultModel.id);
+      await window.ironmic.setSetting('ai_model', defaultModel.id);
+    }
+  }
+
+  async function handleModelChange(m: string) {
+    setModel(m);
+    await window.ironmic.setSetting('ai_model', m);
+  }
+
+  async function handleRefreshAuth() {
+    setRefreshing(true);
+    try {
+      const auth = await window.ironmic.aiRefreshAuth();
+      setAuthState(auth);
+    } catch { /* ignore */ }
+    setRefreshing(false);
+  }
+
+  const providerModels = models.filter((m) => m.provider === provider);
+  const claudeAuth = authState?.claude;
+  const copilotAuth = authState?.copilot;
+
+  return (
+    <>
+      <SectionHeader icon={Sparkles} title="AI Assist" description="Configure the AI assistant and model selection" />
+
       <SettingRow
         icon={Bot}
-        title="AI Assistant"
-        description="Chat with AI via GitHub Copilot or Claude Code CLI"
+        title="Enable AI Assistant"
+        description="Chat with AI using your own CLI tools and credentials"
         control={<Toggle checked={aiEnabled} onChange={setAiEnabled} />}
       />
 
-      <DictionaryManager />
+      {aiEnabled && (
+        <>
+          {/* Provider selection */}
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium text-iron-text">Provider</label>
+            <p className="text-xs text-iron-text-muted">Choose which CLI to use for AI chat</p>
+            <div className="flex gap-1.5 mt-2">
+              {[
+                { value: 'copilot', label: 'GitHub Copilot', sub: 'Free tier available' },
+                { value: 'claude', label: 'Claude Code', sub: 'Anthropic API key' },
+              ].map(({ value, label, sub }) => {
+                const auth = value === 'copilot' ? copilotAuth : claudeAuth;
+                const isActive = provider === value;
+                return (
+                  <button
+                    key={value}
+                    onClick={() => handleProviderChange(value)}
+                    className={`flex-1 text-left px-3 py-2.5 rounded-lg text-xs transition-all ${
+                      isActive
+                        ? 'bg-iron-accent/15 text-iron-accent-light border border-iron-accent/20'
+                        : 'bg-iron-surface text-iron-text-muted border border-iron-border hover:border-iron-border-hover'
+                    }`}
+                  >
+                    <span className="font-medium">{label}</span>
+                    <span className="block text-[10px] mt-0.5 opacity-70">{sub}</span>
+                    {auth && (
+                      <span className={`block text-[10px] mt-1 ${auth.authenticated ? 'text-iron-success' : 'text-iron-warning'}`}>
+                        {auth.authenticated ? '● Connected' : auth.installed ? '○ Not logged in' : '○ Not installed'}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              onClick={handleRefreshAuth}
+              disabled={refreshing}
+              className="flex items-center gap-1.5 text-[11px] text-iron-accent-light hover:underline mt-1"
+            >
+              <RefreshCw className={`w-3 h-3 ${refreshing ? 'animate-spin' : ''}`} />
+              {refreshing ? 'Checking...' : 'Refresh auth status'}
+            </button>
+          </div>
+
+          {/* Model selection */}
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium text-iron-text">Model</label>
+            <p className="text-xs text-iron-text-muted">
+              {provider === 'copilot'
+                ? 'Select which model GitHub Copilot should use'
+                : 'Select which Claude model to use'}
+            </p>
+            <div className="space-y-1 mt-2">
+              {providerModels.map((m) => (
+                <button
+                  key={m.id}
+                  onClick={() => handleModelChange(m.id)}
+                  className={`w-full text-left px-3 py-2.5 rounded-lg text-xs transition-all ${
+                    model === m.id
+                      ? 'bg-iron-accent/15 text-iron-accent-light border border-iron-accent/20'
+                      : 'bg-iron-surface text-iron-text-secondary border border-iron-border hover:border-iron-border-hover'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="font-medium">{m.label}</span>
+                      {m.free && (
+                        <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-iron-success/15 text-iron-success border border-iron-success/20">Free</span>
+                      )}
+                    </div>
+                    {model === m.id && <CheckCircle className="w-3.5 h-3.5 text-iron-accent-light" />}
+                  </div>
+                  <span className="block text-[10px] text-iron-text-muted mt-0.5">{m.description}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Info card */}
+          <Card variant="default" padding="md">
+            <div className="flex items-start gap-2.5">
+              <Info className="w-4 h-4 text-iron-text-muted flex-shrink-0 mt-0.5" />
+              <div className="text-xs text-iron-text-muted leading-relaxed">
+                <p>
+                  AI Assist uses your own CLI tools — <strong className="text-iron-text">GitHub Copilot CLI</strong> (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh copilot</code>) or <strong className="text-iron-text">Claude Code CLI</strong> (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">claude</code>).
+                </p>
+                <p className="mt-1.5">
+                  Your credentials stay on your machine. IronMic never sees or stores your API keys — it calls the CLI directly.
+                </p>
+              </div>
+            </div>
+          </Card>
+        </>
+      )}
     </>
   );
 }

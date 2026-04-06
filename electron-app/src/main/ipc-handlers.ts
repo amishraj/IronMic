@@ -20,6 +20,7 @@ const VALID_PROVIDERS: AIProvider[] = ['copilot', 'claude'];
 const ALLOWED_SETTING_KEYS = new Set([
   'hotkey_record', 'llm_cleanup_enabled', 'default_view', 'theme',
   'whisper_model', 'llm_model', 'ai_enabled',
+  'ai_provider', 'ai_model',
   'tts_auto_readback', 'tts_voice', 'tts_speed', 'tts_enabled',
   'auto_delete_enabled', 'auto_delete_days',
   'security_clipboard_auto_clear', 'security_session_timeout',
@@ -156,15 +157,23 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('ai:get-auth-state', () => aiManager.getAuthState());
   ipcMain.handle('ai:refresh-auth', (_e, provider?: AIProvider) => aiManager.refreshAuth(provider));
   ipcMain.handle('ai:pick-provider', () => aiManager.pickProvider());
-  ipcMain.handle('ai:send-message', async (_e, prompt: string, provider: AIProvider) => {
+  ipcMain.handle('ai:send-message', async (_e, prompt: string, provider: AIProvider, model?: string) => {
     assertString(prompt, 'prompt');
     assertString(provider, 'provider');
     assertMaxLength(prompt, MAX_PROMPT_LENGTH, 'AI prompt');
     if (!VALID_PROVIDERS.includes(provider)) {
       throw new Error(`Invalid AI provider: ${provider}`);
     }
+    if (model !== undefined && model !== null) {
+      assertString(model, 'model');
+      assertMaxLength(model, 100, 'model');
+    }
     const window = BrowserWindow.getFocusedWindow();
-    return aiManager.sendMessage(prompt, provider, window);
+    return aiManager.sendMessage(prompt, provider, window, model || undefined);
+  });
+  ipcMain.handle('ai:get-models', (_e, provider?: AIProvider) => {
+    if (provider) return aiManager.getModels(provider);
+    return aiManager.getAllModels();
   });
   ipcMain.handle('ai:cancel', () => aiManager.cancel());
   ipcMain.handle('ai:reset-session', () => aiManager.resetSession());

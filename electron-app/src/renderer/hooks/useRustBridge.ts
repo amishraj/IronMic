@@ -61,7 +61,8 @@ declare global {
       aiGetAuthState: () => Promise<any>;
       aiRefreshAuth: (provider?: string) => Promise<any>;
       aiPickProvider: () => Promise<string | null>;
-      aiSendMessage: (prompt: string, provider: string) => Promise<string>;
+      aiSendMessage: (prompt: string, provider: string, model?: string) => Promise<string>;
+      aiGetModels: (provider?: string) => Promise<any[]>;
       aiCancel: () => Promise<void>;
       aiResetSession: () => Promise<void>;
       onAiOutput: (callback: (data: any) => void) => () => void;

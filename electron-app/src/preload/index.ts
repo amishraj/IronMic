@@ -75,7 +75,8 @@ const api = {
   aiGetAuthState: () => ipcRenderer.invoke('ai:get-auth-state'),
   aiRefreshAuth: (provider?: string) => ipcRenderer.invoke('ai:refresh-auth', provider),
   aiPickProvider: () => ipcRenderer.invoke('ai:pick-provider'),
-  aiSendMessage: (prompt: string, provider: string) => ipcRenderer.invoke('ai:send-message', prompt, provider),
+  aiSendMessage: (prompt: string, provider: string, model?: string) => ipcRenderer.invoke('ai:send-message', prompt, provider, model),
+  aiGetModels: (provider?: string) => ipcRenderer.invoke('ai:get-models', provider),
   aiCancel: () => ipcRenderer.invoke('ai:cancel'),
   aiResetSession: () => ipcRenderer.invoke('ai:reset-session'),
   onAiOutput: (callback: (data: any) => void) => {

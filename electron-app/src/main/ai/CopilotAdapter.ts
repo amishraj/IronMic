@@ -1,5 +1,5 @@
-import { execSync, execFile } from 'child_process';
-import type { ICLIAdapter, ParsedOutput, AIProvider } from './types';
+import { execSync } from 'child_process';
+import type { ICLIAdapter, ParsedOutput, AIProvider, AIModel } from './types';
 
 export class CopilotAdapter implements ICLIAdapter {
   name: AIProvider = 'copilot';
@@ -57,8 +57,23 @@ export class CopilotAdapter implements ICLIAdapter {
     }
   }
 
-  buildArgs(prompt: string, _continueSession: boolean): string[] {
-    return ['copilot', 'suggest', '-t', 'shell', prompt];
+  buildArgs(prompt: string, _continueSession: boolean, model?: string): string[] {
+    // gh copilot uses models via --model flag in newer versions
+    const args = ['copilot', 'suggest', '-t', 'shell'];
+    if (model) args.push('--model', model);
+    args.push(prompt);
+    return args;
+  }
+
+  availableModels(): AIModel[] {
+    return [
+      { id: 'gpt-4.1-mini', label: 'GPT-4.1 Mini', provider: 'copilot', free: true, description: 'Free with GitHub — fast and capable' },
+      { id: 'gpt-4.1', label: 'GPT-4.1', provider: 'copilot', free: false, description: 'Most capable GPT model' },
+      { id: 'gpt-4o', label: 'GPT-4o', provider: 'copilot', free: false, description: 'Multimodal, fast' },
+      { id: 'gpt-4o-mini', label: 'GPT-4o Mini', provider: 'copilot', free: true, description: 'Lightweight and free' },
+      { id: 'o3-mini', label: 'o3-mini', provider: 'copilot', free: false, description: 'Advanced reasoning' },
+      { id: 'claude-sonnet-4', label: 'Claude Sonnet 4', provider: 'copilot', free: false, description: 'Anthropic via GitHub Models' },
+    ];
   }
 
   parseOutput(data: string): ParsedOutput {
