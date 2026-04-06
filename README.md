@@ -1,11 +1,12 @@
 <p align="center">
-  <img src="assets/logo-dark.png" alt="IronMic" width="360" />
+  <img src="assets/mic-idle.png" alt="IronMic" width="128" />
 </p>
 
 <h1 align="center">IronMic</h1>
 
 <p align="center">
-  <strong>Fully-local enterprise voice AI.</strong> Speak, transcribe, polish, listen back — all on-device. Zero network. Zero telemetry.
+  <strong>Fully-local voice transcription and text-to-speech.</strong><br/>
+  Speak, transcribe, polish, listen back — all on-device. Zero network. Zero telemetry.
 </p>
 
 <p align="center">
