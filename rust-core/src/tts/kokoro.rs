@@ -560,6 +560,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "tts")]
     fn vocab_has_correct_ids() {
         let vocab = build_vocab();
         // Verify key IPA symbols have correct IDs (not sequential)
