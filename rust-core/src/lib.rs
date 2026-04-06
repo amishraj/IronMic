@@ -17,7 +17,7 @@ mod napi_exports {
 
     use crate::audio::capture::CaptureEngine;
     use crate::audio::processor;
-    use crate::llm::cleanup::{LlmConfig, LlmEngine, SharedLlmEngine};
+    use crate::llm::cleanup::{LlmEngine, SharedLlmEngine};
     use crate::transcription::dictionary::Dictionary;
     use crate::transcription::whisper::{SharedWhisperEngine, WhisperConfig, WhisperEngine};
 
@@ -431,7 +431,7 @@ mod napi_exports {
     // ── Model Status & Config ──
 
     use crate::transcription::whisper::{
-        available_models, downloaded_models, gpu_available,
+        downloaded_models, gpu_available,
     };
 
     #[napi(object)]
@@ -541,7 +541,6 @@ mod napi_exports {
 
     use crate::tts::kokoro::{KokoroEngine, SharedTtsEngine};
     use crate::tts::playback::PlaybackEngine;
-    use crate::tts::TtsEngine as TtsEngineTrait;
 
     static TTS_ENGINE: std::sync::LazyLock<SharedTtsEngine> =
         std::sync::LazyLock::new(|| SharedTtsEngine::new(KokoroEngine::with_defaults()));
