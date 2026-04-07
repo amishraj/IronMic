@@ -30,10 +30,7 @@ module.exports = {
     target: ['dmg'],
     category: 'public.app-category.productivity',
     icon: 'resources/icon.png',
-    hardenedRuntime: true,
-    gatekeeperAssess: false,
-    entitlements: 'resources/entitlements.mac.plist',
-    entitlementsInherit: 'resources/entitlements.mac.plist',
+    identity: null,
     extendInfo: {
       NSMicrophoneUsageDescription: 'IronMic needs microphone access for voice dictation.',
     },

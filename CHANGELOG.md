@@ -2,6 +2,18 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.0.9] - 2026-04-06
+
+### Fixed
+- **macOS DMG crash on launch** — Electron Framework failed to load due to code signing Team ID mismatch. Disabled code signing (`identity: null`) for unsigned builds so the main binary and framework signatures are consistent.
+- **DictatePage crash** — `Cannot access 'editor' before initialization` error caused by `handleReadBack` callback referencing the TipTap editor before its `useEditor` declaration. Moved callback below the hook.
+
+### Changed
+- Added macOS unsigned-app install instructions to README (xattr quarantine removal + right-click Open)
+- Removed hardened runtime entitlements from electron-builder config (not applicable without a signing certificate)
+
+---
+
 ## [1.0.8] - 2026-04-06
 
 ### Added
