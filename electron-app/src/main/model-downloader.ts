@@ -3,11 +3,15 @@
  * This is the ONLY network code in the entire app, and it only runs
  * when the user explicitly clicks a download button.
  *
+ * Models are hosted on GitHub Releases (primary) with HuggingFace fallback.
+ * The LLM model is split into multiple parts (exceeds GitHub 2 GB limit).
+ *
  * Security:
  * - SHA-256 integrity verification on all model files
  * - HTTPS enforced, HTTP rejected
- * - Redirect domains validated (HuggingFace only)
+ * - Redirect domains validated (GitHub + HuggingFace)
  * - Download and stall timeouts
+ * - Multi-part reassembly verified against full-file checksum
  */
 
 import https from 'https';
@@ -15,18 +19,36 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { BrowserWindow } from 'electron';
-import { MODEL_URLS, MODEL_FILES, MODEL_CHECKSUMS, TTS_VOICE_BASE_URL, TTS_VOICE_IDS } from '../shared/constants';
+import {
+  MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
+  MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS,
+} from '../shared/constants';
 
-const MODELS_DIR = path.join(__dirname, '..', '..', '..', 'rust-core', 'models');
+/**
+ * Resolve the models directory.
+ * Uses IRONMIC_MODELS_DIR (set by main/index.ts) so Electron and Rust agree
+ * on the same path.  Falls back to the dev-time relative path.
+ */
+function resolveModelsDir(): string {
+  if (process.env.IRONMIC_MODELS_DIR) {
+    return process.env.IRONMIC_MODELS_DIR;
+  }
+  return path.join(__dirname, '..', '..', '..', 'rust-core', 'models');
+}
+
+const MODELS_DIR = resolveModelsDir();
 
 /** Allowed domains for model downloads and redirects */
-const ALLOWED_DOMAINS = ['huggingface.co'];
+const ALLOWED_DOMAINS = ['github.com', 'objects.githubusercontent.com', 'huggingface.co'];
 
 /** Overall download timeout: 10 minutes */
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Stall timeout: abort if no data received for 60 seconds */
 const STALL_TIMEOUT_MS = 60 * 1000;
+
+/** Max retries before falling back to HuggingFace */
+const MAX_RETRIES = 3;
 
 function getModelPath(model: string): string {
   const filename = MODEL_FILES[model];
@@ -62,6 +84,36 @@ export function isTtsModelReady(): boolean {
   return fs.existsSync(defaultVoice);
 }
 
+/**
+ * Ensure bundled TTS voices are copied to the models directory.
+ * Voices are bundled in the installer at process.resourcesPath/models/voices/.
+ * In production, we copy them to userData/models/voices/ on first launch.
+ */
+export function ensureBundledVoices(): void {
+  const destVoicesDir = path.join(MODELS_DIR, 'voices');
+  const defaultVoice = path.join(destVoicesDir, 'af_heart.bin');
+
+  // Already copied
+  if (fs.existsSync(defaultVoice)) return;
+
+  // In production, voices are bundled in resources
+  if (process.resourcesPath) {
+    const bundledDir = path.join(process.resourcesPath, 'models', 'voices');
+    if (fs.existsSync(bundledDir)) {
+      fs.mkdirSync(destVoicesDir, { recursive: true });
+      const files = fs.readdirSync(bundledDir).filter(f => f.endsWith('.bin'));
+      for (const file of files) {
+        const src = path.join(bundledDir, file);
+        const dest = path.join(destVoicesDir, file);
+        if (!fs.existsSync(dest)) {
+          fs.copyFileSync(src, dest);
+        }
+      }
+      console.log(`[model-downloader] Copied ${files.length} bundled voices`);
+    }
+  }
+}
+
 /** Validate a URL is HTTPS and points to an allowed domain */
 function validateUrl(url: string): void {
   if (!url.startsWith('https://')) {
@@ -92,44 +144,20 @@ function cleanupTemp(tempPath: string) {
   try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
 }
 
+type ProgressCallback = (downloaded: number, total: number, status: string) => void;
+
 /**
- * Download a single model file with integrity verification.
+ * Download a single file from a URL to a destination path.
+ * Handles redirects, stall detection, and timeouts.
  */
-export function downloadModel(
-  model: string,
-  window: BrowserWindow | null,
+function downloadFile(
+  url: string,
+  destPath: string,
+  onProgress?: ProgressCallback,
+  bytesOffset = 0,
+  totalOverride = 0,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
-    const url = MODEL_URLS[model];
-    if (!url) {
-      reject(new Error(`Unknown model: ${model}`));
-      return;
-    }
-
-    try { validateUrl(url); } catch (e) { reject(e); return; }
-
-    const destPath = getModelPath(model);
-    const tempPath = destPath + '.downloading';
-    const expectedHash = MODEL_CHECKSUMS[model]; // may be undefined for voice files
-
-    fs.mkdirSync(MODELS_DIR, { recursive: true });
-
-    console.log(`[model-downloader] Starting download: ${model}`);
-    console.log(`[model-downloader] Destination: ${destPath}`);
-    if (expectedHash) console.log(`[model-downloader] Expected SHA-256: ${expectedHash.slice(0, 16)}...`);
-
-    function sendProgress(downloaded: number, total: number, status: string) {
-      if (window && !window.isDestroyed()) {
-        window.webContents.send('ironmic:model-download-progress', {
-          model,
-          downloaded,
-          total,
-          status,
-          percent: total > 0 ? Math.round((downloaded / total) * 100) : 0,
-        });
-      }
-    }
-
     function doRequest(reqUrl: string, redirectCount = 0) {
       if (redirectCount > 5) {
         reject(new Error('Too many redirects'));
@@ -139,7 +167,6 @@ export function downloadModel(
       try { validateUrl(reqUrl); } catch (e) { reject(e); return; }
 
       const req = https.get(reqUrl, (res) => {
-        // Follow redirects — but validate the target domain
         if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           const redirectUrl = res.headers.location;
           console.log(`[model-downloader] Redirect → ${new URL(redirectUrl).hostname}`);
@@ -152,34 +179,33 @@ export function downloadModel(
           return;
         }
 
-        const totalBytes = parseInt(res.headers['content-length'] || '0', 10);
-        let downloadedBytes = 0;
+        const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+        const totalBytes = totalOverride || (bytesOffset + contentLength);
+        let downloadedBytes = bytesOffset;
 
-        const file = fs.createWriteStream(tempPath);
+        const file = fs.createWriteStream(destPath);
 
-        sendProgress(0, totalBytes, 'downloading');
+        if (onProgress) onProgress(downloadedBytes, totalBytes, 'downloading');
 
-        // Stall timer — reset on each data chunk
         let stallTimer = setTimeout(() => {
           req.destroy();
-          cleanupTemp(tempPath);
-          sendProgress(0, 0, 'error');
+          cleanupTemp(destPath);
+          if (onProgress) onProgress(0, 0, 'error');
           reject(new Error('Download stalled — no data received for 60 seconds'));
         }, STALL_TIMEOUT_MS);
 
         res.on('data', (chunk: Buffer) => {
           downloadedBytes += chunk.length;
-          // Reset stall timer
           clearTimeout(stallTimer);
           stallTimer = setTimeout(() => {
             req.destroy();
-            cleanupTemp(tempPath);
-            sendProgress(0, 0, 'error');
+            cleanupTemp(destPath);
+            if (onProgress) onProgress(0, 0, 'error');
             reject(new Error('Download stalled — no data received for 60 seconds'));
           }, STALL_TIMEOUT_MS);
 
           if (downloadedBytes % (1024 * 1024) < chunk.length) {
-            sendProgress(downloadedBytes, totalBytes, 'downloading');
+            if (onProgress) onProgress(downloadedBytes, totalBytes, 'downloading');
           }
         });
 
@@ -187,53 +213,26 @@ export function downloadModel(
 
         file.on('finish', () => {
           clearTimeout(stallTimer);
-          file.close(async () => {
-            // Verify integrity if checksum is known
-            if (expectedHash) {
-              try {
-                const actualHash = await hashFile(tempPath);
-                if (actualHash !== expectedHash) {
-                  cleanupTemp(tempPath);
-                  sendProgress(0, 0, 'error');
-                  reject(new Error(
-                    `Integrity check failed for ${model}. Expected SHA-256: ${expectedHash.slice(0, 16)}..., got: ${actualHash.slice(0, 16)}...`
-                  ));
-                  return;
-                }
-                console.log(`[model-downloader] SHA-256 verified: ${model}`);
-              } catch (hashErr) {
-                cleanupTemp(tempPath);
-                sendProgress(0, 0, 'error');
-                reject(new Error(`Failed to verify download integrity: ${hashErr}`));
-                return;
-              }
-            }
-
-            fs.renameSync(tempPath, destPath);
-            sendProgress(totalBytes, totalBytes, 'complete');
-            console.log(`[model-downloader] Download complete: ${model}`);
-            resolve();
-          });
+          file.close(() => resolve());
         });
 
         file.on('error', (err) => {
           clearTimeout(stallTimer);
-          cleanupTemp(tempPath);
-          sendProgress(0, 0, 'error');
+          cleanupTemp(destPath);
+          if (onProgress) onProgress(0, 0, 'error');
           reject(err);
         });
       });
 
       req.on('error', (err) => {
-        sendProgress(0, 0, 'error');
+        if (onProgress) onProgress(0, 0, 'error');
         reject(err);
       });
 
-      // Overall download timeout
       req.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
         req.destroy();
-        cleanupTemp(tempPath);
-        sendProgress(0, 0, 'error');
+        cleanupTemp(destPath);
+        if (onProgress) onProgress(0, 0, 'error');
         reject(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS / 60000} minutes`));
       });
     }
@@ -243,85 +242,270 @@ export function downloadModel(
 }
 
 /**
- * Download a single voice file to the voices/ subdirectory.
+ * Download a single file with retry + HuggingFace fallback.
  */
-function downloadVoiceFile(voiceId: string, window: BrowserWindow | null): Promise<void> {
-  const voicesDir = path.join(MODELS_DIR, 'voices');
-  fs.mkdirSync(voicesDir, { recursive: true });
+async function downloadWithFallback(
+  url: string,
+  fallbackUrl: string | undefined,
+  destPath: string,
+  onProgress?: ProgressCallback,
+  bytesOffset = 0,
+  totalOverride = 0,
+): Promise<{ usedFallback: boolean }> {
+  let lastError: Error | null = null;
 
-  const destPath = path.join(voicesDir, `${voiceId}.bin`);
-  if (fs.existsSync(destPath)) return Promise.resolve();
-
-  const url = `${TTS_VOICE_BASE_URL}/${voiceId}.bin`;
-  const tempPath = destPath + '.downloading';
-
-  try { validateUrl(url); } catch (e) { return Promise.reject(e); }
-
-  return new Promise((resolve, reject) => {
-    console.log(`[model-downloader] Downloading voice: ${voiceId}`);
-
-    function doRequest(reqUrl: string, redirectCount = 0) {
-      if (redirectCount > 5) { reject(new Error('Too many redirects')); return; }
-      try { validateUrl(reqUrl); } catch (e) { reject(e); return; }
-
-      const req = https.get(reqUrl, (res) => {
-        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          doRequest(res.headers.location, redirectCount + 1);
-          return;
-        }
-        if (res.statusCode !== 200) {
-          reject(new Error(`Voice download failed: HTTP ${res.statusCode} for ${voiceId}`));
-          return;
-        }
-        const file = fs.createWriteStream(tempPath);
-        res.pipe(file);
-        file.on('finish', () => {
-          file.close(() => {
-            fs.renameSync(tempPath, destPath);
-            console.log(`[model-downloader] Voice downloaded: ${voiceId}`);
-            resolve();
-          });
-        });
-        file.on('error', (err) => {
-          cleanupTemp(tempPath);
-          reject(err);
-        });
-      });
-      req.on('error', reject);
-      req.setTimeout(STALL_TIMEOUT_MS, () => {
-        req.destroy();
-        cleanupTemp(tempPath);
-        reject(new Error(`Voice download timed out: ${voiceId}`));
-      });
+  // Try primary URL up to MAX_RETRIES times
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      await downloadFile(url, destPath, onProgress, bytesOffset, totalOverride);
+      return { usedFallback: false };
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`[model-downloader] Primary download attempt ${attempt}/${MAX_RETRIES} failed: ${err.message}`);
     }
+  }
 
-    doRequest(url);
+  // Try fallback if available
+  if (fallbackUrl) {
+    console.log(`[model-downloader] Trying fallback source (HuggingFace)...`);
+    if (onProgress) onProgress(0, 0, 'fallback');
+    try {
+      await downloadFile(fallbackUrl, destPath, onProgress, bytesOffset, totalOverride);
+      return { usedFallback: true };
+    } catch (err: any) {
+      console.error(`[model-downloader] Fallback also failed: ${err.message}`);
+      throw new Error(`Download failed from all sources. Last error: ${err.message}`);
+    }
+  }
+
+  throw lastError || new Error('Download failed');
+}
+
+/**
+ * Concatenate multiple part files into a single file via streaming.
+ */
+async function concatenateParts(partPaths: string[], destPath: string): Promise<void> {
+  const writeStream = fs.createWriteStream(destPath);
+  for (const partPath of partPaths) {
+    await new Promise<void>((resolve, reject) => {
+      const readStream = fs.createReadStream(partPath);
+      readStream.pipe(writeStream, { end: false });
+      readStream.on('end', resolve);
+      readStream.on('error', reject);
+    });
+  }
+  writeStream.end();
+  await new Promise<void>((resolve, reject) => {
+    writeStream.on('finish', resolve);
+    writeStream.on('error', reject);
   });
 }
 
 /**
- * Download TTS model (ONNX) + all English voice files.
+ * Download a multi-part model (e.g., LLM split into chunks).
+ * Downloads each part, concatenates, verifies SHA-256, cleans up parts.
  */
-export async function downloadTtsModel(window: BrowserWindow | null): Promise<void> {
-  if (!isModelDownloaded('tts-model')) {
-    await downloadModel('tts-model', window);
-  }
+async function downloadMultiPartModel(
+  model: string,
+  window: BrowserWindow | null,
+): Promise<void> {
+  const parts = MODEL_PARTS[model];
+  const destPath = getModelPath(model);
+  const expectedHash = MODEL_CHECKSUMS[model];
 
-  if (window && !window.isDestroyed()) {
-    window.webContents.send('ironmic:model-download-progress', {
-      model: 'tts-voices', downloaded: 0, total: TTS_VOICE_IDS.length, status: 'downloading', percent: 0,
-    });
-  }
+  fs.mkdirSync(MODELS_DIR, { recursive: true });
 
-  for (let i = 0; i < TTS_VOICE_IDS.length; i++) {
-    await downloadVoiceFile(TTS_VOICE_IDS[i], window);
+  // Calculate total expected size from all parts for progress
+  // We estimate based on the known model size
+  const partPaths: string[] = [];
+  let downloadedTotal = 0;
+  // Rough estimate: use known size from constants or 0
+  const estimatedTotal = 4_400_000_000; // ~4.4 GB for LLM
+
+  function sendProgress(downloaded: number, total: number, status: string) {
     if (window && !window.isDestroyed()) {
       window.webContents.send('ironmic:model-download-progress', {
-        model: 'tts-voices',
-        downloaded: i + 1,
-        total: TTS_VOICE_IDS.length,
-        status: i === TTS_VOICE_IDS.length - 1 ? 'complete' : 'downloading',
-        percent: Math.round(((i + 1) / TTS_VOICE_IDS.length) * 100),
+        model,
+        downloaded,
+        total,
+        status,
+        percent: total > 0 ? Math.round((downloaded / total) * 100) : 0,
+      });
+    }
+  }
+
+  console.log(`[model-downloader] Starting multi-part download: ${model} (${parts.length} parts)`);
+  sendProgress(0, estimatedTotal, 'downloading');
+
+  // Download each part
+  for (let i = 0; i < parts.length; i++) {
+    const partFilename = parts[i];
+    const partUrl = `${MODELS_BASE_URL}/${partFilename}`;
+    const partPath = path.join(MODELS_DIR, partFilename);
+    partPaths.push(partPath);
+
+    const partProgress: ProgressCallback = (downloaded, total, status) => {
+      if (status === 'downloading') {
+        sendProgress(downloadedTotal + (downloaded - downloadedTotal), estimatedTotal, 'downloading');
+      }
+    };
+
+    // No fallback for individual parts — fallback is for the whole model
+    // (HuggingFace has the full file, not parts)
+    try {
+      await downloadFile(partUrl, partPath, partProgress);
+      const partSize = fs.statSync(partPath).size;
+      downloadedTotal += partSize;
+      sendProgress(downloadedTotal, estimatedTotal, 'downloading');
+      console.log(`[model-downloader] Part ${i + 1}/${parts.length} complete (${partFilename})`);
+    } catch (err: any) {
+      // Clean up any downloaded parts
+      for (const p of partPaths) { cleanupTemp(p); }
+
+      // Try HuggingFace fallback for the whole file
+      const fallbackUrl = MODEL_FALLBACK_URLS[model];
+      if (fallbackUrl) {
+        console.log(`[model-downloader] Part download failed, trying HuggingFace fallback for full file...`);
+        sendProgress(0, 0, 'fallback');
+        const tempPath = destPath + '.downloading';
+        await downloadFile(fallbackUrl, tempPath, (d, t, s) => sendProgress(d, t, s));
+
+        // Verify
+        if (expectedHash) {
+          const actualHash = await hashFile(tempPath);
+          if (actualHash !== expectedHash) {
+            cleanupTemp(tempPath);
+            throw new Error(`Integrity check failed for ${model} (fallback).`);
+          }
+        }
+        fs.renameSync(tempPath, destPath);
+        sendProgress(estimatedTotal, estimatedTotal, 'complete');
+        console.log(`[model-downloader] Download complete via fallback: ${model}`);
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // Concatenate parts into final file
+  console.log(`[model-downloader] Concatenating ${parts.length} parts...`);
+  sendProgress(downloadedTotal, estimatedTotal, 'verifying');
+
+  const tempPath = destPath + '.assembling';
+  await concatenateParts(partPaths, tempPath);
+
+  // Verify integrity of the assembled file
+  if (expectedHash) {
+    const actualHash = await hashFile(tempPath);
+    if (actualHash !== expectedHash) {
+      cleanupTemp(tempPath);
+      for (const p of partPaths) { cleanupTemp(p); }
+      sendProgress(0, 0, 'error');
+      throw new Error(
+        `Integrity check failed for ${model}. Expected SHA-256: ${expectedHash.slice(0, 16)}..., got: ${actualHash.slice(0, 16)}...`
+      );
+    }
+    console.log(`[model-downloader] SHA-256 verified: ${model}`);
+  }
+
+  // Move assembled file to final location and clean up parts
+  fs.renameSync(tempPath, destPath);
+  for (const p of partPaths) { cleanupTemp(p); }
+
+  sendProgress(estimatedTotal, estimatedTotal, 'complete');
+  console.log(`[model-downloader] Multi-part download complete: ${model}`);
+}
+
+/**
+ * Download a model file with integrity verification.
+ * Routes multi-part models to the split-file downloader.
+ */
+export async function downloadModel(
+  model: string,
+  window: BrowserWindow | null,
+): Promise<void> {
+  // Multi-part model (e.g., LLM)
+  if (MODEL_PARTS[model]) {
+    return downloadMultiPartModel(model, window);
+  }
+
+  // Single-file model
+  const url = MODEL_URLS[model];
+  if (!url) {
+    throw new Error(`Unknown model: ${model}`);
+  }
+
+  const destPath = getModelPath(model);
+  const tempPath = destPath + '.downloading';
+  const expectedHash = MODEL_CHECKSUMS[model];
+  const fallbackUrl = MODEL_FALLBACK_URLS[model];
+
+  fs.mkdirSync(MODELS_DIR, { recursive: true });
+
+  console.log(`[model-downloader] Starting download: ${model}`);
+  console.log(`[model-downloader] Destination: ${destPath}`);
+  if (expectedHash) console.log(`[model-downloader] Expected SHA-256: ${expectedHash.slice(0, 16)}...`);
+
+  function sendProgress(downloaded: number, total: number, status: string) {
+    if (window && !window.isDestroyed()) {
+      window.webContents.send('ironmic:model-download-progress', {
+        model,
+        downloaded,
+        total,
+        status,
+        percent: total > 0 ? Math.round((downloaded / total) * 100) : 0,
+      });
+    }
+  }
+
+  const { usedFallback } = await downloadWithFallback(
+    url, fallbackUrl, tempPath, sendProgress,
+  );
+
+  if (usedFallback) {
+    console.log(`[model-downloader] Downloaded ${model} from fallback source (HuggingFace)`);
+  }
+
+  // Verify integrity
+  if (expectedHash) {
+    try {
+      const actualHash = await hashFile(tempPath);
+      if (actualHash !== expectedHash) {
+        cleanupTemp(tempPath);
+        sendProgress(0, 0, 'error');
+        throw new Error(
+          `Integrity check failed for ${model}. Expected SHA-256: ${expectedHash.slice(0, 16)}..., got: ${actualHash.slice(0, 16)}...`
+        );
+      }
+      console.log(`[model-downloader] SHA-256 verified: ${model}`);
+    } catch (hashErr: any) {
+      if (hashErr.message.includes('Integrity check failed')) throw hashErr;
+      cleanupTemp(tempPath);
+      sendProgress(0, 0, 'error');
+      throw new Error(`Failed to verify download integrity: ${hashErr}`);
+    }
+  }
+
+  fs.renameSync(tempPath, destPath);
+  sendProgress(0, 0, 'complete');
+  console.log(`[model-downloader] Download complete: ${model}`);
+}
+
+/**
+ * Download TTS model (ONNX). Voices are bundled in the installer.
+ */
+export async function downloadTtsModel(window: BrowserWindow | null): Promise<void> {
+  // Ensure bundled voices are in place
+  ensureBundledVoices();
+
+  // Download the ONNX model if not present
+  if (!isModelDownloaded('tts-model')) {
+    await downloadModel('tts-model', window);
+  } else {
+    // Already downloaded, signal complete
+    if (window && !window.isDestroyed()) {
+      window.webContents.send('ironmic:model-download-progress', {
+        model: 'tts-model', downloaded: 1, total: 1, status: 'complete', percent: 100,
       });
     }
   }

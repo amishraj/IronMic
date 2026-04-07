@@ -9,8 +9,13 @@ use crate::transcription::dictionary::Dictionary;
 /// Default model filename.
 const DEFAULT_MODEL_FILENAME: &str = "whisper-large-v3-turbo.bin";
 
-/// Resolve the models directory using compile-time manifest dir.
+/// Resolve the models directory.
+/// In production the Electron host sets IRONMIC_MODELS_DIR to the app's
+/// Resources/models path.  Falls back to the compile-time manifest dir for dev.
 fn models_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("IRONMIC_MODELS_DIR") {
+        return PathBuf::from(dir);
+    }
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     PathBuf::from(manifest_dir).join("models")
 }
@@ -43,7 +48,7 @@ pub fn available_models() -> Vec<WhisperModelInfo> {
             speed_label: "1x (baseline)".into(),
             accuracy_label: "Best".into(),
             description: "Highest accuracy. Best for important recordings.".into(),
-            download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin".into(),
+            download_url: "https://github.com/greenpioneersolutions/IronMic/releases/download/models-v1/whisper-large-v3-turbo.bin".into(),
         },
         WhisperModelInfo {
             id: "medium".into(),
@@ -53,7 +58,7 @@ pub fn available_models() -> Vec<WhisperModelInfo> {
             speed_label: "~2x faster".into(),
             accuracy_label: "Very good".into(),
             description: "Great balance of speed and accuracy.".into(),
-            download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin".into(),
+            download_url: "https://github.com/greenpioneersolutions/IronMic/releases/download/models-v1/ggml-medium.bin".into(),
         },
         WhisperModelInfo {
             id: "small".into(),
@@ -63,7 +68,7 @@ pub fn available_models() -> Vec<WhisperModelInfo> {
             speed_label: "~4x faster".into(),
             accuracy_label: "Good".into(),
             description: "Fast with solid accuracy. Good for everyday use.".into(),
-            download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin".into(),
+            download_url: "https://github.com/greenpioneersolutions/IronMic/releases/download/models-v1/ggml-small.bin".into(),
         },
         WhisperModelInfo {
             id: "base".into(),
@@ -73,7 +78,7 @@ pub fn available_models() -> Vec<WhisperModelInfo> {
             speed_label: "~8x faster".into(),
             accuracy_label: "Okay".into(),
             description: "Very fast. Best for quick notes or slower hardware.".into(),
-            download_url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin".into(),
+            download_url: "https://github.com/greenpioneersolutions/IronMic/releases/download/models-v1/ggml-base.bin".into(),
         },
     ]
 }

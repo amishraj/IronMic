@@ -6,6 +6,17 @@ import { app, BrowserWindow, session, globalShortcut, nativeImage } from 'electr
 import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
 import { createTray, destroyTray, updateTrayState } from './tray';
+import { ensureBundledVoices } from './model-downloader';
+
+// Set the models directory env var BEFORE the Rust addon loads.
+// In production, models go to the user's app-data directory (writable).
+// In dev, they live in rust-core/models relative to the source tree.
+if (process.env.NODE_ENV !== 'development') {
+  process.env.IRONMIC_MODELS_DIR = path.join(app.getPath('userData'), 'models');
+} else {
+  process.env.IRONMIC_MODELS_DIR = path.join(__dirname, '..', '..', '..', 'rust-core', 'models');
+}
+
 import { native } from './native-bridge';
 
 const ICON_PATH = path.join(__dirname, '..', '..', 'resources', 'icon.png');
@@ -86,6 +97,11 @@ app.whenReady().then(() => {
   createWindow();
   createTray(() => app.quit());
   registerGlobalHotkey();
+
+  // Copy bundled TTS voices to user data on first launch
+  try { ensureBundledVoices(); } catch (err) {
+    console.warn('[startup] Failed to copy bundled voices:', err);
+  }
 
   // Run auto-cleanup on startup
   try {

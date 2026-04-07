@@ -28,9 +28,14 @@ pub struct TtsConfig {
 
 impl Default for TtsConfig {
     fn default() -> Self {
-        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let model_dir = if let Ok(dir) = std::env::var("IRONMIC_MODELS_DIR") {
+            PathBuf::from(dir)
+        } else {
+            let manifest_dir = env!("CARGO_MANIFEST_DIR");
+            PathBuf::from(manifest_dir).join("models")
+        };
         Self {
-            model_dir: PathBuf::from(manifest_dir).join("models"),
+            model_dir,
             voice_id: "af_heart".to_string(),
             speed: 1.0,
         }

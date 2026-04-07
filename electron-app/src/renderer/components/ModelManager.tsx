@@ -18,7 +18,7 @@ interface DownloadProgress {
   model: string;
   downloaded: number;
   total: number;
-  status: 'downloading' | 'complete' | 'error';
+  status: 'downloading' | 'complete' | 'error' | 'fallback' | 'verifying';
   percent: number;
 }
 
@@ -70,7 +70,9 @@ export function ModelManager() {
     setDownloading(model.id);
     setError(null);
     try {
-      await window.ironmic.downloadModel('whisper');
+      // Map model ID to download key: "large-v3-turbo" → "whisper", others → "whisper-{id}"
+      const downloadKey = model.id === 'large-v3-turbo' ? 'whisper' : `whisper-${model.id}`;
+      await window.ironmic.downloadModel(downloadKey);
     } catch (err: any) {
       setError(err.message || 'Download failed');
       setDownloading(null);
@@ -210,7 +212,11 @@ export function ModelManager() {
                     />
                   </div>
                   <p className="text-[10px] text-iron-text-muted mt-1">
-                    {formatBytes(progress.downloaded)} / {formatBytes(progress.total)} ({progress.percent}%)
+                    {progress.status === 'fallback'
+                      ? 'Primary source unavailable, trying fallback...'
+                      : progress.status === 'verifying'
+                      ? 'Verifying integrity...'
+                      : `${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)} (${progress.percent}%)`}
                   </p>
                 </div>
               )}
@@ -232,34 +238,76 @@ export function ModelManager() {
 
 function LlmModelRow() {
   const [status, setStatus] = useState<any>(null);
-  useEffect(() => { window.ironmic.getModelStatus().then(setStatus); }, []);
+  const [downloading, setDownloading] = useState(false);
+  const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadStatus = () => window.ironmic.getModelStatus().then(setStatus);
+  useEffect(() => {
+    loadStatus();
+    const cleanup = window.ironmic.onModelDownloadProgress((prog: DownloadProgress) => {
+      if (prog.model !== 'llm') return;
+      setProgress(prog);
+      if (prog.status === 'complete') { setDownloading(false); setProgress(null); loadStatus(); }
+      if (prog.status === 'error') { setDownloading(false); setError('Download failed'); }
+    });
+    return cleanup;
+  }, []);
 
   const size = status?.files?.llm?.sizeBytes || status?.llm?.sizeBytes || 0;
   const downloaded = size > 0;
 
+  const handleDownload = async () => {
+    setDownloading(true);
+    setError(null);
+    try {
+      await window.ironmic.downloadModel('llm');
+    } catch (err: any) {
+      setError(err.message || 'Download failed');
+      setDownloading(false);
+    }
+  };
+
   return (
     <Card variant="default" padding="md">
       <div className="flex items-start justify-between">
-        <div>
+        <div className="flex-1 min-w-0">
           <p className="text-sm font-medium text-iron-text">Mistral 7B Instruct Q4</p>
           <p className="text-xs text-iron-text-muted mt-0.5">
-            Removes filler words, fixes grammar. Optional.
+            Removes filler words, fixes grammar. Optional (~4.4 GB).
           </p>
           {downloaded && <p className="text-[11px] text-iron-text-muted mt-1">{formatBytes(size)}</p>}
+          {error && <p className="text-[11px] text-iron-danger mt-1">{error}</p>}
         </div>
-        {downloaded ? (
-          <Badge variant="success">Ready</Badge>
-        ) : (
-          <span className="text-[11px] text-iron-text-muted">Not downloaded</span>
-        )}
+        <div className="ml-3 flex-shrink-0">
+          {downloaded ? (
+            <Badge variant="success">Ready</Badge>
+          ) : downloading ? (
+            <Loader2 className="w-4 h-4 animate-spin text-iron-accent" />
+          ) : (
+            <Button size="sm" icon={<Download className="w-3 h-3" />} onClick={handleDownload}>
+              Download
+            </Button>
+          )}
+        </div>
       </div>
+      {downloading && progress && (
+        <div className="mt-2.5">
+          <div className="w-full h-1 bg-iron-surface-active rounded-full overflow-hidden">
+            <div
+              className="h-full bg-gradient-accent rounded-full transition-all duration-300"
+              style={{ width: `${progress.percent}%` }}
+            />
+          </div>
+          <p className="text-[10px] text-iron-text-muted mt-1">
+            {progress.status === 'fallback'
+              ? 'Primary source unavailable, trying fallback...'
+              : progress.status === 'verifying'
+              ? 'Assembling and verifying integrity...'
+              : `${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)} (${progress.percent}%)`}
+          </p>
+        </div>
+      )}
     </Card>
   );
-
-  function formatBytes(bytes: number): string {
-    if (bytes === 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(1024));
-    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
-  }
 }

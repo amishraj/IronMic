@@ -20,9 +20,9 @@ module.exports = {
       filter: ['**/*'],
     },
     {
-      from: '../rust-core/models/',
-      to: 'models/',
-      filter: ['*.bin', '*.gguf', '*.onnx', 'voices/*.bin'],
+      from: '../rust-core/models/voices/',
+      to: 'models/voices/',
+      filter: ['*.bin'],
     },
   ],
   // electron-builder auto-converts icon.png to .icns (mac) and .ico (win)

@@ -10,10 +10,17 @@ use crate::llm::prompts;
 /// Default model filename.
 const DEFAULT_MODEL_FILENAME: &str = "mistral-7b-instruct-q4_k_m.gguf";
 
-/// Resolve the default model path using compile-time manifest dir.
+/// Resolve the default model path.
+/// In production the Electron host sets IRONMIC_MODELS_DIR to the app's
+/// Resources/models path.  Falls back to the compile-time manifest dir for dev.
 fn default_model_path() -> std::path::PathBuf {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    std::path::PathBuf::from(manifest_dir).join("models").join(DEFAULT_MODEL_FILENAME)
+    let base = if let Ok(dir) = std::env::var("IRONMIC_MODELS_DIR") {
+        std::path::PathBuf::from(dir)
+    } else {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        std::path::PathBuf::from(manifest_dir).join("models")
+    };
+    base.join(DEFAULT_MODEL_FILENAME)
 }
 
 /// Configuration for the LLM cleanup engine.

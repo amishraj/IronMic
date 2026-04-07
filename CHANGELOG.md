@@ -2,6 +2,27 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.0.11] - 2026-04-07
+
+### Changed
+- **Models now hosted on GitHub Releases** — all model downloads (Whisper, LLM, TTS) now pull from `models-v1` release assets on the IronMic GitHub repo instead of HuggingFace. Eliminates external supply chain dependency. SHA-256 integrity verification on all files.
+- **HuggingFace fallback** — if GitHub download fails after 3 retries, falls back to HuggingFace with a warning. Integrity still verified regardless of source.
+- **LLM split-file download** — the 4.4 GB Mistral model is split into 3 parts (~1.5 GB each) on GitHub Releases (2 GB per-asset limit). Automatically reassembled and verified on download.
+- **TTS voices bundled in installer** — all 15 English voice files (~7.5 MB total) are now included in the installer. Text-to-speech read-back works immediately without any download.
+- **Per-variant Whisper downloads** — users can now download medium, small, and base Whisper models individually from Settings (previously only large-v3-turbo was downloadable).
+- **LLM download button** — the Text Cleanup Model section now has a download button with progress tracking.
+- **New `upload-models.yml` workflow** — manually-triggered GitHub Actions workflow to fetch models from HuggingFace, verify checksums, split the LLM, and upload all assets to a pinned models release.
+
+---
+
+## [1.0.10] - 2026-04-07
+
+### Fixed
+- **Model downloads broken in packaged builds** — model-downloader and all Rust model loaders (Whisper, LLM, TTS) used paths that don't exist in packaged apps (`__dirname` relative traversal and `env!("CARGO_MANIFEST_DIR")` compile-time path). Now uses `IRONMIC_MODELS_DIR` env var set by Electron main process, pointing to the user's app-data directory in production.
+- **GPU always reports CPU-only in release builds** — release workflow was missing `--features metal,tts` flag, so Metal GPU support was compiled out. macOS builds now include `metal` feature; all platforms include `tts`.
+
+---
+
 ## [1.0.9] - 2026-04-06
 
 ### Fixed

@@ -14,10 +14,13 @@ jobs:
         include:
           - os: macos-latest
             rust-target: aarch64-apple-darwin
+            cargo-features: '--features metal,tts'
           - os: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
+            cargo-features: '--features tts'
           - os: windows-latest
             rust-target: x86_64-pc-windows-msvc
+            cargo-features: '--features tts'
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +33,7 @@ jobs:
 
       - name: Build Rust addon
         working-directory: rust-core
-        run: cargo build --release
+        run: cargo build --release ${{ matrix.cargo-features }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -40,6 +43,14 @@ jobs:
       - name: Install frontend dependencies
         working-directory: electron-app
         run: npm ci
+
+      - name: Download bundled TTS voices
+        run: |
+          mkdir -p rust-core/models/voices
+          VOICE_BASE="https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices"
+          for v in af_heart af_bella af_sarah af_nicole af_sky af_nova am_adam am_michael am_fenrir bf_alice bf_emma bf_lily bm_daniel bm_george bm_lewis; do
+            curl -L --fail -o "rust-core/models/voices/${v}.bin" "${VOICE_BASE}/${v}.bin"
+          done
 
       - name: Build frontend
         working-directory: electron-app
@@ -97,6 +108,8 @@ jobs:
             2. Go to **Settings > Models**
             3. Download the **Whisper** speech recognition model (~1.5 GB)
             4. Press **Cmd+Shift+V** (or Ctrl+Shift+V) to start dictating
+
+            TTS voices are bundled in the installer — read-back works immediately. Models are hosted on GitHub Releases with SHA-256 integrity verification.
 
             See [CHANGELOG.md](CHANGELOG.md) for the full list of changes.
           files: |
