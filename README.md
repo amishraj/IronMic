@@ -116,6 +116,14 @@ Pre-built packages are available on the **[Releases page](https://github.com/gre
 | Windows | `.exe` installer |
 | Linux | `.AppImage` |
 
+**macOS note:** The app is not code-signed. After downloading, run this in Terminal before opening:
+
+```bash
+xattr -cr ~/Downloads/IronMic-*.dmg
+```
+
+Then open the `.dmg` and drag IronMic to Applications. On first launch you may need to right-click → Open → Open.
+
 After installing, open IronMic and go to **Settings > Models** to download the speech recognition model (~1.5 GB). The app will walk you through setup on first launch.
 
 > Models run entirely on your machine. Nothing is sent externally.

@@ -43,16 +43,6 @@ export function DictatePage() {
   const { handleHotkeyPress, state: recordingState } = useRecordingStore();
   const { state: ttsState, synthesizeAndPlay, stop: ttsStop, toggle: ttsToggle } = useTtsStore();
 
-  const handleReadBack = useCallback(() => {
-    if (!editor) return;
-    if (ttsState === 'playing' || ttsState === 'paused') {
-      ttsStop();
-      return;
-    }
-    const text = editor.getText().trim();
-    if (text) synthesizeAndPlay(text, currentEntryId.current ?? undefined);
-  }, [editor, ttsState, synthesizeAndPlay, ttsStop]);
-
   // Restore draft on mount
   const draft = useRef(loadDraft());
 
@@ -91,6 +81,16 @@ export function DictatePage() {
       }, 1000);
     },
   });
+
+  const handleReadBack = useCallback(() => {
+    if (!editor) return;
+    if (ttsState === 'playing' || ttsState === 'paused') {
+      ttsStop();
+      return;
+    }
+    const text = editor.getText().trim();
+    if (text) synthesizeAndPlay(text, currentEntryId.current ?? undefined);
+  }, [editor, ttsState, synthesizeAndPlay, ttsStop]);
 
   const saveContent = useCallback(async (html: string) => {
     const api = window.ironmic;
