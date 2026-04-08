@@ -35,6 +35,19 @@ jobs:
         working-directory: rust-core
         run: cargo build --release ${{ matrix.cargo-features }}
 
+      - name: Copy Rust addon as .node file
+        shell: bash
+        working-directory: rust-core
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cp target/release/libironmic_core.dylib ironmic-core.node
+          elif [ "$RUNNER_OS" = "Linux" ]; then
+            cp target/release/libironmic_core.so ironmic-core.node
+          elif [ "$RUNNER_OS" = "Windows" ]; then
+            cp target/release/ironmic_core.dll ironmic-core.node
+          fi
+          ls -lh ironmic-core.node
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:

@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.0.13] - 2026-04-08
+
+### Fixed
+- **Blank Models section in packaged app** — the release workflow built the Rust native addon but never copied it to `ironmic-core.node`, so electron-builder couldn't bundle it. The app fell back to JavaScript stubs with no model functions. Added a copy step that handles macOS (.dylib), Linux (.so), and Windows (.dll) correctly.
+
+---
+
 ## [1.0.11] - 2026-04-07
 
 ### Changed

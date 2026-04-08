@@ -1,6 +1,6 @@
 [package]
 name = "ironmic-core"
-version = "1.0.11"
+version = "1.0.13"
 edition = "2021"
 description = "IronMic – fully-local voice transcription and text-to-speech, Rust native core"
 authors = ["IronMic Contributors"]
