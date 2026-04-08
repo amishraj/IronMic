@@ -2,6 +2,14 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.0.14] - 2026-04-08
+
+### Fixed
+- **Hardened release workflow** — merged Rust build and .node copy into a single step to prevent silent failures. Added pre-package verification that fails the build if the native addon or TTS voices are missing.
+- **ModelManager resilience** — each IPC call (models, GPU status) now loads independently so one failure doesn't blank the entire Settings > Models section.
+
+---
+
 ## [1.0.13] - 2026-04-08
 
 ### Fixed

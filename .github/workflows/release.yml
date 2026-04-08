@@ -32,13 +32,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
 
       - name: Build Rust addon
-        working-directory: rust-core
-        run: cargo build --release ${{ matrix.cargo-features }}
-
-      - name: Copy Rust addon as .node file
         shell: bash
         working-directory: rust-core
         run: |
+          cargo build --release ${{ matrix.cargo-features }}
+          echo "--- Copying native addon to ironmic-core.node ---"
           if [ "$RUNNER_OS" = "macOS" ]; then
             cp target/release/libironmic_core.dylib ironmic-core.node
           elif [ "$RUNNER_OS" = "Linux" ]; then
@@ -47,6 +45,7 @@ jobs:
             cp target/release/ironmic_core.dll ironmic-core.node
           fi
           ls -lh ironmic-core.node
+          file ironmic-core.node
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -69,6 +68,15 @@ jobs:
       - name: Build frontend
         working-directory: electron-app
         run: npm run build
+
+      - name: Verify addon and voices before packaging
+        shell: bash
+        run: |
+          echo "=== Verifying build artifacts ==="
+          ls -lh rust-core/ironmic-core.node || { echo "FATAL: ironmic-core.node missing!"; exit 1; }
+          ls rust-core/models/voices/*.bin | wc -l | xargs -I{} echo "TTS voices: {} files"
+          test -f rust-core/models/voices/af_heart.bin || { echo "FATAL: TTS voices missing!"; exit 1; }
+          echo "=== All artifacts present ==="
 
       - name: Package
         working-directory: electron-app

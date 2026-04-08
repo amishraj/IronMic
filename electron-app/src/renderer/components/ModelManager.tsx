@@ -40,20 +40,26 @@ export function ModelManager() {
   const [error, setError] = useState<string | null>(null);
 
   const loadState = async () => {
+    // Load each piece independently so one failure doesn't blank the whole section
     try {
-      const [modelList, current, gpuAvail, gpuOn] = await Promise.all([
-        window.ironmic.getAvailableWhisperModels(),
-        window.ironmic.getCurrentWhisperModel(),
-        window.ironmic.isGpuAvailable(),
-        window.ironmic.isGpuEnabled(),
-      ]);
+      const modelList = await window.ironmic.getAvailableWhisperModels();
       setModels(modelList);
+    } catch (err) { console.error('Failed to load whisper models:', err); }
+
+    try {
+      const current = await window.ironmic.getCurrentWhisperModel();
       setCurrentModel(current);
+    } catch (err) { console.error('Failed to load current model:', err); }
+
+    try {
+      const gpuAvail = await window.ironmic.isGpuAvailable();
       setGpuAvailable(gpuAvail);
+    } catch (err) { console.error('Failed to check GPU:', err); }
+
+    try {
+      const gpuOn = await window.ironmic.isGpuEnabled();
       setGpuEnabled(gpuOn);
-    } catch (err) {
-      console.error('Failed to load model state:', err);
-    }
+    } catch (err) { console.error('Failed to check GPU enabled:', err); }
   };
 
   useEffect(() => {
