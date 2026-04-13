@@ -37,7 +37,11 @@ function resolveModelsDir(): string {
   return path.join(__dirname, '..', '..', '..', 'rust-core', 'models');
 }
 
-const MODELS_DIR = resolveModelsDir();
+// NOTE: Do NOT cache resolveModelsDir() as a top-level const.
+// Import hoisting causes this module to load BEFORE index.ts sets
+// IRONMIC_MODELS_DIR, so the env var would be undefined and the
+// fallback path would point inside the read-only .app bundle.
+// Every call site must invoke resolveModelsDir() at runtime.
 
 /** Allowed domains for model downloads and redirects */
 const ALLOWED_DOMAINS = ['github.com', 'objects.githubusercontent.com', 'huggingface.co', 'xethub.hf.co'];
@@ -54,7 +58,7 @@ const MAX_RETRIES = 3;
 function getModelPath(model: string): string {
   const filename = MODEL_FILES[model];
   if (!filename) throw new Error(`Unknown model: ${model}`);
-  return path.join(MODELS_DIR, filename);
+  return path.join(resolveModelsDir(), filename);
 }
 
 export function isModelDownloaded(model: string): boolean {
@@ -80,7 +84,7 @@ export function getModelsStatus() {
 
 export function isTtsModelReady(): boolean {
   if (!isModelDownloaded('tts-model')) return false;
-  const voicesDir = path.join(MODELS_DIR, 'voices');
+  const voicesDir = path.join(resolveModelsDir(), 'voices');
   const defaultVoice = path.join(voicesDir, 'af_heart.bin');
   return fs.existsSync(defaultVoice);
 }
@@ -91,7 +95,7 @@ export function isTtsModelReady(): boolean {
  * In production, we copy them to userData/models/voices/ on first launch.
  */
 export function ensureBundledVoices(): void {
-  const destVoicesDir = path.join(MODELS_DIR, 'voices');
+  const destVoicesDir = path.join(resolveModelsDir(), 'voices');
   const defaultVoice = path.join(destVoicesDir, 'af_heart.bin');
 
   // Already copied
@@ -314,7 +318,7 @@ async function downloadMultiPartModel(
   const destPath = getModelPath(model);
   const expectedHash = MODEL_CHECKSUMS[model];
 
-  fs.mkdirSync(MODELS_DIR, { recursive: true });
+  fs.mkdirSync(resolveModelsDir(), { recursive: true });
 
   // Calculate total expected size from all parts for progress
   // We estimate based on the known model size
@@ -342,7 +346,7 @@ async function downloadMultiPartModel(
   for (let i = 0; i < parts.length; i++) {
     const partFilename = parts[i];
     const partUrl = `${MODELS_BASE_URL}/${partFilename}`;
-    const partPath = path.join(MODELS_DIR, partFilename);
+    const partPath = path.join(resolveModelsDir(), partFilename);
     partPaths.push(partPath);
 
     const partProgress: ProgressCallback = (downloaded, total, status) => {
@@ -441,7 +445,7 @@ export async function downloadModel(
   const expectedHash = MODEL_CHECKSUMS[model];
   const fallbackUrl = MODEL_FALLBACK_URLS[model];
 
-  fs.mkdirSync(MODELS_DIR, { recursive: true });
+  fs.mkdirSync(resolveModelsDir(), { recursive: true });
 
   console.log(`[model-downloader] Starting download: ${model}`);
   console.log(`[model-downloader] Destination: ${destPath}`);
@@ -521,7 +525,7 @@ export async function downloadTtsModel(window: BrowserWindow | null): Promise<vo
 export function isTFJSModelReady(modelId: string): boolean {
   const meta = TFJS_MODELS.find(m => m.id === modelId);
   if (!meta) return false;
-  const modelJson = path.join(MODELS_DIR, 'tfjs', meta.dirName, 'model.json');
+  const modelJson = path.join(resolveModelsDir(), 'tfjs', meta.dirName, 'model.json');
   return fs.existsSync(modelJson);
 }
 
@@ -563,7 +567,7 @@ export async function downloadTFJSModel(
 
   // Extract to tfjs/<dirName>/
   const tarPath = getModelPath(modelId);
-  const extractDir = path.join(MODELS_DIR, 'tfjs', meta.dirName);
+  const extractDir = path.join(resolveModelsDir(), 'tfjs', meta.dirName);
 
   fs.mkdirSync(extractDir, { recursive: true });
 
@@ -593,7 +597,7 @@ export function ensureBundledTFJSModels(): void {
   const bundledDir = path.join(process.resourcesPath, 'ml-models');
   if (!fs.existsSync(bundledDir)) return;
 
-  const destTfjsDir = path.join(MODELS_DIR, 'tfjs');
+  const destTfjsDir = path.join(resolveModelsDir(), 'tfjs');
   fs.mkdirSync(destTfjsDir, { recursive: true });
 
   for (const meta of TFJS_MODELS) {
