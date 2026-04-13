@@ -119,7 +119,7 @@ fn handle_request(
             let messages = req.messages.as_deref().ok_or("Missing messages")?;
             let model_type_str = req.model_type.as_deref().unwrap_or("mistral");
             let model_type =
-                ChatModel::from_str(model_type_str).ok_or("Unknown model_type")?;
+                ChatModel::parse(model_type_str).ok_or("Unknown model_type")?;
             let max_tokens = req.max_tokens.unwrap_or(2048);
             let temperature = req.temperature.unwrap_or(0.3);
 

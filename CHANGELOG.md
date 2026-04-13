@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.1] - 2026-04-13
+
+### Fixed
+- **Clippy CI failures** — Renamed `ChatModel::from_str()` to `ChatModel::parse()` to avoid `clippy::should_implement_trait` warning. Flattened manual `if let Some` iterator patterns in analytics top-words and source-breakdown aggregation. Added type alias for complex tuple in analytics recompute.
+
+---
+
 ## [1.1.0] - 2026-04-13
 
 ### Added — On-Device Machine Learning (TensorFlow.js)

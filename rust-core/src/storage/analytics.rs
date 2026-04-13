@@ -165,7 +165,8 @@ impl AnalyticsStore {
             )
             .map_err(|e| IronMicError::Storage(format!("Failed to prepare analytics query: {e}")))?;
 
-        let rows: Vec<(String, Option<String>, Option<f64>, Option<String>)> = stmt
+        type EntryRow = (String, Option<String>, Option<f64>, Option<String>);
+        let rows: Vec<EntryRow> = stmt
             .query_map([date], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -414,12 +415,10 @@ impl AnalyticsStore {
             .map_err(|e| IronMicError::Storage(format!("Failed to collect top words: {e}")))?;
 
         let mut merged: HashMap<String, u64> = HashMap::new();
-        for json_opt in rows {
-            if let Some(json) = json_opt {
-                if let Ok(words) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
-                    for (word, count) in words {
-                        *merged.entry(word).or_insert(0) += count;
-                    }
+        for json in rows.into_iter().flatten() {
+            if let Ok(words) = serde_json::from_str::<Vec<(String, u64)>>(&json) {
+                for (word, count) in words {
+                    *merged.entry(word).or_insert(0) += count;
                 }
             }
         }
@@ -454,12 +453,10 @@ impl AnalyticsStore {
             })?;
 
         let mut merged: HashMap<String, u64> = HashMap::new();
-        for json_opt in rows {
-            if let Some(json) = json_opt {
-                if let Ok(map) = serde_json::from_str::<HashMap<String, u64>>(&json) {
-                    for (app, count) in map {
-                        *merged.entry(app).or_insert(0) += count;
-                    }
+        for json in rows.into_iter().flatten() {
+            if let Ok(map) = serde_json::from_str::<HashMap<String, u64>>(&json) {
+                for (app, count) in map {
+                    *merged.entry(app).or_insert(0) += count;
                 }
             }
         }

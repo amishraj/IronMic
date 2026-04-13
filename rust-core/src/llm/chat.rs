@@ -17,7 +17,7 @@ pub enum ChatModel {
 
 impl ChatModel {
     /// Parse a model type string into a ChatModel variant.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "mistral" => Some(Self::Mistral),
             "llama3" => Some(Self::Llama3),
@@ -175,10 +175,10 @@ mod tests {
 
     #[test]
     fn chat_model_from_str() {
-        assert_eq!(ChatModel::from_str("mistral"), Some(ChatModel::Mistral));
-        assert_eq!(ChatModel::from_str("Llama3"), Some(ChatModel::Llama3));
-        assert_eq!(ChatModel::from_str("PHI3"), Some(ChatModel::Phi3));
-        assert_eq!(ChatModel::from_str("unknown"), None);
+        assert_eq!(ChatModel::parse("mistral"), Some(ChatModel::Mistral));
+        assert_eq!(ChatModel::parse("Llama3"), Some(ChatModel::Llama3));
+        assert_eq!(ChatModel::parse("PHI3"), Some(ChatModel::Phi3));
+        assert_eq!(ChatModel::parse("unknown"), None);
     }
 
     // ── Mistral template tests ──
