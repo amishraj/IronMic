@@ -111,6 +111,84 @@ const api = {
     return () => ipcRenderer.removeListener('ai:turn-end', handler);
   },
 
+  // ── ML Features: Notifications ──
+  notificationCreate: (source: string, sourceId: string | null, type: string, title: string, body?: string) =>
+    ipcRenderer.invoke('ironmic:notification-create', source, sourceId, type, title, body),
+  notificationList: (limit: number, offset: number, unreadOnly: boolean) =>
+    ipcRenderer.invoke('ironmic:notification-list', limit, offset, unreadOnly),
+  notificationMarkRead: (id: string) => ipcRenderer.invoke('ironmic:notification-mark-read', id),
+  notificationAct: (id: string) => ipcRenderer.invoke('ironmic:notification-act', id),
+  notificationDismiss: (id: string) => ipcRenderer.invoke('ironmic:notification-dismiss', id),
+  notificationUpdatePriority: (id: string, priority: number) =>
+    ipcRenderer.invoke('ironmic:notification-update-priority', id, priority),
+  notificationLogInteraction: (notificationId: string, action: string, hour?: number, dow?: number) =>
+    ipcRenderer.invoke('ironmic:notification-log-interaction', notificationId, action, hour, dow),
+  notificationGetInteractions: (sinceDate: string) =>
+    ipcRenderer.invoke('ironmic:notification-get-interactions', sinceDate),
+  notificationGetUnreadCount: () => ipcRenderer.invoke('ironmic:notification-get-unread-count'),
+  notificationDeleteOld: (days: number) => ipcRenderer.invoke('ironmic:notification-delete-old', days),
+
+  // ── ML Features: Action Log ──
+  logAction: (actionType: string, metadataJson?: string) =>
+    ipcRenderer.invoke('ironmic:action-log', actionType, metadataJson),
+  queryActionLog: (from: string, to: string, filter?: string) =>
+    ipcRenderer.invoke('ironmic:action-log-query', from, to, filter),
+  getActionCounts: () => ipcRenderer.invoke('ironmic:action-log-get-counts'),
+  deleteOldActions: (days: number) => ipcRenderer.invoke('ironmic:action-log-delete-old', days),
+
+  // ── ML Features: Workflows ──
+  workflowCreate: (seq: string, pattern: string | null, conf: number, count: number) =>
+    ipcRenderer.invoke('ironmic:workflow-create', seq, pattern, conf, count),
+  workflowList: (includeDismissed: boolean) => ipcRenderer.invoke('ironmic:workflow-list', includeDismissed),
+  workflowSave: (id: string, name: string) => ipcRenderer.invoke('ironmic:workflow-save', id, name),
+  workflowDismiss: (id: string) => ipcRenderer.invoke('ironmic:workflow-dismiss', id),
+  workflowDelete: (id: string) => ipcRenderer.invoke('ironmic:workflow-delete', id),
+
+  // ── ML Features: Embeddings ──
+  embeddingStore: (contentId: string, contentType: string, embeddingBytes: Buffer, modelVersion: string) =>
+    ipcRenderer.invoke('ironmic:embedding-store', contentId, contentType, embeddingBytes, modelVersion),
+  embeddingGetAll: (filter?: string) => ipcRenderer.invoke('ironmic:embedding-get-all', filter),
+  embeddingGetAllWithData: (filter?: string) => ipcRenderer.invoke('ironmic:embedding-get-all-with-data', filter),
+  embeddingGetUnembedded: (limit: number) => ipcRenderer.invoke('ironmic:embedding-get-unembedded', limit),
+  embeddingDelete: (contentId: string, contentType: string) =>
+    ipcRenderer.invoke('ironmic:embedding-delete', contentId, contentType),
+  embeddingGetStats: () => ipcRenderer.invoke('ironmic:embedding-get-stats'),
+  embeddingDeleteAll: () => ipcRenderer.invoke('ironmic:embedding-delete-all'),
+
+  // ── ML Features: Model Weights ──
+  mlSaveWeights: (name: string, weightsJson: string, metaJson: string | null, samples: number) =>
+    ipcRenderer.invoke('ironmic:ml-save-weights', name, weightsJson, metaJson, samples),
+  mlLoadWeights: (name: string) => ipcRenderer.invoke('ironmic:ml-load-weights', name),
+  mlDeleteWeights: (name: string) => ipcRenderer.invoke('ironmic:ml-delete-weights', name),
+  mlGetTrainingStatus: () => ipcRenderer.invoke('ironmic:ml-get-training-status'),
+  mlDeleteAllData: () => ipcRenderer.invoke('ironmic:ml-delete-all-data'),
+
+  // ── ML Features: VAD Training ──
+  vadSaveSample: (features: string, label: string, corrected: boolean, sessionId?: string) =>
+    ipcRenderer.invoke('ironmic:vad-save-sample', features, label, corrected, sessionId),
+  vadGetSamples: (limit: number) => ipcRenderer.invoke('ironmic:vad-get-samples', limit),
+  vadGetSampleCount: () => ipcRenderer.invoke('ironmic:vad-get-sample-count'),
+  vadDeleteAllSamples: () => ipcRenderer.invoke('ironmic:vad-delete-all-samples'),
+
+  // ── ML Features: Intent Training ──
+  intentSaveSample: (transcript: string, intent?: string, entities?: string, conf?: number, entryId?: string) =>
+    ipcRenderer.invoke('ironmic:intent-save-sample', transcript, intent, entities, conf, entryId),
+  intentGetSamples: (limit: number) => ipcRenderer.invoke('ironmic:intent-get-samples', limit),
+  intentGetCorrectionCount: () => ipcRenderer.invoke('ironmic:intent-get-correction-count'),
+  intentLogRouting: (screen: string, intent: string, route: string, entryId?: string) =>
+    ipcRenderer.invoke('ironmic:intent-log-routing', screen, intent, route, entryId),
+
+  // ── ML Features: Meeting Sessions ──
+  meetingCreate: () => ipcRenderer.invoke('ironmic:meeting-create'),
+  meetingEnd: (id: string, speakers: number, summary?: string, items?: string, duration?: number, entryIds?: string) =>
+    ipcRenderer.invoke('ironmic:meeting-end', id, speakers, summary, items, duration, entryIds),
+  meetingGet: (id: string) => ipcRenderer.invoke('ironmic:meeting-get', id),
+  meetingList: (limit: number, offset: number) => ipcRenderer.invoke('ironmic:meeting-list', limit, offset),
+  meetingDelete: (id: string) => ipcRenderer.invoke('ironmic:meeting-delete', id),
+
+  // ── TF.js Infrastructure ──
+  getModelsDir: () => ipcRenderer.invoke('ironmic:get-models-dir'),
+
   // Events from main process
   onHotkeyPressed: (callback: () => void) => {
     ipcRenderer.on('ironmic:hotkey-pressed', callback);
@@ -125,6 +203,16 @@ const api = {
     const handler = (_event: any, state: string) => callback(state);
     ipcRenderer.on('ironmic:pipeline-state-changed', handler);
     return () => ipcRenderer.removeListener('ironmic:pipeline-state-changed', handler);
+  },
+  onNotificationNew: (callback: (notification: any) => void) => {
+    const handler = (_event: any, notification: any) => callback(notification);
+    ipcRenderer.on('ironmic:notification-new', handler);
+    return () => ipcRenderer.removeListener('ironmic:notification-new', handler);
+  },
+  onWorkflowDiscovered: (callback: (workflow: any) => void) => {
+    const handler = (_event: any, workflow: any) => callback(workflow);
+    ipcRenderer.on('ironmic:workflow-discovered', handler);
+    return () => ipcRenderer.removeListener('ironmic:workflow-discovered', handler);
   },
 };
 

@@ -19,9 +19,10 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { BrowserWindow } from 'electron';
+import { execSync } from 'child_process';
 import {
   MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
-  MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS,
+  MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS, TFJS_MODELS,
 } from '../shared/constants';
 
 /**
@@ -507,6 +508,122 @@ export async function downloadTtsModel(window: BrowserWindow | null): Promise<vo
       window.webContents.send('ironmic:model-download-progress', {
         model: 'tts-model', downloaded: 1, total: 1, status: 'complete', percent: 100,
       });
+    }
+  }
+}
+
+// ── TF.js ML Model Management ──
+
+/**
+ * Check if a TF.js model is downloaded and extracted.
+ * TF.js models live in MODELS_DIR/tfjs/<dirName>/model.json.
+ */
+export function isTFJSModelReady(modelId: string): boolean {
+  const meta = TFJS_MODELS.find(m => m.id === modelId);
+  if (!meta) return false;
+  const modelJson = path.join(MODELS_DIR, 'tfjs', meta.dirName, 'model.json');
+  return fs.existsSync(modelJson);
+}
+
+/**
+ * Get status of all TF.js models.
+ */
+export function getTFJSModelsStatus(): Record<string, { downloaded: boolean; dirName: string }> {
+  const result: Record<string, { downloaded: boolean; dirName: string }> = {};
+  for (const meta of TFJS_MODELS) {
+    result[meta.id] = {
+      downloaded: isTFJSModelReady(meta.id),
+      dirName: meta.dirName,
+    };
+  }
+  return result;
+}
+
+/**
+ * Download a TF.js model (tar.gz) and extract it to tfjs/<dirName>/.
+ */
+export async function downloadTFJSModel(
+  modelId: string,
+  window: BrowserWindow | null,
+): Promise<void> {
+  const meta = TFJS_MODELS.find(m => m.id === modelId);
+  if (!meta) throw new Error(`Unknown TF.js model: ${modelId}`);
+
+  if (isTFJSModelReady(modelId)) {
+    if (window && !window.isDestroyed()) {
+      window.webContents.send('ironmic:model-download-progress', {
+        model: modelId, downloaded: 1, total: 1, status: 'complete', percent: 100,
+      });
+    }
+    return;
+  }
+
+  // Download the tar.gz
+  await downloadModel(modelId, window);
+
+  // Extract to tfjs/<dirName>/
+  const tarPath = getModelPath(modelId);
+  const extractDir = path.join(MODELS_DIR, 'tfjs', meta.dirName);
+
+  fs.mkdirSync(extractDir, { recursive: true });
+
+  try {
+    execSync(`tar xzf "${tarPath}" -C "${extractDir}"`, { timeout: 30000 });
+    console.log(`[model-downloader] Extracted TF.js model to ${extractDir}`);
+  } catch (err: any) {
+    // Clean up partial extraction
+    try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch { /* ignore */ }
+    throw new Error(`Failed to extract TF.js model ${modelId}: ${err.message}`);
+  }
+
+  // Verify model.json exists after extraction
+  const modelJson = path.join(extractDir, 'model.json');
+  if (!fs.existsSync(modelJson)) {
+    throw new Error(`TF.js model ${modelId} extracted but model.json not found`);
+  }
+}
+
+/**
+ * Ensure all bundled TF.js models are extracted from the installer resources.
+ * Similar to ensureBundledVoices() — copies from resourcesPath on first launch.
+ */
+export function ensureBundledTFJSModels(): void {
+  if (!process.resourcesPath) return;
+
+  const bundledDir = path.join(process.resourcesPath, 'ml-models');
+  if (!fs.existsSync(bundledDir)) return;
+
+  const destTfjsDir = path.join(MODELS_DIR, 'tfjs');
+  fs.mkdirSync(destTfjsDir, { recursive: true });
+
+  for (const meta of TFJS_MODELS) {
+    const destModelDir = path.join(destTfjsDir, meta.dirName);
+    const destModelJson = path.join(destModelDir, 'model.json');
+
+    // Skip if already extracted
+    if (fs.existsSync(destModelJson)) continue;
+
+    // Check if bundled tar.gz exists
+    const bundledTar = path.join(bundledDir, `${meta.id}.tar.gz`);
+    if (fs.existsSync(bundledTar)) {
+      fs.mkdirSync(destModelDir, { recursive: true });
+      try {
+        execSync(`tar xzf "${bundledTar}" -C "${destModelDir}"`, { timeout: 30000 });
+        console.log(`[model-downloader] Extracted bundled TF.js model: ${meta.id}`);
+      } catch (err) {
+        console.warn(`[model-downloader] Failed to extract bundled ${meta.id}:`, err);
+      }
+    }
+
+    // Also check for pre-extracted directory in resources
+    const bundledExtracted = path.join(bundledDir, meta.dirName);
+    if (fs.existsSync(bundledExtracted) && !fs.existsSync(destModelJson)) {
+      fs.mkdirSync(destModelDir, { recursive: true });
+      const files = fs.readdirSync(bundledExtracted);
+      for (const file of files) {
+        fs.copyFileSync(path.join(bundledExtracted, file), path.join(destModelDir, file));
+      }
+      console.log(`[model-downloader] Copied bundled TF.js model: ${meta.id} (${files.length} files)`);
     }
   }
 }

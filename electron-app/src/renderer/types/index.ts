@@ -117,6 +117,58 @@ export interface VocabularyRichness {
   total_count: number;
 }
 
+// ── ML Feature types ──
+
+export interface Notification {
+  id: string;
+  source: string;
+  sourceId: string | null;
+  notificationType: string;
+  title: string;
+  body: string | null;
+  priority: number;
+  createdAt: string;
+  readAt: string | null;
+  actedOnAt: string | null;
+  dismissedAt: string | null;
+  responseLatencyMs: number | null;
+}
+
+export interface Workflow {
+  id: string;
+  name: string | null;
+  actionSequence: string;
+  triggerPattern: string | null;
+  confidence: number;
+  occurrenceCount: number;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  isSaved: boolean;
+  isDismissed: boolean;
+}
+
+export interface MeetingSession {
+  id: string;
+  startedAt: string;
+  endedAt: string | null;
+  speakerCount: number;
+  summary: string | null;
+  actionItems: string | null;
+  totalDurationSeconds: number | null;
+  entryIds: string | null;
+}
+
+export interface MLModelWeights {
+  modelName: string;
+  trainingSamples: number;
+  version: number;
+  trainedAt: string;
+}
+
+export type TurnDetectionMode = 'push-to-talk' | 'auto-detect' | 'always-listening';
+export type VoiceRoute = 'dictation' | 'conversation' | 'command' | 'transcription';
+export type VoiceState = 'speech' | 'silence' | 'unknown';
+
 // Helper to parse tags from JSON string
 export function parseTags(tags: string | null): string[] {
   if (!tags) return [];

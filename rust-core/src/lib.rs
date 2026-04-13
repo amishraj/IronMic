@@ -770,4 +770,394 @@ mod napi_exports {
         let mut playback = PLAYBACK_ENGINE.lock().unwrap();
         playback.toggle().to_string()
     }
+
+    // ── ML Features: Notifications ──
+
+    #[napi]
+    pub fn create_notification(
+        source: String,
+        source_id: Option<String>,
+        notification_type: String,
+        title: String,
+        body: Option<String>,
+    ) -> napi::Result<String> {
+        let n = DATABASE
+            .create_notification(&source, source_id.as_deref(), &notification_type, &title, body.as_deref())
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&n).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn list_notifications(limit: u32, offset: u32, unread_only: bool) -> napi::Result<String> {
+        let notifications = DATABASE.list_notifications(limit, offset, unread_only).map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&notifications).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn mark_notification_read(id: String) -> napi::Result<()> {
+        DATABASE.mark_notification_read(&id).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn notification_act(id: String) -> napi::Result<()> {
+        DATABASE.notification_act(&id).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn notification_dismiss(id: String) -> napi::Result<()> {
+        DATABASE.notification_dismiss(&id).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn update_notification_priority(id: String, priority: f64) -> napi::Result<()> {
+        DATABASE.update_notification_priority(&id, priority).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn log_notification_interaction(
+        notification_id: String,
+        action: String,
+        context_hour: Option<i32>,
+        context_day_of_week: Option<i32>,
+    ) -> napi::Result<()> {
+        DATABASE
+            .log_notification_interaction(&notification_id, &action, context_hour, context_day_of_week)
+            .map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn get_notification_interactions(since_date: String) -> napi::Result<String> {
+        let interactions = DATABASE.get_notification_interactions(&since_date).map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&interactions).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_unread_notification_count() -> napi::Result<u32> {
+        DATABASE.get_unread_notification_count().map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn delete_old_notifications(retention_days: u32) -> napi::Result<u32> {
+        DATABASE.delete_old_notifications(retention_days).map_err(Into::into)
+    }
+
+    // ── ML Features: Action Log ──
+
+    #[napi]
+    pub fn log_action(action_type: String, metadata_json: Option<String>) -> napi::Result<()> {
+        DATABASE.log_action(&action_type, metadata_json.as_deref()).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn query_action_log(
+        from_date: String,
+        to_date: String,
+        action_type_filter: Option<String>,
+    ) -> napi::Result<String> {
+        let entries = DATABASE
+            .query_action_log(&from_date, &to_date, action_type_filter.as_deref())
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&entries).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_action_counts() -> napi::Result<String> {
+        let (total, recent) = DATABASE.get_action_counts().map_err(Into::<napi::Error>::into)?;
+        Ok(format!("{{\"total\":{total},\"recent\":{recent}}}"))
+    }
+
+    #[napi]
+    pub fn delete_old_actions(retention_days: u32) -> napi::Result<u32> {
+        DATABASE.delete_old_actions(retention_days).map_err(Into::into)
+    }
+
+    // ── ML Features: Workflows ──
+
+    #[napi]
+    pub fn create_workflow(
+        action_sequence: String,
+        trigger_pattern: Option<String>,
+        confidence: f64,
+        occurrence_count: i32,
+    ) -> napi::Result<String> {
+        let w = DATABASE
+            .create_workflow(&action_sequence, trigger_pattern.as_deref(), confidence, occurrence_count)
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&w).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn list_workflows(include_dismissed: bool) -> napi::Result<String> {
+        let workflows = DATABASE.list_workflows(include_dismissed).map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&workflows).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn save_workflow(id: String, name: String) -> napi::Result<()> {
+        DATABASE.save_workflow(&id, &name).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn dismiss_workflow(id: String) -> napi::Result<()> {
+        DATABASE.dismiss_workflow(&id).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn delete_workflow(id: String) -> napi::Result<()> {
+        DATABASE.delete_workflow(&id).map_err(Into::into)
+    }
+
+    // ── ML Features: Embeddings ──
+
+    #[napi]
+    pub fn store_embedding(
+        content_id: String,
+        content_type: String,
+        embedding_bytes: Buffer,
+        model_version: String,
+    ) -> napi::Result<()> {
+        DATABASE
+            .store_embedding(&content_id, &content_type, &embedding_bytes, &model_version)
+            .map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn get_all_embeddings(content_type_filter: Option<String>) -> napi::Result<String> {
+        let embeddings = DATABASE
+            .get_all_embeddings(content_type_filter.as_deref())
+            .map_err(Into::<napi::Error>::into)?;
+        // Serialize without raw embedding data — just metadata
+        let records: Vec<_> = embeddings
+            .iter()
+            .map(|e| serde_json::json!({
+                "contentId": e.content_id,
+                "contentType": e.content_type,
+                "embeddedAt": e.embedded_at,
+                "modelVersion": e.model_version,
+            }))
+            .collect();
+        serde_json::to_string(&records).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_all_embeddings_with_data(content_type_filter: Option<String>) -> napi::Result<Buffer> {
+        let embeddings = DATABASE
+            .get_all_embeddings(content_type_filter.as_deref())
+            .map_err(Into::<napi::Error>::into)?;
+        // Pack as: [content_id_len(u32), content_id_bytes, content_type_len(u32), content_type_bytes, embedding_len(u32), embedding_bytes, ...]
+        let mut buf = Vec::new();
+        let count = embeddings.len() as u32;
+        buf.extend_from_slice(&count.to_le_bytes());
+        for e in &embeddings {
+            let id_bytes = e.content_id.as_bytes();
+            buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(id_bytes);
+            let type_bytes = e.content_type.as_bytes();
+            buf.extend_from_slice(&(type_bytes.len() as u32).to_le_bytes());
+            buf.extend_from_slice(type_bytes);
+            buf.extend_from_slice(&(e.embedding.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&e.embedding);
+        }
+        Ok(Buffer::from(buf))
+    }
+
+    #[napi]
+    pub fn get_unembedded_entries(limit: u32) -> napi::Result<String> {
+        let entries = DATABASE.get_unembedded_entries(limit).map_err(Into::<napi::Error>::into)?;
+        let records: Vec<_> = entries
+            .iter()
+            .map(|(id, text)| serde_json::json!({"id": id, "text": text}))
+            .collect();
+        serde_json::to_string(&records).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn delete_embedding(content_id: String, content_type: String) -> napi::Result<()> {
+        DATABASE.delete_embedding(&content_id, &content_type).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn get_embedding_stats() -> napi::Result<String> {
+        let stats = DATABASE.get_embedding_stats().map_err(Into::<napi::Error>::into)?;
+        let map: std::collections::HashMap<_, _> = stats.into_iter().collect();
+        serde_json::to_string(&map).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn delete_all_embeddings() -> napi::Result<u32> {
+        DATABASE.delete_all_embeddings().map_err(Into::into)
+    }
+
+    // ── ML Features: Model Weights ──
+
+    #[napi]
+    pub fn save_ml_weights(
+        model_name: String,
+        weights_json: String,
+        metadata_json: Option<String>,
+        training_samples: i32,
+    ) -> napi::Result<()> {
+        DATABASE
+            .save_ml_weights(&model_name, &weights_json, metadata_json.as_deref(), training_samples)
+            .map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn load_ml_weights(model_name: String) -> napi::Result<String> {
+        let weights = DATABASE.load_ml_weights(&model_name).map_err(Into::<napi::Error>::into)?;
+        match weights {
+            Some(w) => serde_json::to_string(&w).map_err(|e| napi::Error::from_reason(e.to_string())),
+            None => Ok("null".to_string()),
+        }
+    }
+
+    #[napi]
+    pub fn delete_ml_weights(model_name: String) -> napi::Result<()> {
+        DATABASE.delete_ml_weights(&model_name).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn get_ml_training_status() -> napi::Result<String> {
+        let status = DATABASE.get_ml_training_status().map_err(Into::<napi::Error>::into)?;
+        let records: Vec<_> = status
+            .iter()
+            .map(|(name, samples, version, trained_at)| {
+                serde_json::json!({
+                    "modelName": name,
+                    "trainingSamples": samples,
+                    "version": version,
+                    "trainedAt": trained_at,
+                })
+            })
+            .collect();
+        serde_json::to_string(&records).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn delete_all_ml_data() -> napi::Result<()> {
+        DATABASE.delete_all_ml_data().map_err(Into::into)
+    }
+
+    // ── ML Features: VAD Training ──
+
+    #[napi]
+    pub fn save_vad_training_sample(
+        audio_features: String,
+        label: String,
+        is_user_corrected: bool,
+        session_id: Option<String>,
+    ) -> napi::Result<()> {
+        DATABASE
+            .save_vad_training_sample(&audio_features, &label, is_user_corrected, session_id.as_deref())
+            .map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn get_vad_training_samples(limit: u32) -> napi::Result<String> {
+        let samples = DATABASE.get_vad_training_samples(limit).map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&samples).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_vad_sample_count() -> napi::Result<u32> {
+        DATABASE.get_vad_sample_count().map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn delete_all_vad_samples() -> napi::Result<u32> {
+        DATABASE.delete_all_vad_samples().map_err(Into::into)
+    }
+
+    // ── ML Features: Intent Training ──
+
+    #[napi]
+    pub fn save_intent_training_sample(
+        transcript: String,
+        predicted_intent: Option<String>,
+        predicted_entities: Option<String>,
+        confidence: Option<f64>,
+        entry_id: Option<String>,
+    ) -> napi::Result<()> {
+        DATABASE
+            .save_intent_training_sample(
+                &transcript,
+                predicted_intent.as_deref(),
+                predicted_entities.as_deref(),
+                confidence,
+                entry_id.as_deref(),
+            )
+            .map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn get_intent_training_samples(limit: u32) -> napi::Result<String> {
+        let samples = DATABASE.get_intent_training_samples(limit).map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&samples).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_intent_correction_count() -> napi::Result<u32> {
+        DATABASE.get_intent_correction_count().map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn log_voice_routing(
+        active_screen: String,
+        detected_intent: String,
+        routed_to: String,
+        entry_id: Option<String>,
+    ) -> napi::Result<()> {
+        DATABASE
+            .log_voice_routing(&active_screen, &detected_intent, &routed_to, entry_id.as_deref())
+            .map_err(Into::into)
+    }
+
+    // ── ML Features: Meeting Sessions ──
+
+    #[napi]
+    pub fn create_meeting_session() -> napi::Result<String> {
+        let session = DATABASE.create_meeting_session().map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&session).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn end_meeting_session(
+        id: String,
+        speaker_count: i32,
+        summary: Option<String>,
+        action_items: Option<String>,
+        total_duration_seconds: f64,
+        entry_ids: Option<String>,
+    ) -> napi::Result<()> {
+        DATABASE
+            .end_meeting_session(
+                &id,
+                speaker_count,
+                summary.as_deref(),
+                action_items.as_deref(),
+                total_duration_seconds,
+                entry_ids.as_deref(),
+            )
+            .map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn get_meeting_session(id: String) -> napi::Result<String> {
+        let session = DATABASE.get_meeting_session(&id).map_err(Into::<napi::Error>::into)?;
+        match session {
+            Some(s) => serde_json::to_string(&s).map_err(|e| napi::Error::from_reason(e.to_string())),
+            None => Ok("null".to_string()),
+        }
+    }
+
+    #[napi]
+    pub fn list_meeting_sessions(limit: u32, offset: u32) -> napi::Result<String> {
+        let sessions = DATABASE.list_meeting_sessions(limit, offset).map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&sessions).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn delete_meeting_session(id: String) -> napi::Result<()> {
+        DATABASE.delete_meeting_session(&id).map_err(Into::into)
+    }
 }

@@ -2,12 +2,17 @@ import { create } from 'zustand';
 import { useTtsStore } from './useTtsStore';
 import { useAiChatStore } from './useAiChatStore';
 import { useToastStore } from './useToastStore';
-import type { PipelineState, TranscriptionResult } from '../types';
+import { vadService } from '../services/tfjs/VADService';
+import type { PipelineState, TranscriptionResult, VoiceState } from '../types';
 
 interface RecordingStore {
   state: PipelineState;
   lastResult: TranscriptionResult | null;
   error: string | null;
+  /** Real-time voice state from VAD (speech/silence/unknown) */
+  voiceState: VoiceState;
+  /** Whether VAD is active for the current recording */
+  vadActive: boolean;
 
   setState: (state: PipelineState) => void;
   setResult: (result: TranscriptionResult) => void;
@@ -25,11 +30,13 @@ export const useRecordingStore = create<RecordingStore>((set, get) => ({
   state: 'idle',
   lastResult: null,
   error: null,
+  voiceState: 'unknown',
+  vadActive: false,
 
   setState: (state) => set({ state }),
   setResult: (result) => set({ lastResult: result, state: 'idle' }),
   setError: (error) => set({ error }),
-  reset: () => set({ state: 'idle', lastResult: null, error: null }),
+  reset: () => set({ state: 'idle', lastResult: null, error: null, voiceState: 'unknown', vadActive: false }),
 
   handleHotkeyPress: async (sourceApp?: string) => {
     // Prevent double-invocation (sidebar + page button + hotkey racing)
@@ -59,7 +66,24 @@ async function handleRecordingAction(
     try {
       // Stop TTS playback before recording
       try { await useTtsStore.getState().stop(); } catch { /* ignore */ }
-      set({ state: 'recording', error: null });
+      set({ state: 'recording', error: null, voiceState: 'unknown', vadActive: false });
+
+      // Start VAD alongside recording (non-blocking — VAD failure is not fatal)
+      try {
+        const vadEnabled = await api.getSetting('vad_enabled');
+        if (vadEnabled !== 'false') {
+          const sensitivity = parseFloat((await api.getSetting('vad_sensitivity')) || '0.5');
+          vadService.setSensitivity(sensitivity);
+          await vadService.start();
+          set({ vadActive: true });
+          // Subscribe to real-time voice state for UI indicator
+          vadService.onVoiceStateChange((voiceState) => {
+            set({ voiceState });
+          });
+        }
+      } catch (vadErr) {
+        console.warn('[recording] VAD failed to start (non-fatal):', vadErr);
+      }
 
       try {
         await api.startRecording();
@@ -90,7 +114,20 @@ async function handleRecordingAction(
   // ── STOP RECORDING + PROCESS ──
   if (state === 'recording') {
     try {
-      set({ state: 'processing' });
+      set({ state: 'processing', voiceState: 'unknown' });
+
+      // Stop VAD and check speech detection
+      const vadResult = vadService.isActive() ? vadService.stop() : null;
+      set({ vadActive: false });
+
+      // If VAD detected insufficient speech, skip transcription entirely
+      if (vadResult && !vadResult.hasSufficientSpeech) {
+        console.log(`[recording] VAD: insufficient speech (${vadResult.totalSpeechMs}ms) — skipping transcription`);
+        try { await api.stopRecording(); } catch { /* discard audio */ }
+        set({ state: 'idle', lastResult: null, error: null });
+        window.dispatchEvent(new CustomEvent('ironmic:dictation-empty'));
+        return;
+      }
 
       let audioBuffer: Buffer;
       try {

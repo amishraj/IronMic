@@ -1,5 +1,13 @@
+pub mod actions;
 pub mod analytics;
 pub mod db;
 pub mod dictionary;
+pub mod embeddings;
 pub mod entries;
+pub mod intents;
+pub mod meetings;
+pub mod ml_models;
+pub mod notifications;
 pub mod settings;
+pub mod vad;
+pub mod workflows;

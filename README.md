@@ -46,13 +46,35 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 - **Streaming responses** — Real-time token-by-token output.
 - **Privacy-first** — The AI feature is off by default. When enabled, it uses your own CLI tools and credentials.
 
+### On-Device Machine Learning <sup>NEW in 1.1.0</sup>
+
+IronMic includes 5 TensorFlow.js-powered ML features that learn from your usage patterns — entirely on-device.
+
+- **Voice Activity Detection** — Filters silence and noise before Whisper, making transcription faster. Configurable sensitivity.
+- **Turn Detection** — Detects when you're done speaking. Three modes: push-to-talk, auto-detect (default 3s silence), and always-listening. Enables hands-free conversation loops with the AI assistant.
+- **Voice Commands** — Say "search for meeting notes", "open analytics", or "summarize today" — IronMic classifies the intent and executes the action. LLM fallback for complex commands. Voice correction: "no, I meant...".
+- **Context-Aware Routing** — Voice input automatically routes to dictation, AI conversation, or command classification based on your active screen. No manual mode switching.
+- **Ambient Meeting Mode** — Leave IronMic running during a meeting. It transcribes with speaker awareness, detects when the meeting ends, and generates a summary with action items.
+- **Semantic Search** — Search by meaning, not just keywords. "Find everything about the auth redesign" returns semantically related entries across all content.
+- **Smart Notifications** — Learns which notifications matter to you and ranks them by predicted importance. Starts with heuristics, improves over time.
+- **Workflow Discovery** — Detects repeating action patterns (e.g., "You check GitHub PRs, then update Jira, then dictate a status update every Thursday at 2 PM") and suggests automations.
+
+> All ML models are under 50MB total. All training data stays in SQLite on your machine. Toggle each feature independently in **Settings > Voice AI**.
+
 ### Organization & Search
 - **Timeline view** — Scrollable card feed of all dictations, newest first.
 - **Full-text search** — Instant search across all transcriptions (SQLite FTS5).
+- **Semantic search** — AI-powered meaning-based search across all content (TF.js Universal Sentence Encoder).
 - **Tags** — Categorize entries with custom tags.
 - **Pin & archive** — Pin important entries to the top, archive old ones.
 - **Raw vs. polished toggle** — Switch between original transcript and LLM-cleaned version on any entry.
 - **Auto-cleanup** — Configure automatic deletion of entries older than N days.
+
+### Analytics <sup>NEW in 1.0.15</sup>
+- **Dashboard** — Daily word counts, recording time, words per minute, streaks.
+- **Topic classification** — LLM-powered topic tagging with trend charts.
+- **Vocabulary richness** — Type-Token Ratio and unique word tracking.
+- **Productivity comparison** — Period-over-period metrics.
 
 ### Model Management
 - **In-app downloads** — Download Whisper, LLM, and TTS models directly from Settings.
@@ -72,13 +94,14 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 
 ```
 Electron UI ← IPC (contextBridge) → Rust Core (napi-rs)
-                                      ├── Audio capture (cpal)
-                                      ├── Whisper.cpp (speech-to-text)
-                                      ├── llama.cpp (text cleanup)
-                                      ├── Kokoro ONNX (text-to-speech)
-                                      ├── Audio playback (cpal)
-                                      ├── SQLite (storage + FTS5)
-                                      └── Clipboard (arboard)
+  ├── React 18 + Zustand                ├── Audio capture (cpal)
+  ├── TF.js ML Web Worker               ├── Whisper.cpp (speech-to-text)
+  │   ├── VAD (Silero)                   ├── llama.cpp (text cleanup)
+  │   ├── Intent classifier              ├── Kokoro ONNX (text-to-speech)
+  │   ├── Semantic search (USE)          ├── Audio playback (cpal)
+  │   ├── Notification ranker            ├── SQLite (storage + FTS5)
+  │   └── Workflow predictor             └── Clipboard (arboard)
+  └── Web Audio API (AudioWorklet)
 ```
 
 | Layer | Tech | Purpose |
@@ -86,11 +109,12 @@ Electron UI ← IPC (contextBridge) → Rust Core (napi-rs)
 | UI | Electron + React 18 + Tailwind CSS + Zustand | Desktop shell, component UI, state management |
 | Editor | TipTap (ProseMirror) | Rich text editing |
 | Bridge | napi-rs (N-API) | Typed Rust ↔ Node.js communication |
-| Audio | cpal | Cross-platform mic input and speaker output |
+| Audio | cpal + Web Audio API | Cross-platform mic input, real-time VAD frames |
 | STT | whisper-rs (whisper.cpp) | Local speech-to-text |
 | LLM | llama-cpp-rs (llama.cpp) | Local text cleanup |
 | TTS | ort (ONNX Runtime) + Kokoro 82M | Local neural text-to-speech |
-| Storage | rusqlite (SQLite + FTS5) | Entries, settings, dictionary |
+| ML | TensorFlow.js (Web Worker) | VAD, intent, search, notifications, workflows |
+| Storage | rusqlite (SQLite + FTS5) | Entries, settings, ML data, embeddings |
 | Clipboard | arboard | Cross-platform clipboard |
 
 ---
@@ -172,7 +196,7 @@ Models are downloaded through the Settings UI inside the app:
 ## Running Tests
 
 ```bash
-# Rust tests (22 tests)
+# Rust tests (225 tests)
 cd rust-core
 cargo test --no-default-features
 
@@ -206,13 +230,23 @@ IronMic/
 │   ├── src/
 │   │   ├── audio/             # Mic capture + resampling
 │   │   ├── transcription/     # Whisper integration + dictionary
-│   │   ├── llm/               # LLM text cleanup + prompts
+│   │   ├── llm/               # LLM text cleanup + chat + prompts
 │   │   ├── tts/               # Kokoro TTS + playback + timestamps
-│   │   ├── storage/           # SQLite CRUD + FTS5 + migrations
+│   │   ├── storage/           # SQLite CRUD + FTS5 + migrations (v3)
+│   │   │   ├── entries.rs     # Dictation entry CRUD
+│   │   │   ├── analytics.rs   # Analytics snapshots + topics
+│   │   │   ├── notifications.rs # ML notification system
+│   │   │   ├── actions.rs     # Action log for workflow discovery
+│   │   │   ├── workflows.rs   # Discovered workflow patterns
+│   │   │   ├── embeddings.rs  # Semantic search embeddings
+│   │   │   ├── ml_models.rs   # ML model weight persistence
+│   │   │   ├── vad.rs         # VAD training samples
+│   │   │   ├── intents.rs     # Intent + voice routing logs
+│   │   │   └── meetings.rs    # Meeting session management
 │   │   ├── clipboard/         # Clipboard management
 │   │   ├── hotkey/            # Pipeline state machine
 │   │   ├── error.rs           # Unified error types
-│   │   └── lib.rs             # N-API exports (~50 functions)
+│   │   └── lib.rs             # N-API exports (~100 functions)
 │   └── models/                # Downloaded model weights (gitignored)
 ├── electron-app/              # Electron + React frontend
 │   └── src/
@@ -220,8 +254,20 @@ IronMic/
 │       │   └── ai/            # AI chat adapter (Copilot/Claude CLI)
 │       ├── preload/           # Typed contextBridge API
 │       └── renderer/          # React UI
-│           ├── components/    # 25+ components
-│           ├── stores/        # Zustand state (5 stores)
+│           ├── components/    # 30+ components
+│           ├── stores/        # Zustand state (11 stores)
+│           ├── services/tfjs/ # TensorFlow.js ML services
+│           │   ├── VADService.ts         # Voice activity detection
+│           │   ├── TurnDetector.ts       # End-of-turn detection
+│           │   ├── IntentClassifier.ts   # Voice command classification
+│           │   ├── VoiceRouter.ts        # Context-aware routing
+│           │   ├── MeetingDetector.ts    # Ambient meeting mode
+│           │   ├── SemanticSearch.ts     # USE embeddings + similarity
+│           │   ├── NotificationRanker.ts # ML notification ranking
+│           │   ├── WorkflowMiner.ts      # Action pattern mining
+│           │   ├── AudioBridge.ts        # Web Audio API integration
+│           │   └── TFJSRuntime.ts        # TF.js initialization
+│           ├── workers/       # ML Web Worker (TF.js inference)
 │           └── hooks/         # Custom hooks (bridge, theme, search)
 ├── scripts/
 │   └── dev.sh                 # One-command dev launcher

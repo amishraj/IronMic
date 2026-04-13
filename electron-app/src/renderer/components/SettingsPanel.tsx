@@ -9,15 +9,17 @@ import {
   Settings, Bot, Volume2, Monitor, Sun, Moon, Shield, Keyboard,
   Cpu, Database, BookOpen, Lock, ClipboardCheck, Eye, EyeOff,
   Clock, AlertTriangle, CheckCircle, Info, Wifi, WifiOff, FileWarning,
-  Trash2, HardDrive, Sparkles, RefreshCw, Download,
+  Trash2, HardDrive, Sparkles, RefreshCw, Download, Brain,
+  Mic, Route, Users, Search, Bell, Workflow, Sliders,
 } from 'lucide-react';
 
-type SettingsTab = 'general' | 'speech' | 'ai' | 'models' | 'data' | 'security';
+type SettingsTab = 'general' | 'speech' | 'ai' | 'models' | 'data' | 'security' | 'voice-ai';
 
 const TABS: { id: SettingsTab; label: string; icon: typeof Settings }[] = [
   { id: 'general', label: 'General', icon: Settings },
   { id: 'speech', label: 'Speech', icon: Volume2 },
   { id: 'ai', label: 'AI Assist', icon: Sparkles },
+  { id: 'voice-ai', label: 'Voice AI', icon: Brain },
   { id: 'models', label: 'Models', icon: Cpu },
   { id: 'data', label: 'Data', icon: Database },
   { id: 'security', label: 'Security', icon: Shield },
@@ -58,6 +60,7 @@ export function SettingsPanel() {
           {tab === 'speech' && <SpeechSettings />}
           {tab === 'ai' && <AIAssistSettings />}
           {tab === 'models' && <ModelManager />}
+          {tab === 'voice-ai' && <VoiceAISettings />}
           {tab === 'data' && <DataSettings />}
           {tab === 'security' && <SecuritySettings />}
         </div>
@@ -789,6 +792,282 @@ function SecuritySettings() {
               Model files are fetched from HuggingFace over HTTPS. No checksums are currently verified — this is a known limitation. Future releases will include SHA-256 verification.
             </p>
           </div>
+        </div>
+      </Card>
+    </>
+  );
+}
+
+// ═══════════════════════════════════════════
+// Voice AI (ML Features)
+// ═══════════════════════════════════════════
+
+function VoiceAISettings() {
+  const { getSetting, setSetting } = useSettingsStore();
+  const [vadEnabled, setVadEnabled] = useState(true);
+  const [vadSensitivity, setVadSensitivity] = useState(0.5);
+  const [turnDetectionMode, setTurnDetectionMode] = useState('push-to-talk');
+  const [turnTimeout, setTurnTimeout] = useState(3000);
+  const [voiceRoutingEnabled, setVoiceRoutingEnabled] = useState(false);
+  const [meetingModeEnabled, setMeetingModeEnabled] = useState(false);
+  const [intentEnabled, setIntentEnabled] = useState(false);
+  const [notificationsEnabled, setNotificationsEnabled] = useState(false);
+  const [notificationThreshold, setNotificationThreshold] = useState(0.5);
+  const [workflowsEnabled, setWorkflowsEnabled] = useState(false);
+  const [workflowConfidence, setWorkflowConfidence] = useState(0.7);
+  const [semanticSearchEnabled, setSemanticSearchEnabled] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const ironmic = (window as any).ironmic;
+      if (!ironmic) return;
+      const val = (key: string, fallback: string) =>
+        ironmic.getSetting(key).then((v: string | null) => v ?? fallback);
+
+      setVadEnabled((await val('vad_enabled', 'true')) === 'true');
+      setVadSensitivity(parseFloat(await val('vad_sensitivity', '0.5')));
+      setTurnDetectionMode(await val('turn_detection_mode', 'push-to-talk'));
+      setTurnTimeout(parseInt(await val('turn_detection_timeout_ms', '3000'), 10));
+      setVoiceRoutingEnabled((await val('voice_routing_enabled', 'false')) === 'true');
+      setMeetingModeEnabled((await val('meeting_mode_enabled', 'false')) === 'true');
+      setIntentEnabled((await val('intent_classification_enabled', 'false')) === 'true');
+      setNotificationsEnabled((await val('ml_notifications_enabled', 'false')) === 'true');
+      setNotificationThreshold(parseFloat(await val('ml_notifications_threshold', '0.5')));
+      setWorkflowsEnabled((await val('ml_workflows_enabled', 'false')) === 'true');
+      setWorkflowConfidence(parseFloat(await val('ml_workflows_confidence', '0.7')));
+      setSemanticSearchEnabled((await val('ml_semantic_search_enabled', 'false')) === 'true');
+    })();
+  }, []);
+
+  const update = (key: string, value: string) => {
+    const ironmic = (window as any).ironmic;
+    if (ironmic) ironmic.setSetting(key, value);
+  };
+
+  const handleDeleteAllMLData = async () => {
+    if (!confirm('Delete all learned ML data? This cannot be undone.')) return;
+    const ironmic = (window as any).ironmic;
+    if (ironmic?.mlDeleteAllData) await ironmic.mlDeleteAllData();
+  };
+
+  return (
+    <>
+      <SectionHeader icon={Brain} title="Voice AI" description="On-device machine learning features" />
+
+      <Card>
+        <div className="p-4 space-y-5">
+          <div className="text-xs text-iron-text-muted mb-3">
+            All ML processing runs entirely on your device. No data leaves this machine.
+          </div>
+
+          {/* VAD */}
+          <SettingRow
+            icon={Mic}
+            title="Voice Activity Detection"
+            description="Filter silence and noise before transcription for faster processing"
+            control={
+              <Toggle
+                checked={vadEnabled}
+                onChange={(v) => { setVadEnabled(v); update('vad_enabled', String(v)); }}
+              />
+            }
+          />
+          {vadEnabled && (
+            <div className="ml-10 space-y-2">
+              <label className="text-xs text-iron-text-secondary">Sensitivity: {vadSensitivity.toFixed(1)}</label>
+              <input
+                type="range" min="0" max="1" step="0.1"
+                value={vadSensitivity}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setVadSensitivity(v);
+                  update('vad_sensitivity', String(v));
+                }}
+                className="w-full accent-iron-accent"
+              />
+              <div className="flex justify-between text-[10px] text-iron-text-muted">
+                <span>Less sensitive</span>
+                <span>More sensitive</span>
+              </div>
+            </div>
+          )}
+
+          <div className="border-t border-iron-border" />
+
+          {/* Turn Detection */}
+          <SettingRow
+            icon={Volume2}
+            title="Turn Detection Mode"
+            description="How IronMic detects when you're done speaking"
+            control={
+              <select
+                value={turnDetectionMode}
+                onChange={(e) => {
+                  setTurnDetectionMode(e.target.value);
+                  update('turn_detection_mode', e.target.value);
+                }}
+                className="text-xs bg-iron-surface border border-iron-border rounded px-2 py-1 text-iron-text"
+              >
+                <option value="push-to-talk">Push to Talk</option>
+                <option value="auto-detect">Auto Detect</option>
+                <option value="always-listening">Always Listening</option>
+              </select>
+            }
+          />
+          {turnDetectionMode !== 'push-to-talk' && (
+            <div className="ml-10 space-y-2">
+              <label className="text-xs text-iron-text-secondary">Silence timeout: {(turnTimeout / 1000).toFixed(1)}s</label>
+              <input
+                type="range" min="1000" max="10000" step="500"
+                value={turnTimeout}
+                onChange={(e) => {
+                  const v = parseInt(e.target.value, 10);
+                  setTurnTimeout(v);
+                  update('turn_detection_timeout_ms', String(v));
+                }}
+                className="w-full accent-iron-accent"
+              />
+            </div>
+          )}
+          {turnDetectionMode === 'always-listening' && (
+            <div className="ml-10 p-2 bg-yellow-500/10 rounded text-xs text-yellow-400 flex items-center gap-2">
+              <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
+              Microphone will stay active. A red indicator will be shown at all times.
+            </div>
+          )}
+
+          <div className="border-t border-iron-border" />
+
+          {/* Voice Routing */}
+          <SettingRow
+            icon={Route}
+            title="Context-Aware Voice Routing"
+            description="Automatically route voice input based on active screen"
+            control={
+              <Toggle
+                checked={voiceRoutingEnabled}
+                onChange={(v) => { setVoiceRoutingEnabled(v); update('voice_routing_enabled', String(v)); }}
+              />
+            }
+          />
+
+          {/* Meeting Mode */}
+          <SettingRow
+            icon={Users}
+            title="Ambient Meeting Mode"
+            description="Passive transcription with speaker detection and auto-summarization"
+            control={
+              <Toggle
+                checked={meetingModeEnabled}
+                onChange={(v) => { setMeetingModeEnabled(v); update('meeting_mode_enabled', String(v)); }}
+              />
+            }
+          />
+
+          <div className="border-t border-iron-border" />
+
+          {/* Intent Classification */}
+          <SettingRow
+            icon={Sliders}
+            title="Voice Commands"
+            description="Classify voice input as commands (search, navigate, create)"
+            control={
+              <Toggle
+                checked={intentEnabled}
+                onChange={(v) => { setIntentEnabled(v); update('intent_classification_enabled', String(v)); }}
+              />
+            }
+          />
+
+          <div className="border-t border-iron-border" />
+
+          {/* Notification Intelligence */}
+          <SettingRow
+            icon={Bell}
+            title="Smart Notifications"
+            description="Learn which notifications matter to you and rank by importance"
+            control={
+              <Toggle
+                checked={notificationsEnabled}
+                onChange={(v) => { setNotificationsEnabled(v); update('ml_notifications_enabled', String(v)); }}
+              />
+            }
+          />
+          {notificationsEnabled && (
+            <div className="ml-10 space-y-2">
+              <label className="text-xs text-iron-text-secondary">Ranking sensitivity: {notificationThreshold.toFixed(1)}</label>
+              <input
+                type="range" min="0.1" max="0.9" step="0.1"
+                value={notificationThreshold}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setNotificationThreshold(v);
+                  update('ml_notifications_threshold', String(v));
+                }}
+                className="w-full accent-iron-accent"
+              />
+            </div>
+          )}
+
+          {/* Workflow Discovery */}
+          <SettingRow
+            icon={Workflow}
+            title="Workflow Discovery"
+            description="Detect repeating action patterns and suggest automations"
+            control={
+              <Toggle
+                checked={workflowsEnabled}
+                onChange={(v) => { setWorkflowsEnabled(v); update('ml_workflows_enabled', String(v)); }}
+              />
+            }
+          />
+          {workflowsEnabled && (
+            <div className="ml-10 space-y-2">
+              <label className="text-xs text-iron-text-secondary">Confidence threshold: {workflowConfidence.toFixed(1)}</label>
+              <input
+                type="range" min="0.3" max="0.95" step="0.05"
+                value={workflowConfidence}
+                onChange={(e) => {
+                  const v = parseFloat(e.target.value);
+                  setWorkflowConfidence(v);
+                  update('ml_workflows_confidence', String(v));
+                }}
+                className="w-full accent-iron-accent"
+              />
+            </div>
+          )}
+
+          <div className="border-t border-iron-border" />
+
+          {/* Semantic Search */}
+          <SettingRow
+            icon={Search}
+            title="Semantic Search"
+            description="AI-powered search that understands meaning, not just keywords"
+            control={
+              <Toggle
+                checked={semanticSearchEnabled}
+                onChange={(v) => { setSemanticSearchEnabled(v); update('ml_semantic_search_enabled', String(v)); }}
+              />
+            }
+          />
+        </div>
+      </Card>
+
+      {/* Data Management */}
+      <Card>
+        <div className="p-4 space-y-3">
+          <h3 className="text-sm font-medium text-iron-text">ML Data Management</h3>
+          <p className="text-xs text-iron-text-muted">
+            All learned data is stored locally on your device. Deleting it resets all ML features to their initial state.
+          </p>
+          <button
+            onClick={handleDeleteAllMLData}
+            className="flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-red-400 bg-red-500/10 rounded-lg hover:bg-red-500/20 transition-colors"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            Delete all learned data
+          </button>
         </div>
       </Card>
     </>

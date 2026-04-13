@@ -24,6 +24,12 @@ module.exports = {
       to: 'models/voices/',
       filter: ['*.bin'],
     },
+    // TF.js ML models — tar.gz archives extracted on first launch
+    {
+      from: 'resources/ml-models/',
+      to: 'ml-models/',
+      filter: ['*.tar.gz'],
+    },
   ],
   // electron-builder auto-converts icon.png to .icns (mac) and .ico (win)
   mac: {

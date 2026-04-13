@@ -6,7 +6,7 @@ import { app, BrowserWindow, session, globalShortcut, nativeImage } from 'electr
 import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
 import { createTray, destroyTray, updateTrayState } from './tray';
-import { ensureBundledVoices } from './model-downloader';
+import { ensureBundledVoices, ensureBundledTFJSModels } from './model-downloader';
 
 // Set the models directory env var BEFORE the Rust addon loads.
 // In production, models go to the user's app-data directory (writable).
@@ -101,6 +101,11 @@ app.whenReady().then(() => {
   // Copy bundled TTS voices to user data on first launch
   try { ensureBundledVoices(); } catch (err) {
     console.warn('[startup] Failed to copy bundled voices:', err);
+  }
+
+  // Extract bundled TF.js ML models to user data on first launch
+  try { ensureBundledTFJSModels(); } catch (err) {
+    console.warn('[startup] Failed to extract bundled TF.js models:', err);
   }
 
   // Run auto-cleanup on startup

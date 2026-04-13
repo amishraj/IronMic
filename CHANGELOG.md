@@ -2,6 +2,88 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.0] - 2026-04-13
+
+### Added — On-Device Machine Learning (TensorFlow.js)
+
+IronMic now includes 5 TensorFlow.js-powered ML features that run entirely on-device. All models are lightweight (<50MB total), all training data stays local, and everything works offline. A new **Voice AI** settings tab provides toggles and thresholds for each feature.
+
+#### Feature 1: Intelligent Voice Activity Detection (3 parts + bonus)
+
+- **Silent Efficiency Layer (VAD)** — Silero VAD model filters silence and background noise before audio reaches Whisper, reducing unnecessary transcription. Uses a dual-pipeline approach: Web Audio API captures real-time frames for VAD classification while Rust/cpal handles the official recording. Configurable sensitivity slider. Energy-based fallback when model is unavailable.
+- **Conversational AI Turn Detection** — Detects when you've finished speaking and automatically triggers the transcription pipeline. Three modes: push-to-talk (default, existing behavior), auto-detect (silence timeout triggers stop, default 3s), and always-listening (continuous mic with persistent indicator). Creates a hands-free conversation loop: speak -> auto-transcribe -> AI responds -> TTS reads response -> recording resumes.
+- **Context-Aware Voice Routing** — Automatically routes voice input based on your current screen. AI Chat screen routes to conversation, Notes/Editor routes to dictation, command keywords route to intent classification. Voice error recovery: say "no, I meant..." to undo and re-route.
+- **Ambient Meeting Mode** — Passive listening with energy-based speaker turn detection. Auto-detects meeting end after sustained silence. Generates summary and action items via local LLM on meeting end. Meeting sessions stored with full transcript segments.
+
+#### Feature 2: Intent Classification + Entity Extraction
+
+- **Voice commands** — After Whisper transcribes, the intent classifier parses commands into structured actions. Supports: search, open_view, navigate, summarize, create_ticket, update_ticket, assign, set_status, add_label, comment.
+- **Entity extraction** — Extracts ticket names, assignees, search queries, view names, and other entities from voice commands.
+- **Rule-based V1** — Ships with regex pattern matching for immediate use, no model download needed.
+- **LLM fallback** — When rule-based confidence is low, falls back to the local LLM for classification.
+- **ActionRouter** — Maps classified intents to application actions (navigation, search, summarization, structured entry creation for future integrations).
+- **Voice correction** — Say "no, I meant..." or "cancel" to undo the last command and re-classify.
+
+#### Feature 3: Adaptive Notification Intelligence
+
+- **In-app notification system** — New notification bell with unread badge, slide-out panel with notification cards. Sources: entry creation, analytics milestones, workflow suggestions, system events.
+- **ML-powered ranking** — Small feedforward neural network learns which notifications you engage with vs. ignore. Starts with rule-based heuristics, begins ML ranking after ~50 interactions.
+- **On-device training** — Model trains incrementally from your interaction patterns. Weights stored in SQLite. No data leaves the device.
+- **Transparency** — Notifications show why they were ranked ("learning your preferences..." indicator during cold-start phase).
+
+#### Feature 4: Auto-Discovered Workflows
+
+- **Action logging** — Transparently logs action types (never content) as you use the app: create entries, search, dictate, use AI chat, play TTS, edit notes, etc.
+- **Sequence mining** — Sliding-window algorithm detects repeating action patterns with temporal consistency (same day of week, same hour range).
+- **Workflow suggestions** — Discovered patterns surface via the notification system with confidence scores. Users can save, name, dismiss, or edit workflows.
+- **Next-action prediction** — Frequency-based predictor suggests what you might do next based on recent action history.
+
+#### Feature 5: On-Device Semantic Search
+
+- **Universal Sentence Encoder** — Generates 512-dimensional embeddings for all content using a ~30MB model running in the ML Web Worker.
+- **Cosine similarity search** — Search by meaning, not just keywords. "find everything about authentication" returns semantically related entries even if they don't contain that exact word.
+- **Incremental embedding** — New content is embedded on creation. Existing content can be bulk-indexed from Settings.
+- **Merged search** — Semantic results combined with existing FTS5 keyword search for comprehensive results.
+
+### Added — Infrastructure
+
+- **TensorFlow.js runtime** — WebGL backend (falls back to CPU) with LRU model cache
+- **ML Web Worker** — All TF.js inference runs in a dedicated Web Worker to keep the UI thread free. Typed message protocol with Promise-based client.
+- **Web Audio API bridge** — Dual-pipeline audio capture: Web Audio + AudioWorklet for real-time VAD alongside Rust/cpal for Whisper recording
+- **SQLite schema v3** — 11 new tables for ML features: vad_training_samples, intent_training_samples, voice_routing_log, meeting_sessions, notifications, notification_interactions, action_log, workflows, embeddings, ml_model_weights, tfjs_model_metadata
+- **~50 new IPC channels** — Full CRUD for all ML data through the existing Electron IPC bridge
+- **Voice AI settings tab** — Unified controls for all ML features with enable/disable toggles, sensitivity sliders, confidence thresholds, and "Delete all learned data" button
+- **Notification UI** — NotificationBell component with unread badge and NotificationPanel slide-out drawer
+
+### Changed
+
+- **useRecordingStore** — Now integrates VAD: starts voice activity detection alongside recording, skips Whisper transcription when insufficient speech detected
+- **SettingsPanel** — Added 7th tab (Voice AI) with Brain icon
+- **Rust storage layer** — 8 new storage modules with ~40 CRUD functions
+- **lib.rs** — ~50 new napi-rs exports for all ML storage operations
+- **constants.ts** — ~50 new IPC channel definitions
+- **preload/index.ts** — ~50 new typed preload API methods
+- **types/index.ts** — New types: Notification, Workflow, MeetingSession, MLModelWeights, TurnDetectionMode, VoiceRoute, VoiceState
+
+### Privacy
+
+- All ML processing runs on-device via TensorFlow.js (renderer process Web Worker)
+- VAD training stores MFCC audio features, never raw audio
+- Action logging records action types only, never content
+- All learned data stored in local SQLite, deletable per-feature or globally
+- Total TF.js model bundle: ~46MB (well under 100MB budget)
+- No new network calls introduced
+
+---
+
+## [1.0.15] - 2026-04-09
+
+### Added
+- **Analytics dashboard** — new analytics page with daily word counts, topic classification via local LLM, vocabulary richness metrics, streaks, and productivity comparison
+- **LLM-powered topic classification** — batch processing of entries for topic tagging using local Mistral 7B
+
+---
+
 ## [1.0.14] - 2026-04-08
 
 ### Fixed

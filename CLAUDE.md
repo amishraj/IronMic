@@ -266,6 +266,66 @@ copyToClipboard(text: string): Promise<void>
 // --- System ---
 getModelStatus(): Promise<{ whisper: ModelInfo, llm: ModelInfo }>
 // ModelInfo = { loaded: boolean, name: string, sizeBytes: number }
+
+// --- ML Features: Notifications (v1.1.0) ---
+createNotification(source, sourceId, type, title, body): string // JSON
+listNotifications(limit, offset, unreadOnly): string // JSON
+markNotificationRead(id): void
+notificationAct(id): void
+notificationDismiss(id): void
+updateNotificationPriority(id, priority): void
+logNotificationInteraction(notificationId, action, hour, dow): void
+getNotificationInteractions(sinceDate): string // JSON
+getUnreadNotificationCount(): number
+deleteOldNotifications(retentionDays): number
+
+// --- ML Features: Action Log (v1.1.0) ---
+logAction(actionType, metadataJson): void
+queryActionLog(from, to, filter?): string // JSON
+getActionCounts(): string // JSON {total, recent}
+deleteOldActions(retentionDays): number
+
+// --- ML Features: Workflows (v1.1.0) ---
+createWorkflow(actionSequence, triggerPattern, confidence, count): string // JSON
+listWorkflows(includeDismissed): string // JSON
+saveWorkflow(id, name): void
+dismissWorkflow(id): void
+deleteWorkflow(id): void
+
+// --- ML Features: Embeddings (v1.1.0) ---
+storeEmbedding(contentId, contentType, embeddingBytes, modelVersion): void
+getAllEmbeddings(contentTypeFilter?): string // JSON metadata
+getAllEmbeddingsWithData(contentTypeFilter?): Buffer // packed binary
+getUnembeddedEntries(limit): string // JSON
+deleteEmbedding(contentId, contentType): void
+getEmbeddingStats(): string // JSON
+deleteAllEmbeddings(): number
+
+// --- ML Features: Model Weights (v1.1.0) ---
+saveMlWeights(modelName, weightsJson, metadataJson, trainingSamples): void
+loadMlWeights(modelName): string // JSON or "null"
+deleteMlWeights(modelName): void
+getMlTrainingStatus(): string // JSON
+deleteAllMlData(): void
+
+// --- ML Features: VAD Training (v1.1.0) ---
+saveVadTrainingSample(audioFeatures, label, isUserCorrected, sessionId): void
+getVadTrainingSamples(limit): string // JSON
+getVadSampleCount(): number
+deleteAllVadSamples(): number
+
+// --- ML Features: Intent Training (v1.1.0) ---
+saveIntentTrainingSample(transcript, intent, entities, confidence, entryId): void
+getIntentTrainingSamples(limit): string // JSON
+getIntentCorrectionCount(): number
+logVoiceRouting(activeScreen, detectedIntent, routedTo, entryId): void
+
+// --- ML Features: Meeting Sessions (v1.1.0) ---
+createMeetingSession(): string // JSON
+endMeetingSession(id, speakerCount, summary, actionItems, duration, entryIds): void
+getMeetingSession(id): string // JSON or "null"
+listMeetingSessions(limit, offset): string // JSON
+deleteMeetingSession(id): void
 ```
 
 ---
@@ -574,6 +634,104 @@ cd ../electron-app && npm test
 - GitHub Actions CI: lint, test, build all platforms
 - README, LICENSE, contributing guide
 - **Deliverable:** Downloadable, installable app with CI pipeline
+
+---
+
+## TensorFlow.js ML Layer (v1.1.0)
+
+### Architecture
+
+TF.js runs in the **renderer process** (WebGL GPU) and a **dedicated Web Worker** (CPU backend). Heavy inference (Whisper, LLM, TTS) stays in Rust. Lightweight real-time ML (VAD, intent, ranking, embeddings) runs in TF.js.
+
+```
+Renderer Thread                    ML Web Worker (CPU)
+├── TFJSRuntime (WebGL init)       ├── Silero VAD (~900KB)
+├── AudioBridge (Web Audio API)    ├── Intent Classifier LSTM (~5MB)
+├── VADService                     ├── Universal Sentence Encoder (~30MB)
+├── TurnDetector                   ├── Notification Ranker (~2KB)
+├── VoiceRouter                    └── Workflow Predictor GRU (~15KB)
+├── IntentClassifier
+├── SemanticSearch                 Audio Render Thread
+├── NotificationRanker             └── AudioWorkletProcessor
+├── MeetingDetector                    (forwards PCM frames)
+└── WorkflowMiner
+```
+
+### Data Flow
+
+```
+[Mic] ──getUserMedia──> [AudioWorklet] ──frames──> [ML Worker: VAD]
+                                                        │
+                                                   speech/silence
+                                                        │
+                                               [TurnDetector] ──timeout──> auto-stop
+                                                        │
+[Rust/cpal] ──stopRecording──> [Whisper STT] ──transcript──> [VoiceRouter]
+                                                                  │
+                                            ┌─────────────────────┼─────────────┐
+                                        dictation            command        conversation
+                                            │                    │               │
+                                     clipboard + entry    IntentClassifier    AI Chat
+                                                                │
+                                                          ActionRouter
+```
+
+### SQLite Schema v3 Tables
+
+| Table | Feature | Purpose |
+|-------|---------|---------|
+| `vad_training_samples` | VAD | MFCC features for on-device model fine-tuning |
+| `intent_training_samples` | Intent | Classification logs + corrections |
+| `voice_routing_log` | Routing | Route decisions for ML training |
+| `meeting_sessions` | Meeting | Session metadata, summary, action items |
+| `notifications` | Notifications | In-app notification CRUD |
+| `notification_interactions` | Notifications | User engagement tracking for ML |
+| `action_log` | Workflows | Action type + temporal metadata (no content) |
+| `workflows` | Workflows | Discovered patterns |
+| `embeddings` | Search | 512-dim Float32 vectors as BLOB |
+| `ml_model_weights` | Shared | Serialized TF.js model weights |
+| `tfjs_model_metadata` | Shared | Model version tracking |
+
+### ML Settings (all in `settings` table)
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `vad_enabled` | `true` | Voice activity detection |
+| `vad_sensitivity` | `0.5` | VAD threshold (0-1) |
+| `vad_web_audio_enabled` | `true` | Web Audio dual-pipeline (disable for ALSA issues) |
+| `turn_detection_mode` | `push-to-talk` | push-to-talk / auto-detect / always-listening |
+| `turn_detection_timeout_ms` | `3000` | Silence timeout for auto-detect mode |
+| `voice_routing_enabled` | `false` | Context-aware voice routing |
+| `meeting_mode_enabled` | `false` | Ambient meeting mode |
+| `intent_classification_enabled` | `false` | Voice command classification |
+| `intent_llm_fallback` | `true` | Use LLM when classifier confidence is low |
+| `ml_notifications_enabled` | `false` | Smart notification ranking |
+| `ml_notifications_threshold` | `0.5` | Ranking sensitivity |
+| `ml_workflows_enabled` | `false` | Workflow discovery |
+| `ml_workflows_confidence` | `0.7` | Minimum pattern confidence |
+| `ml_semantic_search_enabled` | `false` | Semantic search with USE embeddings |
+
+### Model Budget
+
+| Model | Size | Ships with app? |
+|-------|------|-----------------|
+| Silero VAD | ~900KB | Yes |
+| Intent Classifier LSTM | ~5MB | Yes (pre-trained on synthetic data) |
+| Universal Sentence Encoder Lite | ~30MB | Yes |
+| Meeting Detector | ~5MB | Yes |
+| Turn Detector GRU | ~2MB | No (trained on-device) |
+| Voice Router | ~3MB | No (trained on-device) |
+| Notification Ranker | ~2KB | No (trained on-device) |
+| Workflow Predictor GRU | ~15KB | No (trained on-device) |
+| **Total bundled** | **~41MB** | |
+
+### Privacy Guarantees
+
+- All TF.js inference in renderer Web Worker — no network calls
+- VAD training stores audio features (MFCC), never raw audio
+- Action log records action types only, never user content
+- All learned data in local SQLite, deletable per-feature
+- `blockAllNetworkRequests()` unchanged — no new network access
 
 ---
 

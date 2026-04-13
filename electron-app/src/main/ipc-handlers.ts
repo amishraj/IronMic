@@ -29,6 +29,14 @@ const ALLOWED_SETTING_KEYS = new Set([
   'security_clear_on_exit', 'security_ai_data_confirm', 'security_privacy_mode',
   'migration_tag_ai_done',
   'analytics_backfill_done',
+  // ML Feature settings (v1.1.0)
+  'vad_enabled', 'vad_sensitivity', 'vad_web_audio_enabled',
+  'turn_detection_enabled', 'turn_detection_timeout_ms', 'turn_detection_mode',
+  'voice_routing_enabled', 'meeting_mode_enabled',
+  'intent_classification_enabled', 'intent_llm_fallback',
+  'ml_notifications_enabled', 'ml_notifications_threshold', 'ml_notifications_retention_days',
+  'ml_workflows_enabled', 'ml_workflows_confidence',
+  'ml_semantic_search_enabled',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -286,6 +294,110 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle('ai:cancel', () => aiManager.cancel());
   ipcMain.handle('ai:reset-session', () => aiManager.resetSession());
   ipcMain.handle('ai:local-model-status', () => aiManager.getLocalModelStatuses());
+
+  // ── ML Features: Notifications ──
+
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_CREATE, (_e, source: string, sourceId: string | null, type: string, title: string, body?: string) =>
+    native.addon.createNotification(source, sourceId, type, title, body ?? null)
+  );
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_LIST, (_e, limit: number, offset: number, unreadOnly: boolean) =>
+    native.addon.listNotifications(limit, offset, unreadOnly)
+  );
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_MARK_READ, (_e, id: string) => native.addon.markNotificationRead(id));
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_ACT, (_e, id: string) => native.addon.notificationAct(id));
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_DISMISS, (_e, id: string) => native.addon.notificationDismiss(id));
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_UPDATE_PRIORITY, (_e, id: string, priority: number) =>
+    native.addon.updateNotificationPriority(id, priority)
+  );
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_LOG_INTERACTION, (_e, notificationId: string, action: string, hour?: number, dow?: number) =>
+    native.addon.logNotificationInteraction(notificationId, action, hour ?? null, dow ?? null)
+  );
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_GET_INTERACTIONS, (_e, sinceDate: string) =>
+    native.addon.getNotificationInteractions(sinceDate)
+  );
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_GET_UNREAD_COUNT, () => native.addon.getUnreadNotificationCount());
+  ipcMain.handle(IPC_CHANNELS.NOTIFICATION_DELETE_OLD, (_e, days: number) => native.addon.deleteOldNotifications(days));
+
+  // ── ML Features: Action Log ──
+
+  ipcMain.handle(IPC_CHANNELS.ACTION_LOG, (_e, actionType: string, metadataJson?: string) =>
+    native.addon.logAction(actionType, metadataJson ?? null)
+  );
+  ipcMain.handle(IPC_CHANNELS.ACTION_LOG_QUERY, (_e, from: string, to: string, filter?: string) =>
+    native.addon.queryActionLog(from, to, filter ?? null)
+  );
+  ipcMain.handle(IPC_CHANNELS.ACTION_LOG_GET_COUNTS, () => native.addon.getActionCounts());
+  ipcMain.handle(IPC_CHANNELS.ACTION_LOG_DELETE_OLD, (_e, days: number) => native.addon.deleteOldActions(days));
+
+  // ── ML Features: Workflows ──
+
+  ipcMain.handle(IPC_CHANNELS.WORKFLOW_CREATE, (_e, seq: string, pattern: string | null, conf: number, count: number) =>
+    native.addon.createWorkflow(seq, pattern, conf, count)
+  );
+  ipcMain.handle(IPC_CHANNELS.WORKFLOW_LIST, (_e, includeDismissed: boolean) => native.addon.listWorkflows(includeDismissed));
+  ipcMain.handle(IPC_CHANNELS.WORKFLOW_SAVE, (_e, id: string, name: string) => native.addon.saveWorkflow(id, name));
+  ipcMain.handle(IPC_CHANNELS.WORKFLOW_DISMISS, (_e, id: string) => native.addon.dismissWorkflow(id));
+  ipcMain.handle(IPC_CHANNELS.WORKFLOW_DELETE, (_e, id: string) => native.addon.deleteWorkflow(id));
+
+  // ── ML Features: Embeddings ──
+
+  ipcMain.handle(IPC_CHANNELS.EMBEDDING_STORE, (_e, contentId: string, contentType: string, embeddingBytes: Buffer, modelVersion: string) =>
+    native.addon.storeEmbedding(contentId, contentType, embeddingBytes, modelVersion)
+  );
+  ipcMain.handle(IPC_CHANNELS.EMBEDDING_GET_ALL, (_e, filter?: string) => native.addon.getAllEmbeddings(filter ?? null));
+  ipcMain.handle(IPC_CHANNELS.EMBEDDING_GET_ALL_WITH_DATA, (_e, filter?: string) => native.addon.getAllEmbeddingsWithData(filter ?? null));
+  ipcMain.handle(IPC_CHANNELS.EMBEDDING_GET_UNEMBEDDED, (_e, limit: number) => native.addon.getUnembeddedEntries(limit));
+  ipcMain.handle(IPC_CHANNELS.EMBEDDING_DELETE, (_e, contentId: string, contentType: string) =>
+    native.addon.deleteEmbedding(contentId, contentType)
+  );
+  ipcMain.handle(IPC_CHANNELS.EMBEDDING_GET_STATS, () => native.addon.getEmbeddingStats());
+  ipcMain.handle(IPC_CHANNELS.EMBEDDING_DELETE_ALL, () => native.addon.deleteAllEmbeddings());
+
+  // ── ML Features: Model Weights ──
+
+  ipcMain.handle(IPC_CHANNELS.ML_SAVE_WEIGHTS, (_e, name: string, weightsJson: string, metaJson: string | null, samples: number) =>
+    native.addon.saveMlWeights(name, weightsJson, metaJson, samples)
+  );
+  ipcMain.handle(IPC_CHANNELS.ML_LOAD_WEIGHTS, (_e, name: string) => native.addon.loadMlWeights(name));
+  ipcMain.handle(IPC_CHANNELS.ML_DELETE_WEIGHTS, (_e, name: string) => native.addon.deleteMlWeights(name));
+  ipcMain.handle(IPC_CHANNELS.ML_GET_TRAINING_STATUS, () => native.addon.getMlTrainingStatus());
+  ipcMain.handle(IPC_CHANNELS.ML_DELETE_ALL_DATA, () => native.addon.deleteAllMlData());
+
+  // ── ML Features: VAD Training ──
+
+  ipcMain.handle(IPC_CHANNELS.VAD_SAVE_SAMPLE, (_e, features: string, label: string, corrected: boolean, sessionId?: string) =>
+    native.addon.saveVadTrainingSample(features, label, corrected, sessionId ?? null)
+  );
+  ipcMain.handle(IPC_CHANNELS.VAD_GET_SAMPLES, (_e, limit: number) => native.addon.getVadTrainingSamples(limit));
+  ipcMain.handle(IPC_CHANNELS.VAD_GET_SAMPLE_COUNT, () => native.addon.getVadSampleCount());
+  ipcMain.handle(IPC_CHANNELS.VAD_DELETE_ALL_SAMPLES, () => native.addon.deleteAllVadSamples());
+
+  // ── ML Features: Intent Training ──
+
+  ipcMain.handle(IPC_CHANNELS.INTENT_SAVE_SAMPLE, (_e, transcript: string, intent?: string, entities?: string, conf?: number, entryId?: string) =>
+    native.addon.saveIntentTrainingSample(transcript, intent ?? null, entities ?? null, conf ?? null, entryId ?? null)
+  );
+  ipcMain.handle(IPC_CHANNELS.INTENT_GET_SAMPLES, (_e, limit: number) => native.addon.getIntentTrainingSamples(limit));
+  ipcMain.handle(IPC_CHANNELS.INTENT_GET_CORRECTION_COUNT, () => native.addon.getIntentCorrectionCount());
+  ipcMain.handle(IPC_CHANNELS.INTENT_LOG_ROUTING, (_e, screen: string, intent: string, route: string, entryId?: string) =>
+    native.addon.logVoiceRouting(screen, intent, route, entryId ?? null)
+  );
+
+  // ── ML Features: Meeting Sessions ──
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_CREATE, () => native.addon.createMeetingSession());
+  ipcMain.handle(IPC_CHANNELS.MEETING_END, (_e, id: string, speakers: number, summary?: string, items?: string, duration?: number, entryIds?: string) =>
+    native.addon.endMeetingSession(id, speakers, summary ?? null, items ?? null, duration ?? 0, entryIds ?? null)
+  );
+  ipcMain.handle(IPC_CHANNELS.MEETING_GET, (_e, id: string) => native.addon.getMeetingSession(id));
+  ipcMain.handle(IPC_CHANNELS.MEETING_LIST, (_e, limit: number, offset: number) => native.addon.listMeetingSessions(limit, offset));
+  ipcMain.handle(IPC_CHANNELS.MEETING_DELETE, (_e, id: string) => native.addon.deleteMeetingSession(id));
+
+  // ── TF.js Infrastructure ──
+
+  ipcMain.handle(IPC_CHANNELS.GET_MODELS_DIR, () => {
+    return process.env.IRONMIC_MODELS_DIR || '';
+  });
 
   console.log('[ipc-handlers] All IPC handlers registered');
 }

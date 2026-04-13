@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -121,6 +121,10 @@ impl Database {
 
         if current_version < 2 {
             self.migrate_v2(&conn)?;
+        }
+
+        if current_version < 3 {
+            self.migrate_v3(&conn)?;
         }
 
         // Update version
@@ -252,6 +256,165 @@ impl Database {
         .map_err(|e| IronMicError::Storage(format!("Migration v2 failed: {e}")))?;
 
         info!("Migration v2 applied: created analytics tables");
+        Ok(())
+    }
+
+    /// Migration v3: Create TF.js ML feature tables (v1.1.0).
+    fn migrate_v3(&self, conn: &Connection) -> Result<(), IronMicError> {
+        conn.execute_batch(
+            "
+            -- Feature 1: VAD/turn detection training data
+            CREATE TABLE IF NOT EXISTS vad_training_samples (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                audio_features TEXT NOT NULL,
+                label TEXT NOT NULL,
+                is_user_corrected INTEGER DEFAULT 0,
+                session_id TEXT
+            );
+
+            -- Feature 2: Intent classification training data
+            CREATE TABLE IF NOT EXISTS intent_training_samples (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                transcript TEXT NOT NULL,
+                predicted_intent TEXT,
+                predicted_entities TEXT,
+                corrected_intent TEXT,
+                corrected_entities TEXT,
+                confidence REAL,
+                entry_id TEXT REFERENCES entries(id) ON DELETE SET NULL
+            );
+
+            -- Feature 1C: Voice routing log
+            CREATE TABLE IF NOT EXISTS voice_routing_log (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                active_screen TEXT NOT NULL,
+                detected_intent TEXT NOT NULL,
+                routed_to TEXT NOT NULL,
+                was_correct INTEGER DEFAULT 1,
+                entry_id TEXT REFERENCES entries(id) ON DELETE SET NULL
+            );
+
+            -- Feature 1 Bonus: Meeting sessions
+            CREATE TABLE IF NOT EXISTS meeting_sessions (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                ended_at TEXT,
+                speaker_count INTEGER DEFAULT 0,
+                summary TEXT,
+                action_items TEXT,
+                total_duration_seconds REAL,
+                entry_ids TEXT
+            );
+
+            -- Feature 3: Notifications
+            CREATE TABLE IF NOT EXISTS notifications (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                source_id TEXT,
+                notification_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                body TEXT,
+                priority REAL NOT NULL DEFAULT 0.5,
+                created_at TEXT NOT NULL,
+                read_at TEXT,
+                acted_on_at TEXT,
+                dismissed_at TEXT,
+                response_latency_ms INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_notifications_created ON notifications(created_at);
+
+            -- Feature 3: Notification interaction log
+            CREATE TABLE IF NOT EXISTS notification_interactions (
+                id TEXT PRIMARY KEY,
+                notification_id TEXT NOT NULL REFERENCES notifications(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                context_hour INTEGER,
+                context_day_of_week INTEGER
+            );
+
+            -- Feature 4: Action log for workflow discovery
+            CREATE TABLE IF NOT EXISTS action_log (
+                id TEXT PRIMARY KEY,
+                action_type TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                hour_of_day INTEGER NOT NULL,
+                day_of_week INTEGER NOT NULL,
+                metadata_json TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_action_log_timestamp ON action_log(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_action_log_type ON action_log(action_type);
+
+            -- Feature 4: Discovered workflows
+            CREATE TABLE IF NOT EXISTS workflows (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                action_sequence TEXT NOT NULL,
+                trigger_pattern TEXT,
+                confidence REAL NOT NULL DEFAULT 0.0,
+                occurrence_count INTEGER NOT NULL DEFAULT 0,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                is_saved INTEGER DEFAULT 0,
+                is_dismissed INTEGER DEFAULT 0
+            );
+
+            -- Feature 5: Semantic embeddings
+            CREATE TABLE IF NOT EXISTS embeddings (
+                content_id TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                embedding BLOB NOT NULL,
+                embedded_at TEXT NOT NULL,
+                model_version TEXT NOT NULL DEFAULT 'use-v1',
+                PRIMARY KEY (content_id, content_type)
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_type ON embeddings(content_type);
+
+            -- Shared: ML model weights persistence
+            CREATE TABLE IF NOT EXISTS ml_model_weights (
+                model_name TEXT PRIMARY KEY,
+                weights_json TEXT NOT NULL,
+                metadata_json TEXT,
+                trained_at TEXT NOT NULL,
+                training_samples INTEGER NOT NULL DEFAULT 0,
+                version INTEGER NOT NULL DEFAULT 1
+            );
+
+            -- Shared: TF.js model metadata
+            CREATE TABLE IF NOT EXISTS tfjs_model_metadata (
+                model_id TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                last_loaded_at TEXT,
+                personal_fine_tune_version INTEGER DEFAULT 0,
+                accuracy_score REAL
+            );
+
+            -- Default ML settings
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('vad_enabled', 'true');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('vad_sensitivity', '0.5');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('vad_web_audio_enabled', 'true');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('turn_detection_enabled', 'false');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('turn_detection_timeout_ms', '3000');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('turn_detection_mode', 'push-to-talk');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('voice_routing_enabled', 'false');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_mode_enabled', 'false');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('intent_classification_enabled', 'false');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('intent_llm_fallback', 'true');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('ml_notifications_enabled', 'false');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('ml_notifications_threshold', '0.5');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('ml_notifications_retention_days', '30');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('ml_workflows_enabled', 'false');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('ml_workflows_confidence', '0.7');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('ml_semantic_search_enabled', 'false');
+            ",
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v3 failed: {e}")))?;
+
+        info!("Migration v3 applied: created ML feature tables for v1.1.0");
         Ok(())
     }
 }

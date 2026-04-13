@@ -70,10 +70,75 @@ export const IPC_CHANNELS = {
   ANALYTICS_CLASSIFY_TOPICS_BATCH: 'ironmic:analytics-classify-topics-batch',
   ANALYTICS_GET_UNCLASSIFIED_COUNT: 'ironmic:analytics-get-unclassified-count',
 
+  // Notifications (ML Feature 3)
+  NOTIFICATION_CREATE: 'ironmic:notification-create',
+  NOTIFICATION_LIST: 'ironmic:notification-list',
+  NOTIFICATION_MARK_READ: 'ironmic:notification-mark-read',
+  NOTIFICATION_ACT: 'ironmic:notification-act',
+  NOTIFICATION_DISMISS: 'ironmic:notification-dismiss',
+  NOTIFICATION_UPDATE_PRIORITY: 'ironmic:notification-update-priority',
+  NOTIFICATION_LOG_INTERACTION: 'ironmic:notification-log-interaction',
+  NOTIFICATION_GET_INTERACTIONS: 'ironmic:notification-get-interactions',
+  NOTIFICATION_GET_UNREAD_COUNT: 'ironmic:notification-get-unread-count',
+  NOTIFICATION_DELETE_OLD: 'ironmic:notification-delete-old',
+
+  // Action Log (ML Feature 4)
+  ACTION_LOG: 'ironmic:action-log',
+  ACTION_LOG_QUERY: 'ironmic:action-log-query',
+  ACTION_LOG_GET_COUNTS: 'ironmic:action-log-get-counts',
+  ACTION_LOG_DELETE_OLD: 'ironmic:action-log-delete-old',
+
+  // Workflows (ML Feature 4)
+  WORKFLOW_CREATE: 'ironmic:workflow-create',
+  WORKFLOW_LIST: 'ironmic:workflow-list',
+  WORKFLOW_SAVE: 'ironmic:workflow-save',
+  WORKFLOW_DISMISS: 'ironmic:workflow-dismiss',
+  WORKFLOW_DELETE: 'ironmic:workflow-delete',
+
+  // Embeddings (ML Feature 5)
+  EMBEDDING_STORE: 'ironmic:embedding-store',
+  EMBEDDING_GET_ALL: 'ironmic:embedding-get-all',
+  EMBEDDING_GET_ALL_WITH_DATA: 'ironmic:embedding-get-all-with-data',
+  EMBEDDING_GET_UNEMBEDDED: 'ironmic:embedding-get-unembedded',
+  EMBEDDING_DELETE: 'ironmic:embedding-delete',
+  EMBEDDING_GET_STATS: 'ironmic:embedding-get-stats',
+  EMBEDDING_DELETE_ALL: 'ironmic:embedding-delete-all',
+
+  // ML Model Weights
+  ML_SAVE_WEIGHTS: 'ironmic:ml-save-weights',
+  ML_LOAD_WEIGHTS: 'ironmic:ml-load-weights',
+  ML_DELETE_WEIGHTS: 'ironmic:ml-delete-weights',
+  ML_GET_TRAINING_STATUS: 'ironmic:ml-get-training-status',
+  ML_DELETE_ALL_DATA: 'ironmic:ml-delete-all-data',
+
+  // VAD Training (ML Feature 1)
+  VAD_SAVE_SAMPLE: 'ironmic:vad-save-sample',
+  VAD_GET_SAMPLES: 'ironmic:vad-get-samples',
+  VAD_GET_SAMPLE_COUNT: 'ironmic:vad-get-sample-count',
+  VAD_DELETE_ALL_SAMPLES: 'ironmic:vad-delete-all-samples',
+
+  // Intent Training (ML Feature 2)
+  INTENT_SAVE_SAMPLE: 'ironmic:intent-save-sample',
+  INTENT_GET_SAMPLES: 'ironmic:intent-get-samples',
+  INTENT_GET_CORRECTION_COUNT: 'ironmic:intent-get-correction-count',
+  INTENT_LOG_ROUTING: 'ironmic:intent-log-routing',
+
+  // Meeting Sessions (ML Feature 1 Bonus)
+  MEETING_CREATE: 'ironmic:meeting-create',
+  MEETING_END: 'ironmic:meeting-end',
+  MEETING_GET: 'ironmic:meeting-get',
+  MEETING_LIST: 'ironmic:meeting-list',
+  MEETING_DELETE: 'ironmic:meeting-delete',
+
+  // TF.js Infrastructure
+  GET_MODELS_DIR: 'ironmic:get-models-dir',
+
   // Events (main → renderer)
   PIPELINE_STATE_CHANGED: 'ironmic:pipeline-state-changed',
   RECORDING_COMPLETE: 'ironmic:recording-complete',
   MODEL_DOWNLOAD_PROGRESS: 'ironmic:model-download-progress',
+  NOTIFICATION_NEW: 'ironmic:notification-new',
+  WORKFLOW_DISCOVERED: 'ironmic:workflow-discovered',
 } as const;
 
 // ── Model hosting on GitHub Releases ──
@@ -91,6 +156,11 @@ export const MODEL_URLS: Record<string, string> = {
   'llm-chat-llama3': `${MODELS_BASE_URL}/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`,
   'llm-chat-phi3': `${MODELS_BASE_URL}/Phi-3-mini-4k-instruct-Q4_K_M.gguf`,
   'tts-model': `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx`,
+  // TF.js ML models (v1.1.0) — tar.gz archives containing model.json + weight shards
+  'tfjs-vad-silero': `${MODELS_BASE_URL}/tfjs-vad-silero.tar.gz`,
+  'tfjs-intent-classifier': `${MODELS_BASE_URL}/tfjs-intent-classifier.tar.gz`,
+  'tfjs-use': `${MODELS_BASE_URL}/tfjs-use.tar.gz`,
+  'tfjs-meeting-detector': `${MODELS_BASE_URL}/tfjs-meeting-detector.tar.gz`,
 };
 
 /** Fallback URLs (HuggingFace) — used if GitHub download fails after retries */
@@ -103,6 +173,11 @@ export const MODEL_FALLBACK_URLS: Record<string, string> = {
   'llm-chat-llama3': 'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
   'llm-chat-phi3': 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf',
   'tts-model': 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_fp16.onnx',
+  // TF.js ML models — fallback is same as primary (GitHub only, no HuggingFace equivalent)
+  'tfjs-vad-silero': `${MODELS_BASE_URL}/tfjs-vad-silero.tar.gz`,
+  'tfjs-intent-classifier': `${MODELS_BASE_URL}/tfjs-intent-classifier.tar.gz`,
+  'tfjs-use': `${MODELS_BASE_URL}/tfjs-use.tar.gz`,
+  'tfjs-meeting-detector': `${MODELS_BASE_URL}/tfjs-meeting-detector.tar.gz`,
 };
 
 export const MODEL_FILES: Record<string, string> = {
@@ -114,6 +189,11 @@ export const MODEL_FILES: Record<string, string> = {
   'llm-chat-llama3': 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
   'llm-chat-phi3': 'Phi-3-mini-4k-instruct-q4.gguf',
   'tts-model': 'kokoro-v1.0-fp16.onnx',
+  // TF.js ML models — tar.gz archives extracted to tfjs/<model-name>/
+  'tfjs-vad-silero': 'tfjs-vad-silero.tar.gz',
+  'tfjs-intent-classifier': 'tfjs-intent-classifier.tar.gz',
+  'tfjs-use': 'tfjs-use.tar.gz',
+  'tfjs-meeting-detector': 'tfjs-meeting-detector.tar.gz',
 };
 
 /** SHA-256 checksums for model integrity verification */
@@ -127,6 +207,11 @@ export const MODEL_CHECKSUMS: Record<string, string> = {
   'llm-chat-llama3': '', // Will be populated when model is uploaded to GitHub Releases
   'llm-chat-phi3': '', // Will be populated when model is uploaded to GitHub Releases
   'tts-model': 'ba4527a874b42b21e35f468c10d326fdff3c7fc8cac1f85e9eb6c0dfc35c334a',
+  // TF.js ML models — checksums populated by upload-models workflow
+  'tfjs-vad-silero': '',
+  'tfjs-intent-classifier': '',
+  'tfjs-use': '',
+  'tfjs-meeting-detector': '',
 };
 
 /** Models that are split into multiple parts (exceeds GitHub 2 GB per-asset limit) */
@@ -186,6 +271,61 @@ export const CHAT_LLM_MODELS: ChatLlmModelMeta[] = [
     reusesPolishModel: false,
     description: 'Smallest and fastest option',
     compatible: true,
+  },
+];
+
+// ── TF.js ML model registry ──
+
+export interface TFJSModelMeta {
+  /** Key used in MODEL_FILES / MODEL_URLS for download. */
+  id: string;
+  label: string;
+  sizeLabel: string;
+  /** Feature this model powers */
+  feature: string;
+  /** Directory name under tfjs/ where the model is extracted */
+  dirName: string;
+  /** Whether this model ships with the app (vs trained on-device) */
+  bundled: boolean;
+  description: string;
+}
+
+export const TFJS_MODELS: TFJSModelMeta[] = [
+  {
+    id: 'tfjs-vad-silero',
+    label: 'Silero VAD',
+    sizeLabel: '~900 KB',
+    feature: 'Voice Activity Detection',
+    dirName: 'vad-silero',
+    bundled: true,
+    description: 'Filters silence and noise before Whisper transcription',
+  },
+  {
+    id: 'tfjs-intent-classifier',
+    label: 'Intent Classifier',
+    sizeLabel: '~5 MB',
+    feature: 'Voice Commands',
+    dirName: 'intent-classifier',
+    bundled: true,
+    description: 'Classifies voice input as commands (search, navigate, create)',
+  },
+  {
+    id: 'tfjs-use',
+    label: 'Universal Sentence Encoder',
+    sizeLabel: '~30 MB',
+    feature: 'Semantic Search',
+    dirName: 'use',
+    bundled: true,
+    description: 'Generates text embeddings for meaning-based search',
+  },
+  {
+    id: 'tfjs-meeting-detector',
+    label: 'Meeting Detector',
+    sizeLabel: '~5 MB',
+    feature: 'Ambient Meeting Mode',
+    dirName: 'meeting-detector',
+    bundled: true,
+    description: 'Detects meeting start/end and speaker turns',
   },
 ];
 
