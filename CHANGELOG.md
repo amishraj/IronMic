@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.2] - 2026-04-13
+
+### Fixed
+- **Model downloads fail in packaged app** — `ENOENT: no such file or directory, mkdir .../IronMic.app/Contents/Resources/rust-core/models`. The model directory path was resolved at module load time (top-level `const`), but TypeScript import hoisting caused the module to load before `IRONMIC_MODELS_DIR` was set, so it fell back to a path inside the read-only `.app` bundle. Changed to lazy resolution so the env var is read at download time. This fixes all model downloads: Whisper, LLM, chat models (Llama3, Phi3), TTS, and TF.js ML models.
+
+---
+
 ## [1.1.1] - 2026-04-13
 
 ### Fixed
