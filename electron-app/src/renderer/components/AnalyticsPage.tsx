@@ -1,7 +1,7 @@
-import { useEffect, useCallback } from 'react';
+import { useEffect, useCallback, Component, type ReactNode } from 'react';
 import {
   BarChart3, Clock, Flame, TrendingUp, TrendingDown, Minus,
-  BookOpen, Zap, Loader2, Brain,
+  BookOpen, Zap, Loader2, Brain, AlertTriangle, RefreshCw,
 } from 'lucide-react';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
@@ -37,7 +37,44 @@ function formatNumber(n: number): string {
   return n.toLocaleString();
 }
 
+// Error boundary to catch Recharts or data rendering crashes
+class AnalyticsErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
+  state = { hasError: false };
+  static getDerivedStateFromError() { return { hasError: true }; }
+  componentDidCatch(error: Error) { console.error('[AnalyticsPage] Render error:', error); }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="h-full flex flex-col items-center justify-center gap-4 p-8">
+          <AlertTriangle className="w-10 h-10 text-yellow-500" />
+          <h2 className="text-lg font-semibold text-iron-text">Analytics couldn't load</h2>
+          <p className="text-sm text-iron-text-muted text-center max-w-md">
+            This usually happens on a fresh install before any dictation data exists.
+            Try recording a dictation first, then come back.
+          </p>
+          <button
+            onClick={() => this.setState({ hasError: false })}
+            className="flex items-center gap-2 px-4 py-2 text-sm font-medium bg-iron-accent/10 text-iron-accent-light rounded-lg hover:bg-iron-accent/20 transition-colors"
+          >
+            <RefreshCw className="w-4 h-4" />
+            Try again
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export function AnalyticsPage() {
+  return (
+    <AnalyticsErrorBoundary>
+      <AnalyticsPageInner />
+    </AnalyticsErrorBoundary>
+  );
+}
+
+function AnalyticsPageInner() {
   const {
     overview, dailyTrend, topWords, sourceBreakdown, topicBreakdown,
     topicTrends, streaks, productivity, vocabularyRichness,
