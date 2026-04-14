@@ -54,8 +54,12 @@ function createWindow(): void {
   });
 }
 
+/** Domains allowed for model downloads (must match model-downloader.ts ALLOWED_DOMAINS) */
+const MODEL_DOWNLOAD_DOMAINS = ['github.com', 'objects.githubusercontent.com', 'huggingface.co', 'xethub.hf.co'];
+
 function blockAllNetworkRequests(): void {
-  // Privacy guarantee: block ALL outbound network requests
+  // Privacy guarantee: block ALL outbound network requests except model downloads.
+  // Model downloads are the ONLY network activity, triggered explicitly by the user.
   session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
     const url = details.url;
     // Allow devtools and local file:// and localhost (dev server)
@@ -69,6 +73,16 @@ function blockAllNetworkRequests(): void {
     ) {
       callback({});
       return;
+    }
+    // Allow HTTPS model downloads from trusted domains
+    if (url.startsWith('https://')) {
+      try {
+        const hostname = new URL(url).hostname;
+        if (MODEL_DOWNLOAD_DOMAINS.some(d => hostname === d || hostname.endsWith('.' + d))) {
+          callback({});
+          return;
+        }
+      } catch { /* invalid URL — block it */ }
     }
     console.warn(`[security] Blocked network request: ${url}`);
     callback({ cancel: true });

@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.5] - 2026-04-13
+
+### Fixed
+- **Model downloads blocked by app's own network filter** — Switching to Electron's `net` module in v1.1.3 caused downloads to go through the session's `webRequest` filter, which blocks all outbound traffic. Added a whitelist for model download domains (github.com, objects.githubusercontent.com, huggingface.co, xethub.hf.co) so HTTPS downloads to these trusted hosts pass through. All other outbound traffic remains blocked.
+
+---
+
 ## [1.1.4] - 2026-04-13
 
 ### Fixed
