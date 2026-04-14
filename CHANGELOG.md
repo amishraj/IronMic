@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.9] - 2026-04-13
+
+### Added
+- **HTTP proxy configuration** — New proxy settings in Settings > Security. Supports HTTP, HTTPS, and SOCKS5 proxies for model downloads on corporate networks. Uses Electron's `session.setProxy()` which routes through Chromium's network stack (trusts system certs + handles CONNECT tunnels). Also respects standard `HTTPS_PROXY` / `HTTP_PROXY` environment variables. The Security Posture overview updates to show proxy status.
+
+---
+
 ## [1.1.8] - 2026-04-13
 
 ### Fixed

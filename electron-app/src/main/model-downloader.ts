@@ -18,7 +18,7 @@ import https from 'https';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { BrowserWindow, net } from 'electron';
+import { BrowserWindow, net, session } from 'electron';
 import { execSync } from 'child_process';
 import {
   MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
@@ -51,6 +51,43 @@ const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
 
 /** Stall timeout: abort if no data received for 60 seconds */
 const STALL_TIMEOUT_MS = 60 * 1000;
+
+/**
+ * Resolve the proxy URL from settings, env vars, or system config.
+ * Priority: app setting > HTTPS_PROXY env > HTTP_PROXY env > no proxy
+ */
+function resolveProxyUrl(): string | null {
+  // 1. App setting (set in Settings > Security > Proxy)
+  try {
+    // native-bridge may not be loaded yet at import time, so use require
+    const nativeBridge = require('./native-bridge');
+    const setting = nativeBridge.native?.getSetting?.('proxy_url');
+    const enabled = nativeBridge.native?.getSetting?.('proxy_enabled');
+    if (enabled === 'true' && setting && setting.trim()) {
+      return setting.trim();
+    }
+  } catch { /* native not available yet */ }
+
+  // 2. Standard env vars (corporate environments often set these)
+  return process.env.HTTPS_PROXY || process.env.https_proxy
+    || process.env.HTTP_PROXY || process.env.http_proxy
+    || null;
+}
+
+/**
+ * Configure Electron's session proxy for net.request calls.
+ * Must be called before downloads when proxy is configured.
+ */
+async function applySessionProxy(): Promise<void> {
+  const proxyUrl = resolveProxyUrl();
+  if (proxyUrl) {
+    console.log(`[model-downloader] Configuring proxy: ${proxyUrl}`);
+    await session.defaultSession.setProxy({ proxyRules: proxyUrl });
+  } else {
+    // Use system proxy detection (Electron/Chromium auto-detects PAC, WPAD, etc.)
+    await session.defaultSession.setProxy({ mode: 'system' });
+  }
+}
 
 /** Max retries before falling back to HuggingFace */
 const MAX_RETRIES = 3;
@@ -158,13 +195,20 @@ type ProgressCallback = (downloaded: number, total: number, status: string) => v
  * Falls back to Node.js https if net module is unavailable (e.g. before app ready).
  * Handles redirects, stall detection, and timeouts.
  */
-function downloadFile(
+async function downloadFile(
   url: string,
   destPath: string,
   onProgress?: ProgressCallback,
   bytesOffset = 0,
   totalOverride = 0,
 ): Promise<void> {
+  // Apply proxy configuration before starting download
+  try { await applySessionProxy(); } catch (e) {
+    console.warn('[model-downloader] Failed to configure proxy:', e);
+  }
+
+  const proxyUrl = resolveProxyUrl();
+
   return new Promise((resolve, reject) => {
     function doRequest(reqUrl: string, redirectCount = 0) {
       if (redirectCount > 5) {
@@ -174,8 +218,8 @@ function downloadFile(
 
       try { validateUrl(reqUrl); } catch (e) { reject(e); return; }
 
-      // Use Electron's net module (trusts system cert store) when available,
-      // fall back to Node.js https otherwise
+      // Use Electron's net module (trusts system cert store + respects session proxy)
+      // Fall back to Node.js https otherwise
       const useElectronNet = net && typeof net.request === 'function';
 
       if (useElectronNet) {
@@ -252,6 +296,11 @@ function downloadFile(
         request.end();
       } else {
         // Fallback: Node.js https (for pre-app-ready or testing)
+        // Note: proxy is only supported via Electron's net module (above).
+        // The Node.js fallback does not proxy — it's only used pre-app-ready.
+        if (proxyUrl) {
+          console.warn('[model-downloader] Proxy configured but Node.js fallback does not support it. Use Electron net path.');
+        }
         const req = https.get(reqUrl, (res) => {
           if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
             const redirectUrl = res.headers.location;

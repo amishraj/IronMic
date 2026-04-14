@@ -631,6 +631,9 @@ function SecuritySettings() {
   const [clearOnExit, setClearOnExit] = useState(false);
   const [aiDataConfirm, setAiDataConfirm] = useState(false);
   const [privacyMode, setPrivacyMode] = useState(false);
+  const [proxyEnabled, setProxyEnabled] = useState(false);
+  const [proxyUrl, setProxyUrl] = useState('');
+  const [proxySaved, setProxySaved] = useState(false);
 
   useEffect(() => {
     loadSecuritySettings();
@@ -638,18 +641,22 @@ function SecuritySettings() {
 
   async function loadSecuritySettings() {
     const api = window.ironmic;
-    const [clip, timeout, exit, aiConfirm, privacy] = await Promise.all([
+    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl] = await Promise.all([
       api.getSetting('security_clipboard_auto_clear'),
       api.getSetting('security_session_timeout'),
       api.getSetting('security_clear_on_exit'),
       api.getSetting('security_ai_data_confirm'),
       api.getSetting('security_privacy_mode'),
+      api.getSetting('proxy_enabled'),
+      api.getSetting('proxy_url'),
     ]);
     if (clip) setClipboardAutoClear(clip);
     if (timeout) setSessionTimeout(timeout);
     setClearOnExit(exit === 'true');
     setAiDataConfirm(aiConfirm === 'true');
     setPrivacyMode(privacy === 'true');
+    setProxyEnabled(pEnabled === 'true');
+    if (pUrl) setProxyUrl(pUrl);
   }
 
   async function updateSetting(key: string, value: string) {
@@ -664,11 +671,61 @@ function SecuritySettings() {
       <Card variant="default" padding="md" className="space-y-3">
         <p className="text-xs font-semibold text-iron-text-muted uppercase tracking-wider">Security Posture</p>
         <div className="space-y-2">
-          <PostureItem icon={WifiOff} label="Network Isolation" detail="All outbound requests blocked. Only model downloads allowed on demand." status="strong" />
+          <PostureItem icon={WifiOff} label="Network Isolation" detail={proxyEnabled ? `All traffic blocked except model downloads via proxy (${proxyUrl || 'not set'}).` : 'All outbound requests blocked. Only model downloads allowed on demand.'} status="strong" />
           <PostureItem icon={HardDrive} label="Audio Privacy" detail="Mic audio held in memory only. Buffers zeroed on drop. Never written to disk." status="strong" />
           <PostureItem icon={Lock} label="Context Isolation" detail="Renderer sandboxed from Node.js. Typed IPC bridge only." status="strong" />
           <PostureItem icon={FileWarning} label="Database Encryption" detail="SQLite database stored unencrypted on disk. Enable OS-level disk encryption (FileVault/BitLocker)." status="warning" />
           <PostureItem icon={ClipboardCheck} label="Clipboard" detail={clipboardAutoClear === 'off' ? 'Text remains in clipboard until overwritten. Enable auto-clear below.' : `Auto-cleared after ${clipboardAutoClear}`} status={clipboardAutoClear === 'off' ? 'warning' : 'strong'} />
+        </div>
+      </Card>
+
+      {/* Proxy Configuration */}
+      <Card variant="default" padding="md">
+        <div className="space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Wifi className="w-4 h-4 text-iron-text-muted" />
+              <div>
+                <p className="text-sm font-medium text-iron-text">HTTP Proxy</p>
+                <p className="text-xs text-iron-text-muted">Route model downloads through a corporate proxy</p>
+              </div>
+            </div>
+            <Toggle
+              checked={proxyEnabled}
+              onChange={async (v) => {
+                setProxyEnabled(v);
+                await updateSetting('proxy_enabled', String(v));
+                setProxySaved(false);
+              }}
+            />
+          </div>
+          {proxyEnabled && (
+            <div className="space-y-2">
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  value={proxyUrl}
+                  onChange={(e) => { setProxyUrl(e.target.value); setProxySaved(false); }}
+                  placeholder="http://proxy.company.com:8080"
+                  className="flex-1 text-xs bg-iron-surface border border-iron-border rounded-lg px-3 py-2 text-iron-text placeholder:text-iron-text-muted focus:outline-none focus:border-iron-accent/50"
+                />
+                <button
+                  onClick={async () => {
+                    await updateSetting('proxy_url', proxyUrl.trim());
+                    setProxySaved(true);
+                    setTimeout(() => setProxySaved(false), 3000);
+                  }}
+                  className="px-3 py-1.5 text-xs font-medium bg-iron-accent/10 text-iron-accent-light rounded-lg hover:bg-iron-accent/20 transition-colors"
+                >
+                  {proxySaved ? 'Saved' : 'Save'}
+                </button>
+              </div>
+              <p className="text-[10px] text-iron-text-muted">
+                Supports HTTP/HTTPS/SOCKS5 proxies. Also respects HTTPS_PROXY and HTTP_PROXY environment variables.
+                Examples: http://proxy:8080 &middot; http://user:pass@proxy:8080 &middot; socks5://proxy:1080
+              </p>
+            </div>
+          )}
         </div>
       </Card>
 

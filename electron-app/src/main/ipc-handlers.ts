@@ -37,6 +37,8 @@ const ALLOWED_SETTING_KEYS = new Set([
   'ml_notifications_enabled', 'ml_notifications_threshold', 'ml_notifications_retention_days',
   'ml_workflows_enabled', 'ml_workflows_confidence',
   'ml_semantic_search_enabled',
+  // Network / proxy (v1.1.8)
+  'proxy_url', 'proxy_enabled',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
