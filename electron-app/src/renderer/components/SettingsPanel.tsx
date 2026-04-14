@@ -157,7 +157,7 @@ function AIAssistSettings() {
         }
         if (prog.status === 'error') {
           setDownloadingModel(null);
-          setDownloadError(`Download failed for ${prog.model}`);
+          setDownloadError(prog.errorDetail || `Download failed for ${prog.model}`);
         }
       }
     });
@@ -469,7 +469,7 @@ function SpeechSettings() {
           setDownloading(false);
           setModelReady(true);
         }
-        if (prog.status === 'error') { setDownloading(false); setDownloadError('TTS model download failed'); }
+        if (prog.status === 'error') { setDownloading(false); setDownloadError(prog.errorDetail || 'TTS model download failed'); }
       }
     });
     return cleanup;

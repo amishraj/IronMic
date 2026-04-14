@@ -464,7 +464,7 @@ async function downloadMultiPartModel(
   // Rough estimate: use known size from constants or 0
   const estimatedTotal = 4_400_000_000; // ~4.4 GB for LLM
 
-  function sendProgress(downloaded: number, total: number, status: string) {
+  function sendProgress(downloaded: number, total: number, status: string, errorDetail?: string) {
     if (window && !window.isDestroyed()) {
       window.webContents.send('ironmic:model-download-progress', {
         model,
@@ -472,6 +472,7 @@ async function downloadMultiPartModel(
         total,
         status,
         percent: total > 0 ? Math.round((downloaded / total) * 100) : 0,
+        errorDetail: errorDetail || undefined,
       });
     }
   }
@@ -576,29 +577,7 @@ export async function downloadModel(
   model: string,
   window: BrowserWindow | null,
 ): Promise<void> {
-  // Multi-part model (e.g., LLM)
-  if (MODEL_PARTS[model]) {
-    return downloadMultiPartModel(model, window);
-  }
-
-  // Single-file model
-  const url = MODEL_URLS[model];
-  if (!url) {
-    throw new Error(`Unknown model: ${model}`);
-  }
-
-  const destPath = getModelPath(model);
-  const tempPath = destPath + '.downloading';
-  const expectedHash = MODEL_CHECKSUMS[model];
-  const fallbackUrl = MODEL_FALLBACK_URLS[model];
-
-  fs.mkdirSync(resolveModelsDir(), { recursive: true });
-
-  console.log(`[model-downloader] Starting download: ${model}`);
-  console.log(`[model-downloader] Destination: ${destPath}`);
-  if (expectedHash) console.log(`[model-downloader] Expected SHA-256: ${expectedHash.slice(0, 16)}...`);
-
-  function sendProgress(downloaded: number, total: number, status: string) {
+  function sendProgress(downloaded: number, total: number, status: string, errorDetail?: string) {
     if (window && !window.isDestroyed()) {
       window.webContents.send('ironmic:model-download-progress', {
         model,
@@ -606,41 +585,63 @@ export async function downloadModel(
         total,
         status,
         percent: total > 0 ? Math.round((downloaded / total) * 100) : 0,
+        errorDetail: errorDetail || undefined,
       });
     }
   }
 
-  const { usedFallback } = await downloadWithFallback(
-    url, fallbackUrl, tempPath, sendProgress,
-  );
+  try {
+    // Multi-part model (e.g., LLM)
+    if (MODEL_PARTS[model]) {
+      return await downloadMultiPartModel(model, window);
+    }
 
-  if (usedFallback) {
-    console.log(`[model-downloader] Downloaded ${model} from fallback source (HuggingFace)`);
-  }
+    // Single-file model
+    const url = MODEL_URLS[model];
+    if (!url) {
+      throw new Error(`Unknown model: ${model}`);
+    }
 
-  // Verify integrity
-  if (expectedHash) {
-    try {
+    const destPath = getModelPath(model);
+    const tempPath = destPath + '.downloading';
+    const expectedHash = MODEL_CHECKSUMS[model];
+    const fallbackUrl = MODEL_FALLBACK_URLS[model];
+
+    fs.mkdirSync(resolveModelsDir(), { recursive: true });
+
+    console.log(`[model-downloader] Starting download: ${model}`);
+    console.log(`[model-downloader] Destination: ${destPath}`);
+    if (expectedHash) console.log(`[model-downloader] Expected SHA-256: ${expectedHash.slice(0, 16)}...`);
+
+    const { usedFallback } = await downloadWithFallback(
+      url, fallbackUrl, tempPath, sendProgress,
+    );
+
+    if (usedFallback) {
+      console.log(`[model-downloader] Downloaded ${model} from fallback source (HuggingFace)`);
+    }
+
+    // Verify integrity
+    if (expectedHash) {
       const actualHash = await hashFile(tempPath);
       if (actualHash !== expectedHash) {
         cleanupTemp(tempPath);
-        sendProgress(0, 0, 'error');
         throw new Error(
-          `Integrity check failed for ${model}. Expected SHA-256: ${expectedHash.slice(0, 16)}..., got: ${actualHash.slice(0, 16)}...`
+          `Integrity check failed for ${model}.\nExpected: ${expectedHash.slice(0, 16)}...\nGot: ${actualHash.slice(0, 16)}...`
         );
       }
       console.log(`[model-downloader] SHA-256 verified: ${model}`);
-    } catch (hashErr: any) {
-      if (hashErr.message.includes('Integrity check failed')) throw hashErr;
-      cleanupTemp(tempPath);
-      sendProgress(0, 0, 'error');
-      throw new Error(`Failed to verify download integrity: ${hashErr}`);
     }
-  }
 
-  fs.renameSync(tempPath, destPath);
-  sendProgress(0, 0, 'complete');
-  console.log(`[model-downloader] Download complete: ${model}`);
+    fs.renameSync(tempPath, destPath);
+    sendProgress(0, 0, 'complete');
+    console.log(`[model-downloader] Download complete: ${model}`);
+  } catch (err: any) {
+    // Always send the full error through the progress event so the UI can display it
+    const errorMsg = err.message || 'Download failed';
+    sendProgress(0, 0, 'error', errorMsg);
+    throw err;
+  }
 }
 
 /**

@@ -20,6 +20,7 @@ interface DownloadProgress {
   total: number;
   status: 'downloading' | 'complete' | 'error' | 'fallback' | 'verifying';
   percent: number;
+  errorDetail?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -67,7 +68,7 @@ export function ModelManager() {
     const cleanup = window.ironmic.onModelDownloadProgress((prog: DownloadProgress) => {
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(null); setProgress(null); loadState(); }
-      if (prog.status === 'error') { setDownloading(null); setError('Download failed'); }
+      if (prog.status === 'error') { setDownloading(null); setError(prog.errorDetail || 'Download failed'); }
     });
     return cleanup;
   }, []);
@@ -265,7 +266,7 @@ function ChatModelsSection() {
       if (prog.model === 'llm' && downloading !== 'llm') return; // Only track if we initiated
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(null); setProgress(null); setError(null); loadStatus(); }
-      if (prog.status === 'error') { setDownloading(null); setError(`Download failed for ${prog.model}`); }
+      if (prog.status === 'error') { setDownloading(null); setError(prog.errorDetail || `Download failed for ${prog.model}`); }
     });
     return cleanup;
   }, [downloading]);
@@ -355,7 +356,7 @@ function LlmModelRow() {
       if (prog.model !== 'llm') return;
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(false); setProgress(null); loadStatus(); }
-      if (prog.status === 'error') { setDownloading(false); setError('Download failed'); }
+      if (prog.status === 'error') { setDownloading(false); setError(prog.errorDetail || 'Download failed'); }
     });
     return cleanup;
   }, []);

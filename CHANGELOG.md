@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.10] - 2026-04-14
+
+### Fixed
+- **Download error details now actually visible in the UI** — The error progress event now carries the full error message including URLs tried. All progress handlers (Whisper, LLM, chat models, TTS, AI Assist) read `errorDetail` from the progress event and display it inline. Previously, the progress event fired `status: 'error'` but didn't include the message, so the UI showed generic text like "Download failed" instead of the detailed URL breakdown.
+
+---
+
 ## [1.1.9] - 2026-04-13
 
 ### Added
