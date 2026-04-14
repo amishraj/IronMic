@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.7] - 2026-04-13
+
+### Fixed
+- **Upload-models workflow: USE Lite download 403** — Google's TFHub GCS bucket now returns 403 for all TF.js model downloads (migrated to Kaggle). Changed USE to a placeholder archive like the other TF.js models. Semantic search gracefully disables when the model isn't present, falling back to keyword search. The USE model will be converted offline and uploaded manually in a future release.
+
+---
+
 ## [1.1.6] - 2026-04-13
 
 ### Fixed
