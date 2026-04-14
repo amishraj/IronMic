@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.4] - 2026-04-13
+
+### Fixed
+- **App crash on launch: "Cannot find module ./shared/constants"** — The electron-builder files pattern was too narrow after v1.1.3 change, excluding `dist/shared/` from the asar archive. The main process imports `IPC_CHANNELS` and model constants from `../shared/constants` which compiled to `dist/shared/constants.js`. Changed to `dist/**/*` with negative patterns excluding build output directories.
+
+---
+
 ## [1.1.3] - 2026-04-13
 
 ### Fixed
