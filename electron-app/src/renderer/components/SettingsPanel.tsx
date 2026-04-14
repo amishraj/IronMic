@@ -140,6 +140,7 @@ function AIAssistSettings() {
   const [localModels, setLocalModels] = useState<any[]>([]);
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   useEffect(() => {
     loadAiSettings();
@@ -148,6 +149,7 @@ function AIAssistSettings() {
         setDownloadProgress(prog.percent || 0);
         if (prog.status === 'complete') {
           setDownloadingModel(null);
+          setDownloadError(null);
           // Refresh local model status
           window.ironmic.aiGetLocalModelStatus?.().then((statuses: any[]) => {
             if (statuses) setLocalModels(statuses);
@@ -155,6 +157,7 @@ function AIAssistSettings() {
         }
         if (prog.status === 'error') {
           setDownloadingModel(null);
+          setDownloadError(`Download failed for ${prog.model}`);
         }
       }
     });
@@ -223,10 +226,12 @@ function AIAssistSettings() {
   async function handleDownloadLocalModel(modelId: string) {
     setDownloadingModel(modelId);
     setDownloadProgress(0);
+    setDownloadError(null);
     try {
       await window.ironmic.downloadModel(modelId);
-    } catch {
+    } catch (err: any) {
       setDownloadingModel(null);
+      setDownloadError(err.message || `Download failed for ${modelId}`);
     }
   }
 
@@ -336,6 +341,9 @@ function AIAssistSettings() {
               <p className="text-xs text-iron-text-muted">
                 Download and select a local LLM. Models run entirely on your device.
               </p>
+              {downloadError && (
+                <p className="text-[11px] text-red-400 mt-1">{downloadError}</p>
+              )}
               <div className="space-y-1.5 mt-2">
                 {localModels.map((m: any) => {
                   const isSelected = model === m.id;
@@ -450,6 +458,7 @@ function SpeechSettings() {
   const [modelReady, setModelReady] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   useEffect(() => {
     loadTtsSettings();
@@ -460,7 +469,7 @@ function SpeechSettings() {
           setDownloading(false);
           setModelReady(true);
         }
-        if (prog.status === 'error') setDownloading(false);
+        if (prog.status === 'error') { setDownloading(false); setDownloadError('TTS model download failed'); }
       }
     });
     return cleanup;
@@ -485,8 +494,9 @@ function SpeechSettings() {
   async function handleDownloadModel() {
     setDownloading(true);
     setDownloadProgress(0);
+    setDownloadError(null);
     try { await window.ironmic.downloadModel('tts'); }
-    catch { setDownloading(false); }
+    catch (err: any) { setDownloading(false); setDownloadError(err.message || 'TTS model download failed'); }
   }
 
   async function handleAutoReadbackToggle() {
@@ -551,6 +561,9 @@ function SpeechSettings() {
           <div className="mt-2 w-full h-1 bg-iron-surface-active rounded-full overflow-hidden">
             <div className="h-full bg-gradient-accent rounded-full transition-all duration-300" style={{ width: `${downloadProgress}%` }} />
           </div>
+        )}
+        {downloadError && (
+          <p className="text-[11px] text-red-400 mt-2">{downloadError}</p>
         )}
       </Card>
 

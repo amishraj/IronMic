@@ -40,6 +40,12 @@ jobs:
       - name: Download LLM (Mistral 7B Q4_K_M)
         run: curl -L --fail -o models/mistral-7b-instruct-q4_k_m.gguf "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf"
 
+      - name: Download LLM Chat (Llama 3.1 8B Q4_K_M)
+        run: curl -L --fail -o models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+
+      - name: Download LLM Chat (Phi-3 Mini Q4)
+        run: curl -L --fail -o models/Phi-3-mini-4k-instruct-q4.gguf "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf"
+
       - name: Download TTS model (Kokoro 82M)
         run: curl -L --fail -o models/kokoro-v1.0-fp16.onnx "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_fp16.onnx"
 
@@ -159,13 +165,21 @@ jobs:
 
       # ── Split the LLM (exceeds GitHub 2 GB per-asset limit) ──
 
-      - name: Split LLM into parts
+      - name: Split LLM models into parts
         run: |
           cd models
+          # Mistral 7B (~4.4 GB)
           split -b 1500000000 -d -a 1 mistral-7b-instruct-q4_k_m.gguf mistral-7b-instruct-q4_k_m.gguf.part
           ls -lh mistral-7b-instruct-q4_k_m.gguf.part*
-          # Remove the original to save disk space
           rm mistral-7b-instruct-q4_k_m.gguf
+          # Llama 3.1 8B (~4.7 GB)
+          split -b 1500000000 -d -a 1 Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part
+          ls -lh Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part*
+          rm Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+          # Phi-3 Mini (~2.2 GB) — also needs splitting (exceeds 2 GB limit)
+          split -b 1500000000 -d -a 1 Phi-3-mini-4k-instruct-q4.gguf Phi-3-mini-4k-instruct-q4.gguf.part
+          ls -lh Phi-3-mini-4k-instruct-q4.gguf.part*
+          rm Phi-3-mini-4k-instruct-q4.gguf
 
       # ── Bundle TTS voices ──
 
@@ -236,6 +250,29 @@ jobs:
               'parts': part_list,
           }
 
+          # Multi-part Llama 3.1 8B
+          def add_multipart(name, file_prefix, checksum_needle):
+              parts = sorted(glob.glob(f'models/{file_prefix}.part*'))
+              plist, tsize = [], 0
+              for p in parts:
+                  sz = os.path.getsize(p)
+                  tsize += sz
+                  plist.append({'asset': os.path.basename(p), 'sha256': sha256(p), 'sizeBytes': sz})
+              cksum = ''
+              with open('checksums.txt') as f:
+                  for line in f:
+                      if checksum_needle in line and 'part' not in line:
+                          cksum = line.split()[0]
+              manifest['models'][name] = {
+                  'filename': f'{file_prefix}',
+                  'sha256': cksum,
+                  'sizeBytes': tsize,
+                  'parts': plist,
+              }
+
+          add_multipart('llm-chat-llama3', 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf', 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf')
+          add_multipart('llm-chat-phi3', 'Phi-3-mini-4k-instruct-q4.gguf', 'Phi-3-mini-4k-instruct-q4.gguf')
+
           with open('models/manifest.json', 'w') as f:
               json.dump(manifest, f, indent=2)
           print(json.dumps(manifest, indent=2))
@@ -262,6 +299,11 @@ jobs:
             models/mistral-7b-instruct-q4_k_m.gguf.part0 \
             models/mistral-7b-instruct-q4_k_m.gguf.part1 \
             models/mistral-7b-instruct-q4_k_m.gguf.part2 \
+            models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part0 \
+            models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part1 \
+            models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part2 \
+            models/Phi-3-mini-4k-instruct-q4.gguf.part0 \
+            models/Phi-3-mini-4k-instruct-q4.gguf.part1 \
             models/kokoro-v1.0-fp16.onnx \
             models/voices.tar.gz \
             models/tfjs-vad-silero.tar.gz \

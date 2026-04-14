@@ -226,6 +226,10 @@ export const MODEL_PARTS: Record<string, string[]> = {
     'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part1',
     'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part2',
   ],
+  'llm-chat-phi3': [
+    'Phi-3-mini-4k-instruct-q4.gguf.part0',
+    'Phi-3-mini-4k-instruct-q4.gguf.part1',
+  ],
 };
 
 // ── Chat LLM model registry for AI Assist ──

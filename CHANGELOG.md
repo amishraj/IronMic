@@ -2,6 +2,14 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.6] - 2026-04-13
+
+### Fixed
+- **Download errors now visible in all model sections** — Chat model downloads (Llama3, Phi3) in both Models tab and AI Assist tab, and TTS model (Kokoro 82M) in Speech tab, now show inline error messages when downloads fail instead of silently swallowing errors.
+- **Chat models (Llama3, Phi3) added to upload-models workflow** — These models were never uploaded to GitHub Releases, causing 404 on the primary URL. Added download, split (for GitHub 2GB limit), and upload steps. Also added MODEL_PARTS entry for Phi3.
+
+---
+
 ## [1.1.5] - 2026-04-13
 
 ### Fixed

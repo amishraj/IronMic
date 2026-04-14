@@ -249,6 +249,7 @@ function ChatModelsSection() {
   const [localModels, setLocalModels] = useState<any[]>([]);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const loadStatus = async () => {
     try {
@@ -263,17 +264,19 @@ function ChatModelsSection() {
       if (!prog.model?.startsWith('llm')) return;
       if (prog.model === 'llm' && downloading !== 'llm') return; // Only track if we initiated
       setProgress(prog);
-      if (prog.status === 'complete') { setDownloading(null); setProgress(null); loadStatus(); }
-      if (prog.status === 'error') { setDownloading(null); }
+      if (prog.status === 'complete') { setDownloading(null); setProgress(null); setError(null); loadStatus(); }
+      if (prog.status === 'error') { setDownloading(null); setError(`Download failed for ${prog.model}`); }
     });
     return cleanup;
   }, [downloading]);
 
   const handleDownload = async (modelId: string) => {
     setDownloading(modelId);
+    setError(null);
     try {
       await window.ironmic.downloadModel(modelId);
-    } catch {
+    } catch (err: any) {
+      setError(err.message || `Download failed for ${modelId}`);
       setDownloading(null);
     }
   };
@@ -288,6 +291,9 @@ function ChatModelsSection() {
       <p className="text-xs text-iron-text-muted">
         Local LLMs for the AI Assist chat feature. Download any model to use it as an on-device AI.
       </p>
+      {error && (
+        <p className="text-[11px] text-iron-danger mt-1">{error}</p>
+      )}
       {localModels.map((m: any) => {
         const isDownloading = downloading === m.id;
         return (
