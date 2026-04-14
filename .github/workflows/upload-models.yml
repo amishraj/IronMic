@@ -99,12 +99,25 @@ jobs:
           }
           tar czf models/tfjs-vad-silero.tar.gz -C tfjs-models/vad-silero .
 
-      - name: Download Universal Sentence Encoder Lite
+      - name: Create Universal Sentence Encoder placeholder
         run: |
           mkdir -p tfjs-models/use
-          # USE Lite is available directly in TF.js format from TFHub
-          curl -L --fail -o use_lite.tar.gz "https://storage.googleapis.com/tfhub-tfjs-modules/tensorflow/tfjs-model/universal-sentence-encoder-lite/1/default/1.tar.gz"
-          tar xzf use_lite.tar.gz -C tfjs-models/use
+          # TFHub GCS bucket is now 403 (Google migrated to Kaggle).
+          # USE model will be converted offline and uploaded manually, or
+          # downloaded at runtime via the @tensorflow-models/universal-sentence-encoder
+          # npm package. The app's SemanticSearch service handles model-not-available
+          # gracefully — semantic search is disabled until the model is present.
+          python3 -c "
+          import json
+          manifest = {
+              'format': 'tfjs-graph-model',
+              'generatedBy': 'ironmic-use-converter',
+              'status': 'placeholder',
+              'note': 'Universal Sentence Encoder Lite. Convert from TF SavedModel or download at runtime. Semantic search works without this — falls back to keyword search.'
+          }
+          with open('tfjs-models/use/model.json', 'w') as f:
+              json.dump(manifest, f, indent=2)
+          "
           tar czf models/tfjs-use.tar.gz -C tfjs-models/use .
 
       - name: Create intent classifier placeholder
