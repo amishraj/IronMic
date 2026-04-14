@@ -342,7 +342,7 @@ function AIAssistSettings() {
                 Download and select a local LLM. Models run entirely on your device.
               </p>
               {downloadError && (
-                <p className="text-[11px] text-red-400 mt-1">{downloadError}</p>
+                <p className="text-[11px] text-red-400 mt-1 whitespace-pre-wrap break-all">{downloadError}</p>
               )}
               <div className="space-y-1.5 mt-2">
                 {localModels.map((m: any) => {
@@ -563,7 +563,7 @@ function SpeechSettings() {
           </div>
         )}
         {downloadError && (
-          <p className="text-[11px] text-red-400 mt-2">{downloadError}</p>
+          <p className="text-[11px] text-red-400 mt-2 whitespace-pre-wrap break-all">{downloadError}</p>
         )}
       </Card>
 

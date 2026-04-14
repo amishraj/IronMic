@@ -118,9 +118,9 @@ export function ModelManager() {
       </div>
 
       {error && (
-        <div className="flex items-center gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
-          <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
-          {error}
+        <div className="flex items-start gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
+          <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+          <span className="whitespace-pre-wrap break-all">{error}</span>
         </div>
       )}
 
@@ -292,7 +292,7 @@ function ChatModelsSection() {
         Local LLMs for the AI Assist chat feature. Download any model to use it as an on-device AI.
       </p>
       {error && (
-        <p className="text-[11px] text-iron-danger mt-1">{error}</p>
+        <p className="text-[11px] text-iron-danger mt-1 whitespace-pre-wrap break-all">{error}</p>
       )}
       {localModels.map((m: any) => {
         const isDownloading = downloading === m.id;
@@ -383,7 +383,7 @@ function LlmModelRow() {
             Removes filler words, fixes grammar. Optional (~4.4 GB).
           </p>
           {downloaded && <p className="text-[11px] text-iron-text-muted mt-1">{formatBytes(size)}</p>}
-          {error && <p className="text-[11px] text-iron-danger mt-1">{error}</p>}
+          {error && <p className="text-[11px] text-iron-danger mt-1 whitespace-pre-wrap break-all">{error}</p>}
         </div>
         <div className="ml-3 flex-shrink-0">
           {downloaded ? (

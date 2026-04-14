@@ -2,6 +2,13 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.8] - 2026-04-13
+
+### Fixed
+- **Download errors now show which URLs were tried** — When a model download fails, the error message displays the primary URL and its error, then the fallback URL and its error. This applies to all model downloads: Whisper, text cleanup (Mistral), chat models (Llama3/Phi3), TTS (Kokoro), and TF.js ML models. Error text is displayed with `whitespace-pre-wrap` so the multi-line URL details render properly in all settings sections.
+
+---
+
 ## [1.1.7] - 2026-04-13
 
 ### Fixed

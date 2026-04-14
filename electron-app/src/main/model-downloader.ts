@@ -337,7 +337,8 @@ async function downloadWithFallback(
   bytesOffset = 0,
   totalOverride = 0,
 ): Promise<{ usedFallback: boolean }> {
-  let lastError: Error | null = null;
+  let primaryError: string = '';
+  let fallbackError: string = '';
 
   // Try primary URL up to MAX_RETRIES times
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
@@ -345,25 +346,32 @@ async function downloadWithFallback(
       await downloadFile(url, destPath, onProgress, bytesOffset, totalOverride);
       return { usedFallback: false };
     } catch (err: any) {
-      lastError = err;
-      console.warn(`[model-downloader] Primary download attempt ${attempt}/${MAX_RETRIES} failed: ${err.message}`);
+      primaryError = err.message || 'Unknown error';
+      console.warn(`[model-downloader] Primary attempt ${attempt}/${MAX_RETRIES} failed: ${primaryError}`);
     }
   }
 
   // Try fallback if available
   if (fallbackUrl) {
-    console.log(`[model-downloader] Trying fallback source (HuggingFace)...`);
+    console.log(`[model-downloader] Trying fallback source...`);
     if (onProgress) onProgress(0, 0, 'fallback');
     try {
       await downloadFile(fallbackUrl, destPath, onProgress, bytesOffset, totalOverride);
       return { usedFallback: true };
     } catch (err: any) {
-      console.error(`[model-downloader] Fallback also failed: ${err.message}`);
-      throw new Error(`Download failed from all sources. Last error: ${err.message}`);
+      fallbackError = err.message || 'Unknown error';
+      console.error(`[model-downloader] Fallback also failed: ${fallbackError}`);
     }
   }
 
-  throw lastError || new Error('Download failed');
+  // Both failed — build a detailed error message with URLs tried
+  const lines = [`Primary: ${url}`, `  Error: ${primaryError}`];
+  if (fallbackUrl) {
+    lines.push(`Fallback: ${fallbackUrl}`, `  Error: ${fallbackError}`);
+  } else {
+    lines.push('No fallback URL configured.');
+  }
+  throw new Error(`Download failed.\n${lines.join('\n')}`);
 }
 
 /**
@@ -444,6 +452,7 @@ async function downloadMultiPartModel(
       sendProgress(downloadedTotal, estimatedTotal, 'downloading');
       console.log(`[model-downloader] Part ${i + 1}/${parts.length} complete (${partFilename})`);
     } catch (err: any) {
+      const partError = err.message || 'Unknown error';
       // Clean up any downloaded parts
       for (const p of partPaths) { cleanupTemp(p); }
 
@@ -453,7 +462,14 @@ async function downloadMultiPartModel(
         console.log(`[model-downloader] Part download failed, trying HuggingFace fallback for full file...`);
         sendProgress(0, 0, 'fallback');
         const tempPath = destPath + '.downloading';
-        await downloadFile(fallbackUrl, tempPath, (d, t, s) => sendProgress(d, t, s));
+        try {
+          await downloadFile(fallbackUrl, tempPath, (d, t, s) => sendProgress(d, t, s));
+        } catch (fbErr: any) {
+          cleanupTemp(tempPath);
+          throw new Error(
+            `Download failed.\nPrimary: ${partUrl}\n  Error: ${partError}\nFallback: ${fallbackUrl}\n  Error: ${fbErr.message || 'Unknown error'}`
+          );
+        }
 
         // Verify
         if (expectedHash) {
@@ -468,7 +484,9 @@ async function downloadMultiPartModel(
         console.log(`[model-downloader] Download complete via fallback: ${model}`);
         return;
       }
-      throw err;
+      throw new Error(
+        `Download failed.\nPrimary: ${partUrl}\n  Error: ${partError}\nNo fallback URL configured.`
+      );
     }
   }
 
