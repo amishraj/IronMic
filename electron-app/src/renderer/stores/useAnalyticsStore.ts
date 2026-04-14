@@ -90,70 +90,82 @@ export const useAnalyticsStore = create<AnalyticsStore>((set, get) => ({
     const { period } = get();
     const { from, to } = periodToRange(period);
 
-    try {
-      const api = (window as any).ironmic;
-      const [
-        overviewJson,
-        trendJson,
-        topWordsJson,
-        sourceJson,
-        richJson,
-        streaksJson,
-        productivityJson,
-        topicBreakdownJson,
-        topicTrendsJson,
-        unclassifiedCount,
-      ] = await Promise.all([
-        api.analyticsGetOverview(period),
-        api.analyticsGetDailyTrend(from, to),
-        api.analyticsGetTopWords(from, to, 20),
-        api.analyticsGetSourceBreakdown(from, to),
-        api.analyticsGetVocabularyRichness(from, to),
-        api.analyticsGetStreaks(),
-        api.analyticsGetProductivityComparison(),
-        api.analyticsGetTopicBreakdown(from, to),
-        api.analyticsGetTopicTrends(from, to),
-        api.analyticsGetUnclassifiedCount(),
-      ]);
-
-      set({
-        overview: JSON.parse(overviewJson),
-        dailyTrend: JSON.parse(trendJson),
-        topWords: JSON.parse(topWordsJson),
-        sourceBreakdown: JSON.parse(sourceJson),
-        vocabularyRichness: JSON.parse(richJson),
-        streaks: JSON.parse(streaksJson),
-        productivity: JSON.parse(productivityJson),
-        topicBreakdown: JSON.parse(topicBreakdownJson),
-        topicTrends: JSON.parse(topicTrendsJson),
-        unclassifiedCount,
-        loading: false,
-      });
-    } catch (err) {
-      console.error('[analytics] Failed to load analytics:', err);
-      set({ loading: false });
+    // Safe JSON parse — returns fallback on any failure
+    function safeParse<T>(json: unknown, fallback: T): T {
+      if (json == null || json === '' || json === 'null') return fallback;
+      try {
+        return typeof json === 'string' ? JSON.parse(json) : (json as T);
+      } catch {
+        return fallback;
+      }
     }
+
+    // Load each independently so one failure doesn't blank the whole page
+    const api = (window as any).ironmic;
+    if (!api) { set({ loading: false }); return; }
+
+    const safeCall = async <T>(fn: () => Promise<unknown>, fallback: T): Promise<T> => {
+      try { return safeParse(await fn(), fallback); } catch { return fallback; }
+    };
+
+    const emptyOverview: OverviewStats = {
+      total_words: 0, total_sentences: 0, total_entries: 0,
+      total_duration_seconds: 0, avg_words_per_minute: 0,
+      unique_words: 0, avg_sentence_length: 0, period,
+    };
+
+    const [
+      overview, dailyTrend, topWords, sourceBreakdown,
+      vocabularyRichness, streaks, productivity,
+      topicBreakdown, topicTrends, unclassifiedCount,
+    ] = await Promise.all([
+      safeCall(() => api.analyticsGetOverview(period), emptyOverview),
+      safeCall(() => api.analyticsGetDailyTrend(from, to), [] as DailySnapshot[]),
+      safeCall(() => api.analyticsGetTopWords(from, to, 20), [] as [string, number][]),
+      safeCall(() => api.analyticsGetSourceBreakdown(from, to), {} as Record<string, number>),
+      safeCall(() => api.analyticsGetVocabularyRichness(from, to), { ttr: 0, unique_count: 0, total_count: 0 } as VocabularyRichness),
+      safeCall(() => api.analyticsGetStreaks(), { current_streak: 0, longest_streak: 0, last_active_date: '' } as StreakInfo),
+      safeCall(() => api.analyticsGetProductivityComparison(), { this_period_words: 0, prev_period_words: 0, change_percent: 0, period_label: 'week' } as ProductivityComparison),
+      safeCall(() => api.analyticsGetTopicBreakdown(from, to), [] as TopicStat[]),
+      safeCall(() => api.analyticsGetTopicTrends(from, to), [] as TopicTrend[]),
+      safeCall(async () => { const v = await api.analyticsGetUnclassifiedCount(); return typeof v === 'number' ? v : 0; }, 0),
+    ]);
+
+    set({
+      overview, dailyTrend, topWords, sourceBreakdown,
+      vocabularyRichness, streaks, productivity,
+      topicBreakdown, topicTrends, unclassifiedCount,
+      loading: false,
+    });
   },
 
   runTopicClassification: async () => {
     set({ topicClassificationRunning: true });
     try {
       const api = (window as any).ironmic;
+      if (!api) { set({ topicClassificationRunning: false }); return; }
       await api.analyticsClassifyTopicsBatch(10);
       // Reload topics after classification
       const { period } = get();
       const { from, to } = periodToRange(period);
-      const [topicBreakdownJson, topicTrendsJson, unclassifiedCount] = await Promise.all([
-        api.analyticsGetTopicBreakdown(from, to),
-        api.analyticsGetTopicTrends(from, to),
-        api.analyticsGetUnclassifiedCount(),
-      ]);
-      set({
-        topicBreakdown: JSON.parse(topicBreakdownJson),
-        topicTrends: JSON.parse(topicTrendsJson),
-        unclassifiedCount,
-        topicClassificationRunning: false,
-      });
+
+      let topicBreakdown: TopicStat[] = [];
+      let topicTrends: TopicTrend[] = [];
+      let unclassifiedCount = 0;
+      try {
+        const raw = await api.analyticsGetTopicBreakdown(from, to);
+        topicBreakdown = raw ? JSON.parse(raw) : [];
+      } catch { /* use empty */ }
+      try {
+        const raw = await api.analyticsGetTopicTrends(from, to);
+        topicTrends = raw ? JSON.parse(raw) : [];
+      } catch { /* use empty */ }
+      try {
+        const v = await api.analyticsGetUnclassifiedCount();
+        unclassifiedCount = typeof v === 'number' ? v : 0;
+      } catch { /* use 0 */ }
+
+      set({ topicBreakdown, topicTrends, unclassifiedCount, topicClassificationRunning: false });
     } catch (err) {
       console.error('[analytics] Topic classification failed:', err);
       set({ topicClassificationRunning: false });

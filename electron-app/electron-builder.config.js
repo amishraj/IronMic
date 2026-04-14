@@ -10,7 +10,9 @@ module.exports = {
     output: 'release',
   },
   files: [
-    'dist/**/*',
+    'dist/main/**/*',
+    'dist/preload/**/*',
+    'dist/renderer/**/*',
     'resources/**/*',
   ],
   extraResources: [

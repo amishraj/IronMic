@@ -2,6 +2,14 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.1.3] - 2026-04-13
+
+### Fixed
+- **Analytics white screen on fresh install** — The analytics dashboard crashed with a blank white page when no dictation data existed. Each analytics API call now loads independently with safe fallbacks, so one failure doesn't blank the entire page. Added an error boundary that catches Recharts rendering crashes and shows a friendly recovery message.
+- **"Self-signed certificate in certificate chain" when downloading models** — Model downloads used Node.js `https` module which doesn't trust the system certificate store. Switched to Electron's `net` module which uses the OS certificate store, fixing downloads on corporate networks, VPNs, and systems with proxy TLS interception. Falls back to Node.js `https` if Electron's net module is unavailable.
+
+---
+
 ## [1.1.2] - 2026-04-13
 
 ### Fixed

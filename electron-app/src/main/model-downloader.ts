@@ -18,7 +18,7 @@ import https from 'https';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { BrowserWindow } from 'electron';
+import { BrowserWindow, net } from 'electron';
 import { execSync } from 'child_process';
 import {
   MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
@@ -153,6 +153,9 @@ type ProgressCallback = (downloaded: number, total: number, status: string) => v
 
 /**
  * Download a single file from a URL to a destination path.
+ * Uses Electron's net module which trusts the system certificate store
+ * (fixes "self-signed certificate in certificate chain" on corporate networks).
+ * Falls back to Node.js https if net module is unavailable (e.g. before app ready).
  * Handles redirects, stall detection, and timeouts.
  */
 function downloadFile(
@@ -171,75 +174,152 @@ function downloadFile(
 
       try { validateUrl(reqUrl); } catch (e) { reject(e); return; }
 
-      const req = https.get(reqUrl, (res) => {
-        if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          const redirectUrl = res.headers.location;
-          console.log(`[model-downloader] Redirect → ${new URL(redirectUrl).hostname}`);
+      // Use Electron's net module (trusts system cert store) when available,
+      // fall back to Node.js https otherwise
+      const useElectronNet = net && typeof net.request === 'function';
+
+      if (useElectronNet) {
+        const request = net.request({ url: reqUrl, redirect: 'manual' });
+
+        request.on('redirect', (statusCode, _method, redirectUrl) => {
+          console.log(`[model-downloader] Redirect (${statusCode}) → ${new URL(redirectUrl).hostname}`);
+          try { validateUrl(redirectUrl); } catch (e) { reject(e); return; }
           doRequest(redirectUrl, redirectCount + 1);
-          return;
-        }
+        });
 
-        if (res.statusCode !== 200) {
-          reject(new Error(`Download failed: HTTP ${res.statusCode}`));
-          return;
-        }
+        request.on('response', (res) => {
+          if (res.statusCode !== 200) {
+            reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+            return;
+          }
 
-        const contentLength = parseInt(res.headers['content-length'] || '0', 10);
-        const totalBytes = totalOverride || (bytesOffset + contentLength);
-        let downloadedBytes = bytesOffset;
+          const contentLength = parseInt(res.headers['content-length'] as string || '0', 10);
+          const totalBytes = totalOverride || (bytesOffset + contentLength);
+          let downloadedBytes = bytesOffset;
+          const file = fs.createWriteStream(destPath);
 
-        const file = fs.createWriteStream(destPath);
+          if (onProgress) onProgress(downloadedBytes, totalBytes, 'downloading');
 
-        if (onProgress) onProgress(downloadedBytes, totalBytes, 'downloading');
+          let stallTimer = setTimeout(() => {
+            request.abort();
+            cleanupTemp(destPath);
+            if (onProgress) onProgress(0, 0, 'error');
+            reject(new Error('Download stalled — no data received for 60 seconds'));
+          }, STALL_TIMEOUT_MS);
 
-        let stallTimer = setTimeout(() => {
-          req.destroy();
+          res.on('data', (chunk: Buffer) => {
+            downloadedBytes += chunk.length;
+            file.write(chunk);
+            clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => {
+              request.abort();
+              cleanupTemp(destPath);
+              if (onProgress) onProgress(0, 0, 'error');
+              reject(new Error('Download stalled — no data received for 60 seconds'));
+            }, STALL_TIMEOUT_MS);
+            if (downloadedBytes % (1024 * 1024) < chunk.length) {
+              if (onProgress) onProgress(downloadedBytes, totalBytes, 'downloading');
+            }
+          });
+
+          res.on('end', () => {
+            clearTimeout(stallTimer);
+            file.end(() => resolve());
+          });
+
+          res.on('error', (err: Error) => {
+            clearTimeout(stallTimer);
+            file.destroy();
+            cleanupTemp(destPath);
+            if (onProgress) onProgress(0, 0, 'error');
+            reject(err);
+          });
+        });
+
+        request.on('error', (err: Error) => {
+          if (onProgress) onProgress(0, 0, 'error');
+          reject(err);
+        });
+
+        // Overall timeout
+        setTimeout(() => {
+          request.abort();
           cleanupTemp(destPath);
           if (onProgress) onProgress(0, 0, 'error');
-          reject(new Error('Download stalled — no data received for 60 seconds'));
-        }, STALL_TIMEOUT_MS);
+          reject(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS / 60000} minutes`));
+        }, DOWNLOAD_TIMEOUT_MS);
 
-        res.on('data', (chunk: Buffer) => {
-          downloadedBytes += chunk.length;
-          clearTimeout(stallTimer);
-          stallTimer = setTimeout(() => {
+        request.end();
+      } else {
+        // Fallback: Node.js https (for pre-app-ready or testing)
+        const req = https.get(reqUrl, (res) => {
+          if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            const redirectUrl = res.headers.location;
+            console.log(`[model-downloader] Redirect → ${new URL(redirectUrl).hostname}`);
+            doRequest(redirectUrl, redirectCount + 1);
+            return;
+          }
+
+          if (res.statusCode !== 200) {
+            reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+            return;
+          }
+
+          const contentLength = parseInt(res.headers['content-length'] || '0', 10);
+          const totalBytes = totalOverride || (bytesOffset + contentLength);
+          let downloadedBytes = bytesOffset;
+          const file = fs.createWriteStream(destPath);
+
+          if (onProgress) onProgress(downloadedBytes, totalBytes, 'downloading');
+
+          let stallTimer = setTimeout(() => {
             req.destroy();
             cleanupTemp(destPath);
             if (onProgress) onProgress(0, 0, 'error');
             reject(new Error('Download stalled — no data received for 60 seconds'));
           }, STALL_TIMEOUT_MS);
 
-          if (downloadedBytes % (1024 * 1024) < chunk.length) {
-            if (onProgress) onProgress(downloadedBytes, totalBytes, 'downloading');
-          }
+          res.on('data', (chunk: Buffer) => {
+            downloadedBytes += chunk.length;
+            clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => {
+              req.destroy();
+              cleanupTemp(destPath);
+              if (onProgress) onProgress(0, 0, 'error');
+              reject(new Error('Download stalled — no data received for 60 seconds'));
+            }, STALL_TIMEOUT_MS);
+            if (downloadedBytes % (1024 * 1024) < chunk.length) {
+              if (onProgress) onProgress(downloadedBytes, totalBytes, 'downloading');
+            }
+          });
+
+          res.pipe(file);
+
+          file.on('finish', () => {
+            clearTimeout(stallTimer);
+            file.close(() => resolve());
+          });
+
+          file.on('error', (err) => {
+            clearTimeout(stallTimer);
+            cleanupTemp(destPath);
+            if (onProgress) onProgress(0, 0, 'error');
+            reject(err);
+          });
         });
 
-        res.pipe(file);
-
-        file.on('finish', () => {
-          clearTimeout(stallTimer);
-          file.close(() => resolve());
-        });
-
-        file.on('error', (err) => {
-          clearTimeout(stallTimer);
-          cleanupTemp(destPath);
+        req.on('error', (err) => {
           if (onProgress) onProgress(0, 0, 'error');
           reject(err);
         });
-      });
 
-      req.on('error', (err) => {
-        if (onProgress) onProgress(0, 0, 'error');
-        reject(err);
-      });
-
-      req.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
-        req.destroy();
-        cleanupTemp(destPath);
-        if (onProgress) onProgress(0, 0, 'error');
-        reject(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS / 60000} minutes`));
-      });
+        req.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+          req.destroy();
+          cleanupTemp(destPath);
+          if (onProgress) onProgress(0, 0, 'error');
+          reject(new Error(`Download timed out after ${DOWNLOAD_TIMEOUT_MS / 60000} minutes`));
+        });
+      }
     }
 
     doRequest(url);
