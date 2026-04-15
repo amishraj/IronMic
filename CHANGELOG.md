@@ -2,6 +2,15 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.3.2] - 2026-04-15
+
+### Fixed
+- **Model cards now refresh after import** — Importing a model via the import section now triggers a status refresh across all model sections (Whisper, Text Cleanup, Chat). Previously, importing a chat model would succeed but the card above still showed "Download" instead of "Ready".
+- **Chat models section always visible** — The AI Assist Chat Models section (and its import area) no longer hides when `aiGetLocalModelStatus` returns empty. The import section is always accessible.
+- **GPU "Learn why" explainer** — When GPU acceleration is unavailable, the CPU Mode card now shows a "Learn why" button that expands a detailed explanation (platform requirements, Metal feature flag, Intel vs Apple Silicon, build instructions).
+
+---
+
 ## [1.3.0] - 2026-04-15
 
 ### Added

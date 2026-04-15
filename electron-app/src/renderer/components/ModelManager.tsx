@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu } from 'lucide-react';
+import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu, Info } from 'lucide-react';
 import { Card, Toggle, Badge, Button } from './ui';
 import { ModelImportSection } from './ModelImportBanner';
 
@@ -41,6 +41,14 @@ export function ModelManager() {
   const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [downloadFailed, setDownloadFailed] = useState(false);
+  const [showGpuInfo, setShowGpuInfo] = useState(false);
+  // Incremented after any import to force all sub-sections to re-check downloaded status
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const handleAnyImport = () => {
+    loadState();
+    setRefreshKey(k => k + 1);
+  };
 
   const loadState = async () => {
     try {
@@ -153,13 +161,39 @@ export function ModelManager() {
 
       {!gpuAvailable && (
         <Card variant="default" padding="md">
-          <div className="flex items-center gap-3">
-            <Cpu className="w-5 h-5 text-iron-text-muted" />
-            <div>
-              <p className="text-sm font-medium text-iron-text-secondary">CPU Mode</p>
-              <p className="text-xs text-iron-text-muted">GPU acceleration not available on this device</p>
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <Cpu className="w-5 h-5 text-iron-text-muted" />
+              <div>
+                <p className="text-sm font-medium text-iron-text-secondary">CPU Mode</p>
+                <p className="text-xs text-iron-text-muted">GPU acceleration not available on this device</p>
+              </div>
             </div>
+            <button
+              onClick={() => setShowGpuInfo(!showGpuInfo)}
+              className="flex items-center gap-1 text-[11px] text-iron-accent-light hover:underline"
+            >
+              <Info className="w-3 h-3" />
+              Learn why
+            </button>
           </div>
+          {showGpuInfo && (
+            <div className="mt-3 pt-3 border-t border-iron-border/50 text-xs text-iron-text-muted space-y-2">
+              <p>GPU acceleration requires <strong className="text-iron-text">all three</strong> of the following:</p>
+              <ul className="list-disc list-inside space-y-1 ml-1">
+                <li><strong className="text-iron-text">macOS with Apple Silicon</strong> (M1/M2/M3/M4) — Metal is Apple's GPU framework and only works on macOS.</li>
+                <li><strong className="text-iron-text">Metal feature compiled in</strong> — The app must be built with the <code className="bg-iron-surface-active px-1 py-0.5 rounded">metal</code> Cargo feature flag. Pre-built releases from GitHub include this, but custom builds may not.</li>
+                <li><strong className="text-iron-text">Whisper model downloaded</strong> — The speech recognition model must be present for GPU inference.</li>
+              </ul>
+              <p className="pt-1"><strong className="text-iron-text">Common reasons GPU is unavailable:</strong></p>
+              <ul className="list-disc list-inside space-y-1 ml-1">
+                <li><strong>Windows or Linux</strong> — Metal is macOS-only. CUDA support (NVIDIA GPUs) is planned but not yet available.</li>
+                <li><strong>Intel Mac</strong> — Metal acceleration is only supported on Apple Silicon (M-series) chips.</li>
+                <li><strong>Custom build without metal flag</strong> — If you built from source, ensure you ran: <code className="bg-iron-surface-active px-1 py-0.5 rounded">cargo build --release --features metal,tts</code></li>
+              </ul>
+              <p className="pt-1">CPU mode still works well — transcription takes a few extra seconds but accuracy is identical.</p>
+            </div>
+          )}
         </Card>
       )}
 
@@ -245,7 +279,7 @@ export function ModelManager() {
         <ModelImportSection
           sectionLabel="Speech Recognition"
           filter="whisper"
-          onImported={loadState}
+          onImported={handleAnyImport}
           highlightOnError={downloadFailed}
         />
       </div>
@@ -255,16 +289,16 @@ export function ModelManager() {
         <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
           Text Cleanup Model
         </p>
-        <LlmModelRow />
+        <LlmModelRow refreshKey={refreshKey} onImported={handleAnyImport} />
       </div>
 
       {/* ── Chat Models ── */}
-      <ChatModelsSection />
+      <ChatModelsSection refreshKey={refreshKey} onImported={handleAnyImport} />
     </div>
   );
 }
 
-function ChatModelsSection() {
+function ChatModelsSection({ refreshKey, onImported }: { refreshKey: number; onImported: () => void }) {
   const [localModels, setLocalModels] = useState<any[]>([]);
   const [downloading, setDownloading] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
@@ -277,6 +311,11 @@ function ChatModelsSection() {
       if (statuses) setLocalModels(statuses);
     } catch { /* ignore if not available */ }
   };
+
+  // Re-fetch when refreshKey changes (triggered by import in any section)
+  useEffect(() => {
+    loadStatus();
+  }, [refreshKey]);
 
   useEffect(() => {
     loadStatus();
@@ -306,15 +345,13 @@ function ChatModelsSection() {
     }
   };
 
-  if (localModels.length === 0) return null;
-
   return (
     <div className="space-y-2">
       <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
         AI Assist Chat Models
       </p>
       <p className="text-xs text-iron-text-muted">
-        Local LLMs for the AI Assist chat feature. Download any model to use it as an on-device AI.
+        Local LLMs for the AI Assist chat feature. Download or import a model to use it as an on-device AI.
       </p>
       {error && (
         <div className="flex items-start gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
@@ -376,14 +413,14 @@ function ChatModelsSection() {
       <ModelImportSection
         sectionLabel="Chat"
         filter="chat"
-        onImported={loadStatus}
+        onImported={() => { loadStatus(); onImported(); }}
         highlightOnError={downloadFailed}
       />
     </div>
   );
 }
 
-function LlmModelRow() {
+function LlmModelRow({ refreshKey, onImported }: { refreshKey: number; onImported: () => void }) {
   const [status, setStatus] = useState<any>(null);
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
@@ -391,6 +428,9 @@ function LlmModelRow() {
   const [downloadFailed, setDownloadFailed] = useState(false);
 
   const loadStatus = () => window.ironmic.getModelStatus().then(setStatus);
+
+  useEffect(() => { loadStatus(); }, [refreshKey]);
+
   useEffect(() => {
     loadStatus();
     const cleanup = window.ironmic.onModelDownloadProgress((prog: DownloadProgress) => {
@@ -475,7 +515,7 @@ function LlmModelRow() {
     <ModelImportSection
       sectionLabel="Text Cleanup"
       filter="llm"
-      onImported={loadStatus}
+      onImported={() => { loadStatus(); onImported(); }}
       highlightOnError={downloadFailed}
     />
     </>
