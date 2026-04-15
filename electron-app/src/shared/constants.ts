@@ -148,6 +148,11 @@ export const IPC_CHANNELS = {
   TEXT_TO_HTML: 'ironmic:text-to-html',
   SAVE_FILE_DIALOG: 'ironmic:save-file-dialog',
 
+  // Audio Input
+  LIST_AUDIO_DEVICES: 'ironmic:list-audio-devices',
+  GET_CURRENT_AUDIO_DEVICE: 'ironmic:get-current-audio-device',
+  CHECK_MIC_PERMISSION: 'ironmic:check-mic-permission',
+
   // Meeting App Detection
   MEETING_APP_DETECTED: 'ironmic:meeting-app-detected',
 

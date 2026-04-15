@@ -431,6 +431,25 @@ If the text is too short or unclear, output: ["General"]`;
     } catch { /* ignore invalid URLs */ }
   });
 
+  // ── Audio Input ──
+
+  ipcMain.handle(IPC_CHANNELS.LIST_AUDIO_DEVICES, () => {
+    return native.listAudioDevices();
+  });
+  ipcMain.handle(IPC_CHANNELS.GET_CURRENT_AUDIO_DEVICE, () => {
+    return native.getCurrentAudioDevice();
+  });
+  ipcMain.handle(IPC_CHANNELS.CHECK_MIC_PERMISSION, async () => {
+    // On macOS, check microphone permission via systemPreferences
+    const { systemPreferences } = require('electron');
+    if (process.platform === 'darwin' && systemPreferences.getMediaAccessStatus) {
+      const status = systemPreferences.getMediaAccessStatus('microphone');
+      return status; // 'granted' | 'denied' | 'restricted' | 'not-determined'
+    }
+    // On other platforms, assume granted (permission handled at OS level)
+    return 'granted';
+  });
+
   // ── Meeting Templates ──
 
   ipcMain.handle(IPC_CHANNELS.TEMPLATE_CREATE, (_event, name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string) => {

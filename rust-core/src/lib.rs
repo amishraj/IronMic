@@ -115,6 +115,73 @@ mod napi_exports {
         Ok(())
     }
 
+    /// List all available audio input devices.
+    /// Returns JSON array of { id, name, isDefault, sampleRate, channels }.
+    #[napi]
+    pub fn list_audio_devices() -> napi::Result<String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+
+        let host = cpal::default_host();
+        let default_name = host
+            .default_input_device()
+            .and_then(|d| d.name().ok())
+            .unwrap_or_default();
+
+        let devices: Vec<serde_json::Value> = host
+            .input_devices()
+            .map(|devs| {
+                devs.filter_map(|d| {
+                    let name = d.name().ok()?;
+                    let config = d.default_input_config().ok();
+                    Some(serde_json::json!({
+                        "id": name.clone(),
+                        "name": name.clone(),
+                        "isDefault": name == default_name,
+                        "sampleRate": config.as_ref().map(|c| c.sample_rate().0).unwrap_or(0),
+                        "channels": config.as_ref().map(|c| c.channels()).unwrap_or(0),
+                    }))
+                })
+                .collect()
+            })
+            .unwrap_or_default();
+
+        serde_json::to_string(&devices)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Get info about the current/default input device.
+    #[napi]
+    pub fn get_current_audio_device() -> napi::Result<String> {
+        use cpal::traits::{DeviceTrait, HostTrait};
+
+        let host = cpal::default_host();
+        let device = host.default_input_device();
+
+        let info = match device {
+            Some(d) => {
+                let name = d.name().unwrap_or_else(|_| "Unknown".into());
+                let config = d.default_input_config().ok();
+                serde_json::json!({
+                    "name": name,
+                    "available": true,
+                    "sampleRate": config.as_ref().map(|c| c.sample_rate().0).unwrap_or(0),
+                    "channels": config.as_ref().map(|c| c.channels()).unwrap_or(0),
+                    "sampleFormat": config.as_ref().map(|c| format!("{:?}", c.sample_format())).unwrap_or_default(),
+                })
+            }
+            None => serde_json::json!({
+                "name": null,
+                "available": false,
+                "sampleRate": 0,
+                "channels": 0,
+                "sampleFormat": null,
+            }),
+        };
+
+        serde_json::to_string(&info)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
     /// Transcribe a PCM audio buffer (16kHz mono i16 little-endian) to text.
     #[napi]
     pub async fn transcribe(audio_buffer: Buffer) -> napi::Result<String> {

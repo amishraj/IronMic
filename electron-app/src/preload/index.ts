@@ -188,6 +188,11 @@ const api = {
   meetingCreateWithTemplate: (templateId: string | null, detectedApp: string | null) => ipcRenderer.invoke('ironmic:meeting-create-with-template', templateId, detectedApp),
   meetingSetStructuredOutput: (id: string, structuredOutput: string) => ipcRenderer.invoke('ironmic:meeting-set-structured-output', id, structuredOutput),
 
+  // ── Audio Input ──
+  listAudioDevices: () => ipcRenderer.invoke('ironmic:list-audio-devices'),
+  getCurrentAudioDevice: () => ipcRenderer.invoke('ironmic:get-current-audio-device'),
+  checkMicPermission: () => ipcRenderer.invoke('ironmic:check-mic-permission'),
+
   // ── Meeting Templates ──
   templateCreate: (name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string) => ipcRenderer.invoke('ironmic:template-create', name, meetingType, sections, llmPrompt, displayLayout),
   templateGet: (id: string) => ipcRenderer.invoke('ironmic:template-get', id),

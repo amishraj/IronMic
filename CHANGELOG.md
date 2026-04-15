@@ -9,6 +9,30 @@ All notable changes to IronMic will be documented in this file.
 
 ---
 
+## [1.4.0] - 2026-04-15
+
+### Added
+
+#### Audio Input Settings Page
+- **New "Input" tab in Settings** — Dedicated page for microphone configuration and testing.
+- **Microphone permission status** — Shows whether IronMic has mic access (granted/denied/not-determined) with platform-specific guidance for fixing denied permissions.
+- **Active device info** — Displays current input device name, sample rate, channels, and sample format.
+- **Available devices list** — Shows all detected input devices with their specs and which is the system default.
+- **Real-time level meter** — Start monitoring to see live audio level and peak indicators. Color-coded: green (good), amber (loud), red (clipping). Detects "no audio" and warns if mic may be muted.
+- **Test recording & playback** — Record a 5-second clip and play it back to verify audio quality before dictating.
+- **Tips section** — Best practices for mic placement, level, and noise reduction.
+- **Rust NAPI exports** — `listAudioDevices()` and `getCurrentAudioDevice()` enumerate cpal input devices with sample rate, channels, and default status.
+
+#### Active Model Indicators
+- **Section headers show active model** — Each model section (Speech Recognition, Text Cleanup, Chat Models, TTS, AI Assist) now displays a green badge showing which model is active/ready. Makes it instantly clear what's loaded without scrolling through cards.
+
+### Fixed
+- **Local LLM provider not selectable** — `isInstalled()` now returns true when model files exist, allowing the provider to appear in AI Chat after import.
+- **TTS download button persists after import** — Tracks model file presence separately from full readiness.
+- **GPU "Learn why" explainer** — CPU Mode card explains GPU requirements.
+
+---
+
 ## [1.3.4] - 2026-04-15
 
 ### Fixed

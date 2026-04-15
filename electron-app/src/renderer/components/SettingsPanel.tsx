@@ -3,6 +3,7 @@ import { useSettingsStore } from '../stores/useSettingsStore';
 import { DictionaryManager } from './DictionaryManager';
 import { ModelManager } from './ModelManager';
 import { ModelImportSection, ModelImportBanner } from './ModelImportBanner';
+import { InputSettings } from './InputSettings';
 import { DataManager } from './DataManager';
 import { HotkeyRecorder } from './HotkeyRecorder';
 import { Toggle, Card } from './ui';
@@ -14,10 +15,11 @@ import {
   Mic, Route, Users, Search, Bell, Workflow, Sliders,
 } from 'lucide-react';
 
-type SettingsTab = 'general' | 'speech' | 'ai' | 'models' | 'data' | 'security' | 'voice-ai';
+type SettingsTab = 'general' | 'input' | 'speech' | 'ai' | 'models' | 'data' | 'security' | 'voice-ai';
 
 const TABS: { id: SettingsTab; label: string; icon: typeof Settings }[] = [
   { id: 'general', label: 'General', icon: Settings },
+  { id: 'input', label: 'Input', icon: Mic },
   { id: 'speech', label: 'Speech', icon: Volume2 },
   { id: 'ai', label: 'AI Assist', icon: Sparkles },
   { id: 'voice-ai', label: 'Voice AI', icon: Brain },
@@ -58,6 +60,7 @@ export function SettingsPanel() {
       <div className="flex-1 overflow-y-auto">
         <div className="p-6 max-w-lg mx-auto space-y-6 pb-16">
           {tab === 'general' && <GeneralSettings />}
+          {tab === 'input' && <InputSettings />}
           {tab === 'speech' && <SpeechSettings />}
           {tab === 'ai' && <AIAssistSettings />}
           {tab === 'models' && <ModelManager />}
@@ -246,7 +249,13 @@ function AIAssistSettings() {
 
   return (
     <>
-      <SectionHeader icon={Sparkles} title="AI Assist" description="Configure the AI assistant and model selection" />
+      <SectionHeader icon={Sparkles} title="AI Assist" description="Configure the AI assistant and model selection">
+        {aiEnabled && provider && (
+          <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
+            {provider === 'local' ? 'Local LLM' : provider === 'copilot' ? 'GitHub Copilot' : 'Claude'} — {model || 'default'}
+          </span>
+        )}
+      </SectionHeader>
 
       <SettingRow
         icon={Bot}
@@ -560,7 +569,13 @@ function SpeechSettings() {
 
   return (
     <>
-      <SectionHeader icon={Volume2} title="Text-to-Speech" description="Voice engine, playback speed, and read-back" />
+      <SectionHeader icon={Volume2} title="Text-to-Speech" description="Voice engine, playback speed, and read-back">
+        {ttsModelDownloaded && (
+          <span className={`text-[10px] font-medium px-2 py-0.5 rounded-full ${modelReady ? 'bg-green-500/15 text-green-400 border border-green-500/20' : 'bg-amber-500/15 text-amber-400 border border-amber-500/20'}`}>
+            Kokoro 82M {modelReady ? '— Ready' : '— Imported'}
+          </span>
+        )}
+      </SectionHeader>
 
       <Card variant={ttsModelDownloaded ? 'default' : 'highlighted'} padding="md">
         <div className="flex items-center justify-between">
@@ -1201,16 +1216,19 @@ function VoiceAISettings() {
 // Shared components
 // ═══════════════════════════════════════════
 
-function SectionHeader({ icon: Icon, title, description }: { icon: typeof Settings; title: string; description: string }) {
+function SectionHeader({ icon: Icon, title, description, children }: { icon: typeof Settings; title: string; description: string; children?: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-2.5 mb-2">
-      <div className="w-8 h-8 rounded-lg bg-iron-accent/10 flex items-center justify-center">
-        <Icon className="w-4 h-4 text-iron-accent-light" />
+    <div className="flex items-center justify-between mb-2">
+      <div className="flex items-center gap-2.5">
+        <div className="w-8 h-8 rounded-lg bg-iron-accent/10 flex items-center justify-center">
+          <Icon className="w-4 h-4 text-iron-accent-light" />
+        </div>
+        <div>
+          <h2 className="text-lg font-semibold text-iron-text">{title}</h2>
+          <p className="text-xs text-iron-text-muted">{description}</p>
+        </div>
       </div>
-      <div>
-        <h2 className="text-lg font-semibold text-iron-text">{title}</h2>
-        <p className="text-xs text-iron-text-muted">{description}</p>
-      </div>
+      {children}
     </div>
   );
 }

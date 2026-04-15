@@ -132,6 +132,10 @@ export const native = {
   resetPipelineState(): void { this.addon.resetPipelineState(); },
   getModelStatus(): any { return this.addon.getModelStatus(); },
 
+  // Audio devices
+  listAudioDevices(): string { return this.addon.listAudioDevices(); },
+  getCurrentAudioDevice(): string { return this.addon.getCurrentAudioDevice(); },
+
   // Meeting templates
   createMeetingTemplate(name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string): string { return this.addon.createMeetingTemplate(name, meetingType, sections, llmPrompt, displayLayout); },
   getMeetingTemplate(id: string): string { return this.addon.getMeetingTemplate(id); },

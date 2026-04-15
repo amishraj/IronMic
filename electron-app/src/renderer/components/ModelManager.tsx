@@ -199,9 +199,16 @@ export function ModelManager() {
 
       {/* ── Speech Recognition Models ── */}
       <div className="space-y-2">
-        <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
-          Speech Recognition Model
-        </p>
+        <div className="flex items-center justify-between">
+          <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
+            Speech Recognition Model
+          </p>
+          {currentModel && models.find(m => m.id === currentModel)?.downloaded && (
+            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
+              {models.find(m => m.id === currentModel)?.name || currentModel}
+            </span>
+          )}
+        </div>
 
         {models.map((model) => {
           const isActive = model.id === currentModel;
@@ -286,9 +293,6 @@ export function ModelManager() {
 
       {/* ── Text Cleanup Model ── */}
       <div className="space-y-2">
-        <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
-          Text Cleanup Model
-        </p>
         <LlmModelRow refreshKey={refreshKey} onImported={handleAnyImport} />
       </div>
 
@@ -347,9 +351,16 @@ function ChatModelsSection({ refreshKey, onImported }: { refreshKey: number; onI
 
   return (
     <div className="space-y-2">
-      <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
-        AI Assist Chat Models
-      </p>
+      <div className="flex items-center justify-between">
+        <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
+          AI Assist Chat Models
+        </p>
+        {localModels.some((m: any) => m.downloaded) && (
+          <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
+            {localModels.filter((m: any) => m.downloaded).map((m: any) => m.label).join(', ')}
+          </span>
+        )}
+      </div>
       <p className="text-xs text-iron-text-muted">
         Local LLMs for the AI Assist chat feature. Download or import a model to use it as an on-device AI.
       </p>
@@ -463,6 +474,16 @@ function LlmModelRow({ refreshKey, onImported }: { refreshKey: number; onImporte
 
   return (
     <>
+    <div className="flex items-center justify-between">
+      <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
+        Text Cleanup Model
+      </p>
+      {downloaded && (
+        <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
+          Mistral 7B — Ready
+        </span>
+      )}
+    </div>
     <Card variant="default" padding="md">
       <div className="flex items-start justify-between">
         <div className="flex-1 min-w-0">
