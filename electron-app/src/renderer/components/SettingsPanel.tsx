@@ -472,6 +472,7 @@ function SpeechSettings() {
   const [voices, setVoices] = useState<any[]>([]);
   const [previewPlaying, setPreviewPlaying] = useState<string | null>(null);
   const [modelReady, setModelReady] = useState(false);
+  const [ttsModelDownloaded, setTtsModelDownloaded] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState<string | null>(null);
@@ -484,7 +485,8 @@ function SpeechSettings() {
         if (prog.model === 'tts-model') setDownloadProgress(prog.percent);
         if (prog.status === 'complete' && prog.model === 'tts-model') {
           setDownloading(false);
-          setModelReady(true);
+          setTtsModelDownloaded(true);
+          loadTtsSettings(); // Re-check full readiness (model + voices)
         }
         if (prog.status === 'error') { setDownloading(false); setDownloadError(prog.errorDetail || 'TTS model download failed'); setShowImport(true); }
       }
@@ -494,15 +496,19 @@ function SpeechSettings() {
 
   async function loadTtsSettings() {
     const api = window.ironmic;
-    const [rb, v, s, voicesJson, ready] = await Promise.all([
+    const [rb, v, s, voicesJson, ready, modelsStatus] = await Promise.all([
       api.getSetting('tts_auto_readback'),
       api.getSetting('tts_voice'),
       api.getSetting('tts_speed'),
       api.ttsAvailableVoices(),
       api.isTtsModelReady(),
+      api.getModelStatus(),
     ]);
     setAutoReadback(rb !== 'false');
     setModelReady(ready);
+    // Check if just the .onnx model file exists (even without voices)
+    const ttsStatus = modelsStatus?.files?.['tts-model'] || modelsStatus?.['tts-model'];
+    setTtsModelDownloaded(ready || (ttsStatus?.downloaded === true) || (ttsStatus?.sizeBytes > 0));
     if (v) setVoice(v);
     if (s) setSpeed(parseFloat(s));
     try { setVoices(JSON.parse(voicesJson)); } catch { /* ignore */ }
@@ -556,16 +562,20 @@ function SpeechSettings() {
     <>
       <SectionHeader icon={Volume2} title="Text-to-Speech" description="Voice engine, playback speed, and read-back" />
 
-      <Card variant={modelReady ? 'default' : 'highlighted'} padding="md">
+      <Card variant={ttsModelDownloaded ? 'default' : 'highlighted'} padding="md">
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm font-medium text-iron-text">Kokoro 82M</p>
             <p className="text-xs text-iron-text-muted mt-0.5">
-              {modelReady ? 'Local TTS engine ready (~165 MB)' : 'Download the voice model (~165 MB)'}
+              {modelReady
+                ? 'Local TTS engine ready (~165 MB)'
+                : ttsModelDownloaded
+                ? 'Model imported — voices will download on first use'
+                : 'Download the voice model (~165 MB)'}
             </p>
           </div>
-          {modelReady ? (
-            <StatusBadge status="success" label="Ready" />
+          {ttsModelDownloaded ? (
+            <StatusBadge status={modelReady ? 'success' : 'warning'} label={modelReady ? 'Ready' : 'Imported'} />
           ) : downloading ? (
             <span className="text-xs text-iron-text-muted">{downloadProgress}%</span>
           ) : (

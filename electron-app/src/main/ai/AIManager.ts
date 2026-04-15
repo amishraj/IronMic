@@ -141,7 +141,13 @@ export class AIManager {
     }
 
     if (!llmSubprocess.isAvailable()) {
-      throw new Error('Local LLM binary not found. Build with: cargo build --release --bin ironmic-llm --features llm-bin');
+      throw new Error(
+        'Local LLM inference engine not found.\n\n' +
+        'The model file is imported, but IronMic needs the inference binary (ironmic-llm) to run it.\n\n' +
+        'This binary is not yet included in pre-built releases. To use local AI chat, build from source:\n' +
+        '  cd rust-core && cargo build --release --bin ironmic-llm --features llm-bin\n\n' +
+        'This will be bundled in a future release.'
+      );
     }
 
     const modelPath = getChatModelPath(modelId);

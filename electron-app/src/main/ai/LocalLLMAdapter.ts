@@ -40,7 +40,10 @@ export class LocalLLMAdapter implements IAIAdapter {
   name: AIProvider = 'local';
 
   async isInstalled(): Promise<boolean> {
-    return llmSubprocess.isAvailable();
+    // Local LLM is "installed" if at least one model file exists on disk.
+    // The ironmic-llm binary is a runtime detail — we show a helpful error
+    // at send time if it's missing, rather than hiding the entire provider.
+    return this.hasAnyModelDownloaded() || llmSubprocess.isAvailable();
   }
 
   async isAuthenticated(): Promise<boolean> {

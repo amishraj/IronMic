@@ -2,6 +2,22 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.3.3] - 2026-04-15
+
+### Fixed
+- **TTS Kokoro Download button persists after import** — The Kokoro TTS card checked `isTtsModelReady()` which requires both the model file AND voice files. After importing just the `.onnx` model, the card still showed "Download". Now tracks model file presence separately — shows "Imported" badge when the model exists but voices haven't been downloaded yet, and "Ready" when both are present.
+
+---
+
+## [1.3.4] - 2026-04-15
+
+### Fixed
+- **Local LLM provider not selectable in AI Chat** — `isInstalled()` required the `ironmic-llm` binary which isn't bundled in release builds. Now considers local LLM "installed" when model files exist on disk. The provider shows up in AI Chat after importing a model. A clear error explains the binary requirement at runtime if inference is attempted without it.
+- **TTS Kokoro Download button persists after import** — Tracks model file presence separately from full TTS readiness (model + voices). Shows "Imported" badge when `.onnx` exists but voices haven't been downloaded yet.
+- **GPU "Learn why" explainer** — CPU Mode card now has a "Learn why" button with detailed explanation of GPU requirements.
+
+---
+
 ## [1.3.2] - 2026-04-15
 
 ### Fixed
