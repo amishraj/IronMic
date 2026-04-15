@@ -78,6 +78,8 @@ IronMic includes 5 TensorFlow.js-powered ML features that learn from your usage 
 
 ### Model Management
 - **In-app downloads** — Download Whisper, LLM, and TTS models directly from Settings.
+- **Manual model import** — If downloads are blocked by a corporate proxy, download models in your browser and import them into IronMic with a file picker. The app validates and copies them to the right location.
+- **HTTP proxy support** — Configure a proxy in Settings > Security for corporate networks (HTTP/HTTPS/SOCKS5).
 - **Multiple Whisper sizes** — Switch between tiny, base, small, medium, and large models.
 - **GPU acceleration** — Detect and enable Metal (macOS) or CUDA for faster inference.
 - **Progress tracking** — Download progress bars with percentage indicators.

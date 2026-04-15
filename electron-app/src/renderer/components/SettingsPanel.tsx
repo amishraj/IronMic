@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useSettingsStore } from '../stores/useSettingsStore';
 import { DictionaryManager } from './DictionaryManager';
 import { ModelManager } from './ModelManager';
+import { ModelImportBanner } from './ModelImportBanner';
 import { DataManager } from './DataManager';
 import { HotkeyRecorder } from './HotkeyRecorder';
 import { Toggle, Card } from './ui';
@@ -141,6 +142,7 @@ function AIAssistSettings() {
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [showImport, setShowImport] = useState(false);
 
   useEffect(() => {
     loadAiSettings();
@@ -158,6 +160,7 @@ function AIAssistSettings() {
         if (prog.status === 'error') {
           setDownloadingModel(null);
           setDownloadError(prog.errorDetail || `Download failed for ${prog.model}`);
+          setShowImport(true);
         }
       }
     });
@@ -232,6 +235,7 @@ function AIAssistSettings() {
     } catch (err: any) {
       setDownloadingModel(null);
       setDownloadError(err.message || `Download failed for ${modelId}`);
+      setShowImport(true);
     }
   }
 
@@ -344,6 +348,12 @@ function AIAssistSettings() {
               {downloadError && (
                 <p className="text-[11px] text-red-400 mt-1 whitespace-pre-wrap break-all">{downloadError}</p>
               )}
+              <ModelImportBanner
+                visible={showImport}
+                onDismiss={() => setShowImport(false)}
+                onImported={loadAiSettings}
+                filter="llm"
+              />
               <div className="space-y-1.5 mt-2">
                 {localModels.map((m: any) => {
                   const isSelected = model === m.id;
@@ -459,6 +469,7 @@ function SpeechSettings() {
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [showImport, setShowImport] = useState(false);
 
   useEffect(() => {
     loadTtsSettings();
@@ -469,7 +480,7 @@ function SpeechSettings() {
           setDownloading(false);
           setModelReady(true);
         }
-        if (prog.status === 'error') { setDownloading(false); setDownloadError(prog.errorDetail || 'TTS model download failed'); }
+        if (prog.status === 'error') { setDownloading(false); setDownloadError(prog.errorDetail || 'TTS model download failed'); setShowImport(true); }
       }
     });
     return cleanup;
@@ -496,7 +507,7 @@ function SpeechSettings() {
     setDownloadProgress(0);
     setDownloadError(null);
     try { await window.ironmic.downloadModel('tts'); }
-    catch (err: any) { setDownloading(false); setDownloadError(err.message || 'TTS model download failed'); }
+    catch (err: any) { setDownloading(false); setDownloadError(err.message || 'TTS model download failed'); setShowImport(true); }
   }
 
   async function handleAutoReadbackToggle() {
@@ -566,6 +577,13 @@ function SpeechSettings() {
           <p className="text-[11px] text-red-400 mt-2 whitespace-pre-wrap break-all">{downloadError}</p>
         )}
       </Card>
+
+      <ModelImportBanner
+        visible={showImport}
+        onDismiss={() => setShowImport(false)}
+        onImported={loadTtsSettings}
+        filter="tts"
+      />
 
       <SettingRow
         title="Auto Read-Back"

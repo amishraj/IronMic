@@ -2,6 +2,16 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.2.0] - 2026-04-14
+
+### Added
+- **Manual model import** — When a model download fails (corporate proxy, VPN, firewall), a banner appears offering to import model files manually. Users can download the model in their browser (which goes through the corporate proxy normally), then click "Import File" to load it into IronMic. The app validates the file, copies it to the correct location, and marks it as ready. Works for all model types: Whisper (.bin), LLM/chat (.gguf), and TTS (.onnx). The banner shows direct HuggingFace download links for each model and step-by-step instructions. Available in Settings > Models (all sections), Settings > Speech (TTS), and Settings > AI Assist (local models).
+
+### Fixed
+- **GitHub Releases downloads blocked by own security filter** — GitHub changed its release asset CDN from `objects.githubusercontent.com` to `release-assets.githubusercontent.com`, but IronMic's domain whitelist only included the old domain. Added `release-assets.githubusercontent.com` to both the model downloader's allowed domains and the network blocker's whitelist.
+
+---
+
 ## [1.1.10] - 2026-04-14
 
 ### Fixed
