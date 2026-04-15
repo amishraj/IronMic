@@ -6,7 +6,7 @@
 import { ipcMain, BrowserWindow } from 'electron';
 import { IPC_CHANNELS, MODEL_FILES } from '../shared/constants';
 import { native } from './native-bridge';
-import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels } from './model-downloader';
+import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
@@ -409,6 +409,20 @@ If the text is too short or unclear, output: ["General"]`;
   });
   ipcMain.handle('ironmic:get-importable-models', () => {
     return JSON.stringify(getImportableModels());
+  });
+  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL_FROM_PATH, (_event, filePath: string, sectionFilter: string) => {
+    return importModelFromPath(filePath, sectionFilter);
+  });
+  ipcMain.handle(IPC_CHANNELS.OPEN_EXTERNAL, (_event, url: string) => {
+    // Only allow opening known model download domains
+    try {
+      const parsed = new URL(url);
+      const allowed = ['huggingface.co', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'];
+      if (allowed.some(d => parsed.hostname === d || parsed.hostname.endsWith('.' + d))) {
+        const { shell } = require('electron');
+        shell.openExternal(url);
+      }
+    } catch { /* ignore invalid URLs */ }
   });
 
   console.log('[ipc-handlers] All IPC handlers registered');

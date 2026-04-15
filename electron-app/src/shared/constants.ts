@@ -135,6 +135,8 @@ export const IPC_CHANNELS = {
 
   // Manual model import
   IMPORT_MODEL: 'ironmic:import-model',
+  IMPORT_MODEL_FROM_PATH: 'ironmic:import-model-from-path',
+  OPEN_EXTERNAL: 'ironmic:open-external',
 
   // Events (main → renderer)
   PIPELINE_STATE_CHANGED: 'ironmic:pipeline-state-changed',

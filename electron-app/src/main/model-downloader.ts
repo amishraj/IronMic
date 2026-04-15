@@ -907,3 +907,53 @@ async function copyModelFile(
   console.log(`[model-import] Successfully imported: ${label}`);
   return { modelId, label };
 }
+
+/**
+ * Import a model from a known file path, targeted to a specific section.
+ * The section hint helps validate the file is going to the right place.
+ */
+export async function importModelFromPath(
+  filePath: string,
+  sectionFilter: string,
+): Promise<{ modelId: string; label: string }> {
+  const sourceFilename = path.basename(filePath);
+
+  // Try to match the filename to a known model
+  const match = IMPORTABLE_FILES[sourceFilename];
+  if (match) {
+    return await copyModelFile(filePath, match.modelId, match.label);
+  }
+
+  // Try fuzzy matching
+  let fuzzyMatch: { modelId: string; label: string; downloadUrl: string } | null = null;
+  for (const [knownFile, info] of Object.entries(IMPORTABLE_FILES)) {
+    if (sourceFilename.toLowerCase().includes(knownFile.toLowerCase().replace(/\.[^.]+$/, ''))) {
+      fuzzyMatch = info;
+      break;
+    }
+  }
+  if (fuzzyMatch) {
+    return await copyModelFile(filePath, fuzzyMatch.modelId, fuzzyMatch.label);
+  }
+
+  // Unrecognized file — infer the model ID from the section filter and file extension
+  const ext = path.extname(sourceFilename).toLowerCase();
+  let modelId: string;
+  let label: string;
+
+  if (sectionFilter === 'whisper' || ext === '.bin') {
+    modelId = 'whisper';
+    label = `Custom Whisper model (${sourceFilename})`;
+  } else if (sectionFilter === 'tts' || ext === '.onnx') {
+    modelId = 'tts-model';
+    label = `Custom TTS model (${sourceFilename})`;
+  } else if (sectionFilter === 'chat') {
+    modelId = 'llm-chat-llama3';
+    label = `Custom chat model (${sourceFilename})`;
+  } else {
+    modelId = 'llm';
+    label = `Custom LLM model (${sourceFilename})`;
+  }
+
+  return await copyModelFile(filePath, modelId, label);
+}

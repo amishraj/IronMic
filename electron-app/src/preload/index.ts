@@ -192,6 +192,8 @@ const api = {
   // Manual model import
   importModel: () => ipcRenderer.invoke('ironmic:import-model'),
   getImportableModels: () => ipcRenderer.invoke('ironmic:get-importable-models'),
+  importModelFromPath: (filePath: string, sectionFilter: string) => ipcRenderer.invoke('ironmic:import-model-from-path', filePath, sectionFilter),
+  openExternal: (url: string) => ipcRenderer.invoke('ironmic:open-external', url),
 
   // Events from main process
   onHotkeyPressed: (callback: () => void) => {

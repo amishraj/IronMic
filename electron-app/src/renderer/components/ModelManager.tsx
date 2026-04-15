@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu } from 'lucide-react';
 import { Card, Toggle, Badge, Button } from './ui';
-import { ModelImportBanner } from './ModelImportBanner';
+import { ModelImportSection } from './ModelImportBanner';
 
 interface WhisperModel {
   id: string;
@@ -40,10 +40,9 @@ export function ModelManager() {
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [showImport, setShowImport] = useState(false);
+  const [downloadFailed, setDownloadFailed] = useState(false);
 
   const loadState = async () => {
-    // Load each piece independently so one failure doesn't blank the whole section
     try {
       const modelList = await window.ironmic.getAvailableWhisperModels();
       setModels(modelList);
@@ -70,7 +69,11 @@ export function ModelManager() {
     const cleanup = window.ironmic.onModelDownloadProgress((prog: DownloadProgress) => {
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(null); setProgress(null); loadState(); }
-      if (prog.status === 'error') { setDownloading(null); setError(prog.errorDetail || 'Download failed'); setShowImport(true); }
+      if (prog.status === 'error') {
+        setDownloading(null);
+        setError(prog.errorDetail || 'Download failed');
+        setDownloadFailed(true);
+      }
     });
     return cleanup;
   }, []);
@@ -79,13 +82,12 @@ export function ModelManager() {
     setDownloading(model.id);
     setError(null);
     try {
-      // Map model ID to download key: "large-v3-turbo" → "whisper", others → "whisper-{id}"
       const downloadKey = model.id === 'large-v3-turbo' ? 'whisper' : `whisper-${model.id}`;
       await window.ironmic.downloadModel(downloadKey);
     } catch (err: any) {
       setError(err.message || 'Download failed');
       setDownloading(null);
-      setShowImport(true);
+      setDownloadFailed(true);
     }
   };
 
@@ -124,16 +126,14 @@ export function ModelManager() {
       {error && (
         <div className="flex items-start gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
           <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
-          <span className="whitespace-pre-wrap break-all">{error}</span>
+          <div className="whitespace-pre-wrap break-all">
+            {error}
+            <p className="mt-1.5 text-iron-text-muted font-medium">
+              You can import model files manually using the import sections below each model category.
+            </p>
+          </div>
         </div>
       )}
-
-      <ModelImportBanner
-        visible={showImport}
-        onDismiss={() => setShowImport(false)}
-        onImported={loadState}
-        filter="all"
-      />
 
       {/* GPU Acceleration */}
       {gpuAvailable && (
@@ -163,7 +163,7 @@ export function ModelManager() {
         </Card>
       )}
 
-      {/* Whisper Model Picker */}
+      {/* ── Speech Recognition Models ── */}
       <div className="space-y-2">
         <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
           Speech Recognition Model
@@ -240,9 +240,17 @@ export function ModelManager() {
             </div>
           );
         })}
+
+        {/* Always-visible import for Whisper */}
+        <ModelImportSection
+          sectionLabel="Speech Recognition"
+          filter="whisper"
+          onImported={loadState}
+          highlightOnError={downloadFailed}
+        />
       </div>
 
-      {/* LLM Model */}
+      {/* ── Text Cleanup Model ── */}
       <div className="space-y-2">
         <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
           Text Cleanup Model
@@ -250,7 +258,7 @@ export function ModelManager() {
         <LlmModelRow />
       </div>
 
-      {/* Chat Models */}
+      {/* ── Chat Models ── */}
       <ChatModelsSection />
     </div>
   );
@@ -261,7 +269,7 @@ function ChatModelsSection() {
   const [downloading, setDownloading] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showImport, setShowImport] = useState(false);
+  const [downloadFailed, setDownloadFailed] = useState(false);
 
   const loadStatus = async () => {
     try {
@@ -274,10 +282,14 @@ function ChatModelsSection() {
     loadStatus();
     const cleanup = window.ironmic.onModelDownloadProgress((prog: DownloadProgress) => {
       if (!prog.model?.startsWith('llm')) return;
-      if (prog.model === 'llm' && downloading !== 'llm') return; // Only track if we initiated
+      if (prog.model === 'llm' && downloading !== 'llm') return;
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(null); setProgress(null); setError(null); loadStatus(); }
-      if (prog.status === 'error') { setDownloading(null); setError(prog.errorDetail || `Download failed for ${prog.model}`); setShowImport(true); }
+      if (prog.status === 'error') {
+        setDownloading(null);
+        setError(prog.errorDetail || `Download failed for ${prog.model}`);
+        setDownloadFailed(true);
+      }
     });
     return cleanup;
   }, [downloading]);
@@ -290,7 +302,7 @@ function ChatModelsSection() {
     } catch (err: any) {
       setError(err.message || `Download failed for ${modelId}`);
       setDownloading(null);
-      setShowImport(true);
+      setDownloadFailed(true);
     }
   };
 
@@ -305,14 +317,16 @@ function ChatModelsSection() {
         Local LLMs for the AI Assist chat feature. Download any model to use it as an on-device AI.
       </p>
       {error && (
-        <p className="text-[11px] text-iron-danger mt-1 whitespace-pre-wrap break-all">{error}</p>
+        <div className="flex items-start gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
+          <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+          <div className="whitespace-pre-wrap break-all">
+            {error}
+            <p className="mt-1.5 text-iron-text-muted font-medium">
+              Use the import section below to add model files manually.
+            </p>
+          </div>
+        </div>
       )}
-      <ModelImportBanner
-        visible={showImport}
-        onDismiss={() => setShowImport(false)}
-        onImported={loadStatus}
-        filter="llm"
-      />
       {localModels.map((m: any) => {
         const isDownloading = downloading === m.id;
         return (
@@ -357,6 +371,14 @@ function ChatModelsSection() {
           </Card>
         );
       })}
+
+      {/* Always-visible import for Chat models */}
+      <ModelImportSection
+        sectionLabel="Chat"
+        filter="chat"
+        onImported={loadStatus}
+        highlightOnError={downloadFailed}
+      />
     </div>
   );
 }
@@ -366,7 +388,7 @@ function LlmModelRow() {
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showImport, setShowImport] = useState(false);
+  const [downloadFailed, setDownloadFailed] = useState(false);
 
   const loadStatus = () => window.ironmic.getModelStatus().then(setStatus);
   useEffect(() => {
@@ -375,7 +397,11 @@ function LlmModelRow() {
       if (prog.model !== 'llm') return;
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(false); setProgress(null); loadStatus(); }
-      if (prog.status === 'error') { setDownloading(false); setError(prog.errorDetail || 'Download failed'); setShowImport(true); }
+      if (prog.status === 'error') {
+        setDownloading(false);
+        setError(prog.errorDetail || 'Download failed');
+        setDownloadFailed(true);
+      }
     });
     return cleanup;
   }, []);
@@ -391,7 +417,7 @@ function LlmModelRow() {
     } catch (err: any) {
       setError(err.message || 'Download failed');
       setDownloading(false);
-      setShowImport(true);
+      setDownloadFailed(true);
     }
   };
 
@@ -405,7 +431,14 @@ function LlmModelRow() {
             Removes filler words, fixes grammar. Optional (~4.4 GB).
           </p>
           {downloaded && <p className="text-[11px] text-iron-text-muted mt-1">{formatBytes(size)}</p>}
-          {error && <p className="text-[11px] text-iron-danger mt-1 whitespace-pre-wrap break-all">{error}</p>}
+          {error && (
+            <div className="text-[11px] text-iron-danger mt-1 whitespace-pre-wrap break-all">
+              {error}
+              <p className="mt-1 text-iron-text-muted font-medium">
+                Use the import section below to add the model file manually.
+              </p>
+            </div>
+          )}
         </div>
         <div className="ml-3 flex-shrink-0">
           {downloaded ? (
@@ -437,11 +470,13 @@ function LlmModelRow() {
         </div>
       )}
     </Card>
-    <ModelImportBanner
-      visible={showImport}
-      onDismiss={() => setShowImport(false)}
-      onImported={loadStatus}
+
+    {/* Always-visible import for LLM */}
+    <ModelImportSection
+      sectionLabel="Text Cleanup"
       filter="llm"
+      onImported={loadStatus}
+      highlightOnError={downloadFailed}
     />
     </>
   );

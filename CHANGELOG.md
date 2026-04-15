@@ -2,6 +2,16 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.2.1] - 2026-04-14
+
+### Changed
+- **Always-visible model import sections** — Every model category (Speech Recognition, Text Cleanup, Chat, TTS) now has a permanent "Import Model" section at the bottom, not hidden behind download errors. Expand it anytime to see recommended models with browser download links and a one-click file import button.
+- **Per-section import** — Import buttons are labeled with the target section (e.g. "Choose File & Import to Speech Recognition") so you know exactly where the model is going.
+- **Error messages direct to import** — When a download fails, the error now tells you to use the import section below instead of just showing the error.
+- **Open download links in browser** — Model download URLs now open in your system browser (bypasses the app's network restrictions) via a new `openExternal` IPC channel.
+
+---
+
 ## [1.2.0] - 2026-04-14
 
 ### Added

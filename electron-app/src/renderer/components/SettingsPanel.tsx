@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { useSettingsStore } from '../stores/useSettingsStore';
 import { DictionaryManager } from './DictionaryManager';
 import { ModelManager } from './ModelManager';
-import { ModelImportBanner } from './ModelImportBanner';
+import { ModelImportSection, ModelImportBanner } from './ModelImportBanner';
 import { DataManager } from './DataManager';
 import { HotkeyRecorder } from './HotkeyRecorder';
 import { Toggle, Card } from './ui';
@@ -346,13 +346,19 @@ function AIAssistSettings() {
                 Download and select a local LLM. Models run entirely on your device.
               </p>
               {downloadError && (
-                <p className="text-[11px] text-red-400 mt-1 whitespace-pre-wrap break-all">{downloadError}</p>
+                <div className="text-[11px] text-red-400 mt-1 whitespace-pre-wrap break-all">
+                  {downloadError}
+                  <p className="mt-1 text-iron-text-muted font-medium">
+                    Use the import section below to add the model file manually.
+                  </p>
+                </div>
               )}
-              <ModelImportBanner
-                visible={showImport}
-                onDismiss={() => setShowImport(false)}
+              {/* Always-visible AI model import */}
+              <ModelImportSection
+                sectionLabel="AI Chat"
+                filter="chat"
                 onImported={loadAiSettings}
-                filter="llm"
+                highlightOnError={showImport}
               />
               <div className="space-y-1.5 mt-2">
                 {localModels.map((m: any) => {
@@ -574,15 +580,21 @@ function SpeechSettings() {
           </div>
         )}
         {downloadError && (
-          <p className="text-[11px] text-red-400 mt-2 whitespace-pre-wrap break-all">{downloadError}</p>
+          <div className="text-[11px] text-red-400 mt-2 whitespace-pre-wrap break-all">
+            {downloadError}
+            <p className="mt-1 text-iron-text-muted font-medium">
+              Use the import section below to add the TTS model file manually.
+            </p>
+          </div>
         )}
       </Card>
 
-      <ModelImportBanner
-        visible={showImport}
-        onDismiss={() => setShowImport(false)}
-        onImported={loadTtsSettings}
+      {/* Always-visible TTS import */}
+      <ModelImportSection
+        sectionLabel="TTS Voice"
         filter="tts"
+        onImported={loadTtsSettings}
+        highlightOnError={showImport}
       />
 
       <SettingRow
