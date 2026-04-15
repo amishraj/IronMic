@@ -92,18 +92,18 @@ pub fn text_to_html(text: &str) -> String {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             html.push_str("<br>");
-        } else if trimmed.starts_with("# ") {
-            html.push_str(&format!("<h1>{}</h1>", escape_html(&trimmed[2..])));
-        } else if trimmed.starts_with("## ") {
-            html.push_str(&format!("<h2>{}</h2>", escape_html(&trimmed[3..])));
-        } else if trimmed.starts_with("### ") {
-            html.push_str(&format!("<h3>{}</h3>", escape_html(&trimmed[4..])));
-        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            html.push_str(&format!("<li>{}</li>", escape_html(&trimmed[2..])));
+        } else if let Some(h1) = trimmed.strip_prefix("# ") {
+            html.push_str(&format!("<h1>{}</h1>", escape_html(h1)));
+        } else if let Some(h2) = trimmed.strip_prefix("## ") {
+            html.push_str(&format!("<h2>{}</h2>", escape_html(h2)));
+        } else if let Some(h3) = trimmed.strip_prefix("### ") {
+            html.push_str(&format!("<h3>{}</h3>", escape_html(h3)));
+        } else if let Some(li) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            html.push_str(&format!("<li>{}</li>", escape_html(li)));
         } else if trimmed == "---" {
             html.push_str("<hr>");
-        } else if trimmed.starts_with("**") && trimmed.ends_with("**") {
-            html.push_str(&format!("<p><strong>{}</strong></p>", escape_html(&trimmed[2..trimmed.len() - 2])));
+        } else if let Some(bold) = trimmed.strip_prefix("**").and_then(|s| s.strip_suffix("**")) {
+            html.push_str(&format!("<p><strong>{}</strong></p>", escape_html(bold)));
         } else {
             // Handle inline bold markers
             let processed = process_inline_bold(&escape_html(trimmed));
