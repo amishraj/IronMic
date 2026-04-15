@@ -7,6 +7,7 @@ import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
 import { createTray, destroyTray, updateTrayState } from './tray';
 import { ensureBundledVoices, ensureBundledTFJSModels } from './model-downloader';
+import { startMeetingAppDetection } from './meeting-app-detector';
 
 // Set the models directory env var BEFORE the Rust addon loads.
 // In production, models go to the user's app-data directory (writable).
@@ -130,6 +131,11 @@ app.whenReady().then(() => {
     }
   } catch (err) {
     console.warn('[auto-cleanup] Failed:', err);
+  }
+
+  // Start meeting app auto-detection (opt-in, checks setting)
+  try { startMeetingAppDetection(); } catch (err) {
+    console.warn('[meeting-app-detector] Failed to start:', err);
   }
 });
 

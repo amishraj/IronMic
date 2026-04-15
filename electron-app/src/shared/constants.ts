@@ -129,6 +129,27 @@ export const IPC_CHANNELS = {
   MEETING_GET: 'ironmic:meeting-get',
   MEETING_LIST: 'ironmic:meeting-list',
   MEETING_DELETE: 'ironmic:meeting-delete',
+  MEETING_CREATE_WITH_TEMPLATE: 'ironmic:meeting-create-with-template',
+  MEETING_SET_STRUCTURED_OUTPUT: 'ironmic:meeting-set-structured-output',
+
+  // Meeting Templates
+  TEMPLATE_CREATE: 'ironmic:template-create',
+  TEMPLATE_GET: 'ironmic:template-get',
+  TEMPLATE_LIST: 'ironmic:template-list',
+  TEMPLATE_UPDATE: 'ironmic:template-update',
+  TEMPLATE_DELETE: 'ironmic:template-delete',
+
+  // Export / Sharing
+  COPY_HTML_CLIPBOARD: 'ironmic:copy-html-clipboard',
+  EXPORT_ENTRY_MARKDOWN: 'ironmic:export-entry-markdown',
+  EXPORT_ENTRY_JSON: 'ironmic:export-entry-json',
+  EXPORT_ENTRY_PLAIN_TEXT: 'ironmic:export-entry-plain-text',
+  EXPORT_MEETING_MARKDOWN: 'ironmic:export-meeting-markdown',
+  TEXT_TO_HTML: 'ironmic:text-to-html',
+  SAVE_FILE_DIALOG: 'ironmic:save-file-dialog',
+
+  // Meeting App Detection
+  MEETING_APP_DETECTED: 'ironmic:meeting-app-detected',
 
   // TF.js Infrastructure
   GET_MODELS_DIR: 'ironmic:get-models-dir',

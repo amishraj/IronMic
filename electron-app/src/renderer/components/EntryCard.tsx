@@ -3,6 +3,7 @@ import { Pin, Archive, Trash2, Clock, Sparkles, MessageSquare } from 'lucide-rea
 import { RawPolishedToggle } from './RawPolishedToggle';
 import { PlaybackControls } from './PlaybackControls';
 import { HighlightedText } from './HighlightedText';
+import { ShareMenu } from './ShareMenu';
 import { Card } from './ui';
 import { parseTags } from '../types';
 import { useTtsStore } from '../stores/useTtsStore';
@@ -117,6 +118,7 @@ export function EntryCard({ entry, onDelete, onPin, onArchive, onPolish, onTagCl
       {/* Actions */}
       <div className="flex items-center gap-1 px-3 py-2 border-t border-iron-border">
         <PlaybackControls text={text} entryId={entry.id} compact />
+        <ShareMenu entryId={entry.id} text={text} rawText={entry.rawTranscript} />
         {isAi && sessionId && (
           <>
             <div className="w-px h-4 bg-iron-border mx-0.5" />

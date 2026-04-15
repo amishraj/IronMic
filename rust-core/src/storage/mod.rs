@@ -5,6 +5,7 @@ pub mod dictionary;
 pub mod embeddings;
 pub mod entries;
 pub mod intents;
+pub mod meeting_templates;
 pub mod meetings;
 pub mod ml_models;
 pub mod notifications;

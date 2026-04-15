@@ -11,6 +11,7 @@
  */
 
 import { vadService, type VoiceState } from './VADService';
+import { generateStructuredNotes, structuredToMarkdown, type MeetingTemplate, type StructuredMeetingOutput } from './MeetingTemplateEngine';
 
 export type MeetingState = 'idle' | 'listening' | 'processing' | 'ended';
 
@@ -28,6 +29,7 @@ export interface MeetingResult {
   totalDurationMs: number;
   summary?: string;
   actionItems?: string[];
+  structuredOutput?: StructuredMeetingOutput;
 }
 
 type MeetingStateCallback = (state: MeetingState) => void;
@@ -52,6 +54,8 @@ export class MeetingDetector {
   private speakerEnergyHistory: number[] = [];
   private estimatedSpeakerCount = 1;
   private currentSegmentStart = 0;
+  private template: MeetingTemplate | null = null;
+  private detectedApp: string | null = null;
 
   getState(): MeetingState {
     return this.state;
@@ -63,23 +67,32 @@ export class MeetingDetector {
 
   /**
    * Start ambient meeting mode.
+   * @param template Optional meeting template for structured output
+   * @param detectedApp Optional app name (zoom, teams, meet) if auto-detected
    */
-  async start(): Promise<string> {
+  async start(template?: MeetingTemplate, detectedApp?: string): Promise<string> {
     if (this.state !== 'idle') {
       throw new Error('Meeting already in progress');
     }
 
-    // Create meeting session in storage
+    this.template = template || null;
+    this.detectedApp = detectedApp || null;
+
+    // Create meeting session in storage (with template if provided)
     const ironmic = (window as any).ironmic;
     let sessionId = 'meeting-' + Date.now();
-    if (ironmic?.meetingCreate) {
-      try {
+    try {
+      if (template && ironmic?.meetingCreateWithTemplate) {
+        const result = await ironmic.meetingCreateWithTemplate(template.id, detectedApp || null);
+        const parsed = JSON.parse(result);
+        sessionId = parsed.id;
+      } else if (ironmic?.meetingCreate) {
         const result = await ironmic.meetingCreate();
         const parsed = JSON.parse(result);
         sessionId = parsed.id;
-      } catch (err) {
-        console.warn('[MeetingDetector] Failed to create session in storage:', err);
       }
+    } catch (err) {
+      console.warn('[MeetingDetector] Failed to create session in storage:', err);
     }
 
     this.sessionId = sessionId;
@@ -190,29 +203,45 @@ export class MeetingDetector {
 
     const totalDurationMs = Date.now() - this.startTime;
 
-    // Generate summary via LLM
+    // Build full transcript from segments
+    const fullTranscript = this.segments
+      .map((s) => `${s.speakerLabel}: ${s.transcript || ''}`)
+      .join('\n');
+
     let summary: string | undefined;
     let actionItems: string[] | undefined;
+    let structuredOutput: StructuredMeetingOutput | undefined;
 
-    if (this.segments.length > 0) {
+    if (this.segments.length > 0 && fullTranscript.length > 20) {
       try {
-        const fullTranscript = this.segments
-          .map((s) => `${s.speakerLabel}: ${s.transcript || ''}`)
-          .join('\n');
+        if (this.template) {
+          // Use template engine for structured output
+          structuredOutput = await generateStructuredNotes(this.template, fullTranscript);
+          summary = structuredToMarkdown(structuredOutput);
 
-        const ironmic = (window as any).ironmic;
-        if (ironmic?.polishText && fullTranscript.length > 20) {
-          const summaryPrompt = `Summarize this meeting transcript. List key decisions and action items.\n\n${fullTranscript}`;
-          const result = await ironmic.polishText(summaryPrompt);
-          summary = result;
-
-          // Try to extract action items
-          const actionMatch = result.match(/action\s*items?:?\s*([\s\S]*?)(?:$|\n\n)/i);
-          if (actionMatch) {
-            actionItems = actionMatch[1]
+          // Extract action items from structured sections
+          const actionSection = structuredOutput.sections.find(s => s.key === 'action_items' || s.key === 'next_steps');
+          if (actionSection && actionSection.content !== 'None mentioned') {
+            actionItems = actionSection.content
               .split('\n')
               .map((l: string) => l.replace(/^[-*•]\s*/, '').trim())
               .filter((l: string) => l.length > 0);
+          }
+        } else {
+          // No template — use generic summary prompt
+          const ironmic = (window as any).ironmic;
+          if (ironmic?.polishText) {
+            const summaryPrompt = `Summarize this meeting transcript. List key decisions and action items.\n\n${fullTranscript}`;
+            const result = await ironmic.polishText(summaryPrompt);
+            summary = result;
+
+            const actionMatch = result.match(/action\s*items?:?\s*([\s\S]*?)(?:$|\n\n)/i);
+            if (actionMatch) {
+              actionItems = actionMatch[1]
+                .split('\n')
+                .map((l: string) => l.replace(/^[-*•]\s*/, '').trim())
+                .filter((l: string) => l.length > 0);
+            }
           }
         }
       } catch (err) {
@@ -236,6 +265,13 @@ export class MeetingDetector {
           totalDurationMs / 1000,
           entryIds || undefined,
         );
+        // Save structured output separately if template was used
+        if (structuredOutput && ironmic?.meetingSetStructuredOutput) {
+          await ironmic.meetingSetStructuredOutput(
+            this.sessionId,
+            JSON.stringify(structuredOutput),
+          );
+        }
       } catch (err) {
         console.warn('[MeetingDetector] Failed to save meeting:', err);
       }
@@ -248,6 +284,7 @@ export class MeetingDetector {
       totalDurationMs,
       summary,
       actionItems,
+      structuredOutput,
     };
 
     this.setState('ended');

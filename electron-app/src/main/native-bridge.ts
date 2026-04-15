@@ -131,4 +131,21 @@ export const native = {
   getPipelineState(): string { return this.addon.getPipelineState(); },
   resetPipelineState(): void { this.addon.resetPipelineState(); },
   getModelStatus(): any { return this.addon.getModelStatus(); },
+
+  // Meeting templates
+  createMeetingTemplate(name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string): string { return this.addon.createMeetingTemplate(name, meetingType, sections, llmPrompt, displayLayout); },
+  getMeetingTemplate(id: string): string { return this.addon.getMeetingTemplate(id); },
+  listMeetingTemplates(): string { return this.addon.listMeetingTemplates(); },
+  updateMeetingTemplate(id: string, name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string): void { this.addon.updateMeetingTemplate(id, name, meetingType, sections, llmPrompt, displayLayout); },
+  deleteMeetingTemplate(id: string): void { this.addon.deleteMeetingTemplate(id); },
+  createMeetingSessionWithTemplate(templateId?: string, detectedApp?: string): string { return this.addon.createMeetingSessionWithTemplate(templateId, detectedApp); },
+  setMeetingStructuredOutput(id: string, structuredOutput: string): void { this.addon.setMeetingStructuredOutput(id, structuredOutput); },
+
+  // Export / Sharing
+  copyHtmlToClipboard(html: string, fallbackText: string): void { this.addon.copyHtmlToClipboard(html, fallbackText); },
+  exportEntryMarkdown(id: string): string { return this.addon.exportEntryMarkdown(id); },
+  exportEntryJson(id: string): string { return this.addon.exportEntryJson(id); },
+  exportEntryPlainText(id: string): string { return this.addon.exportEntryPlainText(id); },
+  exportMeetingMarkdown(id: string): string { return this.addon.exportMeetingMarkdown(id); },
+  textToHtml(text: string): string { return this.addon.textToHtml(text); },
 };

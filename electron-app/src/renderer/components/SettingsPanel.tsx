@@ -916,6 +916,7 @@ function VoiceAISettings() {
   const [workflowsEnabled, setWorkflowsEnabled] = useState(false);
   const [workflowConfidence, setWorkflowConfidence] = useState(0.7);
   const [semanticSearchEnabled, setSemanticSearchEnabled] = useState(false);
+  const [meetingAutoDetect, setMeetingAutoDetect] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -936,6 +937,7 @@ function VoiceAISettings() {
       setWorkflowsEnabled((await val('ml_workflows_enabled', 'false')) === 'true');
       setWorkflowConfidence(parseFloat(await val('ml_workflows_confidence', '0.7')));
       setSemanticSearchEnabled((await val('ml_semantic_search_enabled', 'false')) === 'true');
+      setMeetingAutoDetect((await val('meeting_auto_detect_enabled', 'false')) === 'true');
     })();
   }, []);
 
@@ -1060,6 +1062,17 @@ function VoiceAISettings() {
               <Toggle
                 checked={meetingModeEnabled}
                 onChange={(v) => { setMeetingModeEnabled(v); update('meeting_mode_enabled', String(v)); }}
+              />
+            }
+          />
+          <SettingRow
+            icon={Monitor}
+            title="Meeting App Auto-Detection"
+            description="Detect when Zoom, Teams, or Google Meet is active and offer to start meeting mode. Only checks the frontmost window title — no deep process inspection."
+            control={
+              <Toggle
+                checked={meetingAutoDetect}
+                onChange={(v) => { setMeetingAutoDetect(v); update('meeting_auto_detect_enabled', String(v)); }}
               />
             }
           />

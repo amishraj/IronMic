@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -125,6 +125,10 @@ impl Database {
 
         if current_version < 3 {
             self.migrate_v3(&conn)?;
+        }
+
+        if current_version < 4 {
+            self.migrate_v4(&conn)?;
         }
 
         // Update version
@@ -415,6 +419,99 @@ impl Database {
         .map_err(|e| IronMicError::Storage(format!("Migration v3 failed: {e}")))?;
 
         info!("Migration v3 applied: created ML feature tables for v1.1.0");
+        Ok(())
+    }
+
+    /// Migration v4: Meeting templates, meeting session extensions, and new settings.
+    fn migrate_v4(&self, conn: &Connection) -> Result<(), IronMicError> {
+        conn.execute_batch(
+            "
+            -- Meeting templates for structured output
+            CREATE TABLE IF NOT EXISTS meeting_templates (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                meeting_type TEXT NOT NULL,
+                sections TEXT NOT NULL,
+                llm_prompt TEXT NOT NULL,
+                display_layout TEXT NOT NULL,
+                is_builtin INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            -- Extend meeting_sessions with template support
+            ALTER TABLE meeting_sessions ADD COLUMN template_id TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN structured_output TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN detected_app TEXT;
+
+            -- New settings
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_auto_detect_enabled', 'false');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_default_template', '');
+            ",
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v4 failed: {e}")))?;
+
+        // Seed builtin meeting templates
+        self.seed_builtin_templates(conn)?;
+
+        info!("Migration v4 applied: meeting templates and session extensions");
+        Ok(())
+    }
+
+    fn seed_builtin_templates(&self, conn: &Connection) -> Result<(), IronMicError> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let templates = vec![
+            (
+                "builtin-standup",
+                "Daily Standup",
+                "standup",
+                r#"["completed","in_progress","blockers"]"#,
+                "You are a meeting notes assistant. Given the following meeting transcript, extract a structured standup summary.\n\nRules:\n- Extract what was completed yesterday into the \"Completed\" section\n- Extract what is being worked on today into the \"In Progress\" section\n- Extract any blockers or issues into the \"Blockers\" section\n- Use bullet points for each item\n- Keep items concise (1-2 sentences each)\n- If a section has no items, write \"None mentioned\"\n- Output ONLY the structured sections, no preamble\n\nFormat:\n## Completed\n- ...\n\n## In Progress\n- ...\n\n## Blockers\n- ...\n\nTranscript:\n{transcript}",
+                r#"{"order":["completed","in_progress","blockers"]}"#,
+            ),
+            (
+                "builtin-1on1",
+                "1-on-1",
+                "1on1",
+                r#"["discussion_points","action_items","feedback"]"#,
+                "You are a meeting notes assistant. Given the following 1-on-1 meeting transcript, extract structured notes.\n\nRules:\n- Extract main discussion topics into \"Discussion Points\"\n- Extract any agreed-upon action items with owners into \"Action Items\"\n- Extract any feedback given or received into \"Feedback\"\n- Use bullet points for each item\n- Keep items concise but include enough context to be actionable\n- If a section has no items, write \"None mentioned\"\n- Output ONLY the structured sections, no preamble\n\nFormat:\n## Discussion Points\n- ...\n\n## Action Items\n- ...\n\n## Feedback\n- ...\n\nTranscript:\n{transcript}",
+                r#"{"order":["discussion_points","action_items","feedback"]}"#,
+            ),
+            (
+                "builtin-discovery",
+                "Discovery Call",
+                "discovery",
+                r#"["pain_points","requirements","next_steps","budget_timeline"]"#,
+                "You are a meeting notes assistant. Given the following discovery call transcript, extract structured notes.\n\nRules:\n- Extract pain points and problems the prospect described into \"Pain Points\"\n- Extract specific requirements, needs, or desired features into \"Requirements\"\n- Extract agreed-upon next steps into \"Next Steps\"\n- Extract any mentions of budget, timeline, or decision process into \"Budget & Timeline\"\n- Use bullet points for each item\n- Include relevant quotes when they capture the prospect's voice\n- If a section has no items, write \"None mentioned\"\n- Output ONLY the structured sections, no preamble\n\nFormat:\n## Pain Points\n- ...\n\n## Requirements\n- ...\n\n## Next Steps\n- ...\n\n## Budget & Timeline\n- ...\n\nTranscript:\n{transcript}",
+                r#"{"order":["pain_points","requirements","next_steps","budget_timeline"]}"#,
+            ),
+            (
+                "builtin-team-sync",
+                "Team Sync",
+                "team_sync",
+                r#"["updates","decisions","action_items","open_questions"]"#,
+                "You are a meeting notes assistant. Given the following team sync meeting transcript, extract structured notes.\n\nRules:\n- Extract status updates from team members into \"Updates\"\n- Extract any decisions that were made into \"Decisions\"\n- Extract action items with owners and deadlines into \"Action Items\"\n- Extract unresolved questions or topics needing follow-up into \"Open Questions\"\n- Use bullet points for each item\n- Attribute updates to speakers when possible\n- If a section has no items, write \"None mentioned\"\n- Output ONLY the structured sections, no preamble\n\nFormat:\n## Updates\n- ...\n\n## Decisions\n- ...\n\n## Action Items\n- ...\n\n## Open Questions\n- ...\n\nTranscript:\n{transcript}",
+                r#"{"order":["updates","decisions","action_items","open_questions"]}"#,
+            ),
+            (
+                "builtin-retro",
+                "Retrospective",
+                "retro",
+                r#"["went_well","improve","action_items"]"#,
+                "You are a meeting notes assistant. Given the following retrospective meeting transcript, extract structured notes.\n\nRules:\n- Extract things that went well into \"Went Well\"\n- Extract things that need improvement into \"Needs Improvement\"\n- Extract concrete action items to improve into \"Action Items\"\n- Use bullet points for each item\n- Group related items together\n- If a section has no items, write \"None mentioned\"\n- Output ONLY the structured sections, no preamble\n\nFormat:\n## Went Well\n- ...\n\n## Needs Improvement\n- ...\n\n## Action Items\n- ...\n\nTranscript:\n{transcript}",
+                r#"{"order":["went_well","improve","action_items"]}"#,
+            ),
+        ];
+
+        for (id, name, meeting_type, sections, llm_prompt, display_layout) in templates {
+            conn.execute(
+                "INSERT OR IGNORE INTO meeting_templates (id, name, meeting_type, sections, llm_prompt, display_layout, is_builtin, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
+                rusqlite::params![id, name, meeting_type, sections, llm_prompt, display_layout, now],
+            )
+            .map_err(|e| IronMicError::Storage(format!("Failed to seed template {id}: {e}")))?;
+        }
+
         Ok(())
     }
 }

@@ -185,6 +185,24 @@ const api = {
   meetingGet: (id: string) => ipcRenderer.invoke('ironmic:meeting-get', id),
   meetingList: (limit: number, offset: number) => ipcRenderer.invoke('ironmic:meeting-list', limit, offset),
   meetingDelete: (id: string) => ipcRenderer.invoke('ironmic:meeting-delete', id),
+  meetingCreateWithTemplate: (templateId: string | null, detectedApp: string | null) => ipcRenderer.invoke('ironmic:meeting-create-with-template', templateId, detectedApp),
+  meetingSetStructuredOutput: (id: string, structuredOutput: string) => ipcRenderer.invoke('ironmic:meeting-set-structured-output', id, structuredOutput),
+
+  // ── Meeting Templates ──
+  templateCreate: (name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string) => ipcRenderer.invoke('ironmic:template-create', name, meetingType, sections, llmPrompt, displayLayout),
+  templateGet: (id: string) => ipcRenderer.invoke('ironmic:template-get', id),
+  templateList: () => ipcRenderer.invoke('ironmic:template-list'),
+  templateUpdate: (id: string, name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string) => ipcRenderer.invoke('ironmic:template-update', id, name, meetingType, sections, llmPrompt, displayLayout),
+  templateDelete: (id: string) => ipcRenderer.invoke('ironmic:template-delete', id),
+
+  // ── Export / Sharing ──
+  copyHtmlToClipboard: (html: string, fallbackText: string) => ipcRenderer.invoke('ironmic:copy-html-clipboard', html, fallbackText),
+  exportEntryMarkdown: (id: string) => ipcRenderer.invoke('ironmic:export-entry-markdown', id),
+  exportEntryJson: (id: string) => ipcRenderer.invoke('ironmic:export-entry-json', id),
+  exportEntryPlainText: (id: string) => ipcRenderer.invoke('ironmic:export-entry-plain-text', id),
+  exportMeetingMarkdown: (id: string) => ipcRenderer.invoke('ironmic:export-meeting-markdown', id),
+  textToHtml: (text: string) => ipcRenderer.invoke('ironmic:text-to-html', text),
+  saveFileDialog: (content: string, defaultName: string, filters: any[]) => ipcRenderer.invoke('ironmic:save-file-dialog', content, defaultName, JSON.stringify(filters)),
 
   // ── TF.js Infrastructure ──
   getModelsDir: () => ipcRenderer.invoke('ironmic:get-models-dir'),

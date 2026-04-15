@@ -39,6 +39,8 @@ const ALLOWED_SETTING_KEYS = new Set([
   'ml_semantic_search_enabled',
   // Network / proxy (v1.1.8)
   'proxy_url', 'proxy_enabled',
+  // Meeting templates (v1.3.0)
+  'meeting_auto_detect_enabled', 'meeting_default_template',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -427,6 +429,63 @@ If the text is too short or unclear, output: ["General"]`;
         shell.openExternal(url);
       }
     } catch { /* ignore invalid URLs */ }
+  });
+
+  // ── Meeting Templates ──
+
+  ipcMain.handle(IPC_CHANNELS.TEMPLATE_CREATE, (_event, name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string) => {
+    return native.createMeetingTemplate(name, meetingType, sections, llmPrompt, displayLayout);
+  });
+  ipcMain.handle(IPC_CHANNELS.TEMPLATE_GET, (_event, id: string) => {
+    return native.getMeetingTemplate(id);
+  });
+  ipcMain.handle(IPC_CHANNELS.TEMPLATE_LIST, () => {
+    return native.listMeetingTemplates();
+  });
+  ipcMain.handle(IPC_CHANNELS.TEMPLATE_UPDATE, (_event, id: string, name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string) => {
+    return native.updateMeetingTemplate(id, name, meetingType, sections, llmPrompt, displayLayout);
+  });
+  ipcMain.handle(IPC_CHANNELS.TEMPLATE_DELETE, (_event, id: string) => {
+    return native.deleteMeetingTemplate(id);
+  });
+  ipcMain.handle(IPC_CHANNELS.MEETING_CREATE_WITH_TEMPLATE, (_event, templateId: string | null, detectedApp: string | null) => {
+    return native.createMeetingSessionWithTemplate(templateId ?? undefined, detectedApp ?? undefined);
+  });
+  ipcMain.handle(IPC_CHANNELS.MEETING_SET_STRUCTURED_OUTPUT, (_event, id: string, structuredOutput: string) => {
+    return native.setMeetingStructuredOutput(id, structuredOutput);
+  });
+
+  // ── Export / Sharing ──
+
+  ipcMain.handle(IPC_CHANNELS.COPY_HTML_CLIPBOARD, (_event, html: string, fallbackText: string) => {
+    return native.copyHtmlToClipboard(html, fallbackText);
+  });
+  ipcMain.handle(IPC_CHANNELS.EXPORT_ENTRY_MARKDOWN, (_event, id: string) => {
+    return native.exportEntryMarkdown(id);
+  });
+  ipcMain.handle(IPC_CHANNELS.EXPORT_ENTRY_JSON, (_event, id: string) => {
+    return native.exportEntryJson(id);
+  });
+  ipcMain.handle(IPC_CHANNELS.EXPORT_ENTRY_PLAIN_TEXT, (_event, id: string) => {
+    return native.exportEntryPlainText(id);
+  });
+  ipcMain.handle(IPC_CHANNELS.EXPORT_MEETING_MARKDOWN, (_event, id: string) => {
+    return native.exportMeetingMarkdown(id);
+  });
+  ipcMain.handle(IPC_CHANNELS.TEXT_TO_HTML, (_event, text: string) => {
+    return native.textToHtml(text);
+  });
+  ipcMain.handle(IPC_CHANNELS.SAVE_FILE_DIALOG, async (_event, content: string, defaultName: string, filtersJson: string) => {
+    const { dialog } = require('electron');
+    const fs = require('fs');
+    const filters = JSON.parse(filtersJson);
+    const result = await dialog.showSaveDialog({
+      defaultPath: defaultName,
+      filters,
+    });
+    if (result.canceled || !result.filePath) return false;
+    await fs.promises.writeFile(result.filePath, content, 'utf-8');
+    return true;
   });
 
   console.log('[ipc-handlers] All IPC handlers registered');

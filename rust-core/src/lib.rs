@@ -1,6 +1,7 @@
 pub mod audio;
 pub mod clipboard;
 pub mod error;
+pub mod export;
 pub mod hotkey;
 pub mod llm;
 pub mod storage;
@@ -1159,5 +1160,125 @@ mod napi_exports {
     #[napi]
     pub fn delete_meeting_session(id: String) -> napi::Result<()> {
         DATABASE.delete_meeting_session(&id).map_err(Into::into)
+    }
+
+    // ── Meeting Templates ──
+
+    #[napi]
+    pub fn create_meeting_template(
+        name: String,
+        meeting_type: String,
+        sections: String,
+        llm_prompt: String,
+        display_layout: String,
+    ) -> napi::Result<String> {
+        let template = DATABASE
+            .create_meeting_template(&name, &meeting_type, &sections, &llm_prompt, &display_layout)
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&template).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn get_meeting_template(id: String) -> napi::Result<String> {
+        let template = DATABASE.get_meeting_template(&id).map_err(Into::<napi::Error>::into)?;
+        match template {
+            Some(t) => serde_json::to_string(&t).map_err(|e| napi::Error::from_reason(e.to_string())),
+            None => Ok("null".to_string()),
+        }
+    }
+
+    #[napi]
+    pub fn list_meeting_templates() -> napi::Result<String> {
+        let templates = DATABASE.list_meeting_templates().map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&templates).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn update_meeting_template(
+        id: String,
+        name: String,
+        meeting_type: String,
+        sections: String,
+        llm_prompt: String,
+        display_layout: String,
+    ) -> napi::Result<()> {
+        DATABASE
+            .update_meeting_template(&id, &name, &meeting_type, &sections, &llm_prompt, &display_layout)
+            .map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn delete_meeting_template(id: String) -> napi::Result<()> {
+        DATABASE.delete_meeting_template(&id).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn create_meeting_session_with_template(
+        template_id: Option<String>,
+        detected_app: Option<String>,
+    ) -> napi::Result<String> {
+        let session = DATABASE
+            .create_meeting_session_with_template(
+                template_id.as_deref(),
+                detected_app.as_deref(),
+            )
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&session).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn set_meeting_structured_output(id: String, structured_output: String) -> napi::Result<()> {
+        DATABASE
+            .set_meeting_structured_output(&id, &structured_output)
+            .map_err(Into::into)
+    }
+
+    // ── Export / Sharing ──
+
+    #[napi]
+    pub fn copy_html_to_clipboard(html: String, fallback_text: String) -> napi::Result<()> {
+        crate::clipboard::html::copy_html_to_clipboard(&html, &fallback_text)
+            .map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn export_entry_markdown(id: String) -> napi::Result<String> {
+        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        match entry {
+            Some(e) => Ok(crate::export::formatter::entry_to_markdown(&e)),
+            None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),
+        }
+    }
+
+    #[napi]
+    pub fn export_entry_json(id: String) -> napi::Result<String> {
+        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        match entry {
+            Some(e) => Ok(crate::export::formatter::entry_to_json(&e)),
+            None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),
+        }
+    }
+
+    #[napi]
+    pub fn export_entry_plain_text(id: String) -> napi::Result<String> {
+        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        match entry {
+            Some(e) => Ok(crate::export::formatter::entry_to_plain_text(&e)),
+            None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),
+        }
+    }
+
+    #[napi]
+    pub fn export_meeting_markdown(id: String) -> napi::Result<String> {
+        let session = DATABASE.get_meeting_session(&id).map_err(Into::<napi::Error>::into)?;
+        match session {
+            Some(s) => Ok(crate::export::formatter::meeting_to_markdown(&s)),
+            None => Err(napi::Error::from_reason(format!("Meeting not found: {id}"))),
+        }
+    }
+
+    #[napi]
+    pub fn text_to_html(text: String) -> napi::Result<String> {
+        Ok(crate::export::formatter::text_to_html(&text))
     }
 }

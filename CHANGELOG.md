@@ -2,6 +2,30 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.3.0] - 2026-04-15
+
+### Added
+
+#### Meeting Templates & Structured Notes
+- **5 builtin meeting templates** — Standup, 1-on-1, Discovery Call, Team Sync, and Retrospective. Each has tailored sections (action items, blockers, decisions, etc.) and an LLM prompt that extracts structured notes from the transcript.
+- **Custom templates** — Create your own templates with configurable sections and prompts via the Meetings page.
+- **Structured output** — Meeting notes are organized into labeled sections instead of a wall of text. Template-driven extraction with section-level granularity.
+- **Meeting app auto-detection** — Opt-in detection of Zoom, Teams, and Google Meet by checking the frontmost window title. When detected, offers to start meeting mode. Off by default (Settings > Voice AI).
+- **Meetings page** — New nav item with template picker, start/stop controls, live duration counter, and meeting history with expandable structured results.
+
+#### One-Click Sharing & Export
+- **ShareMenu on every entry** — New share button in the entry card actions bar with dropdown: Copy as Rich Text, Copy as Markdown, Copy as Plain Text, Save as File.
+- **Rich clipboard (HTML)** — "Copy as Rich Text" pastes formatted text into Slack, Google Docs, email — headings, bold, bullet points preserved. Uses arboard's `set_html()` for dual HTML + plain-text clipboard.
+- **Markdown export** — Formatted with date, duration, tags, and full text.
+- **Save as File** — Native save dialog for `.md`, `.txt`, `.json` export.
+- **Meeting export** — ShareMenu on meeting session cards exports structured notes or summary.
+
+### Changed
+- SQLite schema upgraded to v4 (meeting_templates table, meeting_sessions extended with template_id/structured_output/detected_app columns)
+- MeetingDetector refactored to delegate summary generation to MeetingTemplateEngine when a template is selected
+
+---
+
 ## [1.2.2] - 2026-04-14
 
 ### Added
