@@ -133,6 +133,9 @@ export const IPC_CHANNELS = {
   // TF.js Infrastructure
   GET_MODELS_DIR: 'ironmic:get-models-dir',
 
+  // Manual model import
+  IMPORT_MODEL: 'ironmic:import-model',
+
   // Events (main → renderer)
   PIPELINE_STATE_CHANGED: 'ironmic:pipeline-state-changed',
   RECORDING_COMPLETE: 'ironmic:recording-complete',

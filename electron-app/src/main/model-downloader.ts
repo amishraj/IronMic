@@ -18,7 +18,7 @@ import https from 'https';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { BrowserWindow, net, session } from 'electron';
+import { BrowserWindow, net, session, dialog } from 'electron';
 import { execSync } from 'child_process';
 import {
   MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
@@ -44,7 +44,7 @@ function resolveModelsDir(): string {
 // Every call site must invoke resolveModelsDir() at runtime.
 
 /** Allowed domains for model downloads and redirects */
-const ALLOWED_DOMAINS = ['github.com', 'objects.githubusercontent.com', 'huggingface.co', 'xethub.hf.co'];
+const ALLOWED_DOMAINS = ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'huggingface.co', 'xethub.hf.co'];
 
 /** Overall download timeout: 10 minutes */
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000;
@@ -778,4 +778,132 @@ export function ensureBundledTFJSModels(): void {
       console.log(`[model-downloader] Copied bundled TF.js model: ${meta.id} (${files.length} files)`);
     }
   }
+}
+
+// ── Manual Model Import ──
+
+/** Map of accepted filenames → model IDs for import validation */
+const IMPORTABLE_FILES: Record<string, { modelId: string; label: string; downloadUrl: string }> = {
+  'whisper-large-v3-turbo.bin': { modelId: 'whisper', label: 'Whisper Large V3 Turbo', downloadUrl: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin' },
+  'ggml-large-v3-turbo.bin': { modelId: 'whisper', label: 'Whisper Large V3 Turbo', downloadUrl: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin' },
+  'ggml-medium.bin': { modelId: 'whisper-medium', label: 'Whisper Medium', downloadUrl: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin' },
+  'ggml-small.bin': { modelId: 'whisper-small', label: 'Whisper Small', downloadUrl: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin' },
+  'ggml-base.bin': { modelId: 'whisper-base', label: 'Whisper Base', downloadUrl: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin' },
+  'mistral-7b-instruct-v0.2.Q4_K_M.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
+  'mistral-7b-instruct-q4_k_m.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
+  'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf': { modelId: 'llm-chat-llama3', label: 'Llama 3.1 8B Instruct', downloadUrl: 'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf' },
+  'Phi-3-mini-4k-instruct-q4.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini', downloadUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf' },
+  'kokoro-v1.0-fp16.onnx': { modelId: 'tts-model', label: 'Kokoro 82M TTS', downloadUrl: 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_fp16.onnx' },
+  'model_fp16.onnx': { modelId: 'tts-model', label: 'Kokoro 82M TTS', downloadUrl: 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_fp16.onnx' },
+};
+
+/** Get the list of importable models with their download URLs (for UI display) */
+export function getImportableModels(): Array<{ modelId: string; label: string; filename: string; downloadUrl: string; downloaded: boolean }> {
+  const seen = new Set<string>();
+  const result: Array<{ modelId: string; label: string; filename: string; downloadUrl: string; downloaded: boolean }> = [];
+
+  for (const [filename, info] of Object.entries(IMPORTABLE_FILES)) {
+    if (seen.has(info.modelId)) continue;
+    seen.add(info.modelId);
+
+    const expectedFile = MODEL_FILES[info.modelId];
+    const downloaded = expectedFile
+      ? fs.existsSync(path.join(resolveModelsDir(), expectedFile))
+      : false;
+
+    result.push({
+      modelId: info.modelId,
+      label: info.label,
+      filename: expectedFile || filename,
+      downloadUrl: info.downloadUrl,
+      downloaded,
+    });
+  }
+  return result;
+}
+
+/**
+ * Import a model file from a user-selected path.
+ * Opens a file dialog, validates the file, copies it to the models directory.
+ * Returns the model ID and label if successful, null if cancelled.
+ */
+export async function importModelFile(
+  window: BrowserWindow | null,
+): Promise<{ modelId: string; label: string } | null> {
+  const dialogWindow = window || BrowserWindow.getFocusedWindow();
+
+  const result = await dialog.showOpenDialog(dialogWindow!, {
+    title: 'Import Model File',
+    message: 'Select a model file (.bin, .gguf, .onnx) that you downloaded from HuggingFace',
+    filters: [
+      { name: 'Model Files', extensions: ['bin', 'gguf', 'onnx'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+    properties: ['openFile'],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  const sourcePath = result.filePaths[0];
+  const sourceFilename = path.basename(sourcePath);
+
+  // Try to match the filename to a known model
+  const match = IMPORTABLE_FILES[sourceFilename];
+  if (!match) {
+    // Try fuzzy matching — check if filename contains a known pattern
+    let fuzzyMatch: { modelId: string; label: string; downloadUrl: string } | null = null;
+    for (const [knownFile, info] of Object.entries(IMPORTABLE_FILES)) {
+      if (sourceFilename.toLowerCase().includes(knownFile.toLowerCase().replace(/\.[^.]+$/, ''))) {
+        fuzzyMatch = info;
+        break;
+      }
+    }
+    if (!fuzzyMatch) {
+      throw new Error(
+        `Unrecognized model file: ${sourceFilename}\n\nExpected one of:\n${Object.keys(IMPORTABLE_FILES).filter((_, i, arr) => i === arr.indexOf(arr[i])).join('\n')}`
+      );
+    }
+    // Use fuzzy match
+    return await copyModelFile(sourcePath, fuzzyMatch.modelId, fuzzyMatch.label);
+  }
+
+  return await copyModelFile(sourcePath, match.modelId, match.label);
+}
+
+async function copyModelFile(
+  sourcePath: string,
+  modelId: string,
+  label: string,
+): Promise<{ modelId: string; label: string }> {
+  const destFilename = MODEL_FILES[modelId];
+  if (!destFilename) {
+    throw new Error(`No destination filename configured for model: ${modelId}`);
+  }
+
+  const modelsDir = resolveModelsDir();
+  fs.mkdirSync(modelsDir, { recursive: true });
+
+  const destPath = path.join(modelsDir, destFilename);
+
+  // Verify the source file exists and has reasonable size
+  const stats = fs.statSync(sourcePath);
+  if (stats.size < 1024) {
+    throw new Error(`File is too small (${stats.size} bytes) — this doesn't look like a valid model file.`);
+  }
+
+  // Copy the file (streaming to handle large files)
+  console.log(`[model-import] Copying ${label} (${(stats.size / 1048576).toFixed(0)} MB) to ${destPath}`);
+  await new Promise<void>((resolve, reject) => {
+    const readStream = fs.createReadStream(sourcePath);
+    const writeStream = fs.createWriteStream(destPath);
+    readStream.pipe(writeStream);
+    writeStream.on('finish', resolve);
+    writeStream.on('error', reject);
+    readStream.on('error', reject);
+  });
+
+  console.log(`[model-import] Successfully imported: ${label}`);
+  return { modelId, label };
 }

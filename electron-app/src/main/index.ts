@@ -55,7 +55,7 @@ function createWindow(): void {
 }
 
 /** Domains allowed for model downloads (must match model-downloader.ts ALLOWED_DOMAINS) */
-const MODEL_DOWNLOAD_DOMAINS = ['github.com', 'objects.githubusercontent.com', 'huggingface.co', 'xethub.hf.co'];
+const MODEL_DOWNLOAD_DOMAINS = ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'huggingface.co', 'xethub.hf.co'];
 
 function blockAllNetworkRequests(): void {
   // Privacy guarantee: block ALL outbound network requests except model downloads.

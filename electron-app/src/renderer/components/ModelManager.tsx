@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu } from 'lucide-react';
 import { Card, Toggle, Badge, Button } from './ui';
+import { ModelImportBanner } from './ModelImportBanner';
 
 interface WhisperModel {
   id: string;
@@ -39,6 +40,7 @@ export function ModelManager() {
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [switching, setSwitching] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showImport, setShowImport] = useState(false);
 
   const loadState = async () => {
     // Load each piece independently so one failure doesn't blank the whole section
@@ -68,7 +70,7 @@ export function ModelManager() {
     const cleanup = window.ironmic.onModelDownloadProgress((prog: DownloadProgress) => {
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(null); setProgress(null); loadState(); }
-      if (prog.status === 'error') { setDownloading(null); setError(prog.errorDetail || 'Download failed'); }
+      if (prog.status === 'error') { setDownloading(null); setError(prog.errorDetail || 'Download failed'); setShowImport(true); }
     });
     return cleanup;
   }, []);
@@ -83,6 +85,7 @@ export function ModelManager() {
     } catch (err: any) {
       setError(err.message || 'Download failed');
       setDownloading(null);
+      setShowImport(true);
     }
   };
 
@@ -124,6 +127,13 @@ export function ModelManager() {
           <span className="whitespace-pre-wrap break-all">{error}</span>
         </div>
       )}
+
+      <ModelImportBanner
+        visible={showImport}
+        onDismiss={() => setShowImport(false)}
+        onImported={loadState}
+        filter="all"
+      />
 
       {/* GPU Acceleration */}
       {gpuAvailable && (
@@ -251,6 +261,7 @@ function ChatModelsSection() {
   const [downloading, setDownloading] = useState<string | null>(null);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showImport, setShowImport] = useState(false);
 
   const loadStatus = async () => {
     try {
@@ -266,7 +277,7 @@ function ChatModelsSection() {
       if (prog.model === 'llm' && downloading !== 'llm') return; // Only track if we initiated
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(null); setProgress(null); setError(null); loadStatus(); }
-      if (prog.status === 'error') { setDownloading(null); setError(prog.errorDetail || `Download failed for ${prog.model}`); }
+      if (prog.status === 'error') { setDownloading(null); setError(prog.errorDetail || `Download failed for ${prog.model}`); setShowImport(true); }
     });
     return cleanup;
   }, [downloading]);
@@ -279,6 +290,7 @@ function ChatModelsSection() {
     } catch (err: any) {
       setError(err.message || `Download failed for ${modelId}`);
       setDownloading(null);
+      setShowImport(true);
     }
   };
 
@@ -295,6 +307,12 @@ function ChatModelsSection() {
       {error && (
         <p className="text-[11px] text-iron-danger mt-1 whitespace-pre-wrap break-all">{error}</p>
       )}
+      <ModelImportBanner
+        visible={showImport}
+        onDismiss={() => setShowImport(false)}
+        onImported={loadStatus}
+        filter="llm"
+      />
       {localModels.map((m: any) => {
         const isDownloading = downloading === m.id;
         return (
@@ -348,6 +366,7 @@ function LlmModelRow() {
   const [downloading, setDownloading] = useState(false);
   const [progress, setProgress] = useState<DownloadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showImport, setShowImport] = useState(false);
 
   const loadStatus = () => window.ironmic.getModelStatus().then(setStatus);
   useEffect(() => {
@@ -356,7 +375,7 @@ function LlmModelRow() {
       if (prog.model !== 'llm') return;
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(false); setProgress(null); loadStatus(); }
-      if (prog.status === 'error') { setDownloading(false); setError(prog.errorDetail || 'Download failed'); }
+      if (prog.status === 'error') { setDownloading(false); setError(prog.errorDetail || 'Download failed'); setShowImport(true); }
     });
     return cleanup;
   }, []);
@@ -372,10 +391,12 @@ function LlmModelRow() {
     } catch (err: any) {
       setError(err.message || 'Download failed');
       setDownloading(false);
+      setShowImport(true);
     }
   };
 
   return (
+    <>
     <Card variant="default" padding="md">
       <div className="flex items-start justify-between">
         <div className="flex-1 min-w-0">
@@ -416,5 +437,12 @@ function LlmModelRow() {
         </div>
       )}
     </Card>
+    <ModelImportBanner
+      visible={showImport}
+      onDismiss={() => setShowImport(false)}
+      onImported={loadStatus}
+      filter="llm"
+    />
+    </>
   );
 }

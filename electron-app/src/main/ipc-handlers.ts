@@ -6,7 +6,7 @@
 import { ipcMain, BrowserWindow } from 'electron';
 import { IPC_CHANNELS, MODEL_FILES } from '../shared/constants';
 import { native } from './native-bridge';
-import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady } from './model-downloader';
+import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
@@ -399,6 +399,16 @@ If the text is too short or unclear, output: ["General"]`;
 
   ipcMain.handle(IPC_CHANNELS.GET_MODELS_DIR, () => {
     return process.env.IRONMIC_MODELS_DIR || '';
+  });
+
+  // ── Manual Model Import ──
+
+  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL, () => {
+    const window = BrowserWindow.getFocusedWindow();
+    return importModelFile(window);
+  });
+  ipcMain.handle('ironmic:get-importable-models', () => {
+    return JSON.stringify(getImportableModels());
   });
 
   console.log('[ipc-handlers] All IPC handlers registered');

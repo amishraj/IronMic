@@ -189,6 +189,10 @@ const api = {
   // ── TF.js Infrastructure ──
   getModelsDir: () => ipcRenderer.invoke('ironmic:get-models-dir'),
 
+  // Manual model import
+  importModel: () => ipcRenderer.invoke('ironmic:import-model'),
+  getImportableModels: () => ipcRenderer.invoke('ironmic:get-importable-models'),
+
   // Events from main process
   onHotkeyPressed: (callback: () => void) => {
     ipcRenderer.on('ironmic:hotkey-pressed', callback);
