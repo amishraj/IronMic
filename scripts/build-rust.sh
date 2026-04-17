@@ -9,6 +9,15 @@ echo "Building IronMic Rust core..."
 echo "Platform: $(uname -s) $(uname -m)"
 echo ""
 
+# macOS C++ toolchain fix:
+# Some CLT installs have an empty /usr/include/c++/v1/ (missing <future>, <string>, etc.).
+# Point the compiler at the SDK's C++ headers to work around it.
+if [ "$(uname -s)" = "Darwin" ]; then
+    export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+    export CPLUS_INCLUDE_PATH="${SDKROOT}/usr/include/c++/v1:${CPLUS_INCLUDE_PATH}"
+fi
+
 # Build the native addon in release mode
 # Build the N-API addon (whisper + TTS, no LLM to avoid ggml collision)
 cargo build --release --features napi-export,metal,tts

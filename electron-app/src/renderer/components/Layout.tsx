@@ -22,6 +22,7 @@ import { useRecordingStore } from '../stores/useRecordingStore';
 import { useSettingsStore } from '../stores/useSettingsStore';
 import { useEntryStore } from '../stores/useEntryStore';
 import { useToastStore } from '../stores/useToastStore';
+import { useMeetingStore } from '../stores/useMeetingStore';
 import iconSmall from '../assets/icon-64.png';
 import micIdle from '../assets/mic-idle.png';
 import micRecording from '../assets/mic-recording.png';
@@ -57,6 +58,8 @@ export function Layout() {
   const [micVisualState, setMicVisualState] = useState<'idle' | 'recording' | 'processing' | 'success'>('idle');
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { handleHotkeyPress, state: recordingState } = useRecordingStore();
+  const isGranolaRecording = useMeetingStore(s => s.isGranolaRecording);
+  const processingMeetings = useMeetingStore(s => s.processingMeetings);
   const { loadSettings, aiEnabled } = useSettingsStore();
   const { refresh } = useEntryStore();
   const pageRef = useRef(page);
@@ -108,13 +111,15 @@ export function Layout() {
     const cleanup = window.ironmic.onHotkeyPressed(() => handleRecord());
     return cleanup;
   }, [handleRecord]);
-  // Sync recording pipeline state → visual mic state with success flash
+  // Sync recording pipeline state → visual mic state with success flash.
+  // Granola meeting recording and background note generation also light up
+  // the mic shield so the user can see capture/inference is active.
   useEffect(() => {
     if (successTimerRef.current) clearTimeout(successTimerRef.current);
 
-    if (recordingState === 'recording') {
+    if (recordingState === 'recording' || isGranolaRecording) {
       setMicVisualState('recording');
-    } else if (recordingState === 'processing') {
+    } else if (recordingState === 'processing' || processingMeetings.length > 0) {
       setMicVisualState('processing');
     } else if (recordingState === 'idle') {
       // If we were processing, show success briefly
@@ -126,7 +131,7 @@ export function Layout() {
       }
       refresh();
     }
-  }, [recordingState]);
+  }, [recordingState, isGranolaRecording, processingMeetings.length]);
 
   useEffect(() => {
     if (!aiEnabled && page === 'ai') setPage('home');

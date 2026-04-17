@@ -191,6 +191,104 @@ impl CaptureEngine {
         Ok(())
     }
 
+    /// Start recording from a named input device (e.g. "BlackHole 2ch" on macOS).
+    /// Falls back to the default input device if the named device is not found.
+    pub fn start_from_device(&mut self, device_name: &str) -> Result<(), IronMicError> {
+        if self.is_recording() {
+            return Err(IronMicError::AlreadyRecording);
+        }
+
+        use cpal::traits::HostTrait;
+        let host = cpal::default_host();
+
+        // Try to find the named device; fall back to default
+        let device = host
+            .input_devices()
+            .map_err(|e| IronMicError::Audio(e.to_string()))?
+            .find(|d| d.name().ok().as_deref() == Some(device_name))
+            .or_else(|| host.default_input_device())
+            .ok_or_else(|| IronMicError::NoDevice(format!("Device '{device_name}' not found and no default available")))?;
+
+        let found_name = device.name().unwrap_or_else(|_| "unknown".into());
+        info!(requested = %device_name, using = %found_name, "Using input device");
+        self.device_name = Some(found_name);
+
+        let config = Self::preferred_config(&device)?;
+        info!(
+            sample_rate = config.sample_rate.0,
+            channels = config.channels,
+            "Recording config"
+        );
+
+        {
+            let mut buf = self.buffer.lock().unwrap();
+            buf.zero();
+            buf.set_format(config.sample_rate.0, config.channels);
+        }
+
+        let buffer = Arc::clone(&self.buffer);
+        let recording = Arc::clone(&self.recording);
+
+        let err_callback = |err: cpal::StreamError| {
+            error!(%err, "Audio stream error");
+        };
+
+        let stream = device
+            .build_input_stream(
+                &config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    if recording.load(Ordering::SeqCst) {
+                        if let Ok(mut buf) = buffer.lock() {
+                            buf.push_samples(data);
+                        }
+                    }
+                },
+                err_callback,
+                None,
+            )
+            .map_err(|e| IronMicError::Audio(e.to_string()))?;
+
+        stream
+            .play()
+            .map_err(|e| IronMicError::Audio(e.to_string()))?;
+
+        self.recording.store(true, Ordering::SeqCst);
+        self.stream = Some(stream);
+
+        info!("Recording started (from named device)");
+        Ok(())
+    }
+
+    /// Extract the current buffer contents and reset the buffer WITHOUT stopping the stream.
+    /// Used by the meeting chunk loop every 30 seconds so the stream keeps running with zero gap.
+    /// Caller is responsible for zeroing the returned CapturedAudio when done (privacy guarantee).
+    pub fn drain_chunk(&mut self) -> Result<CapturedAudio, IronMicError> {
+        if !self.is_recording() {
+            return Err(IronMicError::NotRecording);
+        }
+
+        let mut buf = self.buffer.lock().unwrap();
+        let sample_rate = buf.sample_rate();
+        let channels = buf.channels();
+        // take() uses mem::take — empties the Vec and transfers ownership to caller
+        let samples = buf.take();
+        // Re-set format metadata so subsequent push_samples() calls get correct metadata
+        buf.set_format(sample_rate, channels);
+
+        info!(
+            samples = samples.len(),
+            sample_rate,
+            channels,
+            "Buffer drained (stream still running)"
+        );
+
+        Ok(CapturedAudio {
+            samples,
+            sample_rate,
+            channels,
+        })
+    }
+
     /// Force-reset the recording state. Used for error recovery.
     /// Stops any active stream and zeroes the buffer, returning to a clean idle state.
     pub fn force_reset(&mut self) {

@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -129,6 +129,10 @@ impl Database {
 
         if current_version < 4 {
             self.migrate_v4(&conn)?;
+        }
+
+        if current_version < 5 {
+            self.migrate_v5(&conn)?;
         }
 
         // Update version
@@ -455,6 +459,44 @@ impl Database {
         self.seed_builtin_templates(conn)?;
 
         info!("Migration v4 applied: meeting templates and session extensions");
+        Ok(())
+    }
+
+    /// Migration v5: Transcript segments table and meeting session extensions for the
+    /// Granola-style meeting notetaker feature.
+    fn migrate_v5(&self, conn: &Connection) -> Result<(), IronMicError> {
+        conn.execute_batch(
+            "
+            -- Stores every 30-second transcribed chunk for a meeting session
+            CREATE TABLE IF NOT EXISTS transcript_segments (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES meeting_sessions(id) ON DELETE CASCADE,
+                speaker_label TEXT,
+                start_ms INTEGER NOT NULL,
+                end_ms INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'meeting',
+                participant_id TEXT,
+                confidence REAL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_transcript_segments_session
+                ON transcript_segments(session_id, start_ms);
+
+            -- Extend meeting_sessions for room-based multi-user support
+            ALTER TABLE meeting_sessions ADD COLUMN room_code TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN audio_device TEXT;
+            ALTER TABLE meeting_sessions ADD COLUMN full_transcript TEXT;
+
+            -- New settings for meeting audio device selection
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_audio_device', '');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_chunk_interval_s', '30');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_display_name', '');
+            ",
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v5 failed: {e}")))?;
+
+        info!("Migration v5 applied: transcript_segments table and meeting session extensions");
         Ok(())
     }
 

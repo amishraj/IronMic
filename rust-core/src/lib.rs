@@ -1300,6 +1300,116 @@ mod napi_exports {
             .map_err(Into::into)
     }
 
+    // ── Meeting Recording: Device-Select & Chunk Drain ──
+
+    /// Start recording from a named input device (e.g. "BlackHole 2ch" for system audio).
+    /// Falls back to the default input device if the named device is not found.
+    /// Uses the same CaptureEngine as regular dictation — no new infrastructure.
+    #[napi]
+    pub fn start_recording_from_device(device_name: String) -> napi::Result<()> {
+        init_tracing();
+        info!(device = %device_name, "startRecordingFromDevice called from N-API");
+        let mut engine = CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+        engine.start_from_device(&device_name).map_err(Into::into)
+    }
+
+    /// Drain the current recording buffer and return it as 16kHz mono i16 PCM bytes,
+    /// WITHOUT stopping the stream. The stream keeps running with zero capture gap.
+    /// Used by the meeting chunk loop every 30 seconds.
+    #[napi]
+    pub fn drain_recording_buffer() -> napi::Result<Buffer> {
+        info!("drainRecordingBuffer called from N-API");
+
+        let mut engine = CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+
+        let mut captured = engine.drain_chunk().map_err(napi::Error::from)?;
+
+        // Process to 16kHz mono PCM for Whisper (same path as stop_recording)
+        let mut processed =
+            processor::prepare_for_whisper(&captured).map_err(napi::Error::from)?;
+
+        // Zero the raw captured audio immediately (privacy guarantee)
+        captured.zero();
+
+        // Convert f32 to i16 PCM bytes (little-endian) for the Node.js side
+        let pcm_i16 = processor::f32_to_i16_pcm(&processed.samples);
+        processed.samples.fill(0.0);
+        processed.samples.clear();
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(pcm_i16.len() * 2);
+        for sample in &pcm_i16 {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        info!(
+            pcm_bytes = bytes.len(),
+            duration_seconds = processed.duration_seconds,
+            "Returning drained PCM chunk to Node.js"
+        );
+
+        Ok(bytes.into())
+    }
+
+    // ── Transcript Segments ──
+
+    /// Add a transcript segment to a meeting session.
+    /// Returns the created segment as JSON.
+    #[napi]
+    pub fn add_transcript_segment(
+        session_id: String,
+        speaker_label: Option<String>,
+        start_ms: i64,
+        end_ms: i64,
+        text: String,
+        source: String,
+    ) -> napi::Result<String> {
+        let segment = DATABASE
+            .add_transcript_segment(
+                &session_id,
+                speaker_label.as_deref(),
+                start_ms,
+                end_ms,
+                &text,
+                &source,
+                None,
+                None,
+            )
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&segment).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// List all transcript segments for a meeting session, ordered by start time.
+    /// Returns a JSON array of TranscriptSegment objects.
+    #[napi]
+    pub fn list_transcript_segments(session_id: String) -> napi::Result<String> {
+        let segments = DATABASE
+            .list_transcript_segments(&session_id)
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&segments).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Update the speaker label for a specific transcript segment.
+    /// Called after post-meeting LLM diarization assigns speaker labels.
+    #[napi]
+    pub fn update_segment_speaker(id: String, speaker_label: String) -> napi::Result<()> {
+        DATABASE
+            .update_segment_speaker(&id, &speaker_label)
+            .map_err(Into::into)
+    }
+
+    /// Assemble the full transcript text for a session by joining all segments.
+    /// Speaker labels are prefixed if present: "[Speaker 1]: text"
+    #[napi]
+    pub fn assemble_full_transcript(session_id: String) -> napi::Result<String> {
+        DATABASE
+            .assemble_full_transcript(&session_id)
+            .map_err(Into::into)
+    }
+
     // ── Export / Sharing ──
 
     #[napi]
@@ -1310,7 +1420,8 @@ mod napi_exports {
 
     #[napi]
     pub fn export_entry_markdown(id: String) -> napi::Result<String> {
-        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        let store = EntryStore::new(DATABASE.clone());
+        let entry = store.get(&id).map_err(Into::<napi::Error>::into)?;
         match entry {
             Some(e) => Ok(crate::export::formatter::entry_to_markdown(&e)),
             None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),
@@ -1319,7 +1430,8 @@ mod napi_exports {
 
     #[napi]
     pub fn export_entry_json(id: String) -> napi::Result<String> {
-        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        let store = EntryStore::new(DATABASE.clone());
+        let entry = store.get(&id).map_err(Into::<napi::Error>::into)?;
         match entry {
             Some(e) => Ok(crate::export::formatter::entry_to_json(&e)),
             None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),
@@ -1328,7 +1440,8 @@ mod napi_exports {
 
     #[napi]
     pub fn export_entry_plain_text(id: String) -> napi::Result<String> {
-        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        let store = EntryStore::new(DATABASE.clone());
+        let entry = store.get(&id).map_err(Into::<napi::Error>::into)?;
         match entry {
             Some(e) => Ok(crate::export::formatter::entry_to_plain_text(&e)),
             None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),

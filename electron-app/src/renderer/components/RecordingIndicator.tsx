@@ -1,8 +1,23 @@
 import { Mic, Loader2, MicOff } from 'lucide-react';
 import { useRecordingStore } from '../stores/useRecordingStore';
+import { useMeetingStore } from '../stores/useMeetingStore';
 
 export function RecordingIndicator() {
   const { state, error } = useRecordingStore();
+  const isGranolaRecording = useMeetingStore(s => s.isGranolaRecording);
+  const processingMeetings = useMeetingStore(s => s.processingMeetings);
+
+  // Meeting pipeline (Granola mode) overrides dictation state when active —
+  // the top bar should reflect whichever capture/inference is actually running.
+  let effectiveState: 'idle' | 'recording' | 'processing' = state;
+  let effectiveLabel: string | null = null;
+  if (isGranolaRecording) {
+    effectiveState = 'recording';
+    effectiveLabel = 'Meeting';
+  } else if (processingMeetings.length > 0 && state === 'idle') {
+    effectiveState = 'processing';
+    effectiveLabel = 'Generating notes';
+  }
 
   const config = {
     idle: {
@@ -20,13 +35,13 @@ export function RecordingIndicator() {
       label: 'Processing',
       classes: 'bg-iron-warning/15 text-iron-warning border border-iron-warning/20',
     },
-  }[state];
+  }[effectiveState];
 
   return (
     <div className="flex items-center gap-3">
       <div className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-300 ${config.classes}`}>
         {config.icon}
-        <span>{config.label}</span>
+        <span>{effectiveLabel ?? config.label}</span>
       </div>
       {error && (
         <span className="text-[11px] text-iron-danger max-w-[200px] truncate" title={error}>
