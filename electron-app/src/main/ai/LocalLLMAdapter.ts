@@ -36,6 +36,49 @@ export function isChatModelDownloaded(modelId: string): boolean {
   }
 }
 
+/** Map a chat model id to the modelType string expected by the LLM subprocess. */
+export function getChatModelType(modelId: string): string {
+  if (modelId === 'llm-chat-llama3') return 'llama3';
+  if (modelId === 'llm-chat-phi3') return 'phi3';
+  return 'mistral';
+}
+
+/**
+ * Resolve the LLM model to use for local inference, honoring the user's
+ * settings selection first and falling back to the first downloaded model.
+ *
+ * Returns null if no local chat model is downloaded at all.
+ */
+export function resolveActiveChatModel(
+  settingsReader: { getSetting(key: string): string | null },
+): { id: string; modelPath: string; modelType: string } | null {
+  // 1. Honor settings selection if the user has picked a local model
+  const candidates: string[] = [];
+  const localModel = settingsReader.getSetting('ai_local_model');
+  if (localModel) candidates.push(localModel);
+  const provider = settingsReader.getSetting('ai_provider');
+  const aiModel = settingsReader.getSetting('ai_model');
+  if (aiModel && provider === 'local' && !candidates.includes(aiModel)) {
+    candidates.push(aiModel);
+  }
+
+  // 2. Fall back to the default priority order
+  for (const id of ['llm', 'llm-chat-llama3', 'llm-chat-phi3']) {
+    if (!candidates.includes(id)) candidates.push(id);
+  }
+
+  for (const id of candidates) {
+    if (isChatModelDownloaded(id)) {
+      return {
+        id,
+        modelPath: getChatModelPath(id),
+        modelType: getChatModelType(id),
+      };
+    }
+  }
+  return null;
+}
+
 export class LocalLLMAdapter implements IAIAdapter {
   name: AIProvider = 'local';
 

@@ -188,6 +188,25 @@ const api = {
   meetingCreateWithTemplate: (templateId: string | null, detectedApp: string | null) => ipcRenderer.invoke('ironmic:meeting-create-with-template', templateId, detectedApp),
   meetingSetStructuredOutput: (id: string, structuredOutput: string) => ipcRenderer.invoke('ironmic:meeting-set-structured-output', id, structuredOutput),
 
+  // ── Meeting Recording (Granola-style chunk loop) ──
+  meetingStartRecording: (sessionId: string, deviceName?: string | null, chunkIntervalS?: number) =>
+    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS),
+  meetingStopRecording: () => ipcRenderer.invoke('ironmic:meeting-stop-recording'),
+
+  // ── Meeting Room (LAN multi-user collaboration) ──
+  meetingRoomHostStart: (sessionId: string, hostName: string, templateId?: string | null) =>
+    ipcRenderer.invoke('ironmic:meeting-room-host-start', sessionId, hostName, templateId),
+  meetingRoomHostStop: () => ipcRenderer.invoke('ironmic:meeting-room-host-stop'),
+  meetingRoomHostInfo: () => ipcRenderer.invoke('ironmic:meeting-room-host-info'),
+  meetingRoomJoin: (opts: { hostIp: string; hostPort: number; roomCode: string; displayName: string; deviceName?: string | null }) =>
+    ipcRenderer.invoke('ironmic:meeting-room-join', opts),
+  meetingRoomLeave: () => ipcRenderer.invoke('ironmic:meeting-room-leave'),
+
+  // ── Transcript Segments ──
+  listTranscriptSegments: (sessionId: string) => ipcRenderer.invoke('ironmic:list-transcript-segments', sessionId),
+  updateSegmentSpeaker: (id: string, speakerLabel: string) => ipcRenderer.invoke('ironmic:update-segment-speaker', id, speakerLabel),
+  assembleFullTranscript: (sessionId: string) => ipcRenderer.invoke('ironmic:assemble-full-transcript', sessionId),
+
   // ── Audio Input ──
   listAudioDevices: () => ipcRenderer.invoke('ironmic:list-audio-devices'),
   getCurrentAudioDevice: () => ipcRenderer.invoke('ironmic:get-current-audio-device'),
@@ -243,6 +262,34 @@ const api = {
     const handler = (_event: any, workflow: any) => callback(workflow);
     ipcRenderer.on('ironmic:workflow-discovered', handler);
     return () => ipcRenderer.removeListener('ironmic:workflow-discovered', handler);
+  },
+
+  // ── Meeting Recording Events (main → renderer) ──
+  onMeetingSegmentReady: (callback: (segment: any) => void) => {
+    const handler = (_event: any, segment: any) => callback(segment);
+    ipcRenderer.on('ironmic:meeting-segment-ready', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-segment-ready', handler);
+  },
+  onMeetingRecordingState: (callback: (state: any) => void) => {
+    const handler = (_event: any, state: any) => callback(state);
+    ipcRenderer.on('ironmic:meeting-recording-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-recording-state', handler);
+  },
+  onMeetingAppDetected: (callback: (event: any, data: any) => void) => {
+    ipcRenderer.on('ironmic:meeting-app-detected', callback);
+    return () => ipcRenderer.removeListener('ironmic:meeting-app-detected', callback);
+  },
+
+  // ── Meeting Room Events (main → renderer) ──
+  onMeetingRoomState: (callback: (info: any) => void) => {
+    const handler = (_event: any, info: any) => callback(info);
+    ipcRenderer.on('ironmic:meeting-room-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-state', handler);
+  },
+  onMeetingRoomParticipantUpdate: (callback: (msg: any) => void) => {
+    const handler = (_event: any, msg: any) => callback(msg);
+    ipcRenderer.on('ironmic:meeting-room-participant-update', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-participant-update', handler);
   },
 };
 

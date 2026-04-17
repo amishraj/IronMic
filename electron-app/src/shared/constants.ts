@@ -123,6 +123,20 @@ export const IPC_CHANNELS = {
   INTENT_GET_CORRECTION_COUNT: 'ironmic:intent-get-correction-count',
   INTENT_LOG_ROUTING: 'ironmic:intent-log-routing',
 
+  // Meeting Recording (Granola-style — device-select + chunk drain)
+  MEETING_START_RECORDING: 'ironmic:meeting-start-recording',
+  MEETING_STOP_RECORDING: 'ironmic:meeting-stop-recording',
+  MEETING_SEGMENT_READY: 'ironmic:meeting-segment-ready',      // main → renderer push
+  MEETING_RECORDING_STATE: 'ironmic:meeting-recording-state',  // main → renderer push
+  START_RECORDING_FROM_DEVICE: 'ironmic:start-recording-from-device',
+  DRAIN_RECORDING_BUFFER: 'ironmic:drain-recording-buffer',
+
+  // Transcript Segments
+  ADD_TRANSCRIPT_SEGMENT: 'ironmic:add-transcript-segment',
+  LIST_TRANSCRIPT_SEGMENTS: 'ironmic:list-transcript-segments',
+  UPDATE_SEGMENT_SPEAKER: 'ironmic:update-segment-speaker',
+  ASSEMBLE_FULL_TRANSCRIPT: 'ironmic:assemble-full-transcript',
+
   // Meeting Sessions (ML Feature 1 Bonus)
   MEETING_CREATE: 'ironmic:meeting-create',
   MEETING_END: 'ironmic:meeting-end',
@@ -131,6 +145,15 @@ export const IPC_CHANNELS = {
   MEETING_DELETE: 'ironmic:meeting-delete',
   MEETING_CREATE_WITH_TEMPLATE: 'ironmic:meeting-create-with-template',
   MEETING_SET_STRUCTURED_OUTPUT: 'ironmic:meeting-set-structured-output',
+
+  // Meeting Rooms (LAN multi-user collaboration)
+  MEETING_ROOM_HOST_START: 'ironmic:meeting-room-host-start',
+  MEETING_ROOM_HOST_STOP: 'ironmic:meeting-room-host-stop',
+  MEETING_ROOM_HOST_INFO: 'ironmic:meeting-room-host-info',
+  MEETING_ROOM_JOIN: 'ironmic:meeting-room-join',
+  MEETING_ROOM_LEAVE: 'ironmic:meeting-room-leave',
+  MEETING_ROOM_STATE: 'ironmic:meeting-room-state',                // main → renderer push
+  MEETING_ROOM_PARTICIPANT_UPDATE: 'ironmic:meeting-room-participant-update', // main → renderer push
 
   // Meeting Templates
   TEMPLATE_CREATE: 'ironmic:template-create',

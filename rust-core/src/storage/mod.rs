@@ -7,6 +7,7 @@ pub mod entries;
 pub mod intents;
 pub mod meeting_templates;
 pub mod meetings;
+pub mod transcript_segments;
 pub mod ml_models;
 pub mod notifications;
 pub mod settings;

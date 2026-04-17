@@ -96,6 +96,13 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     analyticsGetUnclassifiedEntries: () => '[]',
     analyticsSaveEntryTopics: () => {},
     analyticsGetUnclassifiedCount: () => 0,
+    // Meeting recording stubs (Granola mode)
+    startRecordingFromDevice: () => {},
+    drainRecordingBuffer: () => Buffer.alloc(0),
+    addTranscriptSegment: () => JSON.stringify({ id: 'stub', session_id: '', speaker_label: null, start_ms: 0, end_ms: 0, text: '', source: 'meeting', participant_id: null, confidence: null, created_at: new Date().toISOString() }),
+    listTranscriptSegments: () => '[]',
+    updateSegmentSpeaker: () => {},
+    assembleFullTranscript: () => '',
   };
 }
 

@@ -8,9 +8,12 @@ import { IPC_CHANNELS, MODEL_FILES } from '../shared/constants';
 import { native } from './native-bridge';
 import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel } from './model-downloader';
 import { aiManager } from './ai/AIManager';
-import { getChatModelPath } from './ai/LocalLLMAdapter';
+import { getChatModelPath, resolveActiveChatModel } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
 import type { AIProvider } from './ai/types';
+import { meetingRecorder } from './meeting-recorder';
+import { meetingRoomServer } from './meeting-room-server';
+import { meetingRoomClient } from './meeting-room-client';
 
 // ── Input validation helpers ──
 
@@ -41,6 +44,8 @@ const ALLOWED_SETTING_KEYS = new Set([
   'proxy_url', 'proxy_enabled',
   // Meeting templates (v1.3.0)
   'meeting_auto_detect_enabled', 'meeting_default_template',
+  // Meeting recording / Granola mode (v1.5.0)
+  'meeting_audio_device', 'meeting_chunk_interval_s', 'meeting_display_name',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -69,9 +74,32 @@ export function registerIpcHandlers(): void {
     const buf = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
     return native.transcribe(buf);
   });
-  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, (_e, rawText: string) =>
-    native.polishText(rawText)
-  );
+  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, async (_e, rawText: string) => {
+    // Route through the actual LLM subprocess when available.
+    // Rust's polish_text() is a stub (returns input unchanged) because
+    // llama.cpp inference lives in the separate ironmic-llm binary to
+    // avoid ggml symbol collisions with whisper.cpp.
+    if (llmSubprocess.isAvailable()) {
+      // Honor user's configured LLM from settings (ai_local_model / ai_model);
+      // fall back to first downloaded if nothing is set.
+      const resolved = resolveActiveChatModel(native);
+      if (resolved) {
+        try {
+          return await llmSubprocess.chatComplete({
+            modelPath: resolved.modelPath,
+            modelType: resolved.modelType,
+            messages: [{ role: 'user', content: rawText }],
+            maxTokens: 2048,
+            temperature: 0.3,
+          });
+        } catch (err) {
+          console.error('[polishText] LLM subprocess error, falling back to stub:', err);
+        }
+      }
+    }
+    // Fallback: return unchanged (stub)
+    return native.polishText(rawText);
+  });
 
   // Entries
   ipcMain.handle(IPC_CHANNELS.CREATE_ENTRY, (_e, entry) => native.createEntry(entry));
@@ -472,6 +500,108 @@ If the text is too short or unclear, output: ["General"]`;
   });
   ipcMain.handle(IPC_CHANNELS.MEETING_SET_STRUCTURED_OUTPUT, (_event, id: string, structuredOutput: string) => {
     return native.setMeetingStructuredOutput(id, structuredOutput);
+  });
+
+  // ── Meeting Recording (Granola-style chunk loop) ──
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (_event, sessionId: string, deviceName?: string | null, chunkIntervalS?: number) => {
+    assertString(sessionId, 'sessionId');
+    return meetingRecorder.startMeetingRecording(sessionId, deviceName, chunkIntervalS ?? 30);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_STOP_RECORDING, async () => {
+    return meetingRecorder.stopMeetingRecording();
+  });
+
+  // ── Meeting Room (LAN multi-user collaboration) ──
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_HOST_START, async (_e, sessionId: string, hostName: string, templateId?: string | null) => {
+    assertString(sessionId, 'sessionId');
+    return meetingRoomServer.start({
+      sessionId,
+      hostName: hostName ?? 'Host',
+      templateId: templateId ?? null,
+    });
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_HOST_STOP, async () => {
+    await meetingRoomServer.stop();
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_HOST_INFO, async () => {
+    return meetingRoomServer.getInfo();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_JOIN, async (_e, opts: {
+    hostIp: string;
+    hostPort: number;
+    roomCode: string;
+    displayName: string;
+    deviceName?: string | null;
+  }) => {
+    assertString(opts?.hostIp, 'hostIp');
+    assertString(opts?.roomCode, 'roomCode');
+    assertString(opts?.displayName, 'displayName');
+    if (typeof opts.hostPort !== 'number') throw new Error('hostPort must be a number');
+    return meetingRoomClient.connect(opts);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_LEAVE, async () => {
+    await meetingRoomClient.disconnect();
+    return { ok: true };
+  });
+
+  // ── Transcript Segments ──
+  // These handlers fall back to in-memory storage (meetingRecorder) when the
+  // transcript_segments SQLite table is not yet available in the compiled addon.
+
+  ipcMain.handle(IPC_CHANNELS.ADD_TRANSCRIPT_SEGMENT, (_event, sessionId: string, speakerLabel: string | null, startMs: number, endMs: number, text: string, source: string) => {
+    assertString(sessionId, 'sessionId');
+    assertString(text, 'text');
+    if (typeof native.addon.addTranscriptSegment === 'function') {
+      return native.addon.addTranscriptSegment(sessionId, speakerLabel, startMs, endMs, text, source);
+    }
+    return JSON.stringify({ id: `seg-${Date.now()}`, session_id: sessionId, speaker_label: speakerLabel, start_ms: startMs, end_ms: endMs, text, source, participant_id: null, confidence: null, created_at: new Date().toISOString() });
+  });
+
+  ipcMain.handle(IPC_CHANNELS.LIST_TRANSCRIPT_SEGMENTS, (_event, sessionId: string) => {
+    assertString(sessionId, 'sessionId');
+    if (typeof native.addon.listTranscriptSegments === 'function') {
+      return native.addon.listTranscriptSegments(sessionId);
+    }
+    // Fall back to in-memory segments from the meeting recorder
+    return JSON.stringify(meetingRecorder.getSegments().filter(s => s.session_id === sessionId));
+  });
+
+  ipcMain.handle(IPC_CHANNELS.UPDATE_SEGMENT_SPEAKER, (_event, id: string, speakerLabel: string) => {
+    assertString(id, 'id');
+    assertString(speakerLabel, 'speakerLabel');
+    if (typeof native.addon.updateSegmentSpeaker === 'function') {
+      return native.addon.updateSegmentSpeaker(id, speakerLabel);
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.ASSEMBLE_FULL_TRANSCRIPT, (_event, sessionId: string) => {
+    assertString(sessionId, 'sessionId');
+    if (typeof native.addon.assembleFullTranscript === 'function') {
+      return native.addon.assembleFullTranscript(sessionId);
+    }
+    // Fall back to assembling from in-memory segments
+    return meetingRecorder.getSegments()
+      .filter(s => s.session_id === sessionId)
+      .sort((a, b) => a.start_ms - b.start_ms)
+      .map(s => s.text)
+      .join('\n\n');
+  });
+
+  ipcMain.handle(IPC_CHANNELS.START_RECORDING_FROM_DEVICE, (_event, deviceName: string) => {
+    assertString(deviceName, 'deviceName');
+    if (typeof native.addon.startRecordingFromDevice === 'function') {
+      return native.addon.startRecordingFromDevice(deviceName);
+    }
+    // Fall back to default mic
+    return native.addon.startRecording();
   });
 
   // ── Export / Sharing ──
