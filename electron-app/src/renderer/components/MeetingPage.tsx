@@ -321,58 +321,26 @@ export function MeetingPage() {
     durationSec: number,
     template: MeetingTemplate | null,
   ) => {
-    let summaryForColumn = '';
-    let finalStructured: any = null;
-    try {
-      if (template) {
-        // Structured notes via template
-        const { generateStructuredNotes: generate } = await import('../services/tfjs/MeetingTemplateEngine');
-        const structured = await generate(template, transcript);
-        if (structured) {
-          // Flatten sections into a plain-text summary for the summary column
-          summaryForColumn = structured.sections
-            .filter(s => s.content && s.content.trim() !== 'None mentioned')
-            .map(s => `## ${s.title}\n${s.content}`)
-            .join('\n\n');
-          finalStructured = {
-            ...structured,
-            processingState: 'done',
-          };
-        }
-      } else {
-        // No template — generate a plain summary via LLM, similar to regular dictation
-        const summary = await window.ironmic.polishText(
-          `Summarize the following meeting transcript in clear, concise bullet points. Include key decisions, action items, and important discussion points.\n\n${transcript}`
-        );
-        const finalSummary = summary && summary.trim().length > 0 ? summary : transcript;
-        summaryForColumn = finalSummary;
-        finalStructured = {
-          sections: [{ key: 'summary', title: 'Summary', content: finalSummary }],
-          plainSummary: finalSummary,
-          processingState: 'done',
-        };
-      }
-    } catch (err) {
-      console.error('[MeetingPage] Failed to generate structured notes:', err);
-      summaryForColumn = transcript;
-      finalStructured = {
-        sections: [{ key: 'summary', title: 'Summary', content: transcript }],
-        plainSummary: transcript,
-        processingState: 'done',
-      };
-    }
+    // Delegate to the shared summarizer so MeetingPage (initial generation) and
+    // MeetingDetailPage (regenerate) share the same echo-guardrails + chunking.
+    const { generateMeetingSummary } = await import('../services/meeting/SummaryGenerator');
+    const structured = await generateMeetingSummary(transcript, template);
 
-    // Persist structured_output with processingState='done' so the card/detail
-    // view know generation is complete.
+    // Flatten sections (or plainSummary) into the plain-text `summary` column so
+    // list views still render a preview. Skip "None mentioned" placeholders.
+    const summaryForColumn =
+      structured.plainSummary ??
+      structured.sections
+        .filter(s => s.content && s.content.trim() !== 'None mentioned')
+        .map(s => `## ${s.title}\n${s.content}`)
+        .join('\n\n');
+
     try {
-      if (finalStructured) {
-        await window.ironmic.meetingSetStructuredOutput(sessionId, JSON.stringify(finalStructured));
-      }
+      await window.ironmic.meetingSetStructuredOutput(sessionId, JSON.stringify(structured));
     } catch (err) {
       console.error('[MeetingPage] Failed to save structured output:', err);
     }
 
-    // Finalize: write summary + duration to the meeting_sessions row so it shows in history
     try {
       await window.ironmic.meetingEnd(sessionId, 1, summaryForColumn, '', durationSec, '');
     } catch (err) {
