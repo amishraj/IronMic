@@ -103,6 +103,16 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     listTranscriptSegments: () => '[]',
     updateSegmentSpeaker: () => {},
     assembleFullTranscript: () => '',
+    // Meeting session stubs — newer Rust builds add these; stubs keep the app
+    // functional when the addon hasn't been (re-)built yet.
+    createMeetingSession: () => JSON.stringify({ id: `stub-session-${Date.now()}`, created_at: new Date().toISOString() }),
+    createMeetingSessionWithTemplate: (_templateId?: string, _detectedApp?: string) => JSON.stringify({ id: `stub-session-${Date.now()}`, created_at: new Date().toISOString() }),
+    endMeetingSession: () => {},
+    getMeetingSession: () => 'null',
+    listMeetingSessions: () => '[]',
+    deleteMeetingSession: () => {},
+    setMeetingStructuredOutput: () => {},
+    setMeetingStructuredOutputJson: () => {},
   };
 }
 
@@ -149,8 +159,30 @@ export const native = {
   listMeetingTemplates(): string { return this.addon.listMeetingTemplates(); },
   updateMeetingTemplate(id: string, name: string, meetingType: string, sections: string, llmPrompt: string, displayLayout: string): void { this.addon.updateMeetingTemplate(id, name, meetingType, sections, llmPrompt, displayLayout); },
   deleteMeetingTemplate(id: string): void { this.addon.deleteMeetingTemplate(id); },
-  createMeetingSessionWithTemplate(templateId?: string, detectedApp?: string): string { return this.addon.createMeetingSessionWithTemplate(templateId, detectedApp); },
-  setMeetingStructuredOutput(id: string, structuredOutput: string): void { this.addon.setMeetingStructuredOutput(id, structuredOutput); },
+  createMeetingSessionWithTemplate(templateId?: string, detectedApp?: string): string {
+    // Prefer the richer export added in the meeting-recording POC build.
+    // Fall back to the older createMeetingSession() so the app works on any
+    // compiled addon version (e.g. a colleague whose Rust build is behind).
+    if (typeof this.addon.createMeetingSessionWithTemplate === 'function') {
+      return this.addon.createMeetingSessionWithTemplate(templateId, detectedApp);
+    }
+    console.warn('[native-bridge] createMeetingSessionWithTemplate not found — falling back to createMeetingSession()');
+    if (typeof this.addon.createMeetingSession === 'function') {
+      return this.addon.createMeetingSession();
+    }
+    // Last resort: return a stub so the UI doesn't crash
+    console.warn('[native-bridge] createMeetingSession also not found — using in-memory stub');
+    return JSON.stringify({ id: `local-${Date.now()}`, created_at: new Date().toISOString() });
+  },
+  setMeetingStructuredOutput(id: string, structuredOutput: string): void {
+    if (typeof this.addon.setMeetingStructuredOutput === 'function') {
+      this.addon.setMeetingStructuredOutput(id, structuredOutput);
+    } else if (typeof this.addon.setMeetingStructuredOutputJson === 'function') {
+      this.addon.setMeetingStructuredOutputJson(id, structuredOutput);
+    } else {
+      console.warn('[native-bridge] setMeetingStructuredOutput not found in addon — notes will not be persisted to DB');
+    }
+  },
 
   // Export / Sharing
   copyHtmlToClipboard(html: string, fallbackText: string): void { this.addon.copyHtmlToClipboard(html, fallbackText); },
