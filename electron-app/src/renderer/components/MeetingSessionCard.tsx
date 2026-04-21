@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Clock, Users, Trash2, ChevronDown, ChevronRight, Mic, Pencil, Loader2 } from 'lucide-react';
+import { Clock, Users, Trash2, ChevronDown, ChevronRight, Mic, Pencil, Loader2, FileText } from 'lucide-react';
 import { Card } from './ui';
 import { ShareMenu } from './ShareMenu';
 import { useMeetingStore } from '../stores/useMeetingStore';
@@ -21,9 +21,11 @@ interface Props {
   session: MeetingSession;
   onDelete: (id: string) => void;
   onOpen?: (id: string) => void;
+  /** Called when user clicks "Share & Collaborate" — opens detail page with collab panel. */
+  onCollaborate?: (id: string) => void;
 }
 
-export function MeetingSessionCard({ session, onDelete, onOpen }: Props) {
+export function MeetingSessionCard({ session, onDelete, onOpen, onCollaborate }: Props) {
   const [expanded, setExpanded] = useState(false);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
 
@@ -49,6 +51,12 @@ export function MeetingSessionCard({ session, onDelete, onOpen }: Props) {
 
   const isProcessing = processingMeetings.includes(session.id) || processingState === 'generating';
   const isEmpty = processingState === 'empty';
+  // Notes are "done" when the LLM finished and produced at least one section or a plainSummary.
+  const hasSummary = !!(
+    (structuredSections && structuredSections.length > 0) ||
+    session.summary
+  );
+  const hasNotes = !isProcessing && !isEmpty && processingState === 'done' && hasSummary;
 
   const defaultTitle = session.detected_app
     ? `${session.detected_app.charAt(0).toUpperCase() + session.detected_app.slice(1)} Meeting`
@@ -75,6 +83,12 @@ export function MeetingSessionCard({ session, onDelete, onOpen }: Props) {
                 <span className="flex items-center gap-1 text-[10px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded">
                   <Loader2 className="w-2.5 h-2.5 animate-spin" />
                   Processing…
+                </span>
+              )}
+              {hasNotes && (
+                <span className="flex items-center gap-1 text-[10px] text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                  <FileText className="w-2.5 h-2.5" />
+                  Notes ready
                 </span>
               )}
               {isEmpty && !isProcessing && (
@@ -105,9 +119,22 @@ export function MeetingSessionCard({ session, onDelete, onOpen }: Props) {
               <Pencil className="w-3.5 h-3.5" />
             </span>
           )}
-          <ShareMenu meetingId={session.id} text={session.summary} />
+          <ShareMenu
+            meetingId={session.id}
+            text={session.summary}
+            onCollaborate={
+              onCollaborate ? () => onCollaborate(session.id) : undefined
+            }
+          />
           <button
-            onClick={(e) => { e.stopPropagation(); onDelete(session.id); }}
+            onClick={(e) => {
+              e.stopPropagation();
+              const label = titleText || 'this meeting';
+              const ok = window.confirm(
+                `Delete "${label}"?\n\nThis will permanently remove the meeting, its transcript, and notes. This cannot be undone.`,
+              );
+              if (ok) onDelete(session.id);
+            }}
             className="p-1.5 rounded-lg text-iron-text-muted hover:text-red-400 hover:bg-red-500/10 transition-colors"
             title="Delete"
           >

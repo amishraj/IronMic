@@ -51,6 +51,9 @@ interface MeetingStore {
   segments: TranscriptSegment[];
   selectedAudioDevice: string | null;
   isGranolaRecording: boolean;
+  /** True while backend is finishing the previous recording (draining buffer + diarization).
+   *  Blocks starting a new recording until it returns to idle. */
+  isGranolaStopping: boolean;
   /** Meeting IDs that are currently generating notes in the background. */
   processingMeetings: string[];
 
@@ -68,6 +71,7 @@ interface MeetingStore {
   loadSegmentsForSession: (sessionId: string) => Promise<void>;
   setSelectedAudioDevice: (device: string | null) => void;
   setIsGranolaRecording: (recording: boolean) => void;
+  setIsGranolaStopping: (stopping: boolean) => void;
 
   markMeetingProcessing: (id: string) => void;
   unmarkMeetingProcessing: (id: string) => void;
@@ -94,6 +98,7 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   segments: [],
   selectedAudioDevice: null,
   isGranolaRecording: false,
+  isGranolaStopping: false,
   processingMeetings: [],
   ...DEFAULT_ROOM_STATE,
   roomDisplayName: 'Me',
@@ -210,6 +215,7 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   },
 
   setIsGranolaRecording: (recording) => set({ isGranolaRecording: recording }),
+  setIsGranolaStopping: (stopping) => set({ isGranolaStopping: stopping }),
 
   markMeetingProcessing: (id) =>
     set(state => state.processingMeetings.includes(id)

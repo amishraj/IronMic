@@ -179,6 +179,26 @@ export const IPC_CHANNELS = {
   // Meeting App Detection
   MEETING_APP_DETECTED: 'ironmic:meeting-app-detected',
 
+  // BlackHole detection & guided install (macOS)
+  BLACKHOLE_CHECK: 'ironmic:blackhole-check',
+  BLACKHOLE_INSTALL: 'ironmic:blackhole-install',
+  BLACKHOLE_OPEN_AUDIO_MIDI_SETUP: 'ironmic:blackhole-open-audio-midi-setup',
+  BLACKHOLE_INSTALL_PROGRESS: 'ironmic:blackhole-install-progress',   // main → renderer push
+
+  // Notes collaboration (finished meetings, LAN only)
+  MEETING_COLLAB_START: 'ironmic:meeting-collab-start',
+  MEETING_COLLAB_STOP: 'ironmic:meeting-collab-stop',
+  MEETING_COLLAB_JOIN: 'ironmic:meeting-collab-join',
+  MEETING_COLLAB_LEAVE: 'ironmic:meeting-collab-leave',
+  MEETING_COLLAB_SAVE_NOTES: 'ironmic:meeting-collab-save-notes',
+  MEETING_COLLAB_SEND_DRAFT: 'ironmic:meeting-collab-send-draft',
+  MEETING_COLLAB_NOTIFY_SAVED: 'ironmic:meeting-collab-notify-saved',
+  MEETING_COLLAB_STATE: 'ironmic:meeting-collab-state',              // main → renderer push
+  MEETING_COLLAB_NOTES_UPDATED: 'ironmic:meeting-collab-notes-updated', // main → renderer push
+  MEETING_COLLAB_DRAFT: 'ironmic:meeting-collab-draft',              // main → renderer push
+  MEETING_COLLAB_ENDED: 'ironmic:meeting-collab-ended',              // main → renderer push
+  MEETING_COLLAB_WELCOME: 'ironmic:meeting-collab-welcome',          // main → renderer push (on join)
+
   // TF.js Infrastructure
   GET_MODELS_DIR: 'ironmic:get-models-dir',
 

@@ -4,7 +4,7 @@
  */
 
 import { useState, useRef, useEffect } from 'react';
-import { Share2, FileText, FileCode, Type, Save, Check, X } from 'lucide-react';
+import { Share2, FileText, FileCode, Type, Save, Check, X, Users } from 'lucide-react';
 
 interface ShareMenuProps {
   /** Entry ID for fetching formatted content from Rust */
@@ -15,9 +15,14 @@ interface ShareMenuProps {
   text?: string;
   /** Raw transcript (used for plain text fallback) */
   rawText?: string;
+  /**
+   * Called when user chooses "Collaborate" for a meeting — navigates to the
+   * detail page and opens the collaborate panel.
+   */
+  onCollaborate?: () => void;
 }
 
-export function ShareMenu({ entryId, meetingId, text, rawText }: ShareMenuProps) {
+export function ShareMenu({ entryId, meetingId, text, rawText, onCollaborate }: ShareMenuProps) {
   const [open, setOpen] = useState(false);
   const [status, setStatus] = useState<'idle' | 'success' | 'error'>('idle');
   const menuRef = useRef<HTMLDivElement>(null);
@@ -153,6 +158,19 @@ export function ShareMenu({ entryId, meetingId, text, rawText }: ShareMenuProps)
             <Type className="w-3.5 h-3.5" />
             Copy as Plain Text
           </button>
+          {/* Collaborate option — only for meeting sessions */}
+          {meetingId && onCollaborate && (
+            <>
+              <div className="my-1 border-t border-iron-border/50" />
+              <button
+                onClick={() => { onCollaborate(); setOpen(false); }}
+                className="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-iron-accent-light hover:bg-iron-accent/10 transition-colors"
+              >
+                <Users className="w-3.5 h-3.5" />
+                Share &amp; Collaborate…
+              </button>
+            </>
+          )}
           <div className="my-1 border-t border-iron-border/50" />
           <button
             onClick={handleSaveFile}

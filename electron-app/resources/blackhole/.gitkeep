@@ -1,0 +1,10 @@
+# BlackHole 2ch bundled installer (optional)
+#
+# To enable offline BlackHole installation, download the official .pkg from:
+#   https://github.com/ExistentialAudio/BlackHole/releases/tag/v0.6.0
+#
+# Place BlackHole2ch.v0.6.0.pkg in this directory.
+# electron-builder will include it as an extraResource at build time.
+# At runtime, the app checks for this file first before downloading.
+#
+# Without the bundled pkg the app falls back to downloading from GitHub.

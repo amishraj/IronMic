@@ -14,6 +14,9 @@ import type { AIProvider } from './ai/types';
 import { meetingRecorder } from './meeting-recorder';
 import { meetingRoomServer } from './meeting-room-server';
 import { meetingRoomClient } from './meeting-room-client';
+import { meetingNotesCollabServer } from './meeting-notes-collab-server';
+import { meetingNotesCollabClient } from './meeting-notes-collab-client';
+import { checkBlackHoleInstalled, installBlackHole, openAudioMidiSetup, broadcastInstallProgress } from './blackhole-setup';
 
 // ── Input validation helpers ──
 
@@ -46,6 +49,8 @@ const ALLOWED_SETTING_KEYS = new Set([
   'meeting_auto_detect_enabled', 'meeting_default_template',
   // Meeting recording / Granola mode (v1.5.0)
   'meeting_audio_device', 'meeting_chunk_interval_s', 'meeting_display_name',
+  // Collaboration (v1.6.0)
+  'meeting_collab_display_name',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -85,13 +90,23 @@ export function registerIpcHandlers(): void {
       const resolved = resolveActiveChatModel(native);
       if (resolved) {
         try {
-          return await llmSubprocess.chatComplete({
-            modelPath: resolved.modelPath,
-            modelType: resolved.modelType,
-            messages: [{ role: 'user', content: rawText }],
-            maxTokens: 2048,
-            temperature: 0.3,
-          });
+          // Hard timeout: 5 minutes per LLM call. Without this, a hung subprocess
+          // causes note generation to block indefinitely (e.g. after app restart
+          // or if the ironmic-llm binary stalls mid-inference).
+          const LLM_TIMEOUT_MS = 5 * 60 * 1000;
+          const timeoutPromise = new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`LLM call timed out after ${LLM_TIMEOUT_MS / 1000}s`)), LLM_TIMEOUT_MS)
+          );
+          return await Promise.race([
+            llmSubprocess.chatComplete({
+              modelPath: resolved.modelPath,
+              modelType: resolved.modelType,
+              messages: [{ role: 'user', content: rawText }],
+              maxTokens: 2048,
+              temperature: 0.3,
+            }),
+            timeoutPromise,
+          ]);
         } catch (err) {
           console.error('[polishText] LLM subprocess error, falling back to stub:', err);
         }
@@ -100,6 +115,16 @@ export function registerIpcHandlers(): void {
     // Fallback: return unchanged (stub)
     return native.polishText(rawText);
   });
+
+  // ── Processing state tracking (for quit-confirmation) ──
+  // Renderer fires this when it starts/stops LLM note generation so the main
+  // process can intercept window close and warn about in-flight work.
+  let activeNotesGeneratingCount = 0;
+  ipcMain.on('ironmic:notify-processing-state', (_e, isActive: boolean) => {
+    activeNotesGeneratingCount = Math.max(0, activeNotesGeneratingCount + (isActive ? 1 : -1));
+  });
+  // Expose the counter so index.ts can read it in the before-close hook.
+  (global as any).__ironmicActiveGeneratingCount = () => activeNotesGeneratingCount;
 
   // Entries
   ipcMain.handle(IPC_CHANNELS.CREATE_ENTRY, (_e, entry) => native.createEntry(entry));
@@ -451,7 +476,7 @@ If the text is too short or unclear, output: ["General"]`;
     // Only allow opening known model download domains
     try {
       const parsed = new URL(url);
-      const allowed = ['huggingface.co', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'];
+      const allowed = ['huggingface.co', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'existential.audio'];
       if (allowed.some(d => parsed.hostname === d || parsed.hostname.endsWith('.' + d))) {
         const { shell } = require('electron');
         shell.openExternal(url);
@@ -635,6 +660,78 @@ If the text is too short or unclear, output: ["General"]`;
     if (result.canceled || !result.filePath) return false;
     await fs.promises.writeFile(result.filePath, content, 'utf-8');
     return true;
+  });
+
+  // ── BlackHole (macOS system audio capture) ──
+
+  ipcMain.handle(IPC_CHANNELS.BLACKHOLE_CHECK, async (_e, deviceListJson?: string) => {
+    return checkBlackHoleInstalled(deviceListJson);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.BLACKHOLE_INSTALL, async () => {
+    // Run installation; stream progress via push events back to renderer.
+    await installBlackHole((progress) => {
+      broadcastInstallProgress(progress);
+    });
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.BLACKHOLE_OPEN_AUDIO_MIDI_SETUP, () => {
+    openAudioMidiSetup();
+    return { ok: true };
+  });
+
+  // ── Notes Collaboration (finished meetings, LAN) ──
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_START, async (
+    _e,
+    sessionId: string,
+    hostName: string,
+    notes: string,
+    version?: number,
+  ) => {
+    assertString(sessionId, 'sessionId');
+    return meetingNotesCollabServer.start({ sessionId, hostName: hostName ?? 'Host', notes, version });
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_STOP, async () => {
+    await meetingNotesCollabServer.stop();
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_NOTIFY_SAVED, (_e, notes: string, savedBy: string) => {
+    assertString(notes, 'notes');
+    meetingNotesCollabServer.notifyNotesSaved(notes, savedBy ?? 'Host');
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_JOIN, async (_e, opts: {
+    hostIp: string;
+    hostPort: number;
+    sessionCode: string;
+    displayName: string;
+  }) => {
+    assertString(opts?.hostIp, 'hostIp');
+    assertString(opts?.sessionCode, 'sessionCode');
+    assertString(opts?.displayName, 'displayName');
+    if (typeof opts.hostPort !== 'number') throw new Error('hostPort must be a number');
+    return meetingNotesCollabClient.connect(opts);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_LEAVE, async () => {
+    await meetingNotesCollabClient.disconnect();
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_SAVE_NOTES, (_e, content: string) => {
+    assertString(content, 'content');
+    meetingNotesCollabClient.saveNotes(content);
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_SEND_DRAFT, (_e, content: string) => {
+    meetingNotesCollabClient.sendDraft(content);
+    return { ok: true };
   });
 
   console.log('[ipc-handlers] All IPC handlers registered');

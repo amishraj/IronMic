@@ -1,11 +1,13 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User } from 'lucide-react';
+import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User, Share2 } from 'lucide-react';
 import { Card, Badge, Button } from './ui';
 import { MeetingSessionCard } from './MeetingSessionCard';
 import { MeetingTemplateEditor } from './MeetingTemplateEditor';
 import { MeetingTranscriptPanel } from './MeetingTranscriptPanel';
 import { MeetingNotesPanel } from './MeetingNotesPanel';
 import { MeetingDetailPage } from './MeetingDetailPage';
+import { MeetingSharedNotesViewer } from './MeetingSharedNotesViewer';
+import type { CollabParticipant } from './MeetingCollaboratePanel';
 import { AudioModeSelector } from './AudioModeSelector';
 import { MeetingRoomPanel } from './MeetingRoomPanel';
 import { useMeetingStore } from '../stores/useMeetingStore';
@@ -21,6 +23,7 @@ export function MeetingPage() {
     segments, addSegment, clearSegments,
     selectedAudioDevice, setSelectedAudioDevice,
     isGranolaRecording, setIsGranolaRecording,
+    isGranolaStopping, setIsGranolaStopping,
     processingMeetings, markMeetingProcessing, unmarkMeetingProcessing,
     roomMode, setRoomMode, roomDisplayName, setRoomDisplayName,
     roomError, setRoomError, applyRoomState, applyParticipantUpdate, resetRoomState,
@@ -38,6 +41,21 @@ export function MeetingPage() {
   const [showEditor, setShowEditor] = useState(false);
   const [durationMs, setDurationMs] = useState(0);
   const [detailSessionId, setDetailSessionId] = useState<string | null>(null);
+  /** When set, open detail page with collab panel pre-opened (from Share icon) */
+  const [collaborateSessionId, setCollaborateSessionId] = useState<string | null>(null);
+
+  // ── Shared notes viewer (participant joining a host's notes collab) ──
+  const [sharedNotesData, setSharedNotesData] = useState<{
+    hostName: string | null;
+    notes: string;
+    participants: CollabParticipant[];
+  } | null>(null);
+
+  // Join shared notes form
+  const [joinCollabInvite, setJoinCollabInvite] = useState('');
+  const [joinCollabName, setJoinCollabName] = useState('');
+  const [joinCollabError, setJoinCollabError] = useState<string | null>(null);
+  const [joiningCollab, setJoiningCollab] = useState(false);
 
   // Granola mode — active session ID and current notes
   const [granolaSessionId, setGranolaSessionId] = useState<string | null>(null);
@@ -52,6 +70,7 @@ export function MeetingPage() {
     });
     const unsubState = window.ironmic?.onMeetingRecordingState?.((state: any) => {
       setIsGranolaRecording(state.status === 'recording');
+      setIsGranolaStopping(state.status === 'stopping');
       if (state.status === 'idle') {
         setDurationMs(0);
       }
@@ -80,10 +99,66 @@ export function MeetingPage() {
     };
   }, []);
 
-  // ── Legacy ambient meeting detector ──
+  // ── Load saved collab display name ──
+  useEffect(() => {
+    window.ironmic?.getSetting?.('meeting_collab_display_name')
+      .then((v) => { if (v) setJoinCollabName(v); })
+      .catch(() => {});
+  }, []);
+
+  // ── Join shared notes handler ──
+  const parseCollabInvite = (raw: string): { ip: string; port: number; code: string } | null => {
+    const parts = raw.trim().split(/[|\s]+/).filter(Boolean);
+    if (parts.length < 2) return null;
+    const [addr, code] = parts;
+    const [ip, portStr] = addr.split(':');
+    const port = Number(portStr);
+    if (!ip || !Number.isFinite(port) || port <= 0 || !code) return null;
+    return { ip, port, code: code.toUpperCase() };
+  };
+
+  const handleJoinSharedNotes = useCallback(async () => {
+    const parsed = parseCollabInvite(joinCollabInvite);
+    if (!parsed) {
+      setJoinCollabError('Invalid invite string. Expected format: 192.168.x.x:PORT|CODE');
+      return;
+    }
+    const displayName = joinCollabName.trim() || 'Viewer';
+    setJoinCollabError(null);
+    setJoiningCollab(true);
+    try {
+      // Persist display name
+      window.ironmic?.setSetting?.('meeting_collab_display_name', displayName).catch(() => {});
+      const result = await window.ironmic.meetingCollabJoin({
+        hostIp: parsed.ip,
+        hostPort: parsed.port,
+        sessionCode: parsed.code,
+        displayName,
+      });
+      const { info, notes } = result as any;
+      setSharedNotesData({
+        hostName: info?.hostName ?? null,
+        notes: notes ?? '',
+        participants: info?.participants ?? [],
+      });
+      setJoinCollabInvite('');
+    } catch (err: any) {
+      setJoinCollabError(err?.message ?? 'Could not connect to shared session');
+    } finally {
+      setJoiningCollab(false);
+    }
+  }, [joinCollabInvite, joinCollabName]);
+
+  // ── Legacy ambient meeting detector + startup recovery ──
   useEffect(() => {
     loadTemplates();
-    loadSessions();
+    // Load sessions, then check for any stuck in 'generating' state and retry them
+    loadSessions().then(() => {
+      // Short delay so the sessions state has been set by loadSessions()
+      setTimeout(() => {
+        void recoverStuckSessions();
+      }, 2000);
+    });
 
     const unsub = meetingDetector.onStateChange((state) => {
       setMeetingState(state);
@@ -96,6 +171,7 @@ export function MeetingPage() {
     window.ironmic?.onMeetingAppDetected?.(handleDetection);
 
     return () => { unsub(); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Live duration counter (Granola mode)
@@ -127,6 +203,14 @@ export function MeetingPage() {
 
   // ── Granola mode start ──
   const handleGranolaStart = useCallback(async () => {
+    // Defensive guard: if the previous recording is still wrapping up, the
+    // backend will reject startRecording with "already active". Abort early
+    // with a clear message so the renderer console doesn't show a cryptic
+    // IPC error.
+    if (isGranolaStopping || isGranolaRecording) {
+      console.warn('[MeetingPage] Cannot start — previous recording still finalizing');
+      return;
+    }
     try {
       clearSegments();
       setGranolaStructuredOutput(null);
@@ -165,7 +249,7 @@ export function MeetingPage() {
     } catch (err) {
       console.error('[MeetingPage] Failed to start Granola recording:', err);
     }
-  }, [selectedTemplate, detectedApp, selectedAudioDevice, roomMode, roomDisplayName]);
+  }, [selectedTemplate, detectedApp, selectedAudioDevice, roomMode, roomDisplayName, isGranolaStopping, isGranolaRecording]);
 
   // ── Join an existing room ──
   const parseInvite = (raw: string): { ip: string; port: number; code: string } | null => {
@@ -244,6 +328,10 @@ export function MeetingPage() {
     //    instead of a blank gap. Also seed an optimistic structured_output so
     //    the card is rendered even before loadSessions() completes.
     markMeetingProcessing(sessionId);
+    // Also flag the recorder as stopping right away (synchronously) so the
+    // "Start Meeting" button disables immediately — we don't want to wait
+    // for the backend 'stopping' state push, which can race with a fast click.
+    setIsGranolaStopping(true);
     try {
       // Optimistic: ensure an entry exists in the sessions list right now.
       // The session was already created in startGranolaRecording, so just
@@ -306,6 +394,14 @@ export function MeetingPage() {
         }
 
         await generateStructuredNotes(sessionId, fullTranscript, durationSec, templateSnapshot);
+
+        // After notes are generated: if this was a hosted room, automatically open
+        // the detail page with the Collaborate panel pre-opened. The host's
+        // participants are already present on the LAN and are waiting to review/edit
+        // the notes — this shortcut saves them having to navigate to the Share menu.
+        if (roomModeSnapshot === 'host') {
+          setCollaborateSessionId(sessionId);
+        }
       } catch (err) {
         console.error('[MeetingPage] Background stop pipeline failed:', err);
       } finally {
@@ -321,30 +417,122 @@ export function MeetingPage() {
     durationSec: number,
     template: MeetingTemplate | null,
   ) => {
-    // Delegate to the shared summarizer so MeetingPage (initial generation) and
-    // MeetingDetailPage (regenerate) share the same echo-guardrails + chunking.
-    const { generateMeetingSummary } = await import('../services/meeting/SummaryGenerator');
-    const structured = await generateMeetingSummary(transcript, template);
-
-    // Flatten sections (or plainSummary) into the plain-text `summary` column so
-    // list views still render a preview. Skip "None mentioned" placeholders.
-    const summaryForColumn =
-      structured.plainSummary ??
-      structured.sections
-        .filter(s => s.content && s.content.trim() !== 'None mentioned')
-        .map(s => `## ${s.title}\n${s.content}`)
-        .join('\n\n');
-
+    // ── Step 0: Persist the transcript + processingState BEFORE calling the LLM.
+    // This is the key durability fix: if the app crashes or is closed mid-generation,
+    // the next startup can find this session, read the stored transcript, and retry.
+    // We also notify the main process so it can warn on window close.
     try {
-      await window.ironmic.meetingSetStructuredOutput(sessionId, JSON.stringify(structured));
+      await window.ironmic.meetingSetStructuredOutput(sessionId, JSON.stringify({
+        processingState: 'generating',
+        sections: [],
+        plainSummary: '',
+        // Store the raw transcript so recovery is possible on restart
+        _recoveryTranscript: transcript,
+        _recoveryTemplateId: template?.id ?? null,
+        _recoveryDurationSec: durationSec,
+      }));
     } catch (err) {
-      console.error('[MeetingPage] Failed to save structured output:', err);
+      console.error('[MeetingPage] Failed to persist recovery checkpoint:', err);
     }
+    // Tell main process we're generating (for quit-confirmation dialog)
+    window.ironmic?.notifyProcessingState?.(true);
 
     try {
-      await window.ironmic.meetingEnd(sessionId, 1, summaryForColumn, '', durationSec, '');
-    } catch (err) {
-      console.error('[MeetingPage] Failed to finalize meeting:', err);
+      // Delegate to the shared summarizer so MeetingPage (initial generation) and
+      // MeetingDetailPage (regenerate) share the same echo-guardrails + chunking.
+      const { generateMeetingSummary } = await import('../services/meeting/SummaryGenerator');
+      const structured = await generateMeetingSummary(transcript, template);
+
+      // Flatten sections (or plainSummary) into the plain-text `summary` column so
+      // list views still render a preview. Skip "None mentioned" placeholders.
+      const summaryForColumn =
+        structured.plainSummary ??
+        structured.sections
+          .filter(s => s.content && s.content.trim() !== 'None mentioned')
+          .map(s => `## ${s.title}\n${s.content}`)
+          .join('\n\n');
+
+      try {
+        await window.ironmic.meetingSetStructuredOutput(sessionId, JSON.stringify(structured));
+      } catch (err) {
+        console.error('[MeetingPage] Failed to save structured output:', err);
+      }
+
+      try {
+        await window.ironmic.meetingEnd(sessionId, 1, summaryForColumn, '', durationSec, '');
+      } catch (err) {
+        console.error('[MeetingPage] Failed to finalize meeting:', err);
+      }
+    } finally {
+      // Always release the processing-active flag so the quit guard doesn't
+      // block the user forever if generation fails or throws.
+      window.ironmic?.notifyProcessingState?.(false);
+    }
+  };
+
+  /**
+   * On mount: find any sessions whose structured_output.processingState is still
+   * 'generating' — these were interrupted mid-generation by an app crash/close.
+   * Re-trigger note generation using the transcript we saved as a recovery checkpoint.
+   */
+  const recoverStuckSessions = async () => {
+    // Re-read the latest sessions directly from DB to avoid a stale closure
+    let liveSessions: any[] = [];
+    try {
+      const raw = await window.ironmic.meetingList(50, 0);
+      liveSessions = JSON.parse(raw);
+    } catch { return; }
+
+    for (const session of liveSessions) {
+      let parsed: any = null;
+      try {
+        parsed = session.structured_output
+          ? JSON.parse(session.structured_output)
+          : null;
+      } catch { /* malformed JSON, skip */ }
+
+      if (!parsed || parsed.processingState !== 'generating') continue;
+
+      const recoveryTranscript: string | undefined = parsed._recoveryTranscript;
+      if (!recoveryTranscript || recoveryTranscript.trim().length < 20) {
+        // No stored transcript → mark empty so the session doesn't stay stuck forever
+        console.warn(`[MeetingPage] Recovery: no transcript for ${session.id}, marking empty`);
+        try {
+          await window.ironmic.meetingSetStructuredOutput(session.id, JSON.stringify({
+            processingState: 'empty',
+            sections: [],
+            plainSummary: 'Note generation was interrupted before a transcript was saved.',
+          }));
+        } catch { /* ignore */ }
+        continue;
+      }
+
+      const durationSec: number = parsed._recoveryDurationSec ?? 0;
+      const templateId: string | null = parsed._recoveryTemplateId ?? null;
+
+      console.info(`[MeetingPage] Recovery: retrying note generation for session ${session.id}`);
+      markMeetingProcessing(session.id);
+
+      // Resolve the template object if we stored a templateId
+      let templateForRecovery: MeetingTemplate | null = null;
+      if (templateId) {
+        try {
+          const raw = await window.ironmic.templateGet(templateId);
+          templateForRecovery = raw ? JSON.parse(raw) : null;
+        } catch { /* template gone, use none */ }
+      }
+
+      // Fire-and-forget the generation (same background pattern as handleGranolaStop)
+      void (async () => {
+        try {
+          await generateStructuredNotes(session.id, recoveryTranscript, durationSec, templateForRecovery);
+        } catch (err) {
+          console.error(`[MeetingPage] Recovery generation failed for ${session.id}:`, err);
+        } finally {
+          unmarkMeetingProcessing(session.id);
+          void loadSessions();
+        }
+      })();
     }
   };
 
@@ -375,13 +563,27 @@ export function MeetingPage() {
 
   const isActive = isGranolaRecording || meetingState !== 'idle';
 
-  // ── Meeting detail view (opened from history) ──
-  if (detailSessionId && !isActive) {
+  // ── Shared notes viewer (participant) ──
+  if (sharedNotesData) {
+    return (
+      <MeetingSharedNotesViewer
+        hostName={sharedNotesData.hostName}
+        initialNotes={sharedNotesData.notes}
+        participants={sharedNotesData.participants}
+        onLeave={() => setSharedNotesData(null)}
+      />
+    );
+  }
+
+  // ── Meeting detail view (opened from history, optionally with collab panel) ──
+  if ((detailSessionId || collaborateSessionId) && !isActive) {
+    const sid = collaborateSessionId ?? detailSessionId!;
     return (
       <MeetingDetailPage
-        sessionId={detailSessionId}
-        onBack={() => setDetailSessionId(null)}
+        sessionId={sid}
+        onBack={() => { setDetailSessionId(null); setCollaborateSessionId(null); }}
         onUpdated={loadSessions}
+        openCollabOnMount={collaborateSessionId !== null}
       />
     );
   }
@@ -481,8 +683,8 @@ export function MeetingPage() {
               >
                 Dismiss
               </button>
-              <Button size="sm" onClick={handleGranolaStart}>
-                Start
+              <Button size="sm" onClick={handleGranolaStart} disabled={isGranolaStopping || isGranolaRecording}>
+                {isGranolaStopping ? 'Finishing…' : 'Start'}
               </Button>
             </div>
           </div>
@@ -693,14 +895,28 @@ export function MeetingPage() {
 
           {/* Start button — only shown for solo + host modes; participant uses Join button */}
           {roomMode !== 'participant' && (
-            <Button
-              onClick={handleGranolaStart}
-              className="w-full"
-              icon={roomMode === 'host' ? <Wifi className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
-              disabled={roomMode === 'host' && (!roomDisplayName || roomDisplayName.trim().length === 0)}
-            >
-              {roomMode === 'host' ? 'Host Meeting Room' : 'Start Meeting'}
-            </Button>
+            <>
+              <Button
+                onClick={handleGranolaStart}
+                className="w-full"
+                icon={isGranolaStopping
+                  ? <span className="w-4 h-4 rounded-full border-2 border-iron-accent-light/40 border-t-iron-accent-light animate-spin" />
+                  : roomMode === 'host' ? <Wifi className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
+                disabled={
+                  isGranolaStopping
+                  || (roomMode === 'host' && (!roomDisplayName || roomDisplayName.trim().length === 0))
+                }
+              >
+                {isGranolaStopping
+                  ? 'Finishing previous meeting…'
+                  : roomMode === 'host' ? 'Host Meeting Room' : 'Start Meeting'}
+              </Button>
+              {isGranolaStopping && (
+                <p className="text-[10px] text-iron-text-muted text-center mt-1">
+                  Transcribing the last few seconds and generating notes. You can start a new meeting once this finishes.
+                </p>
+              )}
+            </>
           )}
         </div>
       )}
@@ -731,6 +947,50 @@ export function MeetingPage() {
         </Card>
       )}
 
+      {/* Join Shared Notes section */}
+      <div className="border border-iron-border/60 rounded-xl p-3 space-y-2 bg-iron-surface/50">
+        <div className="flex items-center gap-2">
+          <Share2 className="w-3.5 h-3.5 text-iron-text-muted" />
+          <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
+            Join Shared Notes
+          </p>
+        </div>
+        <p className="text-[10px] text-iron-text-muted">
+          Paste an invite code from a colleague to view and edit their meeting notes.
+        </p>
+        <input
+          type="text"
+          value={joinCollabName}
+          onChange={(e) => setJoinCollabName(e.target.value)}
+          placeholder="Your display name"
+          maxLength={64}
+          className="w-full px-3 py-2 text-sm bg-iron-surface text-iron-text rounded-lg border border-iron-border focus:outline-none focus:border-iron-accent/40"
+        />
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={joinCollabInvite}
+            onChange={(e) => { setJoinCollabInvite(e.target.value); setJoinCollabError(null); }}
+            onKeyDown={(e) => e.key === 'Enter' && handleJoinSharedNotes()}
+            placeholder="192.168.x.x:PORT|CODE"
+            className="flex-1 px-3 py-2 text-xs font-mono bg-iron-surface text-iron-text rounded-lg border border-iron-border focus:outline-none focus:border-iron-accent/40"
+          />
+          <button
+            onClick={handleJoinSharedNotes}
+            disabled={joiningCollab || !joinCollabInvite.trim()}
+            className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium bg-iron-accent/10 text-iron-accent-light border border-iron-accent/20 rounded-lg hover:bg-iron-accent/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap"
+          >
+            {joiningCollab
+              ? <><span className="w-3 h-3 rounded-full border-2 border-iron-accent-light/50 border-t-iron-accent-light animate-spin" />Joining…</>
+              : <><LogIn className="w-3 h-3" />Open Notes</>
+            }
+          </button>
+        </div>
+        {joinCollabError && (
+          <p className="text-[10px] text-red-400">{joinCollabError}</p>
+        )}
+      </div>
+
       {/* Meeting history */}
       {sessions.length > 0 && (
         <div className="space-y-2">
@@ -741,6 +1001,10 @@ export function MeetingPage() {
               session={s}
               onDelete={deleteSession}
               onOpen={() => setDetailSessionId(s.id)}
+              onCollaborate={(id) => {
+                // Open the detail page with the collaborate panel pre-opened
+                setCollaborateSessionId(id);
+              }}
             />
           ))}
         </div>

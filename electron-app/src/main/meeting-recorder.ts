@@ -153,42 +153,54 @@ class MeetingRecorderManager {
       this.chunkTimer = null;
     }
 
-    // Wait for any in-flight chunk to complete before processing the final one
-    let waited = 0;
-    while (this.isProcessingChunk && waited < 10_000) {
-      await new Promise(r => setTimeout(r, 100));
-      waited += 100;
-    }
-
-    // Process the final partial chunk (whatever accumulated since last drain)
-    await this.processChunk(true /* isFinal */);
-
-    // Assemble the full transcript from in-memory segments
-    const fullTranscript = this.segments
-      .sort((a, b) => a.start_ms - b.start_ms)
-      .map(s => s.text)
-      .join('\n\n');
-
-    // Run post-meeting LLM diarization to assign speaker labels
-    if (fullTranscript && this.segments.length > 0) {
-      const labeled = await this.runDiarization(fullTranscript);
-      if (labeled) {
-        this.applyDiarizationLabels(labeled);
+    // Wrap the rest in try/finally so state ALWAYS returns to 'idle', even
+    // if the final chunk transcription, diarization, or LLM call throws.
+    // Otherwise the recorder would be stuck in 'stopping' and block future
+    // recordings with "already active".
+    try {
+      // Wait for any in-flight chunk to complete before processing the final one
+      let waited = 0;
+      while (this.isProcessingChunk && waited < 10_000) {
+        await new Promise(r => setTimeout(r, 100));
+        waited += 100;
       }
+
+      // Process the final partial chunk (whatever accumulated since last drain)
+      try { await this.processChunk(true /* isFinal */); }
+      catch (err) { console.error('[MeetingRecorder] Final chunk failed:', err); }
+
+      // Assemble the full transcript from in-memory segments
+      const fullTranscript = this.segments
+        .sort((a, b) => a.start_ms - b.start_ms)
+        .map(s => s.text)
+        .join('\n\n');
+
+      // Run post-meeting LLM diarization to assign speaker labels
+      if (fullTranscript && this.segments.length > 0) {
+        try {
+          const labeled = await this.runDiarization(fullTranscript);
+          if (labeled) this.applyDiarizationLabels(labeled);
+        } catch (err) {
+          console.error('[MeetingRecorder] Diarization failed:', err);
+        }
+      }
+
+      const finalSegments = [...this.segments];
+      return { fullTranscript, segments: finalSegments };
+    } finally {
+      // Belt-and-braces: make sure the native recorder is stopped even if we
+      // never reached the restart branch in processChunk. Ignore errors —
+      // stopRecording throws if no stream is active.
+      try { native.addon.stopRecording(); } catch { /* expected if already stopped */ }
+      this.state = {
+        status: 'idle',
+        sessionId: null,
+        startedAt: null,
+        segmentCount: 0,
+        deviceName: null,
+      };
+      this.pushStateToRenderer();
     }
-
-    const finalSegments = [...this.segments];
-
-    this.state = {
-      status: 'idle',
-      sessionId: null,
-      startedAt: null,
-      segmentCount: 0,
-      deviceName: null,
-    };
-    this.pushStateToRenderer();
-
-    return { fullTranscript, segments: finalSegments };
   }
 
   /**

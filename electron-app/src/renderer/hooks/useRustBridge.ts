@@ -195,6 +195,25 @@ declare global {
       onMeetingSegmentReady: (callback: (segment: any) => void) => () => void;
       onMeetingRecordingState: (callback: (state: any) => void) => () => void;
       onMeetingAppDetected: (callback: (event: any, data: any) => void) => () => void;
+      // BlackHole (macOS system audio)
+      blackholeCheck: (deviceListJson?: string) => Promise<'installed' | 'not_installed' | 'unsupported'>;
+      blackholeInstall: () => Promise<{ ok: boolean }>;
+      blackholeOpenAudioMidiSetup: () => Promise<{ ok: boolean }>;
+      onBlackholeInstallProgress: (callback: (p: any) => void) => () => void;
+      // Notes Collaboration
+      meetingCollabStart: (sessionId: string, hostName: string, notes: string, version?: number) => Promise<any>;
+      meetingCollabStop: () => Promise<{ ok: boolean }>;
+      meetingCollabNotifySaved: (notes: string, savedBy: string) => Promise<{ ok: boolean }>;
+      meetingCollabJoin: (opts: { hostIp: string; hostPort: number; sessionCode: string; displayName: string }) => Promise<any>;
+      meetingCollabLeave: () => Promise<{ ok: boolean }>;
+      meetingCollabSaveNotes: (content: string) => Promise<{ ok: boolean }>;
+      meetingCollabSendDraft: (content: string) => Promise<{ ok: boolean }>;
+      onMeetingCollabState: (callback: (info: any) => void) => () => void;
+      onMeetingCollabNotesUpdated: (callback: (data: any) => void) => () => void;
+      onMeetingCollabDraft: (callback: (data: any) => void) => () => void;
+      onMeetingCollabEnded: (callback: () => void) => () => void;
+      // Processing-state notification (fire-and-forget, renderer → main)
+      notifyProcessingState: (isActive: boolean) => void;
     };
   }
 }

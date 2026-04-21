@@ -291,6 +291,55 @@ const api = {
     ipcRenderer.on('ironmic:meeting-room-participant-update', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-room-participant-update', handler);
   },
+
+  // ── BlackHole (macOS system audio) ──
+  blackholeCheck: (deviceListJson?: string) =>
+    ipcRenderer.invoke('ironmic:blackhole-check', deviceListJson),
+  blackholeInstall: () => ipcRenderer.invoke('ironmic:blackhole-install'),
+  blackholeOpenAudioMidiSetup: () => ipcRenderer.invoke('ironmic:blackhole-open-audio-midi-setup'),
+  onBlackholeInstallProgress: (callback: (p: any) => void) => {
+    const handler = (_event: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:blackhole-install-progress', handler);
+    return () => ipcRenderer.removeListener('ironmic:blackhole-install-progress', handler);
+  },
+
+  // ── Processing state notifications (renderer → main, fire-and-forget) ──
+  // Called when note generation starts/ends so the main process can intercept
+  // window close and warn the user about in-flight work.
+  notifyProcessingState: (isActive: boolean) =>
+    ipcRenderer.send('ironmic:notify-processing-state', isActive),
+
+  // ── Notes Collaboration ──
+  meetingCollabStart: (sessionId: string, hostName: string, notes: string, version?: number) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-start', sessionId, hostName, notes, version),
+  meetingCollabStop: () => ipcRenderer.invoke('ironmic:meeting-collab-stop'),
+  meetingCollabNotifySaved: (notes: string, savedBy: string) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-notify-saved', notes, savedBy),
+  meetingCollabJoin: (opts: { hostIp: string; hostPort: number; sessionCode: string; displayName: string }) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-join', opts),
+  meetingCollabLeave: () => ipcRenderer.invoke('ironmic:meeting-collab-leave'),
+  meetingCollabSaveNotes: (content: string) => ipcRenderer.invoke('ironmic:meeting-collab-save-notes', content),
+  meetingCollabSendDraft: (content: string) => ipcRenderer.invoke('ironmic:meeting-collab-send-draft', content),
+  onMeetingCollabState: (callback: (info: any) => void) => {
+    const handler = (_event: any, info: any) => callback(info);
+    ipcRenderer.on('ironmic:meeting-collab-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-state', handler);
+  },
+  onMeetingCollabNotesUpdated: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-notes-updated', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-notes-updated', handler);
+  },
+  onMeetingCollabDraft: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-draft', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-draft', handler);
+  },
+  onMeetingCollabEnded: (callback: () => void) => {
+    const handler = () => callback();
+    ipcRenderer.on('ironmic:meeting-collab-ended', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-ended', handler);
+  },
 };
 
 contextBridge.exposeInMainWorld('ironmic', api);
