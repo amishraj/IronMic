@@ -24,6 +24,8 @@ export function MeetingPage() {
     selectedAudioDevice, setSelectedAudioDevice,
     isGranolaRecording, setIsGranolaRecording,
     isGranolaStopping, setIsGranolaStopping,
+    granolaSessionId, setGranolaSessionId,
+    granolaRecordingStartedAt, setGranolaRecordingStartedAt,
     processingMeetings, markMeetingProcessing, unmarkMeetingProcessing,
     roomMode, setRoomMode, roomDisplayName, setRoomDisplayName,
     roomError, setRoomError, applyRoomState, applyParticipantUpdate, resetRoomState,
@@ -57,8 +59,7 @@ export function MeetingPage() {
   const [joinCollabError, setJoinCollabError] = useState<string | null>(null);
   const [joiningCollab, setJoiningCollab] = useState(false);
 
-  // Granola mode — active session ID and current notes
-  const [granolaSessionId, setGranolaSessionId] = useState<string | null>(null);
+  // Granola mode — current notes (session ID lives in Zustand to survive tab switches)
   const [granolaStructuredOutput, setGranolaStructuredOutput] = useState<StructuredMeetingOutput | null>(null);
   const [granolaPlainSummary, setGranolaPlainSummary] = useState<string | null>(null);
   const [granolaNotesGenerating, setGranolaNotesGenerating] = useState(false);
@@ -71,8 +72,17 @@ export function MeetingPage() {
     const unsubState = window.ironmic?.onMeetingRecordingState?.((state: any) => {
       setIsGranolaRecording(state.status === 'recording');
       setIsGranolaStopping(state.status === 'stopping');
-      if (state.status === 'idle') {
+      if (state.status === 'recording') {
+        // Keep Zustand store in sync with the backend on every push event.
+        // This is the recovery path: if the component remounted (tab switch)
+        // while recording was active, the next chunk-boundary push restores
+        // granolaSessionId so the "End Meeting" button works again.
+        if (state.sessionId) setGranolaSessionId(state.sessionId);
+        if (state.startedAt) setGranolaRecordingStartedAt(state.startedAt);
+      } else if (state.status === 'idle') {
         setDurationMs(0);
+        setGranolaSessionId(null);
+        setGranolaRecordingStartedAt(null);
       }
     });
     return () => {
@@ -174,15 +184,19 @@ export function MeetingPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Live duration counter (Granola mode)
+  // Live duration counter (Granola mode).
+  // Uses granolaRecordingStartedAt from the store — not a fresh Date.now() — so
+  // the timer shows the true elapsed time after a tab switch / component remount.
   useEffect(() => {
     if (!isGranolaRecording) return;
-    const start = Date.now();
+    const startedAt = granolaRecordingStartedAt ?? Date.now();
+    // Update immediately so there's no 1-second blank on remount
+    setDurationMs(Date.now() - startedAt);
     const interval = setInterval(() => {
-      setDurationMs(Date.now() - start);
+      setDurationMs(Date.now() - startedAt);
     }, 1000);
     return () => clearInterval(interval);
-  }, [isGranolaRecording]);
+  }, [isGranolaRecording, granolaRecordingStartedAt]);
 
   // Live duration counter (legacy ambient mode)
   useEffect(() => {
@@ -224,6 +238,7 @@ export function MeetingPage() {
       );
       const session = JSON.parse(sessionJson);
       setGranolaSessionId(session.id);
+      setGranolaRecordingStartedAt(Date.now());
       setDetectedApp(null);
 
       // Start the chunk recording loop via main process
@@ -300,6 +315,7 @@ export function MeetingPage() {
       // The client manages its own local session and recorder; mirror its id
       if (info?.sessionId) {
         setGranolaSessionId(info.sessionId);
+        setGranolaRecordingStartedAt(Date.now());
       }
       // Reset form
       setJoinInviteRaw('');
@@ -343,6 +359,7 @@ export function MeetingPage() {
     //    isn't staring at a blank/stuck view while we drain the buffer +
     //    run the LLM in the background.
     setGranolaSessionId(null);
+    setGranolaRecordingStartedAt(null);
     setGranolaStructuredOutput(null);
     setGranolaPlainSummary(null);
     setGranolaNotesGenerating(false);

@@ -54,6 +54,12 @@ interface MeetingStore {
   /** True while backend is finishing the previous recording (draining buffer + diarization).
    *  Blocks starting a new recording until it returns to idle. */
   isGranolaStopping: boolean;
+  /** Active session ID — kept in Zustand (not component local state) so it survives
+   *  MeetingPage unmount when the user switches tabs mid-recording. */
+  granolaSessionId: string | null;
+  /** Unix ms timestamp when the current recording started — used by the timer so it
+   *  shows accurate elapsed time after a tab switch/remount. */
+  granolaRecordingStartedAt: number | null;
   /** Meeting IDs that are currently generating notes in the background. */
   processingMeetings: string[];
 
@@ -72,6 +78,8 @@ interface MeetingStore {
   setSelectedAudioDevice: (device: string | null) => void;
   setIsGranolaRecording: (recording: boolean) => void;
   setIsGranolaStopping: (stopping: boolean) => void;
+  setGranolaSessionId: (id: string | null) => void;
+  setGranolaRecordingStartedAt: (ts: number | null) => void;
 
   markMeetingProcessing: (id: string) => void;
   unmarkMeetingProcessing: (id: string) => void;
@@ -99,6 +107,8 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   selectedAudioDevice: null,
   isGranolaRecording: false,
   isGranolaStopping: false,
+  granolaSessionId: null,
+  granolaRecordingStartedAt: null,
   processingMeetings: [],
   ...DEFAULT_ROOM_STATE,
   roomDisplayName: 'Me',
@@ -216,6 +226,8 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
 
   setIsGranolaRecording: (recording) => set({ isGranolaRecording: recording }),
   setIsGranolaStopping: (stopping) => set({ isGranolaStopping: stopping }),
+  setGranolaSessionId: (id) => set({ granolaSessionId: id }),
+  setGranolaRecordingStartedAt: (ts) => set({ granolaRecordingStartedAt: ts }),
 
   markMeetingProcessing: (id) =>
     set(state => state.processingMeetings.includes(id)
