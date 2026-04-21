@@ -34,6 +34,17 @@ module.exports = {
       to: 'ml-models/',
       filter: ['*.tar.gz'],
     },
+    // BlackHole 2ch pkg for macOS system-audio capture (optional — if the file
+    // is absent the app downloads it at runtime from the official GitHub release).
+    // To bundle it: download BlackHole2ch.v0.6.0.pkg from
+    //   https://github.com/ExistentialAudio/BlackHole/releases/tag/v0.6.0
+    // and place it at electron-app/resources/blackhole/BlackHole2ch.v0.6.0.pkg
+    // The glob filter means electron-builder silently skips this if no .pkg exists.
+    {
+      from: 'resources/blackhole/',
+      to: 'blackhole/',
+      filter: ['*.pkg'],
+    },
   ],
   // electron-builder auto-converts icon.png to .icns (mac) and .ico (win)
   mac: {

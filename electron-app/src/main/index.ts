@@ -2,12 +2,13 @@
  * Electron main process entry point.
  */
 
-import { app, BrowserWindow, session, globalShortcut, nativeImage } from 'electron';
+import { app, BrowserWindow, session, globalShortcut, nativeImage, dialog } from 'electron';
 import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
 import { createTray, destroyTray, updateTrayState } from './tray';
 import { ensureBundledVoices, ensureBundledTFJSModels } from './model-downloader';
 import { startMeetingAppDetection } from './meeting-app-detector';
+import { meetingRecorder } from './meeting-recorder';
 
 // Set the models directory env var BEFORE the Rust addon loads.
 // In production, models go to the user's app-data directory (writable).
@@ -49,6 +50,46 @@ function createWindow(): void {
     // In production, load the built renderer
     mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   }
+
+  // Intercept window close to warn about in-progress recording or note generation.
+  // We must call event.preventDefault() synchronously and re-try the close from
+  // inside the async dialog callback — that's Electron's required pattern.
+  mainWindow.on('close', (event) => {
+    const isRecording = meetingRecorder.isActive();
+    const generatingCount: number =
+      typeof (global as any).__ironmicActiveGeneratingCount === 'function'
+        ? (global as any).__ironmicActiveGeneratingCount()
+        : 0;
+
+    if (!isRecording && generatingCount === 0) return; // nothing to warn about
+
+    event.preventDefault(); // hold the close while the dialog is shown
+
+    const lines: string[] = [];
+    if (isRecording) lines.push('• A meeting is currently being recorded.');
+    if (generatingCount > 0) lines.push(`• Meeting notes are still being generated (${generatingCount} in progress).`);
+
+    dialog.showMessageBox(mainWindow!, {
+      type: 'warning',
+      buttons: ['Quit anyway', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      title: 'IronMic — work in progress',
+      message: 'Quitting now may lose data:',
+      detail: lines.join('\n') + '\n\nQuit anyway?',
+    }).then(({ response }) => {
+      if (response === 0) {
+        // User confirmed — force close (remove this listener so it doesn't loop)
+        mainWindow?.removeAllListeners('close');
+        mainWindow?.close();
+      }
+      // Otherwise: do nothing, window stays open
+    }).catch(() => {
+      // Dialog failed (unlikely) — close anyway
+      mainWindow?.removeAllListeners('close');
+      mainWindow?.close();
+    });
+  });
 
   mainWindow.on('closed', () => {
     mainWindow = null;

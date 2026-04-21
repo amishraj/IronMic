@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, Clock, Users, ChevronDown, ChevronRight, Pencil, Save, X, Loader2, RefreshCw, History } from 'lucide-react';
+import { ArrowLeft, Clock, Users, ChevronDown, ChevronRight, Pencil, Save, X, Loader2, RefreshCw, History, Share2 } from 'lucide-react';
 import { MeetingTranscriptPanel, type TranscriptSegment } from './MeetingTranscriptPanel';
 import { MeetingNotesPanel } from './MeetingNotesPanel';
 import { MeetingRegenerateModal, type EditsDisposition } from './MeetingRegenerateModal';
 import { MeetingVersionsDrawer } from './MeetingVersionsDrawer';
+import { MeetingCollaboratePanel } from './MeetingCollaboratePanel';
 import type { MeetingTemplate, StructuredMeetingOutput } from '../services/tfjs/MeetingTemplateEngine';
 import {
   generateMeetingSummary,
@@ -29,9 +30,11 @@ interface Props {
   sessionId: string;
   onBack: () => void;
   onUpdated?: () => void;
+  /** When true, automatically open the collaborate panel (e.g. via Share icon). */
+  openCollabOnMount?: boolean;
 }
 
-export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
+export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMount }: Props) {
   const [session, setSession] = useState<MeetingSession | null>(null);
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const [transcriptOpen, setTranscriptOpen] = useState(false);
@@ -41,6 +44,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
   const [saving, setSaving] = useState(false);
   const [regenerateOpen, setRegenerateOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [collaborateOpen, setCollaborateOpen] = useState(openCollabOnMount ?? false);
   const [regenerating, setRegenerating] = useState(false);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
   const markMeetingProcessing = useMeetingStore(s => s.markMeetingProcessing);
@@ -260,7 +264,8 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       await window.ironmic.meetingSetStructuredOutput(session.id, JSON.stringify(placeholder));
       setSession({ ...session, structured_output: JSON.stringify(placeholder) });
 
-      // 3. Run the shared summarizer.
+      // 3. Run the shared summarizer (notify main process for quit-guard).
+      window.ironmic?.notifyProcessingState?.(true);
       const fresh = await generateMeetingSummary(transcript, args.template);
 
       // 4. Preserve title + carried versions in the fresh output.
@@ -298,6 +303,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
     } catch (err) {
       console.error('[MeetingDetailPage] Regenerate failed:', err);
     } finally {
+      window.ironmic?.notifyProcessingState?.(false);
       setRegenerating(false);
       unmarkMeetingProcessing(session.id);
     }
@@ -465,6 +471,21 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
             </>
           ) : (
             <>
+              {/* Collaborate button (always shown for finished meetings) */}
+              {!isProcessing && (
+                <button
+                  onClick={() => setCollaborateOpen(v => !v)}
+                  className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-lg border transition-colors ${
+                    collaborateOpen
+                      ? 'bg-iron-accent/10 text-iron-accent-light border-iron-accent/20'
+                      : 'text-iron-text-muted border-iron-border hover:bg-iron-surface-hover'
+                  }`}
+                  title="Share & Collaborate — invite others to view and edit"
+                >
+                  <Share2 className="w-3.5 h-3.5" />
+                  Collaborate
+                </button>
+              )}
               {versions.length > 0 && (
                 <button
                   onClick={() => setHistoryOpen(true)}
@@ -510,6 +531,37 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       <div className="flex-1 overflow-hidden flex flex-col">
         <div className="flex-1 overflow-y-auto">
           <div className="max-w-3xl mx-auto px-6 py-6 space-y-6">
+            {/* Collaboration panel */}
+            {collaborateOpen && !isProcessing && (
+              <MeetingCollaboratePanel
+                sessionId={session.id}
+                currentNotes={draftSummary || extractEditableSummary(session)}
+                hostName={parsedStructured?.templateName ? `Host (${parsedStructured.templateName})` : 'Host'}
+                onClose={() => setCollaborateOpen(false)}
+                onNotesUpdated={(notes, savedBy) => {
+                  // Apply notes from a participant save to our local state + DB
+                  let existing: any = {};
+                  if (session.structured_output) {
+                    try { existing = JSON.parse(session.structured_output); } catch { /* ignore */ }
+                  }
+                  const merged = {
+                    ...existing,
+                    sections: [{ key: 'summary', title: 'Summary', content: notes }],
+                    plainSummary: notes,
+                    hasUserEdits: true,
+                    collaborativeEdit: true,
+                  };
+                  const newStructured = JSON.stringify(merged);
+                  window.ironmic.meetingSetStructuredOutput(session.id, newStructured).catch(() => {});
+                  const updated = { ...session, summary: notes, structured_output: newStructured };
+                  setSession(updated);
+                  setDraftSummary(notes);
+                  patchSession(session.id, { summary: notes, structured_output: newStructured });
+                  onUpdated?.();
+                }}
+              />
+            )}
+
             {/* Notes */}
             <div>
               <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider mb-2">Notes</p>
