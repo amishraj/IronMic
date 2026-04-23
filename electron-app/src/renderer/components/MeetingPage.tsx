@@ -542,6 +542,14 @@ export function MeetingPage() {
         console.error('[MeetingPage] Background stop pipeline failed:', err);
       } finally {
         unmarkMeetingProcessing(sessionId);
+        // Always clear the recording/stopping flags here — the onMeetingRecordingState
+        // listener (which normally clears them) is tied to MeetingPage's lifecycle.
+        // If the user navigated away during processing, that listener was already
+        // cleaned up and the 'idle' push from the backend was silently dropped,
+        // leaving isGranolaStopping=true in the store forever. Clearing here is
+        // unconditionally safe because the pipeline is complete at this point.
+        setIsGranolaStopping(false);
+        setIsGranolaRecording(false);
         void loadSessions();
       }
     })();
