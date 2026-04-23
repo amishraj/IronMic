@@ -173,6 +173,20 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
     return session.summary ?? null;
   })();
 
+  /** TipTap-formatted HTML synced from the Notes page. When present, the
+   *  meeting notes panel renders this instead of plain text so the user's
+   *  formatting (bold, headings, lists, etc.) is preserved. */
+  const notesHtmlContent = (() => {
+    if (!session?.structured_output) return null;
+    try {
+      const parsed = JSON.parse(session.structured_output);
+      if (typeof parsed?.htmlContent === 'string' && parsed.htmlContent.trim()) {
+        return parsed.htmlContent as string;
+      }
+    } catch { /* ignore */ }
+    return null;
+  })();
+
   const handleSave = async () => {
     if (!session) return;
     setSaving(true);
@@ -189,6 +203,9 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
         title: draftTitle.trim(),
         sections: [{ key: 'summary', title: 'Summary', content: draftSummary }],
         plainSummary: draftSummary,
+        // Clear any formatted HTML from the Notes page — the user is now editing
+        // in the plain-text textarea, so the HTML would be stale after this save.
+        htmlContent: null,
         processingState: existing.processingState === 'empty' ? 'empty' : 'done',
         hasUserEdits: true,
       };
@@ -312,6 +329,8 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
         title: existing?.title,
         versions: carriedVersions,
         hasUserEdits: false,
+        // AI-generated output is always plain — clear any user-formatted HTML.
+        htmlContent: null,
         // Carry forward the linked notebook entry id so regen updates in place.
         notebookEntryId: (existing as any)?.notebookEntryId,
       } as StructuredOutput;
@@ -655,6 +674,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
                 <MeetingNotesPanel
                   structuredOutput={structuredOutput}
                   summary={plainSummary}
+                  htmlContent={notesHtmlContent}
                   isGenerating={false}
                 />
               )}

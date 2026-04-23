@@ -4,6 +4,9 @@ import type { StructuredMeetingOutput, StructuredSection } from '../services/tfj
 interface Props {
   structuredOutput: StructuredMeetingOutput | null;
   summary: string | null;
+  /** Formatted HTML synced from the Notes page (TipTap output). When present,
+   *  rendered instead of plain text so user formatting is preserved. */
+  htmlContent?: string | null;
   isGenerating: boolean;
 }
 
@@ -28,9 +31,9 @@ function SectionBlock({ section }: { section: StructuredSection }) {
   );
 }
 
-export function MeetingNotesPanel({ structuredOutput, summary, isGenerating }: Props) {
+export function MeetingNotesPanel({ structuredOutput, summary, htmlContent, isGenerating }: Props) {
   // Generating skeleton
-  if (isGenerating && !structuredOutput && !summary) {
+  if (isGenerating && !structuredOutput && !summary && !htmlContent) {
     return (
       <div className="space-y-5 animate-pulse">
         <div className="space-y-2">
@@ -49,6 +52,23 @@ export function MeetingNotesPanel({ structuredOutput, summary, isGenerating }: P
           <SkeletonLine width="2/3" />
           <SkeletonLine width="1/2" />
         </div>
+      </div>
+    );
+  }
+
+  // User-formatted HTML from Notes page — highest priority. Renders TipTap HTML
+  // so bold, headings, bullet lists, etc. are preserved exactly as the user set them.
+  if (htmlContent) {
+    return (
+      <div className="space-y-3">
+        {isGenerating && (
+          <p className="text-xs text-gray-400 italic">Updating notes…</p>
+        )}
+        <div
+          className="prose prose-invert prose-sm max-w-none text-iron-text leading-relaxed"
+          // htmlContent originates from TipTap on the same machine — safe to render.
+          dangerouslySetInnerHTML={{ __html: htmlContent }}
+        />
       </div>
     );
   }
