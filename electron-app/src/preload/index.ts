@@ -193,6 +193,25 @@ const api = {
     ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS),
   meetingStopRecording: () => ipcRenderer.invoke('ironmic:meeting-stop-recording'),
 
+  // ── Streaming dictation (near-real-time) ──
+  dictationStreamStart: () => ipcRenderer.invoke('ironmic:dictation-stream-start'),
+  dictationStreamStop: () => ipcRenderer.invoke('ironmic:dictation-stream-stop'),
+  onDictationStreamChunk: (callback: (payload: { index: number; text: string; isFinal: boolean }) => void) => {
+    const handler = (_e: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:dictation-stream-chunk', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-chunk', handler);
+  },
+  onDictationStreamState: (callback: (state: { status: string; startedAt: number | null; chunkCount: number }) => void) => {
+    const handler = (_e: any, s: any) => callback(s);
+    ipcRenderer.on('ironmic:dictation-stream-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-state', handler);
+  },
+  /** Notify the main-process LiveSummarizer that the user typed new notes.
+   *  Fire-and-forget — the summarizer will re-read the persisted notes and
+   *  debounce a re-summary. Caller should persist via meetingSetStructuredOutput FIRST. */
+  notifyMeetingUserNotesChanged: (sessionId: string) =>
+    ipcRenderer.send('ironmic:meeting-user-notes-changed', sessionId),
+
   // ── Meeting Room (LAN multi-user collaboration) ──
   meetingRoomHostStart: (sessionId: string, hostName: string, templateId?: string | null) =>
     ipcRenderer.invoke('ironmic:meeting-room-host-start', sessionId, hostName, templateId),
@@ -274,6 +293,17 @@ const api = {
     const handler = (_event: any, state: any) => callback(state);
     ipcRenderer.on('ironmic:meeting-recording-state', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-recording-state', handler);
+  },
+  onMeetingLiveSummary: (callback: (payload: any) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-live-summary', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-live-summary', handler);
+  },
+  /** Tray/menu/notification quick actions → renderer opens the right page and runs the action. */
+  onQuickAction: (callback: (action: 'start-dictation' | 'start-meeting') => void) => {
+    const handler = (_event: any, action: 'start-dictation' | 'start-meeting') => callback(action);
+    ipcRenderer.on('ironmic:quick-action', handler);
+    return () => ipcRenderer.removeListener('ironmic:quick-action', handler);
   },
   onMeetingAppDetected: (callback: (event: any, data: any) => void) => {
     ipcRenderer.on('ironmic:meeting-app-detected', callback);

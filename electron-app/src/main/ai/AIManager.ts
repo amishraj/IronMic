@@ -8,9 +8,10 @@ import { spawn, ChildProcess } from 'child_process';
 import { BrowserWindow } from 'electron';
 import { CopilotAdapter } from './CopilotAdapter';
 import { ClaudeAdapter } from './ClaudeAdapter';
-import { LocalLLMAdapter, getChatModelPath } from './LocalLLMAdapter';
+import { LocalLLMAdapter, getChatModelPath, resolveActiveChatModel } from './LocalLLMAdapter';
 import { llmSubprocess } from './LlmSubprocess';
 import { CHAT_LLM_MODELS } from '../../shared/constants';
+import { native } from '../native-bridge';
 import type { AIProvider, AuthStatus, AIAuthState, ChatMessage, ICLIAdapter, IAIAdapter, AIModel } from './types';
 
 const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
@@ -134,10 +135,34 @@ export class AIManager {
     window: BrowserWindow | null,
     model?: string,
   ): Promise<string> {
-    const modelId = model || 'llm';
-    const modelMeta = CHAT_LLM_MODELS.find((m) => m.id === modelId);
+    // Resolve the model ID to a LOCAL model. The renderer may pass a stale
+    // model ID here — most commonly when the user previously chose a cloud
+    // provider (e.g. 'claude-sonnet-4-20250514'), then switched to local,
+    // but the persisted `ai_model` setting still holds the cloud id. Before,
+    // we threw "Unknown local LLM model"; now we fall back to the best
+    // available local model using the same resolver the meeting + dictation
+    // pipelines use. Keeps the feature working without forcing the user to
+    // manually re-pick a model.
+    let modelMeta = model ? CHAT_LLM_MODELS.find((m) => m.id === model) : undefined;
+    let modelId = modelMeta?.id;
     if (!modelMeta) {
-      throw new Error(`Unknown local LLM model: ${modelId}`);
+      const resolved = resolveActiveChatModel(native);
+      if (!resolved) {
+        throw new Error(
+          'No local chat model is available.\n\n' +
+          'Import or download a local LLM (Mistral 7B, Llama 3.1, or Phi-3) from Settings → Models, then try again.'
+        );
+      }
+      modelId = resolved.id;
+      modelMeta = CHAT_LLM_MODELS.find((m) => m.id === modelId);
+      if (model && model !== modelId) {
+        console.info(`[AIManager] Requested model "${model}" is not a local model — falling back to "${modelId}".`);
+      }
+    }
+    if (!modelMeta || !modelId) {
+      // Should be unreachable after the resolver path above, but keep a
+      // belt-and-braces guard so TypeScript is happy.
+      throw new Error('Failed to resolve a local LLM model.');
     }
 
     if (!llmSubprocess.isAvailable()) {

@@ -7,7 +7,7 @@ import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
 import { createTray, destroyTray, updateTrayState } from './tray';
 import { ensureBundledVoices, ensureBundledTFJSModels } from './model-downloader';
-import { startMeetingAppDetection } from './meeting-app-detector';
+import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
 import { meetingRecorder } from './meeting-recorder';
 
 // Set the models directory env var BEFORE the Rust addon loads.
@@ -174,7 +174,14 @@ app.whenReady().then(() => {
     console.warn('[auto-cleanup] Failed:', err);
   }
 
-  // Start meeting app auto-detection (opt-in, checks setting)
+  // Apply the one-time migration that flips the seeded auto-detect default
+  // from 'false' to 'true' for users who never explicitly set it. Must run
+  // BEFORE startMeetingAppDetection reads the setting.
+  try { applyAutoDetectDefaultMigration(); } catch (err) {
+    console.warn('[meeting-app-detector] Migration failed (non-fatal):', err);
+  }
+
+  // Start meeting app auto-detection (default: enabled; user can disable in Settings)
   try { startMeetingAppDetection(); } catch (err) {
     console.warn('[meeting-app-detector] Failed to start:', err);
   }

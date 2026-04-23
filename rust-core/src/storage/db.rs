@@ -490,7 +490,7 @@ impl Database {
 
             -- New settings for meeting audio device selection
             INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_audio_device', '');
-            INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_chunk_interval_s', '30');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_chunk_interval_s', '15');
             INSERT OR IGNORE INTO settings (key, value) VALUES ('meeting_display_name', '');
             ",
         )

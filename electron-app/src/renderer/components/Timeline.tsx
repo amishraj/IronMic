@@ -34,7 +34,7 @@ export function Timeline() {
   const {
     entries, loading, hasMore, selectedTag,
     loadEntries, loadMore, deleteEntry, pinEntry,
-    archiveEntry, polishEntry, setSelectedTag,
+    archiveEntry, polishEntry, setSelectedTag, polishingIds,
   } = useEntryStore();
 
   const { query, setQuery, debouncedQuery } = useSearch();
@@ -142,6 +142,7 @@ export function Timeline() {
               onArchive={archiveEntry}
               onPolish={polishEntry}
               onTagClick={setSelectedTag}
+              isPolishing={polishingIds.has(row.entry.id)}
             />
           );
         })}

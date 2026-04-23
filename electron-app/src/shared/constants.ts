@@ -20,6 +20,12 @@ export const IPC_CHANNELS = {
   STOP_RECORDING: 'ironmic:stop-recording',
   IS_RECORDING: 'ironmic:is-recording',
 
+  // Streaming dictation (chunked near-real-time transcription)
+  DICTATION_STREAM_START: 'ironmic:dictation-stream-start',
+  DICTATION_STREAM_STOP: 'ironmic:dictation-stream-stop',
+  DICTATION_STREAM_CHUNK: 'ironmic:dictation-stream-chunk',    // main → renderer push
+  DICTATION_STREAM_STATE: 'ironmic:dictation-stream-state',    // main → renderer push
+
   // Transcription
   TRANSCRIBE: 'ironmic:transcribe',
   POLISH_TEXT: 'ironmic:polish-text',
@@ -128,6 +134,8 @@ export const IPC_CHANNELS = {
   MEETING_STOP_RECORDING: 'ironmic:meeting-stop-recording',
   MEETING_SEGMENT_READY: 'ironmic:meeting-segment-ready',      // main → renderer push
   MEETING_RECORDING_STATE: 'ironmic:meeting-recording-state',  // main → renderer push
+  MEETING_LIVE_SUMMARY: 'ironmic:meeting-live-summary',        // main → renderer push (incremental notes)
+  MEETING_USER_NOTES_CHANGED: 'ironmic:meeting-user-notes-changed', // renderer → main (fire-and-forget)
   START_RECORDING_FROM_DEVICE: 'ironmic:start-recording-from-device',
   DRAIN_RECORDING_BUFFER: 'ironmic:drain-recording-buffer',
 

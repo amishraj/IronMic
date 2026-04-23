@@ -19,6 +19,7 @@ import { GpuPrompt } from './GpuPrompt';
 import { SessionLock } from './SessionLock';
 import { ToastContainer } from './Toast';
 import { useRecordingStore } from '../stores/useRecordingStore';
+import { useDictationStore } from '../stores/useDictationStore';
 import { useSettingsStore } from '../stores/useSettingsStore';
 import { useEntryStore } from '../stores/useEntryStore';
 import { useToastStore } from '../stores/useToastStore';
@@ -42,9 +43,11 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'home', label: 'Home', icon: Home, section: 'core' },
   { id: 'main', label: 'Timeline', icon: List, section: 'core' },
   { id: 'ai', label: 'AI Assistant', icon: Sparkles, section: 'core' },
-  { id: 'dictate', label: 'Dictate', icon: PenTool, section: 'tools' },
-  { id: 'listen', label: 'Listen', icon: Volume2, section: 'tools' },
+  // Notes = the canonical dictation-integrated note page (renders DictatePage).
+  // The standalone "Dictate" nav item was removed because it pointed at the
+  // same workflow with a confusingly different label.
   { id: 'notes', label: 'Notes', icon: StickyNote, section: 'tools' },
+  { id: 'listen', label: 'Listen', icon: Volume2, section: 'tools' },
   { id: 'search', label: 'Search', icon: Search, section: 'tools' },
   { id: 'analytics', label: 'Analytics', icon: BarChart3, section: 'tools' },
   { id: 'meetings', label: 'Meetings', icon: Users, section: 'tools' },
@@ -57,7 +60,7 @@ export function Layout() {
   const [sessionTimeout, setSessionTimeout] = useState('off');
   const [micVisualState, setMicVisualState] = useState<'idle' | 'recording' | 'processing' | 'success'>('idle');
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const { handleHotkeyPress, state: recordingState } = useRecordingStore();
+  const { state: recordingState } = useRecordingStore();
   const isGranolaRecording = useMeetingStore(s => s.isGranolaRecording);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
   const { loadSettings, aiEnabled } = useSettingsStore();
@@ -74,11 +77,22 @@ export function Layout() {
   }, []);
 
   const handleRecord = useCallback(() => {
-    const source = pageRef.current === 'ai' ? 'ai-chat'
-      : pageRef.current === 'dictate' ? 'dictate'
-      : undefined;
-    handleHotkeyPress(source);
-  }, [handleHotkeyPress]);
+    const currentPage = pageRef.current;
+
+    if (currentPage === 'notes' || currentPage === 'dictate') {
+      // Already on the notes page — toggle dictation via the event bus that
+      // DictatePage listens to. handleDictateToggle handles start/stop itself.
+      window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+      return;
+    }
+
+    // From any other page: set a flag in the dictation store that DictatePage
+    // reads on mount and auto-starts recording. This avoids the race between
+    // a setTimeout-dispatched event and the component's useEffect registering
+    // its listener — the flag persists in the store until consumed.
+    useDictationStore.setState({ pendingQuickStart: true });
+    setPage('notes');
+  }, []);
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
 
@@ -184,12 +198,36 @@ export function Layout() {
   useEffect(() => {
     const handler = (e: Event) => {
       const target = (e as CustomEvent).detail as string;
-      if (['home', 'main', 'ai', 'dictate', 'listen', 'notes', 'search', 'analytics', 'settings'].includes(target)) {
+      if (['home', 'main', 'ai', 'dictate', 'listen', 'notes', 'search', 'analytics', 'meetings', 'settings'].includes(target)) {
         setPage(target as Page);
       }
     };
     window.addEventListener('ironmic:navigate', handler);
     return () => window.removeEventListener('ironmic:navigate', handler);
+  }, []);
+
+  // ── Tray / notification quick actions ──
+  // Tray → Quick Start Dictation / Quick Start Meeting.
+  // We navigate to the right page first, then emit a page-specific event
+  // that the target page listens for (e.g. DictatePage auto-starts recording,
+  // MeetingPage auto-starts a meeting).
+  useEffect(() => {
+    const unsub = window.ironmic?.onQuickAction?.((action) => {
+      if (action === 'start-dictation') {
+        setPage('dictate');
+        // Fire the intent on the next tick so DictatePage has mounted and
+        // registered its listener before we dispatch.
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+        }, 60);
+      } else if (action === 'start-meeting') {
+        setPage('meetings');
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('ironmic:quick-action-meeting'));
+        }, 60);
+      }
+    });
+    return () => { try { unsub?.(); } catch { /* noop */ } };
   }, []);
 
   const handleNavigate = useCallback((p: string) => setPage(p as Page), []);
@@ -264,9 +302,12 @@ export function Layout() {
           {page === 'home' && <WelcomePage onNavigate={handleNavigate} />}
           {page === 'main' && <Timeline />}
           {page === 'ai' && <AIChat />}
+          {/* Notes IS the dictation experience — both routes render DictatePage
+              so tray quick-actions and legacy nav both land users in the
+              canonical entries-backed note surface. */}
           {page === 'dictate' && <DictatePage />}
+          {page === 'notes' && <DictatePage />}
           {page === 'listen' && <ListenPage />}
-          {page === 'notes' && <NotesPage />}
           {page === 'search' && <SearchPage />}
           {page === 'analytics' && <AnalyticsPage />}
           {page === 'meetings' && <MeetingPage />}

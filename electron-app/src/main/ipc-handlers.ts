@@ -12,6 +12,8 @@ import { getChatModelPath, resolveActiveChatModel } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
 import type { AIProvider } from './ai/types';
 import { meetingRecorder } from './meeting-recorder';
+import { liveSummarizer } from './live-summarizer';
+import { dictationStreamer } from './dictation-streamer';
 import { meetingRoomServer } from './meeting-room-server';
 import { meetingRoomClient } from './meeting-room-client';
 import { meetingNotesCollabServer } from './meeting-notes-collab-server';
@@ -34,6 +36,7 @@ const ALLOWED_SETTING_KEYS = new Set([
   'security_clipboard_auto_clear', 'security_session_timeout',
   'security_clear_on_exit', 'security_ai_data_confirm', 'security_privacy_mode',
   'migration_tag_ai_done',
+  'migration_auto_detect_default_v2',
   'analytics_backfill_done',
   // ML Feature settings (v1.1.0)
   'vad_enabled', 'vad_sensitivity', 'vad_web_audio_enabled',
@@ -51,6 +54,8 @@ const ALLOWED_SETTING_KEYS = new Set([
   'meeting_audio_device', 'meeting_chunk_interval_s', 'meeting_display_name',
   // Collaboration (v1.6.0)
   'meeting_collab_display_name',
+  // Notebooks — JSON array of {id,name,createdAt}
+  'notebooks',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -165,7 +170,10 @@ export function registerIpcHandlers(): void {
     if (!ALLOWED_SETTING_KEYS.has(key)) {
       throw new Error(`Unknown setting key: ${key}`);
     }
-    assertMaxLength(value, MAX_SETTING_VALUE_LENGTH, 'setting value');
+    // `notebooks` stores a JSON array and can exceed the default 1KB cap as
+    // the user adds more notebooks. Give it headroom.
+    const maxLen = key === 'notebooks' ? 64_000 : MAX_SETTING_VALUE_LENGTH;
+    assertMaxLength(value, maxLen, 'setting value');
     return native.setSetting(key, value);
   });
 
@@ -531,11 +539,64 @@ If the text is too short or unclear, output: ["General"]`;
 
   ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (_event, sessionId: string, deviceName?: string | null, chunkIntervalS?: number) => {
     assertString(sessionId, 'sessionId');
-    return meetingRecorder.startMeetingRecording(sessionId, deviceName, chunkIntervalS ?? 30);
+    // If the renderer didn't pass an interval, read the user's configured value
+    // from settings; fall back to 15s. Clamp to [10, 60] — shorter hurts Whisper
+    // accuracy, longer hurts the live-summary cadence.
+    let interval = chunkIntervalS;
+    if (typeof interval !== 'number' || !Number.isFinite(interval)) {
+      try {
+        const stored = native.getSetting('meeting_chunk_interval_s');
+        const parsed = stored ? parseInt(stored, 10) : NaN;
+        interval = Number.isFinite(parsed) ? parsed : 15;
+      } catch {
+        interval = 15;
+      }
+    }
+    interval = Math.max(10, Math.min(60, Math.round(interval)));
+    await meetingRecorder.startMeetingRecording(sessionId, deviceName, interval);
+    // Kick off the live-summary stream for this session.
+    try { liveSummarizer.start(sessionId); }
+    catch (err) { console.warn('[ipc] liveSummarizer.start failed:', err); }
   });
 
   ipcMain.handle(IPC_CHANNELS.MEETING_STOP_RECORDING, async () => {
-    return meetingRecorder.stopMeetingRecording();
+    // Order matters:
+    //   1. Stop the recorder first — this processes the final chunk and
+    //      emits one last segment via the listener, which the LiveSummarizer
+    //      picks up. Also runs diarization on the transcript.
+    //   2. Flush the summarizer — waits for any in-flight pass to complete
+    //      AND does one final pass covering the last segment + user notes.
+    //   3. Only then actually stop() the summarizer (teardown).
+    const recorderResult = await meetingRecorder.stopMeetingRecording();
+    let liveSummary = '';
+    let liveInsufficient = false;
+    try {
+      const flushed = await liveSummarizer.flush();
+      liveSummary = flushed.summary;
+      liveInsufficient = flushed.insufficient;
+    } catch (err) {
+      console.warn('[ipc] liveSummarizer.flush failed:', err);
+    } finally {
+      try { liveSummarizer.stop(); } catch { /* noop */ }
+    }
+    return { ...recorderResult, liveSummary, liveInsufficient };
+  });
+
+  // ── Streaming dictation (near-real-time, chunked) ──
+  ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_START, async () => {
+    return dictationStreamer.start();
+  });
+  ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_STOP, async () => {
+    return dictationStreamer.stop();
+  });
+
+  // Fire-and-forget: renderer tells the summarizer that user notes changed.
+  // The summarizer debounces and will re-run, picking up the new notes from
+  // the DB (YourNotesPanel persists them via meetingSetStructuredOutput first).
+  ipcMain.on(IPC_CHANNELS.MEETING_USER_NOTES_CHANGED, (_e, sessionId: string) => {
+    if (typeof sessionId !== 'string' || !sessionId) return;
+    try { liveSummarizer.notifyUserNotesChanged(sessionId); }
+    catch (err) { console.warn('[ipc] notifyUserNotesChanged failed:', err); }
   });
 
   // ── Meeting Room (LAN multi-user collaboration) ──
