@@ -24,6 +24,10 @@ module.exports = {
       filter: ['**/*'],
     },
     {
+      from: `../rust-core/target/release/ironmic-llm${process.platform === 'win32' ? '.exe' : ''}`,
+      to: `ironmic-llm${process.platform === 'win32' ? '.exe' : ''}`,
+    },
+    {
       from: '../rust-core/models/voices/',
       to: 'models/voices/',
       filter: ['*.bin'],
