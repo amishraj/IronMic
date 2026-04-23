@@ -35,7 +35,7 @@ jobs:
         shell: bash
         working-directory: rust-core
         run: |
-          cargo build --release ${{ matrix.cargo-features }}
+          cargo build --release --features napi-export ${{ matrix.cargo-features }}
           echo "--- Copying native addon to ironmic-core.node ---"
           if [ "$RUNNER_OS" = "macOS" ]; then
             cp target/release/libironmic_core.dylib ironmic-core.node
@@ -45,7 +45,11 @@ jobs:
             cp target/release/ironmic_core.dll ironmic-core.node
           fi
           ls -lh ironmic-core.node
-          file ironmic-core.node
+
+      - name: Build LLM binary
+        shell: bash
+        working-directory: rust-core
+        run: cargo build --release --bin ironmic-llm --features llm-bin
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -74,6 +78,9 @@ jobs:
         run: |
           echo "=== Verifying build artifacts ==="
           ls -lh rust-core/ironmic-core.node || { echo "FATAL: ironmic-core.node missing!"; exit 1; }
+          LLM_BIN="rust-core/target/release/ironmic-llm"
+          [ "$RUNNER_OS" = "Windows" ] && LLM_BIN="${LLM_BIN}.exe"
+          ls -lh "$LLM_BIN" || { echo "FATAL: ironmic-llm binary missing!"; exit 1; }
           ls rust-core/models/voices/*.bin | wc -l | xargs -I{} echo "TTS voices: {} files"
           test -f rust-core/models/voices/af_heart.bin || { echo "FATAL: TTS voices missing!"; exit 1; }
           echo "=== All artifacts present ==="
