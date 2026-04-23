@@ -43,6 +43,17 @@ function formatBytes(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
 }
 
+/**
+ * Pull the real error text out of an IPC rejection. Electron wraps handler
+ * errors as "Error invoking remote method 'x': Error: <real message>" — the
+ * user doesn't care about the wrapper, they just need to know what broke.
+ */
+function ipcErrorMessage(err: any, fallback: string): string {
+  const raw = (err && err.message) ? String(err.message) : fallback;
+  const match = raw.match(/Error invoking remote method[^:]*:\s*(?:Error:\s*)?(.*)$/s);
+  return (match ? match[1] : raw).trim() || fallback;
+}
+
 export function ModelManager() {
   const [models, setModels] = useState<WhisperModel[]>([]);
   const [currentModel, setCurrentModel] = useState('');
@@ -106,7 +117,7 @@ export function ModelManager() {
       const downloadKey = model.id === 'large-v3-turbo' ? 'whisper' : `whisper-${model.id}`;
       await window.ironmic.downloadModel(downloadKey);
     } catch (err: any) {
-      setError(err.message || 'Download failed');
+      setError(ipcErrorMessage(err, 'Download failed'));
       setDownloading(null);
       setDownloadFailed(true);
     }
@@ -377,7 +388,7 @@ function ChatModelsSection({ refreshKey, onImported }: { refreshKey: number; onI
     try {
       await window.ironmic.downloadModel(modelId);
     } catch (err: any) {
-      setError(err.message || `Download failed for ${modelId}`);
+      setError(ipcErrorMessage(err, `Download failed for ${modelId}`));
       setDownloading(null);
       setDownloadFailed(true);
     }
@@ -500,7 +511,7 @@ function LlmModelRow({ refreshKey, onImported }: { refreshKey: number; onImporte
     try {
       await window.ironmic.downloadModel('llm');
     } catch (err: any) {
-      setError(err.message || 'Download failed');
+      setError(ipcErrorMessage(err, 'Download failed'));
       setDownloading(false);
       setDownloadFailed(true);
     }

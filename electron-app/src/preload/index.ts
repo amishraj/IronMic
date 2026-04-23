@@ -345,6 +345,8 @@ const api = {
   meetingCollabStop: () => ipcRenderer.invoke('ironmic:meeting-collab-stop'),
   meetingCollabNotifySaved: (notes: string, savedBy: string) =>
     ipcRenderer.invoke('ironmic:meeting-collab-notify-saved', notes, savedBy),
+  meetingCollabNotifyDraft: (content: string, senderName: string) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-notify-draft', content, senderName),
   meetingCollabJoin: (opts: { hostIp: string; hostPort: number; sessionCode: string; displayName: string }) =>
     ipcRenderer.invoke('ironmic:meeting-collab-join', opts),
   meetingCollabLeave: () => ipcRenderer.invoke('ironmic:meeting-collab-leave'),

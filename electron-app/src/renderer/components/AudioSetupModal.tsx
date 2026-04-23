@@ -1,13 +1,15 @@
 /**
- * AudioSetupModal — step-by-step guide for installing + configuring BlackHole 2ch
- * on macOS.
+ * AudioSetupModal — step-by-step guide for setting up system-audio capture.
  *
- * BlackHole alone is useless — it's just a virtual audio driver. To actually
- * capture system audio, the user needs to ROUTE audio into it via Audio MIDI
- * Setup. This modal walks through all three supported capture scenarios.
+ * macOS: installs BlackHole 2ch and walks the user through building an
+ * Aggregate/Multi-Output device in Audio MIDI Setup so Whisper can hear both
+ * the microphone and the other meeting participants.
  *
- * On Windows system audio can be captured natively via WASAPI loopback, so
- * this modal is macOS-only.
+ * Windows: links to VB-CABLE (the closest BlackHole equivalent) or walks the
+ * user through enabling Stereo Mix — whichever the hardware supports. We can't
+ * drive the VB-CABLE installer with a silent admin-password prompt the way we
+ * can on macOS (it's an interactive Setup.exe), so the Windows flow is a
+ * guided manual install plus a one-click link.
  */
 
 import { useState, useEffect } from 'react';
@@ -30,6 +32,7 @@ export function AudioSetupModal({ onClose, onInstalled }: Props) {
   const [progressPct, setProgressPct] = useState(0);
   const [errorMsg, setErrorMsg] = useState('');
   const [scenario, setScenario] = useState<CaptureScenario>('both');
+  const isWindows = typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('windows');
 
   useEffect(() => {
     const unsub = window.ironmic?.onBlackholeInstallProgress?.((p: any) => {
@@ -111,9 +114,17 @@ export function AudioSetupModal({ onClose, onInstalled }: Props) {
           <p className="text-[12px] text-iron-text/80 leading-relaxed">
             By default IronMic captures <strong className="text-iron-text">only your microphone</strong>.
             To transcribe other participants (in Zoom/Teams/Meet) or any other
-            system audio, you need to install <strong className="text-iron-text">BlackHole 2ch</strong>{' '}
-            — a free, open-source virtual audio driver by Existential Audio — and
-            then tell macOS to route audio through it.
+            system audio, you need a virtual audio driver that Windows or macOS
+            can route system sound through.
+            {isWindows ? (
+              <> On Windows the free <strong className="text-iron-text">VB-CABLE</strong> driver
+                (or the built-in <strong className="text-iron-text">Stereo Mix</strong>, if your
+                sound card supports it) fills that role.</>
+            ) : (
+              <> On macOS we use <strong className="text-iron-text">BlackHole 2ch</strong>,
+                a free open-source driver by Existential Audio, then route audio through
+                it via Audio MIDI Setup.</>
+            )}
           </p>
 
           {/* Scenario picker */}
@@ -155,6 +166,99 @@ export function AudioSetupModal({ onClose, onInstalled }: Props) {
                 </div>
               </div>
             </div>
+          ) : isWindows ? (
+            <>
+              {/* Step 1 — Install VB-CABLE (Windows) */}
+              <div className="rounded-lg border border-iron-border bg-iron-surface-hover/50 p-3 space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 bg-iron-accent/20 text-iron-accent-light">1</div>
+                  <p className="text-[12px] font-medium text-iron-text">Install VB-CABLE</p>
+                </div>
+                <div className="pl-7 space-y-2">
+                  <p className="text-[11px] text-iron-text-muted leading-relaxed">
+                    VB-CABLE is a free virtual audio cable that acts as a
+                    loopback input IronMic can read from. Download the installer,
+                    right-click <strong className="text-iron-text">VBCABLE_Setup_x64.exe</strong> →{' '}
+                    <strong className="text-iron-text">Run as administrator</strong>, click{' '}
+                    <strong>Install Driver</strong>, then reboot when prompted.
+                  </p>
+                  <button
+                    onClick={() => window.ironmic?.openExternal?.('https://vb-audio.com/Cable/')}
+                    className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-iron-accent/15 text-iron-accent-light border border-iron-accent/20 rounded-lg hover:bg-iron-accent/25 transition-colors"
+                  >
+                    <ExternalLink className="w-3 h-3" />
+                    Open VB-CABLE download page
+                  </button>
+                </div>
+              </div>
+
+              {/* Step 2 — Route audio (Windows) */}
+              <div className="rounded-lg border border-iron-border bg-iron-surface-hover/50 p-3 space-y-2">
+                <div className="flex items-center gap-2">
+                  <div className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 bg-iron-accent/20 text-iron-accent-light">2</div>
+                  <p className="text-[12px] font-medium text-iron-text">
+                    {scenario === 'system'
+                      ? 'Route Windows output through CABLE Input'
+                      : 'Capture mic + system audio together'}
+                  </p>
+                </div>
+                <div className="pl-7 space-y-2">
+                  {scenario === 'system' ? (
+                    <ol className="text-[11px] text-iron-text-muted leading-relaxed list-decimal pl-4 space-y-0.5">
+                      <li>Open <strong className="text-iron-text">Settings → System → Sound</strong>.</li>
+                      <li>Under <strong>Output</strong> pick{' '}
+                        <strong className="text-iron-text">CABLE Input (VB-Audio Virtual Cable)</strong>.
+                        Everything Windows plays will flow into the cable.
+                      </li>
+                      <li>To still hear audio: open <strong className="text-iron-text">Sound → More sound settings → Playback</strong>,
+                        right-click <strong>CABLE Input</strong> → <strong>Properties</strong> → <strong>Listen</strong> tab →
+                        check <strong className="text-iron-text">Listen to this device</strong> and pick your headphones/speakers.
+                      </li>
+                      <li>Back in IronMic, select{' '}
+                        <strong className="text-iron-text">CABLE Output (VB-Audio Virtual Cable)</strong> as the audio source.
+                      </li>
+                    </ol>
+                  ) : (
+                    <ol className="text-[11px] text-iron-text-muted leading-relaxed list-decimal pl-4 space-y-0.5">
+                      <li>Route system output through CABLE Input (same as the "System audio" flow above).</li>
+                      <li>
+                        In your meeting app (Zoom/Teams/Meet) set the{' '}
+                        <strong className="text-iron-text">speaker</strong> to{' '}
+                        <strong className="text-iron-text">CABLE Input</strong> — this pipes the other
+                        participants into the cable without touching the rest of Windows.
+                      </li>
+                      <li>
+                        In IronMic select <strong className="text-iron-text">CABLE Output</strong>. Your mic
+                        is mixed in automatically because the meeting app is already capturing it
+                        and IronMic records the same transcript stream.
+                      </li>
+                      <li>
+                        Prefer a single-device capture? If your sound card exposes{' '}
+                        <strong className="text-iron-text">Stereo Mix</strong> (open{' '}
+                        <strong>Sound → Recording</strong>, right-click empty space → <strong>Show Disabled Devices</strong>,
+                        enable Stereo Mix), pick it in IronMic — it captures mic + system mix in one stream and skips VB-CABLE entirely.
+                      </li>
+                    </ol>
+                  )}
+                </div>
+              </div>
+
+              {/* Step 3 — Verify (Windows) */}
+              <div className="rounded-lg border border-iron-border/50 bg-iron-surface/50 p-3 space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <div className="w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0 bg-iron-accent/20 text-iron-accent-light">3</div>
+                  <p className="text-[12px] font-medium text-iron-text">Verify the setup</p>
+                </div>
+                <div className="pl-7 space-y-1">
+                  <p className="text-[11px] text-iron-text-muted leading-relaxed">
+                    Play a short YouTube clip. You should still hear audio through your speakers
+                    (via the "Listen to this device" pass-through). Start a quick test recording in
+                    IronMic — if transcripts come back empty or repeat "Thank you." your routing didn't
+                    reach the cable; re-check the output device in Windows Sound settings.
+                  </p>
+                </div>
+              </div>
+            </>
           ) : (
             <>
               {/* Step 1 — Install BlackHole */}
@@ -338,9 +442,11 @@ export function AudioSetupModal({ onClose, onInstalled }: Props) {
         {/* Footer */}
         <div className="flex items-center justify-between gap-2 px-4 py-3 border-t border-iron-border shrink-0">
           <p className="text-[10px] text-iron-text-muted">
-            Everything stays on your machine. BlackHole is a local CoreAudio plug-in — no network.
+            {isWindows
+              ? 'Everything stays on your machine. VB-CABLE is a local WDM audio driver — no network.'
+              : 'Everything stays on your machine. BlackHole is a local CoreAudio plug-in — no network.'}
           </p>
-          {stage === 'done' || scenario === 'mic' ? (
+          {stage === 'done' || scenario === 'mic' || isWindows ? (
             <button
               onClick={handleDone}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-iron-accent/15 text-iron-accent-light border border-iron-accent/20 rounded-lg hover:bg-iron-accent/25 transition-colors shrink-0"

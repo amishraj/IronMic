@@ -158,8 +158,19 @@ async function handleRecordingAction(
         return;
       }
 
+      // If the native addon returned a stub response, Whisper was not compiled
+      // into this build. Surface a clear error so the user knows why nothing happens.
+      if (rawTranscript.trim().startsWith('[stub')) {
+        set({ state: 'idle', error: 'Whisper engine not available in this build' });
+        showErrorToast(
+          'Transcription engine missing.',
+          'This build does not include Whisper support. Reinstall the latest release from GitHub.',
+        );
+        return;
+      }
+
       // If nothing was heard, skip everything
-      if (!rawTranscript.trim() || rawTranscript.trim().startsWith('[stub')) {
+      if (!rawTranscript.trim()) {
         set({ state: 'idle', lastResult: null, error: null });
         window.dispatchEvent(new CustomEvent('ironmic:dictation-empty'));
         return;

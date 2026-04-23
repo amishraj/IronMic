@@ -163,6 +163,15 @@ class MeetingNotesCollabServerManager {
   }
 
   /**
+   * Called when the HOST is typing — broadcasts a live draft preview so
+   * participants see keystrokes in real-time without requiring an explicit save.
+   */
+  notifyDraft(content: string, hostName: string): void {
+    if (!this.isActive()) return;
+    this.broadcast({ type: 'draft', content, peerId: 'host', peerName: hostName });
+  }
+
+  /**
    * Called when the HOST saves notes locally (e.g. via the Edit UI).
    * Broadcasts the update to all connected participants so they see the
    * latest content without polling.
@@ -290,6 +299,11 @@ class MeetingNotesCollabServerManager {
 
   private persistNotes(notes: string): void {
     if (!this.sessionId) return;
+    // Generic note collab (from NotesPage) uses sessionIds prefixed with
+    // "note:<id>". Those are client-side notes stored in localStorage — the
+    // renderer handles persistence when it receives the 'saved' broadcast.
+    // Skip the meetings-DB write to avoid creating orphan meeting rows.
+    if (this.sessionId.startsWith('note:')) return;
     try {
       native.addon.meetingSetStructuredOutput(
         this.sessionId,

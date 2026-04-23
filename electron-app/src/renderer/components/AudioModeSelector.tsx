@@ -3,10 +3,12 @@
  *
  * Features:
  *  - Lists all audio input devices (via existing listAudioDevices() N-API call)
- *  - Highlights virtual/loopback devices (BlackHole, Soundflower, etc.) with a
- *    badge so users know which device captures system audio
- *  - When no virtual device is found, shows a "Set up system audio" hint that
- *    opens AudioSetupModal (macOS only; Windows has WASAPI loopback natively)
+ *  - Highlights virtual/loopback devices (BlackHole, VB-CABLE, VoiceMeeter,
+ *    Stereo Mix, Soundflower, etc.) with a badge so users know which device
+ *    captures system audio
+ *  - When no virtual/loopback device is found, shows a "Set up system audio"
+ *    hint. On macOS the modal walks the user through installing BlackHole; on
+ *    Windows it points to VB-CABLE or Stereo Mix. Linux is left alone for now.
  */
 
 import { useState, useEffect } from 'react';
@@ -21,7 +23,7 @@ interface AudioDevice {
   channels: number;
 }
 
-const VIRTUAL_RE = /blackhole|soundflower|loopback|virtual|vb.?cable|voicemeeter/i;
+const VIRTUAL_RE = /blackhole|soundflower|loopback|virtual|vb.?cable|voicemeeter|stereo\s*mix|what\s*u\s*hear/i;
 
 interface Props {
   selectedDevice: string | null;
@@ -51,7 +53,13 @@ export function AudioModeSelector({ selectedDevice, onDeviceChange }: Props) {
     : 'Default Mic';
 
   const hasVirtualDevice = devices.some(d => VIRTUAL_RE.test(d.name));
-  const isMac = navigator.userAgent.toLowerCase().includes('mac');
+  const ua = navigator.userAgent.toLowerCase();
+  const isMac = ua.includes('mac');
+  const isWindows = ua.includes('windows');
+  // Both platforms surface the same "capture everyone" flow; each OS just has a
+  // different virtual-audio driver to install (BlackHole on macOS, VB-CABLE on
+  // Windows). Linux isn't covered yet — the hint stays hidden there.
+  const showSystemAudioHint = (isMac || isWindows) && !hasVirtualDevice;
 
   const handleInstalled = () => {
     // Re-fetch device list so the new BlackHole device appears
@@ -126,8 +134,8 @@ export function AudioModeSelector({ selectedDevice, onDeviceChange }: Props) {
                   </>
                 )}
 
-                {/* macOS: suggest BlackHole if not found */}
-                {isMac && !hasVirtualDevice && (
+                {/* Suggest a virtual audio driver when none is present. */}
+                {showSystemAudioHint && (
                   <>
                     <div className="border-t border-iron-border/50 mx-2 my-0.5" />
                     <button
@@ -138,7 +146,9 @@ export function AudioModeSelector({ selectedDevice, onDeviceChange }: Props) {
                       <div>
                         <p className="text-[11px] font-medium text-amber-400">Set up system audio…</p>
                         <p className="text-[10px] text-iron-text-muted leading-snug">
-                          Install BlackHole to capture all meeting audio
+                          {isWindows
+                            ? 'Install VB-CABLE (or enable Stereo Mix) to capture everyone'
+                            : 'Install BlackHole to capture all meeting audio'}
                         </p>
                       </div>
                     </button>
@@ -190,14 +200,16 @@ export function AudioModeSelector({ selectedDevice, onDeviceChange }: Props) {
           </p>
         )}
 
-        {/* macOS: setup nudge when nothing is capturing system audio */}
-        {isMac && !hasVirtualDevice && !selectedDevice && (
+        {/* Nudge when nothing is capturing system audio */}
+        {showSystemAudioHint && !selectedDevice && (
           <button
             onClick={() => setShowSetup(true)}
             className="flex items-center gap-1.5 text-[10px] text-amber-400/80 hover:text-amber-400 transition-colors"
           >
             <AlertCircle className="w-2.5 h-2.5" />
-            Mic only — install BlackHole to capture other participants
+            {isWindows
+              ? 'Mic only — install VB-CABLE or enable Stereo Mix to capture participants'
+              : 'Mic only — install BlackHole to capture other participants'}
           </button>
         )}
       </div>

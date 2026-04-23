@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Plus, Search, StickyNote, FolderOpen, Pin, Trash2, Tag, ChevronRight,
-  BookOpen, MoreHorizontal, X, Hash, Pencil, Check,
+  BookOpen, MoreHorizontal, X, Hash, Pencil, Check, Users,
 } from 'lucide-react';
 import { Card } from './ui';
 import { useNotesStore, type Note, type Notebook } from '../stores/useNotesStore';
+import { NotesCollaborateModal } from './NotesCollaborateModal';
 
 export function NotesPage() {
   const {
@@ -22,6 +23,12 @@ export function NotesPage() {
   const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
   const [editingNotebookName, setEditingNotebookName] = useState('');
   const [tagInput, setTagInput] = useState('');
+  const [collabOpen, setCollabOpen] = useState(false);
+  const [collabActive, setCollabActive] = useState(false);
+  const [collabParticipantCount, setCollabParticipantCount] = useState(0);
+  const [collabNoteId, setCollabNoteId] = useState<string | null>(null);
+  const collabActiveRef = useRef(false);
+  const draftThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const titleRef = useRef<HTMLInputElement>(null);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -32,6 +39,56 @@ export function NotesPage() {
       titleRef.current.focus();
     }
   }, [activeNoteId]);
+
+  // Apply remote saves from participants (and live host edits) into the local note store.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
+      if (!activeNoteId) return;
+      updateNote(activeNoteId, { content: data?.notes ?? '' });
+    });
+    return () => { unsub?.(); };
+  }, [activeNoteId, updateNote]);
+
+  // Track live collab session state for the button indicator.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabState?.((info: any) => {
+      const active = info?.active ?? false;
+      setCollabActive(active);
+      collabActiveRef.current = active;
+      setCollabParticipantCount(info?.participants?.length ?? 0);
+      const sid = info?.sessionId as string | null;
+      setCollabNoteId(sid?.startsWith('note:') ? sid.slice(5) : null);
+    });
+    return () => { unsub?.(); };
+  }, []);
+
+  // Broadcast host keystrokes to participants as live draft (300 ms throttle).
+  useEffect(() => {
+    if (!collabActive || !activeNote) return;
+    if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
+    draftThrottleRef.current = setTimeout(() => {
+      const name = (() => { try { return localStorage.getItem('ironmic-collab-display-name') || 'Host'; } catch { return 'Host'; } })();
+      window.ironmic?.meetingCollabNotifySaved?.(activeNote.content, name)?.catch(() => {});
+    }, 300);
+    return () => { if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current); };
+  }, [activeNote?.content, collabActive]);
+
+  // Apply incoming draft content when we're a participant.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
+      if (collabActiveRef.current) return; // we're the host, ignore
+      if (!activeNoteId) return;
+      if (data?.content != null) updateNote(activeNoteId, { content: String(data.content) });
+    });
+    return () => { unsub?.(); };
+  }, [activeNoteId, updateNote]);
+
+  // Auto-stop when the last participant leaves while the modal is closed.
+  useEffect(() => {
+    if (!collabOpen && collabActive && collabParticipantCount === 0) {
+      window.ironmic?.meetingCollabStop?.().catch(() => {});
+    }
+  }, [collabOpen, collabActive, collabParticipantCount]);
 
   const handleCreateNotebook = () => {
     if (!newNotebookName.trim()) return;
@@ -153,13 +210,33 @@ export function NotesPage() {
                 ? notebooks.find((nb) => nb.id === activeNotebookId)?.name || 'Notes'
                 : 'All Notes'}
             </h3>
-            <button
-              onClick={() => createNote()}
-              className="p-1.5 rounded-lg bg-iron-accent/10 text-iron-accent-light hover:bg-iron-accent/20 transition-colors"
-              title="New note"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setCollabOpen(true)}
+                className={`p-1.5 rounded-lg transition-colors relative ${
+                  collabActive
+                    ? 'text-green-400 bg-green-500/10 hover:bg-green-500/20'
+                    : 'text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10'
+                }`}
+                title={collabActive
+                  ? `Live session — ${collabParticipantCount} participant${collabParticipantCount !== 1 ? 's' : ''} connected`
+                  : 'Collaborate / join a session'}
+              >
+                <Users className="w-3.5 h-3.5" />
+                {collabActive && (
+                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-green-400 border border-iron-surface animate-pulse" />
+                )}
+              </button>
+              {/* Derive lock: session running on a different note */}
+              {/* (lockIcon hidden; the note-list badge handles discoverability) */}
+              <button
+                onClick={() => createNote()}
+                className="p-1.5 rounded-lg bg-iron-accent/10 text-iron-accent-light hover:bg-iron-accent/20 transition-colors"
+                title="New note"
+              >
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-iron-text-muted" />
@@ -191,6 +268,7 @@ export function NotesPage() {
               note={note}
               active={activeNoteId === note.id}
               notebook={notebooks.find((nb) => nb.id === note.notebookId)}
+              isCollabLive={collabActive && collabNoteId === note.id}
               onClick={() => setActiveNote(note.id)}
               onDelete={() => deleteNote(note.id)}
               onPin={() => updateNote(note.id, { isPinned: !note.isPinned })}
@@ -205,13 +283,46 @@ export function NotesPage() {
           <>
             {/* Note header */}
             <div className="px-6 pt-5 pb-3 border-b border-iron-border">
-              <input
-                ref={titleRef}
-                value={activeNote.title}
-                onChange={(e) => updateNote(activeNote.id, { title: e.target.value })}
-                placeholder="Note title..."
-                className="w-full text-xl font-bold bg-transparent text-iron-text placeholder:text-iron-text-muted/50 focus:outline-none"
-              />
+              <div className="flex items-start gap-3">
+                <input
+                  ref={titleRef}
+                  value={activeNote.title}
+                  onChange={(e) => updateNote(activeNote.id, { title: e.target.value })}
+                  placeholder="Note title..."
+                  className="flex-1 text-xl font-bold bg-transparent text-iron-text placeholder:text-iron-text-muted/50 focus:outline-none"
+                />
+                {(() => {
+                  const isThisNote = !collabActive || collabNoteId === activeNote.id;
+                  const isLocked = collabActive && collabNoteId !== null && collabNoteId !== activeNote.id;
+                  return (
+                    <button
+                      onClick={() => !isLocked && setCollabOpen(true)}
+                      disabled={isLocked}
+                      title={
+                        isLocked
+                          ? 'A live session is already running on another note — end it first'
+                          : collabActive
+                          ? `Live session — ${collabParticipantCount} connected`
+                          : 'Collaborate on this note'
+                      }
+                      className={`flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium rounded-lg border transition-colors shrink-0 ${
+                        isLocked
+                          ? 'opacity-40 cursor-not-allowed bg-iron-surface border-iron-border text-iron-text-muted'
+                          : collabActive
+                          ? 'bg-green-500/10 text-green-400 border-green-500/20 hover:bg-green-500/20'
+                          : 'bg-iron-accent/10 text-iron-accent-light border-iron-accent/20 hover:bg-iron-accent/20'
+                      }`}
+                    >
+                      {collabActive && isThisNote
+                        ? <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse shrink-0" />
+                        : <Users className="w-3.5 h-3.5" />}
+                      {collabActive && isThisNote
+                        ? `Live${collabParticipantCount > 0 ? ` · ${collabParticipantCount}` : ''}`
+                        : 'Collaborate'}
+                    </button>
+                  );
+                })()}
+              </div>
               {/* Notebook selector */}
               <div className="flex items-center gap-3 mt-2">
                 <select
@@ -269,22 +380,49 @@ export function NotesPage() {
             <p className="text-xs text-iron-text-muted mt-1 max-w-[240px]">
               Select a note to view it, or create a new one to get started.
             </p>
-            <button
-              onClick={() => createNote()}
-              className="mt-4 px-4 py-2 text-xs font-medium bg-gradient-accent text-white rounded-lg hover:shadow-glow transition-all"
-            >
-              <Plus className="w-3.5 h-3.5 inline mr-1.5" />
-              New Note
-            </button>
+            <div className="mt-4 flex items-center gap-2">
+              <button
+                onClick={() => createNote()}
+                className="px-4 py-2 text-xs font-medium bg-gradient-accent text-white rounded-lg hover:shadow-glow transition-all"
+              >
+                <Plus className="w-3.5 h-3.5 inline mr-1.5" />
+                New Note
+              </button>
+              <button
+                onClick={() => setCollabOpen(true)}
+                className="px-4 py-2 text-xs font-medium bg-iron-accent/10 text-iron-accent-light border border-iron-accent/20 rounded-lg hover:bg-iron-accent/20 transition-colors"
+              >
+                <Users className="w-3.5 h-3.5 inline mr-1.5" />
+                Join a session
+              </button>
+            </div>
           </div>
         )}
       </div>
+
+      {collabOpen && (
+        <NotesCollaborateModal
+          noteId={activeNote?.id ?? null}
+          initialNotes={activeNote?.content ?? ''}
+          onNotesUpdated={(notes) => {
+            if (activeNote) updateNote(activeNote.id, { content: notes });
+          }}
+          onJoined={({ notes }) => {
+            // Land the joined content as a new local note so the viewer has
+            // something to edit; subsequent saves flow back over the socket.
+            const id = createNote();
+            updateNote(id, { title: 'Shared note', content: notes });
+          }}
+          onClose={() => setCollabOpen(false)}
+        />
+      )}
     </div>
   );
 }
 
-function NoteListItem({ note, active, notebook, onClick, onDelete, onPin }: {
-  note: Note; active: boolean; notebook?: Notebook; onClick: () => void; onDelete: () => void; onPin: () => void;
+function NoteListItem({ note, active, notebook, isCollabLive, onClick, onDelete, onPin }: {
+  note: Note; active: boolean; notebook?: Notebook; isCollabLive?: boolean;
+  onClick: () => void; onDelete: () => void; onPin: () => void;
 }) {
   const preview = note.content.slice(0, 80).replace(/\n/g, ' ') || 'Empty note';
   const time = new Date(note.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
@@ -294,7 +432,7 @@ function NoteListItem({ note, active, notebook, onClick, onDelete, onPin }: {
       onClick={onClick}
       className={`w-full text-left px-3 py-2.5 border-b border-iron-border transition-colors group ${
         active ? 'bg-iron-accent/10' : 'hover:bg-iron-surface-hover'
-      }`}
+      } ${isCollabLive ? 'border-l-2 border-l-green-500/50' : ''}`}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
@@ -303,6 +441,12 @@ function NoteListItem({ note, active, notebook, onClick, onDelete, onPin }: {
             <p className={`text-xs font-medium truncate ${active ? 'text-iron-text' : 'text-iron-text-secondary'}`}>
               {note.title || 'Untitled'}
             </p>
+            {isCollabLive && (
+              <span className="flex items-center gap-0.5 text-[9px] font-medium text-green-400 bg-green-500/10 border border-green-500/20 px-1.5 py-0.5 rounded-full shrink-0 leading-none">
+                <span className="w-1 h-1 rounded-full bg-green-400 animate-pulse" />
+                Live
+              </span>
+            )}
           </div>
           <p className="text-[11px] text-iron-text-muted truncate mt-0.5">{preview}</p>
           <div className="flex items-center gap-2 mt-1">
