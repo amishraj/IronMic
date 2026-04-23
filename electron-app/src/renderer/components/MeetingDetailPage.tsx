@@ -14,6 +14,7 @@ import {
   type VersionEntry,
 } from '../services/meeting/SummaryGenerator';
 import { useMeetingStore } from '../stores/useMeetingStore';
+import { upsertMeetingNoteEntry } from '../services/notebooks';
 
 interface MeetingSession {
   id: string;
@@ -78,23 +79,28 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
     };
 
     load();
-    // Make sure the templates list is hydrated so the regenerate modal has
-    // something to offer even if the user landed here via a deep-link.
     if (templates.length === 0) void loadTemplates();
 
-    // Poll while this meeting is still in the background-processing set.
-    // Stops polling as soon as the store unmarks the id.
     const poll = setInterval(() => {
-      if (processingMeetings.includes(sessionId)) {
-        load();
-      }
+      if (processingMeetings.includes(sessionId)) load();
     }, 2000);
+
+    // Reload the session whenever an entries-changed event fires — this covers
+    // edits made in the Notes sidebar (DictatePage dispatches entries-changed
+    // after syncing the meeting session via syncMeetingEntryToSession, so the
+    // freshly-fetched session already has the updated content).
+    const onEntriesChanged = () => {
+      if (editing) return; // don't clobber a local draft in progress
+      void load();
+    };
+    window.addEventListener('ironmic:entries-changed', onEntriesChanged);
 
     return () => {
       cancelled = true;
       clearInterval(poll);
+      window.removeEventListener('ironmic:entries-changed', onEntriesChanged);
     };
-  }, [sessionId, processingMeetings]);
+  }, [sessionId, processingMeetings, editing]);
 
   function extractEditableSummary(s: MeetingSession): string {
     if (s.structured_output) {
@@ -112,12 +118,15 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
   }
 
   function extractTitle(s: MeetingSession): string {
+    let sequence: number | null = null;
     if (s.structured_output) {
       try {
         const parsed = JSON.parse(s.structured_output);
         if (parsed.title && typeof parsed.title === 'string') return parsed.title;
+        if (typeof parsed.sequence === 'number' && parsed.sequence > 0) sequence = parsed.sequence;
       } catch { /* ignore */ }
     }
+    if (sequence != null) return `Meeting #${sequence}`;
     return s.detected_app
       ? `${s.detected_app.charAt(0).toUpperCase() + s.detected_app.slice(1)} Meeting`
       : 'Meeting';
@@ -136,6 +145,19 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
     try {
       const parsed = JSON.parse(session.structured_output);
       if (parsed.sections && !parsed.plainSummary) return parsed as StructuredMeetingOutput;
+    } catch { /* ignore */ }
+    return null;
+  })();
+
+  // User-authored notes captured during the live meeting (Your Notes panel).
+  // Kept read-only on this detail page per product spec.
+  const userNotesHtml = (() => {
+    if (!session?.structured_output) return null;
+    try {
+      const parsed = JSON.parse(session.structured_output);
+      if (typeof parsed?.userNotes === 'string' && parsed.userNotes.trim()) {
+        return parsed.userNotes as string;
+      }
     } catch { /* ignore */ }
     return null;
   })();
@@ -162,7 +184,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
       if (session.structured_output) {
         try { existing = JSON.parse(session.structured_output); } catch { /* ignore */ }
       }
-      const merged = {
+      const merged: any = {
         ...existing,
         title: draftTitle.trim(),
         sections: [{ key: 'summary', title: 'Summary', content: draftSummary }],
@@ -170,8 +192,24 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
         processingState: existing.processingState === 'empty' ? 'empty' : 'done',
         hasUserEdits: true,
       };
-      const newStructured = JSON.stringify(merged);
 
+      // Keep the Notes sidebar in sync — upsert the linked notebook entry so
+      // edits made here are immediately reflected in the Notes > Meeting Notes
+      // view. This is the same record, so updating it here is a no-op write
+      // if the text is identical.
+      try {
+        const entryId = await upsertMeetingNoteEntry({
+          existingEntryId: merged.notebookEntryId ?? null,
+          sessionId: session.id,
+          title: draftTitle.trim() || 'Meeting',
+          plainText: draftSummary,
+        });
+        merged.notebookEntryId = entryId;
+      } catch (err) {
+        console.warn('[MeetingDetailPage] Notebook sync failed:', err);
+      }
+
+      const newStructured = JSON.stringify(merged);
       await window.ironmic.meetingSetStructuredOutput(session.id, newStructured);
       await window.ironmic.meetingEnd(
         session.id,
@@ -274,14 +312,30 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
         title: existing?.title,
         versions: carriedVersions,
         hasUserEdits: false,
-      };
-      const newStructured = JSON.stringify(merged);
+        // Carry forward the linked notebook entry id so regen updates in place.
+        notebookEntryId: (existing as any)?.notebookEntryId,
+      } as StructuredOutput;
       const summaryForColumn =
         merged.plainSummary ??
         merged.sections
           .filter(s => s.content && s.content.trim() !== 'None mentioned')
           .map(s => `## ${s.title}\n${s.content}`)
           .join('\n\n');
+
+      // Upsert the Meeting Notes notebook entry for this session so the
+      // regenerated summary is reflected in the unified notes corpus.
+      try {
+        const entryId = await upsertMeetingNoteEntry({
+          existingEntryId: (merged as any).notebookEntryId ?? null,
+          sessionId: session.id,
+          title: merged.title || `Meeting ${new Date().toLocaleString()}`,
+          plainText: summaryForColumn,
+        });
+        (merged as any).notebookEntryId = entryId;
+      } catch (err) {
+        console.warn('[MeetingDetailPage] Notebook upsert failed:', err);
+      }
+      const newStructured = JSON.stringify(merged);
 
       await window.ironmic.meetingSetStructuredOutput(session.id, newStructured);
       await window.ironmic.meetingEnd(
@@ -363,6 +417,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
   const isProcessing =
     processingMeetings.includes(sessionId) || processingState === 'generating' || regenerating;
   const isEmpty = processingState === 'empty';
+  const isInsufficient = processingState === 'insufficient';
   const titleText = extractTitle(session);
 
   // ── Derived state for regenerate / history UI ──
@@ -428,6 +483,11 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
                 {isEmpty && !isProcessing && (
                   <span className="text-[10px] text-iron-text-muted bg-iron-surface-hover px-1.5 py-0.5 rounded">
                     No speech
+                  </span>
+                )}
+                {isInsufficient && !isProcessing && (
+                  <span className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded">
+                    Not enough content
                   </span>
                 )}
               </div>
@@ -578,8 +638,18 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
                   Your meeting notes are currently being processed. Please check back in a few moments — you'll be able to edit them once they're ready.
                 </div>
               ) : isEmpty ? (
-                <div className="text-sm text-iron-text-muted bg-iron-surface border border-iron-border rounded-lg px-4 py-3">
-                  No speech was detected during this recording, so no notes were generated. You can still edit the title or write notes manually by clicking Edit above.
+                <div className="text-sm text-iron-text-muted bg-iron-surface border border-iron-border rounded-lg px-4 py-3 leading-relaxed">
+                  <p className="font-medium mb-1 text-iron-text">No audio captured</p>
+                  <p>
+                    The recording didn't pick up any sound — this usually means the wrong microphone was selected, the mic was muted, or the meeting audio wasn't routed to IronMic (e.g. BlackHole not installed for system audio). You can still use <em>Edit</em> above to write notes manually.
+                  </p>
+                </div>
+              ) : isInsufficient ? (
+                <div className="text-sm text-amber-300/90 bg-amber-500/5 border border-amber-500/20 rounded-lg px-4 py-3 leading-relaxed">
+                  <p className="font-medium mb-1">Too brief to summarize</p>
+                  <p className="text-amber-300/70">
+                    Audio <em>was</em> captured, but it contained too little actual speech for the AI to produce faithful notes — we'd rather leave this blank than fabricate bullets. The raw transcript is saved below, and you can write your own notes with <em>Edit</em>.
+                  </p>
                 </div>
               ) : (
                 <MeetingNotesPanel
@@ -589,6 +659,21 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated, openCollabOnMo
                 />
               )}
             </div>
+
+            {/* User's own notes — read-only post-meeting */}
+            {userNotesHtml && (
+              <div className="border-t border-iron-border/50 pt-4">
+                <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider mb-2">
+                  Your Notes
+                </p>
+                <div
+                  className="prose prose-invert prose-sm max-w-none text-iron-text"
+                  // userNotesHtml originates from TipTap's getHTML() on the same
+                  // user's machine — never from network — so it's safe to render.
+                  dangerouslySetInnerHTML={{ __html: userNotesHtml }}
+                />
+              </div>
+            )}
 
             {/* Collapsible transcript */}
             <div className="border-t border-iron-border/50 pt-4">

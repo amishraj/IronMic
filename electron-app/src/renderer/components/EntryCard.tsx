@@ -5,7 +5,7 @@ import { PlaybackControls } from './PlaybackControls';
 import { HighlightedText } from './HighlightedText';
 import { ShareMenu } from './ShareMenu';
 import { Card } from './ui';
-import { parseTags } from '../types';
+import { parseTags, parseTitleTag } from '../types';
 import { useTtsStore } from '../stores/useTtsStore';
 import type { Entry } from '../types';
 
@@ -24,9 +24,12 @@ interface EntryCardProps {
   onArchive: (id: string, archived: boolean) => void;
   onPolish: (id: string) => void;
   onTagClick?: (tag: string) => void;
+  /** True while this entry's polish pass is running. Drives the spinner
+   *  in RawPolishedToggle. */
+  isPolishing?: boolean;
 }
 
-export function EntryCard({ entry, onDelete, onPin, onArchive, onPolish, onTagClick }: EntryCardProps) {
+export function EntryCard({ entry, onDelete, onPin, onArchive, onPolish, onTagClick, isPolishing }: EntryCardProps) {
   const [displayMode, setDisplayMode] = useState<'raw' | 'polished'>(
     entry.polishedText ? 'polished' : 'raw'
   );
@@ -39,6 +42,7 @@ export function EntryCard({ entry, onDelete, onPin, onArchive, onPolish, onTagCl
   const isThisPlaying = activeEntryId === entry.id && (ttsState === 'playing' || ttsState === 'paused');
 
   const tags = parseTags(entry.tags);
+  const noteTitle = parseTitleTag(entry.tags);
   const time = new Date(entry.createdAt).toLocaleString();
 
   const { isAi, sessionId } = parseAiSource(entry.sourceApp);
@@ -87,8 +91,15 @@ export function EntryCard({ entry, onDelete, onPin, onArchive, onPolish, onTagCl
           hasPolished={!!entry.polishedText}
           onToggle={() => setDisplayMode((m) => (m === 'raw' ? 'polished' : 'raw'))}
           onPolishNow={() => onPolish(entry.id)}
+          isPolishing={isPolishing}
         />
       </div>
+
+      {noteTitle && (
+        <div className="px-4 pt-0.5 pb-1">
+          <p className="text-sm font-semibold text-iron-text truncate">{noteTitle}</p>
+        </div>
+      )}
 
       {/* Content */}
       <div className="text-sm leading-relaxed whitespace-pre-wrap px-4 pb-3 text-iron-text">

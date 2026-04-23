@@ -145,6 +145,12 @@ declare global {
       // Meeting Recording (Granola-style chunk loop)
       meetingStartRecording: (sessionId: string, deviceName?: string | null, chunkIntervalS?: number) => Promise<void>;
       meetingStopRecording: () => Promise<any>;
+      notifyMeetingUserNotesChanged: (sessionId: string) => void;
+      // Streaming dictation (near-real-time chunked transcription)
+      dictationStreamStart: () => Promise<void>;
+      dictationStreamStop: () => Promise<{ text: string; chunkCount: number }>;
+      onDictationStreamChunk: (cb: (p: { index: number; text: string; isFinal: boolean }) => void) => () => void;
+      onDictationStreamState: (cb: (s: { status: string; startedAt: number | null; chunkCount: number }) => void) => () => void;
       // Meeting Room (LAN multi-user)
       meetingRoomHostStart: (sessionId: string, hostName: string, templateId?: string | null) => Promise<any>;
       meetingRoomHostStop: () => Promise<any>;
@@ -194,6 +200,8 @@ declare global {
       onWorkflowDiscovered: (callback: (workflow: any) => void) => () => void;
       onMeetingSegmentReady: (callback: (segment: any) => void) => () => void;
       onMeetingRecordingState: (callback: (state: any) => void) => () => void;
+      onMeetingLiveSummary: (callback: (payload: { sessionId: string; summary: string; segmentCount: number; generatedAt: number }) => void) => () => void;
+      onQuickAction: (callback: (action: 'start-dictation' | 'start-meeting') => void) => () => void;
       onMeetingAppDetected: (callback: (event: any, data: any) => void) => () => void;
       // BlackHole (macOS system audio)
       blackholeCheck: (deviceListJson?: string) => Promise<'installed' | 'not_installed' | 'unsupported'>;

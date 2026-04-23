@@ -21,6 +21,18 @@ import { native } from './native-bridge';
 import { llmSubprocess } from './ai/LlmSubprocess';
 import { resolveActiveChatModel } from './ai/LocalLLMAdapter';
 import { IPC_CHANNELS } from '../shared/constants';
+import {
+  isAudioSilent,
+  sanitizeTranscribedText,
+  transcribeWithTimeout,
+} from './transcribe-clean';
+
+/** Upper bound on how long we wait for a single Whisper transcribe call to
+ *  return before moving on. If the native call hangs (happens occasionally
+ *  with large models + GPU init), we drop the chunk rather than letting the
+ *  whole chunk loop freeze. Picked at 35s: legitimate 15s-chunk + turbo-v3
+ *  Whisper transcribe is <10s on CPU, ~2s on GPU — 35s is very generous. */
+const TRANSCRIBE_TIMEOUT_MS = 35_000;
 
 export interface TranscriptSegment {
   id: string;
@@ -56,7 +68,9 @@ Transcript:
 `;
 
 class MeetingRecorderManager {
-  private chunkIntervalMs = 30_000;
+  // Default — overridden by the startMeetingRecording IPC which reads
+  // `meeting_chunk_interval_s` from settings (default 15s, clamped 10–60s).
+  private chunkIntervalMs = 15_000;
   private chunkTimer: ReturnType<typeof setInterval> | null = null;
   private isProcessingChunk = false;
 
@@ -96,12 +110,12 @@ class MeetingRecorderManager {
    * @param deviceName Optional named audio device (e.g. "BlackHole 2ch").
    *                   Falls back to startRecording() until Rust is rebuilt with
    *                   startRecordingFromDevice().
-   * @param chunkIntervalS  Chunk interval in seconds (default 30).
+   * @param chunkIntervalS  Chunk interval in seconds (default 15).
    */
   async startMeetingRecording(
     sessionId: string,
     deviceName?: string | null,
-    chunkIntervalS = 30,
+    chunkIntervalS = 15,
   ): Promise<void> {
     if (this.state.status !== 'idle') {
       throw new Error('Meeting recording is already active');
@@ -175,17 +189,38 @@ class MeetingRecorderManager {
         .map(s => s.text)
         .join('\n\n');
 
-      // Run post-meeting LLM diarization to assign speaker labels
-      if (fullTranscript && this.segments.length > 0) {
-        try {
-          const labeled = await this.runDiarization(fullTranscript);
-          if (labeled) this.applyDiarizationLabels(labeled);
-        } catch (err) {
-          console.error('[MeetingRecorder] Diarization failed:', err);
-        }
+      const finalSegments = [...this.segments];
+
+      // Decide whether to run diarization at all. Skip when:
+      //   - there's only one distinct participant (solo recording — speaker
+      //     labels are meaningless and the LLM call just burns 10-30s)
+      //   - the transcript is short (< 400 chars — not enough for the model
+      //     to reliably discriminate speakers anyway)
+      // When we DO run diarization, we run it in the BACKGROUND — the stop
+      // handler returns immediately, so the user isn't blocked on it. The
+      // labels show up on the next detail-page load once the update finishes.
+      const uniqueParticipants = new Set(
+        finalSegments.map(s => s.participant_id || 'local'),
+      );
+      const shouldDiarize = fullTranscript.length >= 400
+        && finalSegments.length > 1
+        && uniqueParticipants.size > 1;
+
+      if (shouldDiarize) {
+        // Fire and forget. Capture the segments array explicitly so we
+        // label the RIGHT session's segments even if a new meeting starts
+        // before this completes.
+        const segmentsSnapshot = finalSegments;
+        void (async () => {
+          try {
+            const labeled = await this.runDiarization(fullTranscript);
+            if (labeled) this.applyDiarizationLabels(labeled, segmentsSnapshot);
+          } catch (err) {
+            console.error('[MeetingRecorder] Background diarization failed:', err);
+          }
+        })();
       }
 
-      const finalSegments = [...this.segments];
       return { fullTranscript, segments: finalSegments };
     } finally {
       // Belt-and-braces: make sure the native recorder is stopped even if we
@@ -251,21 +286,32 @@ class MeetingRecorderManager {
         }
       }
 
-      if (!audioBuffer || audioBuffer.length < 500) {
-        // Silence / near-empty chunk — skip transcription
+      // ── Silence / low-energy gate ──
+      // Compute RMS on the raw PCM buffer. If it's below the noise floor we
+      // skip Whisper entirely — running the model on silence is expensive
+      // AND dangerous (Whisper hallucinates "thank you", "[BLANK_AUDIO]",
+      // etc. which would then pollute the AI notes summary).
+      if (isAudioSilent(audioBuffer)) {
         return;
       }
 
-      // Transcribe the chunk using the same Whisper pipeline as regular dictation
-      let text = '';
-      try {
-        text = await native.addon.transcribe(audioBuffer);
-      } catch (err) {
-        console.error('[MeetingRecorder] Transcription error:', err);
-        return;
-      }
+      // ── Transcribe with a timeout guard ──
+      // If Whisper hangs (rare but observed on GPU init/model reload), we
+      // drop this chunk and keep recording rather than stalling the whole
+      // session. The orphan native call will eventually complete and its
+      // output is simply discarded.
+      const rawText = await transcribeWithTimeout(
+        Promise.resolve(native.addon.transcribe(audioBuffer)),
+        TRANSCRIBE_TIMEOUT_MS,
+        'MeetingRecorder.transcribe',
+      );
+      if (rawText == null) return;
 
-      if (!text || text.trim().length === 0) return;
+      // ── Text hygiene ──
+      // Strip bracket markers, collapse repetition loops, drop exact-match
+      // hallucinations. Keeps junk out of the transcript AND the AI notes.
+      const text = sanitizeTranscribedText(rawText);
+      if (!text) return;
 
       // Build the segment object and store in memory
       const segment: TranscriptSegment = {
@@ -274,7 +320,7 @@ class MeetingRecorderManager {
         speaker_label: null, // assigned post-meeting by LLM diarization
         start_ms: chunkStartMs,
         end_ms: chunkEndMs,
-        text: text.trim(),
+        text,
         source: 'meeting',
         participant_id: null,
         confidence: null,
@@ -341,9 +387,13 @@ class MeetingRecorderManager {
   }
 
   /**
-   * Parse "[Speaker N]" labels from the LLM output and update in-memory segments.
+   * Parse "[Speaker N]" labels from the LLM output and update the given
+   * segments. Takes `segments` as an explicit argument (rather than
+   * reading `this.segments`) so background diarization work started on
+   * session A doesn't corrupt session B if the user starts a new meeting
+   * before diarization completes.
    */
-  private applyDiarizationLabels(labeledTranscript: string): void {
+  private applyDiarizationLabels(labeledTranscript: string, segmentsToLabel?: TranscriptSegment[]): void {
     const speakerPattern = /\[Speaker (\d+)\][:：]?\s*([\s\S]*?)(?=\[Speaker \d+\]|$)/g;
     const labeledChunks: Array<{ label: string; text: string }> = [];
     let match: RegExpExecArray | null;
@@ -356,7 +406,8 @@ class MeetingRecorderManager {
 
     if (labeledChunks.length === 0) return;
 
-    for (const segment of this.segments) {
+    const targets = segmentsToLabel ?? this.segments;
+    for (const segment of targets) {
       const segWords = new Set(segment.text.toLowerCase().split(/\s+/).filter(w => w.length > 3));
       let bestLabel = labeledChunks[0].label;
       let bestScore = 0;

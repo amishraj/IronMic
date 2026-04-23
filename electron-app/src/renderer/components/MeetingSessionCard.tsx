@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Clock, Users, Trash2, ChevronDown, ChevronRight, Mic, Pencil, Loader2, FileText } from 'lucide-react';
 import { Card } from './ui';
 import { ShareMenu } from './ShareMenu';
+import { AddToNotebookMenu } from './AddToNotebookMenu';
 import { useMeetingStore } from '../stores/useMeetingStore';
 
 interface MeetingSession {
@@ -40,27 +41,38 @@ export function MeetingSessionCard({ session, onDelete, onOpen, onCollaborate }:
   let structuredSections: Array<{ key: string; title: string; content: string }> | null = null;
   let processingState: string | null = null;
   let customTitle: string | null = null;
+  let sequence: number | null = null;
   if (session.structured_output) {
     try {
       const parsed = JSON.parse(session.structured_output);
       structuredSections = parsed.sections || null;
       processingState = parsed.processingState ?? null;
       customTitle = parsed.title ?? null;
+      if (typeof parsed.sequence === 'number' && parsed.sequence > 0) {
+        sequence = parsed.sequence;
+      }
     } catch { /* fallback to summary */ }
   }
 
   const isProcessing = processingMeetings.includes(session.id) || processingState === 'generating';
   const isEmpty = processingState === 'empty';
+  const isInsufficient = processingState === 'insufficient';
   // Notes are "done" when the LLM finished and produced at least one section or a plainSummary.
   const hasSummary = !!(
     (structuredSections && structuredSections.length > 0) ||
     session.summary
   );
-  const hasNotes = !isProcessing && !isEmpty && processingState === 'done' && hasSummary;
+  const hasNotes = !isProcessing && !isEmpty && !isInsufficient && processingState === 'done' && hasSummary;
 
-  const defaultTitle = session.detected_app
-    ? `${session.detected_app.charAt(0).toUpperCase() + session.detected_app.slice(1)} Meeting`
-    : 'Meeting';
+  // Default title precedence (when the user hasn't set a custom title):
+  //   1. Sequential number ("Meeting #N") — stable, assigned at create time.
+  //   2. Detected meeting app (e.g. "Zoom Meeting") — for pre-sequence sessions.
+  //   3. Plain "Meeting" — last resort for older sessions missing both.
+  const defaultTitle = sequence != null
+    ? `Meeting #${sequence}`
+    : session.detected_app
+      ? `${session.detected_app.charAt(0).toUpperCase() + session.detected_app.slice(1)} Meeting`
+      : 'Meeting';
   const titleText = customTitle && customTitle.trim().length > 0 ? customTitle : defaultTitle;
 
   return (
@@ -92,8 +104,19 @@ export function MeetingSessionCard({ session, onDelete, onOpen, onCollaborate }:
                 </span>
               )}
               {isEmpty && !isProcessing && (
-                <span className="text-[10px] text-iron-text-muted bg-iron-surface-hover px-1.5 py-0.5 rounded">
-                  No speech
+                <span
+                  className="text-[10px] text-iron-text-muted bg-iron-surface-hover px-1.5 py-0.5 rounded"
+                  title="No audio was captured — check that your microphone was unmuted."
+                >
+                  No audio captured
+                </span>
+              )}
+              {isInsufficient && !isProcessing && (
+                <span
+                  className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded"
+                  title="Audio was captured but too little speech was present to summarize faithfully."
+                >
+                  Too brief to summarize
                 </span>
               )}
             </div>
@@ -118,6 +141,15 @@ export function MeetingSessionCard({ session, onDelete, onOpen, onCollaborate }:
             >
               <Pencil className="w-3.5 h-3.5" />
             </span>
+          )}
+          {hasNotes && (
+            <div onClick={(e) => e.stopPropagation()}>
+              <AddToNotebookMenu
+                title={titleText}
+                plainText={buildMeetingPlainText(titleText, structuredSections, session.summary)}
+                sourceApp={`meeting-export:${session.id}`}
+              />
+            </div>
           )}
           <ShareMenu
             meetingId={session.id}
@@ -154,7 +186,11 @@ export function MeetingSessionCard({ session, onDelete, onOpen, onCollaborate }:
             </div>
           ) : isEmpty ? (
             <p className="text-xs text-iron-text-muted pt-3">
-              No speech was detected during this recording, so no notes were generated.
+              No audio was captured. Check that the correct microphone is selected and not muted, then try again.
+            </p>
+          ) : isInsufficient ? (
+            <p className="text-xs text-amber-300/90 pt-3">
+              Too little speech was captured to generate reliable AI notes. The raw transcript is preserved and visible on the detail page — you can write your own notes there.
             </p>
           ) : structuredSections && structuredSections.length > 0 ? (
             // Structured output from template
@@ -192,4 +228,30 @@ export function MeetingSessionCard({ session, onDelete, onOpen, onCollaborate }:
       )}
     </Card>
   );
+}
+
+/**
+ * Build a plaintext rendering of the meeting notes suitable for storing
+ * in the entries table when the user adds them to a notebook. Preserves
+ * section headings for readability.
+ */
+function buildMeetingPlainText(
+  title: string,
+  sections: Array<{ key: string; title: string; content: string }> | null,
+  fallbackSummary: string | undefined,
+): string {
+  const parts: string[] = [];
+  parts.push(`# ${title}`);
+  if (sections && sections.length > 0) {
+    for (const s of sections) {
+      if (!s.content || !s.content.trim()) continue;
+      parts.push('');
+      parts.push(`## ${s.title}`);
+      parts.push(s.content.trim());
+    }
+  } else if (fallbackSummary && fallbackSummary.trim()) {
+    parts.push('');
+    parts.push(fallbackSummary.trim());
+  }
+  return parts.join('\n');
 }

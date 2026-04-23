@@ -75,7 +75,7 @@ export function MeetingTranscriptPanel({ segments, isLive }: Props) {
           {isLive ? 'Listening… transcript will appear here.' : 'No transcript segments yet.'}
         </p>
         {isLive && (
-          <p className="text-xs text-gray-300 mt-1">Segments appear every 30 seconds.</p>
+          <p className="text-xs text-gray-300 mt-1">Segments appear every ~15 seconds.</p>
         )}
       </div>
     );

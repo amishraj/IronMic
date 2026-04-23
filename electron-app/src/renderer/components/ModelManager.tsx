@@ -2,6 +2,18 @@ import { useState, useEffect } from 'react';
 import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu, Info } from 'lucide-react';
 import { Card, Toggle, Badge, Button } from './ui';
 import { ModelImportSection } from './ModelImportBanner';
+import { useDictationStore } from '../stores/useDictationStore';
+import { useMeetingStore } from '../stores/useMeetingStore';
+import { useToastStore } from '../stores/useToastStore';
+
+/** True if any mic-owning pipeline is active. Used to lock settings that
+ *  would tear down the Whisper engine or audio device mid-recording and
+ *  corrupt the in-flight session. */
+function useMicBusy(): boolean {
+  const dictating = useDictationStore((s) => s.status !== 'idle');
+  const meeting = useMeetingStore((s) => s.isGranolaRecording || s.isGranolaStopping);
+  return dictating || meeting;
+}
 
 interface WhisperModel {
   id: string;
@@ -44,6 +56,7 @@ export function ModelManager() {
   const [showGpuInfo, setShowGpuInfo] = useState(false);
   // Incremented after any import to force all sub-sections to re-check downloaded status
   const [refreshKey, setRefreshKey] = useState(0);
+  const micBusy = useMicBusy();
 
   const handleAnyImport = () => {
     loadState();
@@ -102,6 +115,17 @@ export function ModelManager() {
   const handleSelectModel = async (modelId: string) => {
     const model = models.find((m) => m.id === modelId);
     if (!model?.downloaded) return;
+    // Lock-out: switching the Whisper model reloads the native engine, which
+    // would corrupt any in-flight transcription. Toast instead of silently
+    // breaking the user's recording.
+    if (micBusy) {
+      useToastStore.getState().show({
+        type: 'info',
+        message: 'Stop the current recording before changing the Whisper model.',
+        durationMs: 5000,
+      });
+      return;
+    }
     setSwitching(true);
     setError(null);
     try {
@@ -115,6 +139,16 @@ export function ModelManager() {
   };
 
   const handleGpuToggle = async () => {
+    // Lock-out: toggling GPU reloads the Whisper backend. Same hazard as
+    // swapping the model — can't do it mid-session.
+    if (micBusy) {
+      useToastStore.getState().show({
+        type: 'info',
+        message: 'Stop the current recording before toggling GPU acceleration.',
+        durationMs: 5000,
+      });
+      return;
+    }
     setError(null);
     try {
       await window.ironmic.setGpuEnabled(!gpuEnabled);

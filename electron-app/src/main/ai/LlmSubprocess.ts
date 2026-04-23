@@ -58,8 +58,12 @@ class LlmSubprocessManager {
     onToken?: (token: string) => void;
     resolve: (result: string) => void;
     reject: (err: Error) => void;
+    signal?: AbortSignal;
+    signalHandler?: () => void;
   }> = [];
   private busy = false;
+  /** Tracks the in-flight request so its AbortSignal can cancel it mid-stream. */
+  private activeAbort: { signal: AbortSignal; handler: () => void } | null = null;
 
   /** Check if the binary exists. */
   isAvailable(): boolean {
@@ -160,6 +164,7 @@ class LlmSubprocessManager {
       this.pendingReject = null;
       this.pendingOnToken = null;
       this.busy = false;
+      this.clearActiveAbort();
       this.processQueue();
       return;
     }
@@ -176,6 +181,7 @@ class LlmSubprocessManager {
       this.pendingReject = null;
       this.pendingOnToken = null;
       this.busy = false;
+      this.clearActiveAbort();
       this.processQueue();
       return;
     }
@@ -190,8 +196,21 @@ class LlmSubprocessManager {
   private processQueue() {
     if (this.busy || this.requestQueue.length === 0) return;
 
-    const { request, onToken, resolve, reject } = this.requestQueue.shift()!;
-    this.executeRequest(request, onToken, resolve, reject);
+    // Skip already-aborted queued requests
+    while (this.requestQueue.length > 0) {
+      const head = this.requestQueue[0];
+      if (head.signal?.aborted) {
+        this.requestQueue.shift();
+        if (head.signalHandler) head.signal?.removeEventListener('abort', head.signalHandler);
+        head.reject(new Error('LLM request aborted'));
+        continue;
+      }
+      break;
+    }
+    if (this.requestQueue.length === 0) return;
+
+    const { request, onToken, resolve, reject, signal } = this.requestQueue.shift()!;
+    this.executeRequest(request, onToken, resolve, reject, signal);
   }
 
   /** Execute a request against the subprocess. */
@@ -200,6 +219,7 @@ class LlmSubprocessManager {
     onToken: ((token: string) => void) | undefined,
     resolve: (result: string) => void,
     reject: (err: Error) => void,
+    signal?: AbortSignal,
   ) {
     this.busy = true;
     this.outputBuffer = '';
@@ -207,12 +227,48 @@ class LlmSubprocessManager {
     this.pendingReject = reject;
     this.pendingOnToken = onToken || null;
 
+    // Wire cancellation: aborting mid-stream kills the subprocess (it respawns
+    // on next request). This is the only way to stop llama.cpp inference —
+    // the protocol has no cancel command.
+    if (signal) {
+      if (signal.aborted) {
+        this.busy = false;
+        this.pendingResolve = null;
+        this.pendingReject = null;
+        this.pendingOnToken = null;
+        reject(new Error('LLM request aborted'));
+        // Process the next request after microtask so state is clean
+        setImmediate(() => this.processQueue());
+        return;
+      }
+      const handler = () => {
+        if (this.pendingReject) {
+          const rej = this.pendingReject;
+          this.pendingResolve = null;
+          this.pendingReject = null;
+          this.pendingOnToken = null;
+          rej(new Error('LLM request aborted'));
+        }
+        // Kill the subprocess — the 'close' handler will reset busy and drain queue.
+        if (this.proc && !this.proc.killed) {
+          try { this.proc.kill('SIGTERM'); } catch { /* ignore */ }
+        }
+        this.activeAbort = null;
+      };
+      signal.addEventListener('abort', handler, { once: true });
+      this.activeAbort = { signal, handler };
+    }
+
     try {
       const proc = this.ensureProcess();
       const json = JSON.stringify(request) + '\n';
       proc.stdin?.write(json);
     } catch (err: unknown) {
       this.busy = false;
+      if (this.activeAbort) {
+        this.activeAbort.signal.removeEventListener('abort', this.activeAbort.handler);
+        this.activeAbort = null;
+      }
       reject(err instanceof Error ? err : new Error(String(err)));
     }
   }
@@ -221,17 +277,43 @@ class LlmSubprocessManager {
   private sendRequest(
     request: LlmRequest,
     onToken?: (token: string) => void,
+    signal?: AbortSignal,
   ): Promise<string> {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new Error('LLM request aborted'));
+        return;
+      }
       if (this.busy) {
-        this.requestQueue.push({ request, onToken, resolve, reject });
+        const entry = { request, onToken, resolve, reject, signal, signalHandler: undefined as (() => void) | undefined };
+        if (signal) {
+          const handler = () => {
+            // Remove from queue if still there
+            const idx = this.requestQueue.indexOf(entry);
+            if (idx !== -1) {
+              this.requestQueue.splice(idx, 1);
+              reject(new Error('LLM request aborted'));
+            }
+          };
+          entry.signalHandler = handler;
+          signal.addEventListener('abort', handler, { once: true });
+        }
+        this.requestQueue.push(entry);
       } else {
-        this.executeRequest(request, onToken, resolve, reject);
+        this.executeRequest(request, onToken, resolve, reject, signal);
       }
     });
   }
 
-  /** Run chat completion. */
+  /** Clear the AbortSignal listener for the current in-flight request. */
+  private clearActiveAbort(): void {
+    if (this.activeAbort) {
+      this.activeAbort.signal.removeEventListener('abort', this.activeAbort.handler);
+      this.activeAbort = null;
+    }
+  }
+
+  /** Run chat completion. Pass `signal` to cancel mid-stream. */
   async chatComplete(
     params: {
       modelPath: string;
@@ -239,6 +321,7 @@ class LlmSubprocessManager {
       messages: Array<{ role: string; content: string }>;
       maxTokens: number;
       temperature: number;
+      signal?: AbortSignal;
     },
     onToken?: (token: string) => void,
   ): Promise<string> {
@@ -252,6 +335,7 @@ class LlmSubprocessManager {
         temperature: params.temperature,
       },
       onToken,
+      params.signal,
     );
   }
 
