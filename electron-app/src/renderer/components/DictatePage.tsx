@@ -293,7 +293,9 @@ export function DictatePage() {
           const fresh = await api.getEntry(currentId);
           const sessionId = parseMeetingTag((fresh as any)?.tags ?? null);
           if (sessionId) {
-            await syncMeetingEntryToSession({ sessionId, plainText });
+            // Pass the original HTML so the meeting detail page can render the
+            // user's formatting (bold, lists, headings) rather than plain text.
+            await syncMeetingEntryToSession({ sessionId, plainText, htmlContent: html });
             // Tell MeetingDetailPage (if open) to reload the now-updated session.
             try { window.dispatchEvent(new CustomEvent('ironmic:entries-changed')); } catch { /* noop */ }
           }
@@ -511,7 +513,12 @@ export function DictatePage() {
         if (sessionId) {
           const titleTag = tagArr.find((s) => s.startsWith(TITLE_TAG_PREFIX));
           const finalTitle = titleTag ? titleTag.slice(TITLE_TAG_PREFIX.length) : undefined;
-          await syncMeetingEntryToSession({ sessionId, plainText: text, title: finalTitle });
+          await syncMeetingEntryToSession({
+            sessionId,
+            plainText: text,
+            htmlContent: editor.getHTML(),
+            title: finalTitle,
+          });
         }
       } catch (err) {
         console.warn('[DictatePage] Could not finalize note:', err);

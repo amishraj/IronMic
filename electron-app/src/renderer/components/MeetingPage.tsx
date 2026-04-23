@@ -541,6 +541,49 @@ export function MeetingPage() {
       } catch (err) {
         console.error('[MeetingPage] Background stop pipeline failed:', err);
       } finally {
+        // ── Guaranteed Notes-sidebar auto-file ──────────────────────────────
+        // Runs after EVERY processing path — live-summary, full LLM, empty,
+        // insufficient, or pipeline error. Individual finalize functions also
+        // call upsertMeetingNoteEntry for notebookEntryId bookkeeping, but
+        // those are buried in try/catch and silently fail on any error.
+        // This single call in the finally block is the authoritative guarantee
+        // that the note always lands in the Notes sidebar without the user
+        // having to manually edit and save on the Meetings page.
+        // We re-read from DB so we file whatever content was actually persisted,
+        // not a stale in-memory snapshot from a partially-completed pipeline.
+        try {
+          const rawFinal = await window.ironmic.meetingGet(sessionId);
+          if (rawFinal) {
+            const latestSession = JSON.parse(rawFinal);
+            let so: any = {};
+            try { so = JSON.parse(latestSession.structured_output || '{}'); } catch {}
+
+            const title = so.title || `Meeting ${new Date().toLocaleString()}`;
+            const plainText = (so.plainSummary || latestSession.summary || '').trim();
+
+            // Only file meetings that produced actual content. Empty/insufficient
+            // sessions have no summary worth showing in the Notes sidebar.
+            if (plainText && so.processingState !== 'generating') {
+              const entryId = await upsertMeetingNoteEntry({
+                existingEntryId: so.notebookEntryId ?? null,
+                sessionId,
+                title,
+                plainText,
+              });
+              // Persist notebookEntryId back so future upserts (regen, edit-save)
+              // find this exact entry and update in place rather than duplicating.
+              if (entryId !== so.notebookEntryId) {
+                await window.ironmic.meetingSetStructuredOutput(
+                  sessionId,
+                  JSON.stringify({ ...so, notebookEntryId: entryId }),
+                );
+              }
+            }
+          }
+        } catch (err) {
+          console.warn('[MeetingPage] Auto-file to Notes sidebar failed:', err);
+        }
+
         unmarkMeetingProcessing(sessionId);
         // Always clear the recording/stopping flags here — the onMeetingRecordingState
         // listener (which normally clears them) is tied to MeetingPage's lifecycle.

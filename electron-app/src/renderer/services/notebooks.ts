@@ -217,6 +217,9 @@ export async function findMeetingEntryBySessionId(sessionId: string): Promise<an
 export async function syncMeetingEntryToSession(params: {
   sessionId: string;
   plainText?: string;
+  /** Formatted HTML from TipTap — stored so the meeting detail page can render
+   *  user formatting (bold, headings, lists, etc.) instead of plain text. */
+  htmlContent?: string;
   title?: string;
 }): Promise<void> {
   const api = window.ironmic;
@@ -236,7 +239,15 @@ export async function syncMeetingEntryToSession(params: {
     }
     if (params.plainText !== undefined) {
       updated.plainSummary = params.plainText;
-      // Mirror into the first section so the Notes panel renders the same text.
+      // Store the TipTap HTML so the meeting detail panel can render formatting.
+      // When htmlContent is explicitly passed we store it; when it's omitted we
+      // leave any existing htmlContent untouched so a title-only sync doesn't
+      // wipe previously saved formatting.
+      if (params.htmlContent !== undefined) {
+        updated.htmlContent = params.htmlContent || null;
+      }
+      // Mirror plain text into sections as a fallback for older renderers /
+      // export flows that read sections[].content directly.
       const sections: any[] = Array.isArray(existing.sections) && existing.sections.length > 0
         ? existing.sections.slice()
         : [{ key: 'summary', title: 'Summary', content: '' }];
