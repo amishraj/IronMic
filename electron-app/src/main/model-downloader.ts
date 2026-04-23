@@ -76,17 +76,16 @@ function resolveProxyUrl(): string | null {
 
 /**
  * Configure Electron's session proxy for net.request calls.
- * Must be called before downloads when proxy is configured.
+ * Only touches the session when a proxy is explicitly configured by the user
+ * or the environment — calling setProxy({mode:'system'}) unconditionally can
+ * stall for many seconds on Windows boxes that rely on WPAD auto-detection
+ * and have no proxy, which looks to users like the download is broken.
  */
 async function applySessionProxy(): Promise<void> {
   const proxyUrl = resolveProxyUrl();
-  if (proxyUrl) {
-    console.log(`[model-downloader] Configuring proxy: ${proxyUrl}`);
-    await session.defaultSession.setProxy({ proxyRules: proxyUrl });
-  } else {
-    // Use system proxy detection (Electron/Chromium auto-detects PAC, WPAD, etc.)
-    await session.defaultSession.setProxy({ mode: 'system' });
-  }
+  if (!proxyUrl) return;
+  console.log(`[model-downloader] Configuring proxy: ${proxyUrl}`);
+  await session.defaultSession.setProxy({ proxyRules: proxyUrl });
 }
 
 /** Max retries before falling back to HuggingFace */

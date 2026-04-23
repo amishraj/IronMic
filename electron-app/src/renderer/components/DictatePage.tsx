@@ -35,7 +35,7 @@ import {
   Quote, Code, Minus, Link as LinkIcon, Highlighter, Undo2, Redo2,
   AlignLeft, AlignCenter, AlignRight, Mic, MicOff, Check,
   Volume2, Square, Pause, Play, ChevronDown,
-  Pencil, Circle, BookPlus, HelpCircle, X,
+  Pencil, Circle, BookPlus, HelpCircle, X, Users, Plus,
 } from 'lucide-react';
 import { useTtsStore } from '../stores/useTtsStore';
 import { useDictationStore } from '../stores/useDictationStore';
@@ -44,6 +44,7 @@ import { useToastStore } from '../stores/useToastStore';
 import { listNotebooks, createNotebook, getDefaultNotebookId, syncMeetingEntryToSession, type Notebook } from '../services/notebooks';
 import { TITLE_TAG_PREFIX, parseTitleTag, parseNotebookTag, parseMeetingTag, parseStatusTag, type Entry } from '../types';
 import { NotesSidebar } from './NotesSidebar';
+import { NotesCollaborateModal } from './NotesCollaborateModal';
 
 const STORAGE_KEY = 'ironmic-dictate-draft';
 
@@ -108,6 +109,8 @@ async function computeNextNoteNumber(): Promise<number> {
 
 export function DictatePage() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const draftThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const collabActiveRef = useRef(false);
   const [wordCount, setWordCount] = useState(0);
   const [charCount, setCharCount] = useState(0);
   const [saved, setSaved] = useState(true);
@@ -120,6 +123,9 @@ export function DictatePage() {
   const [loadedEntryStatus, setLoadedEntryStatus] = useState<'draft' | 'done' | null>(null);
   const helpRef = useRef<HTMLDivElement>(null);
   const [showHelp, setShowHelp] = useState(false);
+  const [collabOpen, setCollabOpen] = useState(false);
+  const [collabActive, setCollabActive] = useState(false);
+  const [collabParticipantCount, setCollabParticipantCount] = useState(0);
 
   // ── Dictation state lives in the store (foolproof across navigation) ──
   const status = useDictationStore((s) => s.status);
@@ -396,6 +402,58 @@ export function DictatePage() {
     return () => window.removeEventListener('ironmic:quick-action-dictate', handler);
   }, [handleDictateToggle]);
 
+  // Track live collab session state for the button indicator.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabState?.((info: any) => {
+      const active = info?.active ?? false;
+      setCollabActive(active);
+      collabActiveRef.current = active;
+      setCollabParticipantCount(info?.participants?.length ?? 0);
+    });
+    return () => { unsub?.(); };
+  }, []);
+
+  // Broadcast host keystrokes to participants as live draft events (300 ms throttle).
+  useEffect(() => {
+    if (!collabActive || !editor) return;
+    if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
+    draftThrottleRef.current = setTimeout(() => {
+      const content = editor.getText();
+      const name = (() => { try { return localStorage.getItem('ironmic-collab-display-name') || 'Host'; } catch { return 'Host'; } })();
+      window.ironmic?.meetingCollabNotifySaved?.(content, name)?.catch(() => {});
+    }, 300);
+    return () => { if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current); };
+  }, [charCount, collabActive, editor]);
+
+  // Apply incoming draft content when we're a participant (no local server running).
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
+      if (collabActiveRef.current) return; // we're the host, ignore
+      if (editor && data?.content != null) {
+        const html = `<p>${String(data.content).replace(/\n/g, '</p><p>')}</p>`;
+        editor.commands.setContent(html, false);
+      }
+    });
+    return () => { unsub?.(); };
+  }, [editor]);
+
+  // Keep notes in sync while session is running but modal is closed.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
+      if (editor && data?.notes) {
+        editor.commands.setContent(`<p>${String(data.notes).replace(/\n/g, '</p><p>')}</p>`);
+      }
+    });
+    return () => { unsub?.(); };
+  }, [editor]);
+
+  // Auto-stop when the last participant leaves while the modal is closed.
+  useEffect(() => {
+    if (!collabOpen && collabActive && collabParticipantCount === 0) {
+      window.ironmic?.meetingCollabStop?.().catch(() => {});
+    }
+  }, [collabOpen, collabActive, collabParticipantCount]);
+
   const handleReadBack = useCallback(() => {
     if (!editor) return;
     if (ttsState === 'playing' || ttsState === 'paused') {
@@ -542,7 +600,57 @@ export function DictatePage() {
     catch { /* noop */ }
   }, [editor, status, storeStop, storeReset, notebookId, bumpSidebar]);
 
-  /** Done — finalize the current note (status=done) and open a fresh one. */
+  /** Save — persist the current note (status=done) and stay on it. */
+  const handleSave = useCallback(async () => {
+    if (!editor) return;
+    const text = editor.getText().trim();
+    if (!text) return;
+
+    if (status !== 'idle') {
+      try { await storeStop(); } catch { /* noop */ }
+    }
+
+    // Flush any pending auto-save debounce.
+    if (debounceRef.current) { clearTimeout(debounceRef.current); debounceRef.current = null; }
+    await saveContent(editor.getHTML());
+
+    const currentId = useDictationStore.getState().entryId;
+    if (currentId) {
+      try {
+        const freshRaw = await window.ironmic.getEntry(currentId);
+        let tagArr: string[] = [];
+        try {
+          const parsed = JSON.parse((freshRaw as any)?.tags || '[]');
+          if (Array.isArray(parsed)) tagArr = parsed.filter((s: any) => typeof s === 'string');
+        } catch { /* ignore */ }
+
+        if (!tagArr.some((s) => s.startsWith(TITLE_TAG_PREFIX))) {
+          const n = await computeNextNoteNumber();
+          tagArr.push(`${TITLE_TAG_PREFIX}Note #${n}`);
+        }
+        tagArr = tagArr.filter((s) => !s.startsWith('__notebook__:'));
+        tagArr.push(`__notebook__:${notebookId}`);
+        tagArr = tagArr.filter((s) => !s.startsWith('__status__:'));
+        tagArr.push('__status__:done');
+
+        await window.ironmic.updateEntry(currentId, {
+          tags: JSON.stringify(tagArr),
+          rawTranscript: text,
+        } as any);
+        setLoadedEntryStatus('done');
+        setSaved(true);
+        bumpSidebar();
+        try { window.dispatchEvent(new CustomEvent('ironmic:entries-changed')); } catch { /* noop */ }
+      } catch (err) {
+        console.warn('[DictatePage] Could not save note:', err);
+      }
+    }
+
+    setDoneFlash(true);
+    setTimeout(() => setDoneFlash(false), 1200);
+  }, [editor, status, storeStop, notebookId, bumpSidebar, saveContent]);
+
+  /** New Note — finalize the current note (status=done) and open a fresh one. */
   const handleDone = useCallback(async () => {
     await finalizeAndReset('done');
     setDoneFlash(true);
@@ -821,6 +929,26 @@ export function DictatePage() {
               {!windowNarrow && (isRecording ? 'Stop' : isStopping ? 'Stopping…' : 'Dictate')}
             </button>
 
+            {/* Collaborate */}
+            <button
+              onClick={() => setCollabOpen(true)}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
+                collabActive
+                  ? 'bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20'
+                  : 'text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10 border border-iron-border hover:border-iron-accent/30'
+              }`}
+              title={collabActive
+                ? `Live session — ${collabParticipantCount} participant${collabParticipantCount !== 1 ? 's' : ''} connected`
+                : 'Collaborate on this note with teammates'}
+            >
+              {collabActive
+                ? <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse shrink-0" />
+                : <Users className="w-3.5 h-3.5" />}
+              {!windowNarrow && (collabActive
+                ? `Live${collabParticipantCount > 0 ? ` · ${collabParticipantCount}` : ''}`
+                : 'Collaborate')}
+            </button>
+
             {/* Read Back — icon only */}
             <button
               onClick={ttsState === 'playing' || ttsState === 'paused' ? () => ttsToggle() : handleReadBack}
@@ -851,18 +979,27 @@ export function DictatePage() {
               </button>
             )}
 
-            {/* Done */}
+            {/* Save */}
             <button
-              onClick={handleDone}
+              onClick={handleSave}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
                 doneFlash
                   ? 'bg-emerald-500/15 text-emerald-400'
                   : 'text-iron-text-muted hover:text-emerald-400 hover:bg-emerald-500/10'
               }`}
-              title="Finalize this note and start a fresh one"
+              title="Save this note"
             >
               <Check className="w-3.5 h-3.5" />
-              {!windowNarrow && (doneFlash ? 'Filed' : 'Done')}
+              {!windowNarrow && (doneFlash ? 'Saved!' : 'Save')}
+            </button>
+
+            {/* New note */}
+            <button
+              onClick={handleDone}
+              className="p-1.5 rounded-xl text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10 transition-all"
+              title="Save and start a new note"
+            >
+              <Plus className="w-3.5 h-3.5" />
             </button>
           </div>
         </div>
@@ -916,6 +1053,20 @@ export function DictatePage() {
         <span>{saved ? 'Saved' : 'Saving...'}</span>
       </div>
       </div>
+
+      {collabOpen && (
+        <NotesCollaborateModal
+          noteId={entryId}
+          initialNotes={editor?.getText() ?? ''}
+          onNotesUpdated={(notes) => {
+            if (editor) editor.commands.setContent(`<p>${notes.replace(/\n/g, '</p><p>')}</p>`);
+          }}
+          onJoined={({ notes }) => {
+            if (editor) editor.commands.setContent(`<p>${notes.replace(/\n/g, '</p><p>')}</p>`);
+          }}
+          onClose={() => setCollabOpen(false)}
+        />
+      )}
     </div>
   );
 }

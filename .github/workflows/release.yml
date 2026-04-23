@@ -17,10 +17,10 @@ jobs:
             cargo-features: '--features metal,tts'
           - os: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
-            cargo-features: '--features tts'
+            cargo-features: '--features whisper,tts'
           - os: windows-latest
             rust-target: x86_64-pc-windows-msvc
-            cargo-features: '--features tts'
+            cargo-features: '--features whisper,tts'
     steps:
       - uses: actions/checkout@v4
 

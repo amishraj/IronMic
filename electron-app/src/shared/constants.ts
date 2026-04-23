@@ -201,6 +201,7 @@ export const IPC_CHANNELS = {
   MEETING_COLLAB_SAVE_NOTES: 'ironmic:meeting-collab-save-notes',
   MEETING_COLLAB_SEND_DRAFT: 'ironmic:meeting-collab-send-draft',
   MEETING_COLLAB_NOTIFY_SAVED: 'ironmic:meeting-collab-notify-saved',
+  MEETING_COLLAB_NOTIFY_DRAFT: 'ironmic:meeting-collab-notify-draft',
   MEETING_COLLAB_STATE: 'ironmic:meeting-collab-state',              // main → renderer push
   MEETING_COLLAB_NOTES_UPDATED: 'ironmic:meeting-collab-notes-updated', // main → renderer push
   MEETING_COLLAB_DRAFT: 'ironmic:meeting-collab-draft',              // main → renderer push

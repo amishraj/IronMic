@@ -193,7 +193,7 @@ export function registerIpcHandlers(): void {
     files: getModelsStatus(),
   }));
 
-  // Model downloads — validate model name against known list
+  // Model downloads — validate model name against known list.
   ipcMain.handle(IPC_CHANNELS.DOWNLOAD_MODEL, (_e, model: string) => {
     assertString(model, 'model');
     if (model !== 'tts' && !MODEL_FILES[model]) {
@@ -484,7 +484,7 @@ If the text is too short or unclear, output: ["General"]`;
     // Only allow opening known model download domains
     try {
       const parsed = new URL(url);
-      const allowed = ['huggingface.co', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'existential.audio'];
+      const allowed = ['huggingface.co', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'existential.audio', 'vb-audio.com'];
       if (allowed.some(d => parsed.hostname === d || parsed.hostname.endsWith('.' + d))) {
         const { shell } = require('electron');
         shell.openExternal(url);
@@ -763,6 +763,12 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_NOTIFY_SAVED, (_e, notes: string, savedBy: string) => {
     assertString(notes, 'notes');
     meetingNotesCollabServer.notifyNotesSaved(notes, savedBy ?? 'Host');
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_NOTIFY_DRAFT, (_e, content: string, senderName: string) => {
+    assertString(content, 'content');
+    meetingNotesCollabServer.notifyDraft(content, senderName ?? 'Host');
     return { ok: true };
   });
 
