@@ -30,15 +30,20 @@ type LlmRequest = ChatRequest | PolishRequest;
 
 /** Find the ironmic-llm binary. */
 function findBinary(): string | null {
+  // On Windows the binary is `ironmic-llm.exe`. The previous lookup used the
+  // bare name on every platform, so packaged Windows installs (where the
+  // .exe is bundled into resources) silently failed and local LLM "didn't
+  // work" with no clear error.
+  const exe = process.platform === 'win32' ? 'ironmic-llm.exe' : 'ironmic-llm';
   const possiblePaths = [
     // Development path — __dirname is dist/main/ai/, need to go up to project root
-    path.join(__dirname, '..', '..', '..', '..', 'rust-core', 'target', 'release', 'ironmic-llm'),
+    path.join(__dirname, '..', '..', '..', '..', 'rust-core', 'target', 'release', exe),
     // Also check via IRONMIC_MODELS_DIR which is set reliably in index.ts
     process.env.IRONMIC_MODELS_DIR
-      ? path.join(process.env.IRONMIC_MODELS_DIR, '..', '..', 'target', 'release', 'ironmic-llm')
+      ? path.join(process.env.IRONMIC_MODELS_DIR, '..', '..', 'target', 'release', exe)
       : '',
     // Production path (bundled)
-    path.join(process.resourcesPath || '', 'ironmic-llm'),
+    path.join(process.resourcesPath || '', exe),
   ].filter(Boolean);
   for (const p of possiblePaths) {
     if (fs.existsSync(p)) return p;

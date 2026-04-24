@@ -454,7 +454,10 @@ function AIAssistSettings() {
                 ) : (
                   <>
                     <p>
-                      AI Assist uses your own CLI tools — <strong className="text-iron-text">GitHub Copilot CLI</strong> (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh copilot</code>) or <strong className="text-iron-text">Claude Code CLI</strong> (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">claude</code>).
+                      AI Assist uses your own CLI tools — <strong className="text-iron-text">GitHub CLI</strong> with the GitHub Models extension (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh models run</code>) or <strong className="text-iron-text">Claude Code CLI</strong> (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">claude</code>).
+                    </p>
+                    <p className="mt-1.5">
+                      First-time GitHub Copilot setup: <code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh auth login</code> then <code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh extension install github/gh-models</code>.
                     </p>
                     <p className="mt-1.5">
                       Your credentials stay on your machine. IronMic never sees or stores your API keys — it calls the CLI directly.

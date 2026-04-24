@@ -1,50 +1,53 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import type { ICLIAdapter, ParsedOutput, AIProvider, AIModel } from './types';
 
 export class ClaudeAdapter implements ICLIAdapter {
   name: AIProvider = 'claude';
 
   async isInstalled(): Promise<boolean> {
-    const path = await this.getBinaryPath();
-    return path !== null;
+    return (await this.getBinaryPath()) !== null;
   }
 
   async isAuthenticated(): Promise<boolean> {
-    try {
-      // Check env var first
-      if (process.env.ANTHROPIC_API_KEY) return true;
+    if (process.env.ANTHROPIC_API_KEY) return true;
 
-      // Try claude auth status
-      const result = execSync('claude auth status 2>&1', {
-        encoding: 'utf-8',
-        timeout: 5000,
-        shell: process.env.SHELL || '/bin/zsh',
-      });
-      return !result.toLowerCase().includes('not logged in') && !result.toLowerCase().includes('no api key');
-    } catch {
-      // If the command fails, check for credential files
+    const bin = await this.getBinaryPath();
+    if (bin) {
       try {
-        const fs = require('fs');
-        const path = require('path');
-        const home = process.env.HOME || '';
-        const credPaths = [
-          path.join(home, '.claude', '.credentials.json'),
-          path.join(home, '.claude', 'credentials.json'),
-          path.join(home, '.claude', 'auth.json'),
-        ];
-        return credPaths.some((p: string) => fs.existsSync(p));
+        const result = execFileSync(bin, ['auth', 'status'], {
+          encoding: 'utf-8',
+          timeout: 5000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        const text = result.toLowerCase();
+        return !text.includes('not logged in') && !text.includes('no api key');
       } catch {
-        return false;
+        // fall through to credential-file probe
       }
+    }
+    // Fallback: detect Claude credential files in the user's home dir.
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const home = process.env.HOME || process.env.USERPROFILE || '';
+      const credPaths = [
+        path.join(home, '.claude', '.credentials.json'),
+        path.join(home, '.claude', 'credentials.json'),
+        path.join(home, '.claude', 'auth.json'),
+      ];
+      return credPaths.some((p: string) => fs.existsSync(p));
+    } catch {
+      return false;
     }
   }
 
   async getVersion(): Promise<string | null> {
+    const bin = await this.getBinaryPath();
+    if (!bin) return null;
     try {
-      const result = execSync('claude --version 2>/dev/null', {
+      const result = execFileSync(bin, ['--version'], {
         encoding: 'utf-8',
         timeout: 5000,
-        shell: process.env.SHELL || '/bin/zsh',
       });
       const match = result.match(/(\d+\.\d+\.\d+)/);
       return match ? match[1] : null;
@@ -54,13 +57,14 @@ export class ClaudeAdapter implements ICLIAdapter {
   }
 
   async getBinaryPath(): Promise<string | null> {
+    const lookup = process.platform === 'win32' ? 'where' : 'which';
     try {
-      const result = execSync('which claude 2>/dev/null', {
+      const out = execFileSync(lookup, ['claude'], {
         encoding: 'utf-8',
         timeout: 3000,
-        shell: process.env.SHELL || '/bin/zsh',
       });
-      return result.trim() || null;
+      const first = out.split(/\r?\n/).find((line) => line.trim().length > 0);
+      return first ? first.trim() : null;
     } catch {
       return null;
     }
