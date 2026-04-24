@@ -39,6 +39,7 @@ const SILERO_SAMPLE_RATE = 16000;
 
 export class VADService {
   private active = false;
+  private streamRunning = false;
   private modelLoaded = false;
   private sensitivity = 0.5;
   private stateCallbacks: VoiceStateCallback[] = [];
@@ -119,9 +120,14 @@ export class VADService {
     // Start audio stream
     try {
       await audioBridge.startStream();
+      this.streamRunning = true;
     } catch (err) {
-      console.warn('[VADService] Failed to start audio stream:', err);
-      this.active = true; // Still mark active so stop() returns a result
+      console.warn('[VADService] Failed to start audio stream — VAD disabled for this recording:', err);
+      // Mark active so stop() returns a result, but leave streamRunning=false
+      // so stop() knows it never got any frames and won't falsely gate
+      // transcription on "insufficient speech".
+      this.active = true;
+      this.streamRunning = false;
       return;
     }
 
@@ -160,14 +166,28 @@ export class VADService {
       this.unsubFrame();
       this.unsubFrame = null;
     }
-    audioBridge.stopStream();
+    if (this.streamRunning) {
+      audioBridge.stopStream();
+    }
+    const streamDidRun = this.streamRunning;
+    this.streamRunning = false;
     this.active = false;
+
+    // If the VAD stream never started, OR it started but never actually
+    // delivered any frames (broken AudioWorklet in a packaged build, mic
+    // contended by Rust/cpal, etc.), don't gate transcription on a bogus
+    // 0ms speech reading — let Whisper decide. Otherwise silent VAD ==
+    // silent dictation, which looks like the app is broken.
+    const gotFrames = this.totalSpeechMs + this.totalSilenceMs > 0;
+    const hasSufficientSpeech = streamDidRun && gotFrames
+      ? this.totalSpeechMs >= MIN_SPEECH_MS
+      : true;
 
     const result: VADResult = {
       totalSpeechMs: this.totalSpeechMs,
       totalSilenceMs: this.totalSilenceMs,
       speechSegments: this.speechSegments,
-      hasSufficientSpeech: this.totalSpeechMs >= MIN_SPEECH_MS,
+      hasSufficientSpeech,
     };
 
     console.log(`[VADService] Stopped — speech: ${this.totalSpeechMs}ms, silence: ${this.totalSilenceMs}ms, segments: ${this.speechSegments.length}`);
