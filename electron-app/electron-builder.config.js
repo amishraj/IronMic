@@ -17,6 +17,7 @@ module.exports = {
     '!dist/linux-unpacked',
     'resources/**/*',
   ],
+  asarUnpack: ['**/*.node'],
   extraResources: [
     {
       from: '../rust-core/ironmic-core.node',
@@ -55,10 +56,21 @@ module.exports = {
     target: ['dmg'],
     category: 'public.app-category.productivity',
     icon: 'resources/icon.png',
-    identity: null,
+    // Ad-hoc sign ('-') produces a valid local signature so Gatekeeper shows
+    // "unidentified developer" (right-click → Open works) instead of
+    // "damaged and can't be opened" on downloaded, unsigned DMGs.
+    identity: '-',
+    hardenedRuntime: true,
+    gatekeeperAssess: false,
+    entitlements: 'resources/entitlements.mac.plist',
+    entitlementsInherit: 'resources/entitlements.mac.plist',
     extendInfo: {
       NSMicrophoneUsageDescription: 'IronMic needs microphone access for voice dictation.',
     },
+  },
+  dmg: {
+    // Don't sign the DMG itself — ad-hoc app signing is what matters for Gatekeeper.
+    sign: false,
   },
   win: {
     target: ['nsis'],

@@ -501,13 +501,15 @@ If the text is too short or unclear, output: ["General"]`;
     return native.getCurrentAudioDevice();
   });
   ipcMain.handle(IPC_CHANNELS.CHECK_MIC_PERMISSION, async () => {
-    // On macOS, check microphone permission via systemPreferences
+    // systemPreferences.getMediaAccessStatus('microphone') works on both
+    // macOS and Windows (Electron 17+). On Windows it reflects the
+    // Settings > Privacy > Microphone toggle. Hardcoding 'granted' here
+    // hid real denial states on Windows.
     const { systemPreferences } = require('electron');
-    if (process.platform === 'darwin' && systemPreferences.getMediaAccessStatus) {
-      const status = systemPreferences.getMediaAccessStatus('microphone');
-      return status; // 'granted' | 'denied' | 'restricted' | 'not-determined'
+    if ((process.platform === 'darwin' || process.platform === 'win32')
+        && typeof systemPreferences.getMediaAccessStatus === 'function') {
+      return systemPreferences.getMediaAccessStatus('microphone');
     }
-    // On other platforms, assume granted (permission handled at OS level)
     return 'granted';
   });
 

@@ -142,13 +142,17 @@ Pre-built packages are available on the **[Releases page](https://github.com/gre
 | Windows | `.exe` installer |
 | Linux | `.AppImage` |
 
-**macOS note:** The app is not code-signed. After downloading, run this in Terminal before opening:
+**macOS note:** The app is ad-hoc signed (no Apple Developer ID), so Gatekeeper flags it as "unidentified developer." If you see **"IronMic is damaged and can't be opened"**, macOS has attached the `com.apple.quarantine` attribute to the downloaded DMG. Strip it before and after installing:
 
 ```bash
+# Before opening the DMG:
 xattr -cr ~/Downloads/IronMic-*.dmg
+
+# After dragging IronMic into /Applications:
+xattr -cr /Applications/IronMic.app
 ```
 
-Then open the `.dmg` and drag IronMic to Applications. On first launch you may need to right-click → Open → Open.
+Then right-click IronMic → **Open** → **Open** on first launch to confirm.
 
 After installing, open IronMic and go to **Settings > Models** to download the speech recognition model (~1.5 GB). The app will walk you through setup on first launch.
 

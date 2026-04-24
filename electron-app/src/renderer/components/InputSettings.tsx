@@ -41,6 +41,8 @@ export function InputSettings() {
   // Test recording
   const [testRecording, setTestRecording] = useState(false);
   const [testAudioUrl, setTestAudioUrl] = useState<string | null>(null);
+  const [testAudioBytes, setTestAudioBytes] = useState<number>(0);
+  const [testPlaybackError, setTestPlaybackError] = useState<string | null>(null);
   const [testPlaying, setTestPlaying] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -158,6 +160,8 @@ export function InputSettings() {
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
         const url = URL.createObjectURL(blob);
         setTestAudioUrl(url);
+        setTestAudioBytes(blob.size);
+        setTestPlaybackError(null);
         setTestRecording(false);
       };
 
@@ -186,9 +190,20 @@ export function InputSettings() {
     if (!testAudioUrl) return;
     const audio = new Audio(testAudioUrl);
     audioElRef.current = audio;
+    setTestPlaybackError(null);
     setTestPlaying(true);
     audio.onended = () => setTestPlaying(false);
-    audio.play();
+    audio.onerror = () => {
+      setTestPlaying(false);
+      setTestPlaybackError('Playback failed. Check the app console for CSP or codec errors.');
+    };
+    const p = audio.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch((e: any) => {
+        setTestPlaying(false);
+        setTestPlaybackError(`Playback rejected: ${e?.message || e}`);
+      });
+    }
   }, [testAudioUrl]);
 
   const stopPlayback = useCallback(() => {
@@ -426,6 +441,20 @@ export function InputSettings() {
               <p className="text-[11px] text-red-400 animate-pulse flex items-center gap-1.5">
                 <Mic className="w-3 h-3" />
                 Recording... (auto-stops in 5s)
+              </p>
+            )}
+            {!testRecording && testAudioUrl && (
+              <p className="text-[11px] text-iron-text-muted">
+                Captured {(testAudioBytes / 1024).toFixed(1)} KB.{' '}
+                {testAudioBytes < 1024 && (
+                  <span className="text-amber-400">Clip is suspiciously small — the mic likely captured silence.</span>
+                )}
+              </p>
+            )}
+            {testPlaybackError && (
+              <p className="text-[11px] text-red-400 flex items-center gap-1.5">
+                <AlertTriangle className="w-3 h-3" />
+                {testPlaybackError}
               </p>
             )}
           </div>
