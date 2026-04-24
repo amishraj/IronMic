@@ -68,15 +68,22 @@ async function handleRecordingAction(
       try { await useTtsStore.getState().stop(); } catch { /* ignore */ }
       set({ state: 'recording', error: null, voiceState: 'unknown', vadActive: false });
 
-      // Start VAD alongside recording (non-blocking — VAD failure is not fatal)
+      // Start VAD alongside recording — but ONLY in turn-detection modes that
+      // actually need it (auto-detect, always-listening). For default
+      // push-to-talk, opening a second mic stream via getUserMedia + Web Audio
+      // contends with Rust/cpal on Windows WASAPI and macOS CoreAudio, causing
+      // empty captures and "dictation hangs" symptoms. The skip-if-empty
+      // optimization VAD provided isn't worth that cost in push-to-talk where
+      // the user is explicitly framing the recording.
       try {
         const vadEnabled = await api.getSetting('vad_enabled');
-        if (vadEnabled !== 'false') {
+        const turnMode = (await api.getSetting('turn_detection_mode')) || 'push-to-talk';
+        const needsVad = vadEnabled !== 'false' && turnMode !== 'push-to-talk';
+        if (needsVad) {
           const sensitivity = parseFloat((await api.getSetting('vad_sensitivity')) || '0.5');
           vadService.setSensitivity(sensitivity);
           await vadService.start();
           set({ vadActive: true });
-          // Subscribe to real-time voice state for UI indicator
           vadService.onVoiceStateChange((voiceState) => {
             set({ voiceState });
           });
