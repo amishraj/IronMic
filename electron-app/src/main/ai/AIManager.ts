@@ -270,12 +270,26 @@ export class AIManager {
         window.webContents.send('ai:turn-start', { provider });
       }
 
-      // Scoped environment — only pass what the CLIs need, not the full process.env
+      // Scoped environment — pass what each CLI needs, not the full process.env.
+      // The previous list was Unix-only (PATH, HOME, SHELL, XDG_*) which broke
+      // every Windows install: `gh` reads its auth state from
+      // %LOCALAPPDATA%\GitHub CLI\ and the gh-models extension also touches
+      // %APPDATA% / %USERPROFILE%. Without those forwarded, the child process
+      // sees an empty config dir and exits 1 with "not logged in", even though
+      // the auth-status check passes (that runs with the full env).
       const scopedEnv: Record<string, string> = {
         TERM: 'dumb',
       };
-      // System essentials
-      for (const key of ['PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'TMPDIR', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME']) {
+      const passthroughKeys = [
+        // POSIX
+        'PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'LC_ALL', 'TMPDIR',
+        'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
+        // Windows — gh, claude, and most CLIs need these
+        'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA',
+        'HOMEDRIVE', 'HOMEPATH', 'SYSTEMROOT', 'SYSTEMDRIVE',
+        'TEMP', 'TMP', 'COMSPEC', 'PATHEXT', 'WINDIR',
+      ];
+      for (const key of passthroughKeys) {
         if (process.env[key]) scopedEnv[key] = process.env[key]!;
       }
       // Auth tokens needed by CLIs
@@ -287,13 +301,22 @@ export class AIManager {
         if (process.env.GITHUB_TOKEN) scopedEnv.GITHUB_TOKEN = process.env.GITHUB_TOKEN;
       }
 
+      // No shell:true — `gh.exe` and `claude` (or `claude.cmd`) are real
+      // executables resolvable directly. shell:true would require escaping
+      // the user prompt to avoid cmd.exe metachar injection, which is risky.
       const proc = spawn(binary, args, {
         env: scopedEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
       });
+
+      // Close stdin immediately. gh-models otherwise waits on EOF before
+      // streaming the response when run with a positional prompt arg.
+      try { proc.stdin?.end(); } catch { /* ignore */ }
 
       this.activeProcess = proc;
       let fullOutput = '';
+      let stderrBuf = '';
 
       proc.stdout?.on('data', (chunk: Buffer) => {
         const text = chunk.toString();
@@ -310,8 +333,10 @@ export class AIManager {
       });
 
       proc.stderr?.on('data', (chunk: Buffer) => {
+        const text = chunk.toString();
+        stderrBuf += text;
         if (process.env.NODE_ENV === 'development') {
-          console.error(`[ai] ${provider} stderr:`, chunk.toString());
+          console.error(`[ai] ${provider} stderr:`, text);
         }
       });
 
@@ -329,7 +354,11 @@ export class AIManager {
         }
 
         if (code !== 0 && !fullOutput.trim()) {
-          reject(new Error(`${provider} exited with code ${code}`));
+          // Surface stderr in the error so the user / logs can actually see
+          // *why* the CLI failed (missing extension, auth lapsed, model not
+          // entitled, etc.) instead of a bare "exited with code 1".
+          const detail = stderrBuf.trim().slice(0, 800) || '(no stderr)';
+          reject(new Error(`${provider} exited with code ${code}: ${detail}`));
         } else {
           resolve(fullOutput.trim());
         }
