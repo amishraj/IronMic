@@ -12,7 +12,7 @@ import { LocalLLMAdapter, getChatModelPath, resolveActiveChatModel } from './Loc
 import { llmSubprocess } from './LlmSubprocess';
 import { CHAT_LLM_MODELS } from '../../shared/constants';
 import { native } from '../native-bridge';
-import type { AIProvider, AuthStatus, AIAuthState, ChatMessage, ICLIAdapter, IAIAdapter, AIModel } from './types';
+import type { AIProvider, AuthStatus, AIAuthState, ChatMessage, ICLIAdapter, IHTTPAdapter, IAIAdapter, AIModel } from './types';
 
 const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
@@ -29,6 +29,8 @@ export class AIManager {
 
   /** Conversation history for the local LLM (managed in-app since there's no CLI session). */
   private localHistory: Array<{ role: string; content: string }> = [];
+  /** Conversation history for Copilot HTTP sessions (no CLI session state). */
+  private copilotHistory: Array<{ role: string; content: string }> = [];
 
   private getAdapter(provider: AIProvider): IAIAdapter {
     if (provider === 'local') return this.local;
@@ -36,8 +38,12 @@ export class AIManager {
   }
 
   private getCLIAdapter(provider: AIProvider): ICLIAdapter {
-    if (provider === 'copilot') return this.copilot;
+    // Only Claude is CLI-based; Copilot uses HTTP.
     return this.claude;
+  }
+
+  private isHTTPAdapter(adapter: IAIAdapter): adapter is IHTTPAdapter {
+    return typeof (adapter as IHTTPAdapter).sendMessageHTTP === 'function';
   }
 
   /** Check auth status for all providers. Uses cache. */
@@ -123,6 +129,10 @@ export class AIManager {
   ): Promise<string> {
     if (provider === 'local') {
       return this.sendLocalMessage(prompt, window, model);
+    }
+    const adapter = this.getAdapter(provider);
+    if (this.isHTTPAdapter(adapter)) {
+      return this.sendHTTPMessage(prompt, provider, adapter, window, model);
     }
     return this.sendCLIMessage(prompt, provider, window, model);
   }
@@ -238,7 +248,61 @@ export class AIManager {
   }
 
   /**
-   * Send a message via CLI subprocess (Copilot or Claude).
+   * Send a message via HTTP (used by Copilot).
+   * Manages conversation history and streams tokens to the renderer window.
+   */
+  private async sendHTTPMessage(
+    prompt: string,
+    provider: AIProvider,
+    adapter: IHTTPAdapter,
+    window: BrowserWindow | null,
+    model?: string,
+  ): Promise<string> {
+    const auth = await this.checkAuth(provider);
+    if (!auth.installed) throw new Error(`${provider} CLI (gh) is not installed`);
+    if (!auth.authenticated) throw new Error(`${provider} is not authenticated. Run: gh auth login`);
+
+    this.copilotHistory.push({ role: 'user', content: prompt });
+    if (this.copilotHistory.length > MAX_HISTORY_MESSAGES) {
+      this.copilotHistory = this.copilotHistory.slice(-MAX_HISTORY_MESSAGES);
+    }
+
+    const messages = [
+      { role: 'system', content: 'You are a helpful AI assistant. Be concise and helpful.' },
+      ...this.copilotHistory,
+    ];
+
+    if (window && !window.isDestroyed()) {
+      window.webContents.send('ai:turn-start', { provider });
+    }
+
+    try {
+      const result = await adapter.sendMessageHTTP(messages, model, (token) => {
+        if (window && !window.isDestroyed()) {
+          window.webContents.send('ai:output', { provider, type: 'text', content: token });
+        }
+      });
+
+      if (window && !window.isDestroyed()) {
+        window.webContents.send('ai:turn-end', { provider });
+      }
+
+      this.copilotHistory.push({ role: 'assistant', content: result });
+      this.turnCount++;
+      return result;
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      if (window && !window.isDestroyed()) {
+        window.webContents.send('ai:output', { provider, type: 'error', content: errorMsg });
+        window.webContents.send('ai:turn-end', { provider });
+      }
+      this.copilotHistory.pop();
+      throw new Error(errorMsg);
+    }
+  }
+
+  /**
+   * Send a message via CLI subprocess (Claude).
    */
   private async sendCLIMessage(
     prompt: string,
@@ -384,6 +448,7 @@ export class AIManager {
     this.cancel();
     this.turnCount = 0;
     this.localHistory = [];
+    this.copilotHistory = [];
   }
 }
 
