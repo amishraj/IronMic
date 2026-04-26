@@ -114,7 +114,22 @@ class MeetingNotesCollabClientManager {
       ws.on('error', (err: Error) => {
         clearTimeout(timeout);
         this.ws = null;
-        reject(new Error(`WebSocket error: ${err.message}`));
+        const isUnreachable = err.message.includes('EHOSTUNREACH') || err.message.includes('ENETUNREACH');
+        const isRefused = err.message.includes('ECONNREFUSED');
+        let msg: string;
+        if (isUnreachable) {
+          msg =
+            `Cannot reach ${opts.hostIp}:${opts.hostPort}. ` +
+            'If the host is on Windows, IronMic may be blocked by Windows Firewall — ' +
+            'open Windows Security → Firewall & network protection → Allow an app through firewall, ' +
+            'then allow IronMic. If the host is on macOS, check that a firewall or VPN is not ' +
+            'blocking inbound TCP connections.';
+        } else if (isRefused) {
+          msg = `Connection refused at ${opts.hostIp}:${opts.hostPort}. Make sure the host has started the collaboration session and the invite string is correct.`;
+        } else {
+          msg = `WebSocket error: ${err.message}`;
+        }
+        reject(new Error(msg));
       });
 
       ws.on('close', () => {

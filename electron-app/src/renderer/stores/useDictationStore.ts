@@ -49,6 +49,10 @@ interface DictationState {
    *  DictatePage reads + clears this on mount to auto-start recording. */
   pendingQuickStart: boolean;
 
+  /** Set by Layout so NoteEditor starts a blank note instead of loading the
+   *  most-recent entry. Consumed (cleared) by NoteEditor on mount. */
+  newNoteRequested: boolean;
+
   setNotebook: (id: string) => void;
   setTitle: (title: string) => void;
   /** Reset everything (used by the "Done" button after the note is filed). */
@@ -115,6 +119,7 @@ export const useDictationStore = create<DictationState>((set, get) => ({
   chunkSeq: 0,
   lastChunkText: '',
   pendingQuickStart: false,
+  newNoteRequested: false,
 
   setNotebook: (id) => set({ notebookId: id }),
   setTitle: (title) => set({ title }),

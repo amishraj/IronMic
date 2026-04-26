@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
+import { useDictationStore } from '../stores/useDictationStore';
 import { useEditor, EditorContent, BubbleMenu } from '@tiptap/react';
 import StarterKit from '@tiptap/starter-kit';
 import Placeholder from '@tiptap/extension-placeholder';
@@ -75,6 +76,20 @@ export function NoteEditor() {
   }, []);
 
   useEffect(() => {
+    if (!editor) return;
+
+    // If the user clicked the mic shield to start a new note, skip loading the
+    // most-recent entry and open a blank canvas instead.
+    const { newNoteRequested } = useDictationStore.getState();
+    if (newNoteRequested) {
+      useDictationStore.setState({ newNoteRequested: false });
+      currentEntryId.current = null;
+      editor.commands.setContent('');
+      setWordCount(0);
+      setCharCount(0);
+      return;
+    }
+
     async function loadRecent() {
       try {
         const entries = await window.ironmic.listEntries({ limit: 1, offset: 0, archived: false });
@@ -87,7 +102,22 @@ export function NoteEditor() {
         }
       } catch { /* fresh start */ }
     }
-    if (editor) loadRecent();
+    loadRecent();
+  }, [editor]);
+
+  // When the user clicks the shield while already on the notes page, open a blank note.
+  useEffect(() => {
+    if (!editor) return;
+    const handler = () => {
+      currentEntryId.current = null;
+      editor.commands.setContent('');
+      editor.commands.focus();
+      setWordCount(0);
+      setCharCount(0);
+      setSaved(true);
+    };
+    window.addEventListener('ironmic:quick-action-dictate', handler);
+    return () => window.removeEventListener('ironmic:quick-action-dictate', handler);
   }, [editor]);
 
   useEffect(() => {

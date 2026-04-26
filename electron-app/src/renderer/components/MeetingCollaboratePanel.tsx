@@ -38,9 +38,14 @@ export function MeetingCollaboratePanel({
   const [starting, setStarting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
-  /** peerId → display name, for showing "X is editing…" */
-  const [drafting, setDrafting] = useState<{ peerId: string; peerName: string } | null>(null);
+  const [drafting, setDrafting] = useState<{ peerId: string; peerName: string; content: string } | null>(null);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Keep a ref to the latest onNotesUpdated so the subscription never captures
+  // a stale closure (the effect only re-runs when sessionId changes, but
+  // onNotesUpdated is a new arrow function on every parent render).
+  const onNotesUpdatedRef = useRef(onNotesUpdated);
+  useEffect(() => { onNotesUpdatedRef.current = onNotesUpdated; }, [onNotesUpdated]);
 
   // Start the collab server when this panel mounts
   useEffect(() => {
@@ -68,17 +73,17 @@ export function MeetingCollaboratePanel({
       if (!cancelled && info?.sessionId === sessionId) setCollabInfo(info);
     });
 
-    // When a participant saves, propagate to parent
+    // When a participant saves, call the latest onNotesUpdated via ref.
     const unsubNotes = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
-      if (!cancelled) onNotesUpdated(data.notes, data.savedBy);
+      if (!cancelled) onNotesUpdatedRef.current(data.notes, data.savedBy);
     });
 
-    // Show "X is editing…" indicator
+    // Show "X is editing…" + their live draft content so the host can see what's changing.
     const unsubDraft = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
       if (cancelled) return;
-      setDrafting({ peerId: data.peerId, peerName: data.peerName });
+      setDrafting({ peerId: data.peerId, peerName: data.peerName, content: data.content ?? '' });
       if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
-      draftTimerRef.current = setTimeout(() => setDrafting(null), 3000);
+      draftTimerRef.current = setTimeout(() => setDrafting(null), 4000);
     });
 
     return () => {
@@ -216,9 +221,16 @@ export function MeetingCollaboratePanel({
               </div>
             )}
             {drafting && (
-              <p className="text-[10px] text-amber-400/80 mt-1">
-                {drafting.peerName} is editing…
-              </p>
+              <div className="mt-2 space-y-1">
+                <p className="text-[10px] text-amber-400/80">
+                  {drafting.peerName} is editing…
+                </p>
+                {drafting.content && (
+                  <div className="text-[10px] text-iron-text-muted bg-iron-surface-hover border border-amber-500/15 rounded px-2 py-1.5 max-h-20 overflow-y-auto leading-relaxed line-clamp-4">
+                    {drafting.content}
+                  </div>
+                )}
+              </div>
             )}
           </div>
         </>

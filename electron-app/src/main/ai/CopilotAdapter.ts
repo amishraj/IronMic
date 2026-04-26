@@ -1,5 +1,5 @@
 import { execFileSync } from 'child_process';
-import * as https from 'https';
+import { net } from 'electron';
 import type { IAIAdapter, AIProvider, AIModel } from './types';
 
 /**
@@ -10,13 +10,16 @@ import type { IAIAdapter, AIProvider, AIModel } from './types';
  * same endpoint VS Code's Copilot extension uses. Chat completions are streamed
  * directly over HTTPS — no `gh` subcommands are spawned for inference.
  *
+ * Uses Electron's `net` module (not Node's `https`) so the OS/system certificate
+ * store is respected. This fixes "self-signed certificate in the chain" errors on
+ * enterprise networks with TLS-intercepting proxies.
+ *
  * Works with any active GitHub Copilot plan (Individual, Business, Enterprise).
  * Does NOT require the `gh-models` extension.
  *
  * Cross-platform:
  *   - Binary discovery uses `where` on Windows / `which` elsewhere with an
  *     augmented PATH so Electron finds `gh` even when launched from the Finder.
- *   - HTTPS calls use Node's built-in `https` module — no extra dependencies.
  */
 export class CopilotAdapter implements IAIAdapter {
   name: AIProvider = 'copilot';
@@ -126,7 +129,7 @@ export class CopilotAdapter implements IAIAdapter {
 
   /**
    * Exchange a GitHub OAuth token for a short-lived Copilot API token.
-   * This is the same exchange VS Code's Copilot extension performs.
+   * Uses Electron net module so corporate TLS proxies are handled correctly.
    */
   async getCopilotToken(): Promise<string> {
     if (this.tokenCache && Date.now() < this.tokenCache.expiresAt) {
@@ -141,46 +144,43 @@ export class CopilotAdapter implements IAIAdapter {
     }
 
     const token = await new Promise<string>((resolve, reject) => {
-      const req = https.request(
-        {
-          hostname: 'api.github.com',
-          path: '/copilot_internal/v2/token',
-          method: 'GET',
-          headers: {
-            Authorization: `token ${githubToken}`,
-            'User-Agent': 'IronMic/1.0',
-            'Editor-Version': 'vscode/1.94.0',
-            'Editor-Plugin-Version': 'copilot-chat/0.22.0',
-          },
+      const req = net.request({
+        method: 'GET',
+        url: 'https://api.github.com/copilot_internal/v2/token',
+        headers: {
+          Authorization: `token ${githubToken}`,
+          'User-Agent': 'IronMic/1.0',
+          'Editor-Version': 'vscode/1.94.0',
+          'Editor-Plugin-Version': 'copilot-chat/0.22.0',
         },
-        (res) => {
-          let body = '';
-          res.on('data', (chunk) => { body += chunk; });
-          res.on('end', () => {
-            if (res.statusCode === 401 || res.statusCode === 403) {
-              reject(
-                new Error(
-                  'GitHub Copilot subscription required.\n\n' +
-                  'Make sure your GitHub account has an active Copilot plan ' +
-                  '(Individual, Business, or Enterprise).'
-                )
-              );
-              return;
-            }
-            if (res.statusCode !== 200) {
-              reject(new Error(`Copilot token request failed (HTTP ${res.statusCode}): ${body.slice(0, 200)}`));
-              return;
-            }
-            try {
-              const data = JSON.parse(body) as { token: string };
-              resolve(data.token);
-            } catch {
-              reject(new Error('Unexpected response from GitHub Copilot API'));
-            }
-          });
-          res.on('error', reject);
-        }
-      );
+      });
+
+      req.on('response', (res) => {
+        let body = '';
+        res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+        res.on('end', () => {
+          if (res.statusCode === 401 || res.statusCode === 403) {
+            reject(new Error(
+              'GitHub Copilot subscription required.\n\n' +
+              'Make sure your GitHub account has an active Copilot plan ' +
+              '(Individual, Business, or Enterprise).'
+            ));
+            return;
+          }
+          if (res.statusCode !== 200) {
+            reject(new Error(`Copilot token request failed (HTTP ${res.statusCode}): ${body.slice(0, 200)}`));
+            return;
+          }
+          try {
+            const data = JSON.parse(body) as { token: string };
+            resolve(data.token);
+          } catch {
+            reject(new Error('Unexpected response from GitHub Copilot API'));
+          }
+        });
+        res.on('error', reject);
+      });
+
       req.on('error', reject);
       req.end();
     });
@@ -191,7 +191,7 @@ export class CopilotAdapter implements IAIAdapter {
 
   /**
    * Send a chat completion request and stream tokens via `onToken`.
-   * Messages should include the full conversation history.
+   * Uses Electron net module so corporate TLS proxies are handled correctly.
    */
   async sendMessageHTTP(
     messages: Array<{ role: string; content: string }>,
@@ -216,64 +216,61 @@ export class CopilotAdapter implements IAIAdapter {
     return new Promise((resolve, reject) => {
       let fullText = '';
 
-      const req = https.request(
-        {
-          hostname: 'api.githubcopilot.com',
-          path: '/chat/completions',
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${copilotToken}`,
-            'Content-Type': 'application/json',
-            'Content-Length': Buffer.byteLength(body),
-            'User-Agent': 'IronMic/1.0',
-            'Editor-Version': 'vscode/1.94.0',
-            'Editor-Plugin-Version': 'copilot-chat/0.22.0',
-            'Copilot-Integration-Id': 'vscode-chat',
-            'OpenAI-Intent': 'conversation-panel',
-          },
+      const req = net.request({
+        method: 'POST',
+        url: 'https://api.githubcopilot.com/chat/completions',
+        headers: {
+          Authorization: `Bearer ${copilotToken}`,
+          'Content-Type': 'application/json',
+          'Content-Length': String(Buffer.byteLength(body)),
+          'User-Agent': 'IronMic/1.0',
+          'Editor-Version': 'vscode/1.94.0',
+          'Editor-Plugin-Version': 'copilot-chat/0.22.0',
+          'Copilot-Integration-Id': 'vscode-chat',
+          'OpenAI-Intent': 'conversation-panel',
         },
-        (res) => {
-          if (res.statusCode === 401) {
-            // Token expired — bust cache so next call re-fetches
-            this.tokenCache = null;
-            reject(new Error('Copilot token expired. Please send your message again.'));
-            return;
-          }
-          if (res.statusCode !== 200) {
-            let errBody = '';
-            res.on('data', (chunk) => { errBody += chunk; });
-            res.on('end', () =>
-              reject(new Error(`Copilot API error ${res.statusCode}: ${errBody.slice(0, 300)}`))
-            );
-            return;
-          }
+      });
 
-          // Parse Server-Sent Events stream
-          let sseBuffer = '';
-          res.on('data', (chunk: Buffer) => {
-            sseBuffer += chunk.toString();
-            const lines = sseBuffer.split('\n');
-            sseBuffer = lines.pop() ?? '';
-
-            for (const line of lines) {
-              if (!line.startsWith('data: ')) continue;
-              const payload = line.slice(6).trim();
-              if (payload === '[DONE]') continue;
-              try {
-                const json = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: string } }> };
-                const token = json.choices?.[0]?.delta?.content;
-                if (token) {
-                  fullText += token;
-                  onToken(token);
-                }
-              } catch { /* skip malformed SSE frames */ }
-            }
-          });
-
-          res.on('end', () => resolve(fullText));
-          res.on('error', reject);
+      req.on('response', (res) => {
+        if (res.statusCode === 401) {
+          this.tokenCache = null;
+          reject(new Error('Copilot token expired. Please send your message again.'));
+          return;
         }
-      );
+        if (res.statusCode !== 200) {
+          let errBody = '';
+          res.on('data', (chunk: Buffer) => { errBody += chunk.toString(); });
+          res.on('end', () =>
+            reject(new Error(`Copilot API error ${res.statusCode}: ${errBody.slice(0, 300)}`))
+          );
+          return;
+        }
+
+        // Parse Server-Sent Events stream
+        let sseBuffer = '';
+        res.on('data', (chunk: Buffer) => {
+          sseBuffer += chunk.toString();
+          const lines = sseBuffer.split('\n');
+          sseBuffer = lines.pop() ?? '';
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const payload = line.slice(6).trim();
+            if (payload === '[DONE]') continue;
+            try {
+              const json = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: string } }> };
+              const token = json.choices?.[0]?.delta?.content;
+              if (token) {
+                fullText += token;
+                onToken(token);
+              }
+            } catch { /* skip malformed SSE frames */ }
+          }
+        });
+
+        res.on('end', () => resolve(fullText));
+        res.on('error', reject);
+      });
 
       req.on('error', reject);
       req.write(body);

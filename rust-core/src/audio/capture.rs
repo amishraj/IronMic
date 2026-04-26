@@ -305,34 +305,54 @@ impl CaptureEngine {
         })
     }
 
-    /// Choose the best input config — prefer f32, fall back to whatever is available.
-    /// Returns (StreamConfig, SampleFormat) so callers can dispatch on the
-    /// actual format. The previous version threw away the SampleFormat by
-    /// returning only StreamConfig, which left start() hardcoded to an `&[f32]`
-    /// callback. On Windows WASAPI most devices expose I16 natively, so that
-    /// hardcode either failed silently at stream-build or produced garbage
-    /// samples — which is why dictation broke on Windows but worked on macOS
-    /// (CoreAudio almost always exposes F32).
+    /// Choose the best input config for Whisper transcription.
+    ///
+    /// Strategy: prefer F32 at a canonical rate close to 48 kHz, then any
+    /// format at a canonical rate, then fall back to the first available config
+    /// at max rate. Using max rate unconditionally caused problems on Windows
+    /// WASAPI devices that report 192 kHz as their max — rubato handles the
+    /// resampling but the very high ratio degrades quality. 48 kHz → 16 kHz
+    /// (3:1) is the ideal target; 44100 and 96000 also resample cleanly.
     fn preferred_config(device: &Device) -> Result<(StreamConfig, SampleFormat), IronMicError> {
-        let supported = device
-            .supported_input_configs()
-            .map_err(|e| IronMicError::Audio(e.to_string()))?;
+        const PREFERRED_RATES: &[u32] = &[48_000, 44_100, 16_000, 24_000, 96_000, 192_000];
 
-        let mut best = None;
-        for cfg in supported {
-            if cfg.sample_format() == SampleFormat::F32 {
-                best = Some(cfg.with_max_sample_rate());
-                break;
-            }
-            if best.is_none() {
-                best = Some(cfg.with_max_sample_rate());
+        let supported: Vec<_> = device
+            .supported_input_configs()
+            .map_err(|e| IronMicError::Audio(e.to_string()))?
+            .collect();
+
+        if supported.is_empty() {
+            return Err(IronMicError::NoDevice("No supported input configs found".into()));
+        }
+
+        // Pass 1: F32 at a preferred rate (best quality, no conversion needed).
+        for &rate in PREFERRED_RATES {
+            let sr = cpal::SampleRate(rate);
+            for cfg in &supported {
+                if cfg.sample_format() == SampleFormat::F32
+                    && cfg.min_sample_rate() <= sr
+                    && cfg.max_sample_rate() >= sr
+                {
+                    return Ok((cfg.with_sample_rate(sr).into(), SampleFormat::F32));
+                }
             }
         }
 
-        let config = best
-            .ok_or_else(|| IronMicError::NoDevice("No supported input config found".into()))?;
-        let format = config.sample_format();
-        Ok((config.into(), format))
+        // Pass 2: any format at a preferred rate (will be converted to f32 in callback).
+        for &rate in PREFERRED_RATES {
+            let sr = cpal::SampleRate(rate);
+            for cfg in &supported {
+                if cfg.min_sample_rate() <= sr && cfg.max_sample_rate() >= sr {
+                    let fmt = cfg.sample_format();
+                    return Ok((cfg.with_sample_rate(sr).into(), fmt));
+                }
+            }
+        }
+
+        // Fallback: first available config at its max rate.
+        let cfg = supported.into_iter().next().unwrap();
+        let fmt = cfg.sample_format();
+        Ok((cfg.with_max_sample_rate().into(), fmt))
     }
 }
 

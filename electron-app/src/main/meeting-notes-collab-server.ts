@@ -33,6 +33,7 @@
 
 import * as os from 'os';
 import * as crypto from 'crypto';
+import { exec } from 'child_process';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
 import { BrowserWindow } from 'electron';
 import { native } from './native-bridge';
@@ -72,6 +73,7 @@ class MeetingNotesCollabServerManager {
   private sessionCode: string | null = null;
   private boundIp: string | null = null;
   private boundPort: number | null = null;
+  private firewallRuleName: string | null = null;
 
   private currentNotes: string = '';
   private version: number = 0;
@@ -139,12 +141,14 @@ class MeetingNotesCollabServerManager {
       wss.on('connection', (ws: WebSocket) => this.handleConnection(ws));
     });
 
+    if (this.boundPort) this.addWindowsFirewallRule(this.boundPort);
     this.pushStateToRenderer();
     return this.getInfo();
   }
 
   async stop(): Promise<void> {
     if (!this.wss) return;
+    this.removeWindowsFirewallRule();
     this.broadcast({ type: 'collab_ended' });
     for (const ws of this.clients.keys()) {
       try { ws.close(1000, 'host stopped'); } catch { /* ignore */ }
@@ -346,6 +350,33 @@ class MeetingNotesCollabServerManager {
         win.webContents.send('ironmic:meeting-collab-draft', { content, peerId, peerName });
       }
     }
+  }
+
+  private addWindowsFirewallRule(port: number): void {
+    if (process.platform !== 'win32') return;
+    const name = `IronMic-Collab-${port}`;
+    this.firewallRuleName = name;
+    exec(
+      `netsh advfirewall firewall add rule name="${name}" dir=in action=allow protocol=TCP localport=${port}`,
+      (err) => {
+        if (err) {
+          console.warn(
+            `[NotesCollabServer] Could not add Windows Firewall rule for port ${port}. ` +
+            'Participants on other machines may see EHOSTUNREACH. ' +
+            'Allow IronMic through Windows Firewall manually if needed.',
+          );
+        } else {
+          console.info(`[NotesCollabServer] Windows Firewall rule added: ${name}`);
+        }
+      },
+    );
+  }
+
+  private removeWindowsFirewallRule(): void {
+    if (process.platform !== 'win32' || !this.firewallRuleName) return;
+    const name = this.firewallRuleName;
+    this.firewallRuleName = null;
+    exec(`netsh advfirewall firewall delete rule name="${name}"`, () => {});
   }
 
   private detectLanIp(): string | null {

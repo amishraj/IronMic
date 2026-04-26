@@ -87,11 +87,11 @@ export function Layout() {
       return;
     }
 
-    // From any other page: set a flag in the dictation store that DictatePage
-    // reads on mount and auto-starts recording. This avoids the race between
-    // a setTimeout-dispatched event and the component's useEffect registering
-    // its listener — the flag persists in the store until consumed.
-    useDictationStore.setState({ pendingQuickStart: true });
+    // From any other page: navigate to notes with a blank-note flag so
+    // NoteEditor doesn't load the previous entry, and a quick-start flag so
+    // DictatePage (if on 'dictate') auto-starts. Both flags persist in the
+    // store until consumed by the respective component on mount.
+    useDictationStore.setState({ pendingQuickStart: true, newNoteRequested: true });
     setPage('notes');
   }, []);
 
