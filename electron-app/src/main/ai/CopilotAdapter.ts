@@ -1,22 +1,28 @@
 import { execFileSync } from 'child_process';
-import type { ICLIAdapter, ParsedOutput, AIProvider, AIModel } from './types';
+import * as https from 'https';
+import type { IAIAdapter, AIProvider, AIModel } from './types';
 
 /**
- * GitHub Copilot via the `gh` CLI. Chat is routed through the gh-models
- * extension (`gh models run <model> <prompt>`) — NOT `gh copilot suggest`,
- * which is a shell-command suggestion tool, not a chat completion endpoint.
+ * GitHub Copilot adapter.
  *
- * Requirements on the user's machine:
- *   1. `gh` CLI installed and authenticated (`gh auth login`)
- *   2. `gh-models` extension installed: `gh extension install github/gh-models`
+ * Authentication uses the `gh` CLI (GitHub CLI) to retrieve the stored OAuth
+ * token, which is then exchanged for a short-lived Copilot API token via the
+ * same endpoint VS Code's Copilot extension uses. Chat completions are streamed
+ * directly over HTTPS — no `gh` subcommands are spawned for inference.
  *
- * Cross-platform notes:
- *   - Binary discovery uses `where` on Windows / `which` elsewhere via
- *     execFileSync with NO shell, so it works on systems without zsh/bash.
- *   - All probes are sync with short timeouts so they don't block the UI.
+ * Works with any active GitHub Copilot plan (Individual, Business, Enterprise).
+ * Does NOT require the `gh-models` extension.
+ *
+ * Cross-platform:
+ *   - Binary discovery uses `where` on Windows / `which` elsewhere with an
+ *     augmented PATH so Electron finds `gh` even when launched from the Finder.
+ *   - HTTPS calls use Node's built-in `https` module — no extra dependencies.
  */
-export class CopilotAdapter implements ICLIAdapter {
+export class CopilotAdapter implements IAIAdapter {
   name: AIProvider = 'copilot';
+
+  /** Copilot token cache (GitHub issues tokens with ~30-min TTL; we refresh at 25). */
+  private tokenCache: { token: string; expiresAt: number } | null = null;
 
   async isInstalled(): Promise<boolean> {
     return (await this.getBinaryPath()) !== null;
@@ -28,14 +34,12 @@ export class CopilotAdapter implements ICLIAdapter {
     const bin = await this.getBinaryPath();
     if (!bin) return false;
 
-    // `gh auth status` exits 0 iff at least one host is logged in.
-    // It writes its status report to stderr, but we only care about the
-    // exit code here — execFileSync throws on non-zero.
     try {
       execFileSync(bin, ['auth', 'status'], {
         encoding: 'utf-8',
         timeout: 5000,
         stdio: ['ignore', 'pipe', 'pipe'],
+        env: this.augmentedEnv(),
       });
       return true;
     } catch {
@@ -50,6 +54,7 @@ export class CopilotAdapter implements ICLIAdapter {
       const out = execFileSync(bin, ['--version'], {
         encoding: 'utf-8',
         timeout: 5000,
+        env: this.augmentedEnv(),
       });
       const match = out.match(/(\d+\.\d+\.\d+)/);
       return match ? match[1] : null;
@@ -64,54 +69,232 @@ export class CopilotAdapter implements ICLIAdapter {
       const out = execFileSync(lookup, ['gh'], {
         encoding: 'utf-8',
         timeout: 3000,
+        env: this.augmentedEnv(),
       });
-      // `where` can return multiple paths on Windows (one per line); take the first.
       const first = out.split(/\r?\n/).find((line) => line.trim().length > 0);
-      return first ? first.trim() : null;
+      if (first) return first.trim();
+    } catch { /* fall through to direct path probes */ }
+
+    const { existsSync } = require('fs') as typeof import('fs');
+    const candidates =
+      process.platform === 'win32'
+        ? [
+            'C:\\Program Files\\GitHub CLI\\gh.exe',
+            `${process.env.LOCALAPPDATA}\\Programs\\GitHub CLI\\gh.exe`,
+          ]
+        : [
+            '/opt/homebrew/bin/gh',
+            '/usr/local/bin/gh',
+            '/usr/bin/gh',
+            `${process.env.HOME || ''}/.local/bin/gh`,
+          ];
+    for (const p of candidates) {
+      if (p && existsSync(p)) return p;
+    }
+    return null;
+  }
+
+  availableModels(): AIModel[] {
+    return [
+      { id: 'gpt-4o', label: 'GPT-4o', provider: 'copilot', free: false, description: 'Flagship GPT-4o via GitHub Copilot' },
+      { id: 'gpt-4o-mini', label: 'GPT-4o Mini', provider: 'copilot', free: true, description: 'Fast and efficient' },
+      { id: 'o3-mini', label: 'o3-mini', provider: 'copilot', free: false, description: 'Advanced reasoning' },
+      { id: 'claude-3.5-sonnet', label: 'Claude 3.5 Sonnet', provider: 'copilot', free: false, description: 'Anthropic model via Copilot' },
+    ];
+  }
+
+  /** Retrieve the GitHub OAuth token stored by `gh auth login`. */
+  async getGithubToken(): Promise<string | null> {
+    const envToken = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+    if (envToken) return envToken;
+
+    const bin = await this.getBinaryPath();
+    if (!bin) return null;
+
+    try {
+      const out = execFileSync(bin, ['auth', 'token'], {
+        encoding: 'utf-8',
+        timeout: 5000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: this.augmentedEnv(),
+      });
+      return out.trim() || null;
     } catch {
       return null;
     }
   }
 
   /**
-   * Args for `gh models run <model> <prompt>`. The gh-models extension
-   * streams the assistant response on stdout as plain text.
+   * Exchange a GitHub OAuth token for a short-lived Copilot API token.
+   * This is the same exchange VS Code's Copilot extension performs.
    */
-  buildArgs(prompt: string, _continueSession: boolean, model?: string): string[] {
-    // Default to the free, fast tier so unconfigured runs still work.
-    const modelId = model || 'gpt-4o-mini';
-    return ['models', 'run', modelId, prompt];
+  async getCopilotToken(): Promise<string> {
+    if (this.tokenCache && Date.now() < this.tokenCache.expiresAt) {
+      return this.tokenCache.token;
+    }
+
+    const githubToken = await this.getGithubToken();
+    if (!githubToken) {
+      throw new Error(
+        'No GitHub token found.\n\nRun `gh auth login` in your terminal, then refresh.'
+      );
+    }
+
+    const token = await new Promise<string>((resolve, reject) => {
+      const req = https.request(
+        {
+          hostname: 'api.github.com',
+          path: '/copilot_internal/v2/token',
+          method: 'GET',
+          headers: {
+            Authorization: `token ${githubToken}`,
+            'User-Agent': 'IronMic/1.0',
+            'Editor-Version': 'vscode/1.94.0',
+            'Editor-Plugin-Version': 'copilot-chat/0.22.0',
+          },
+        },
+        (res) => {
+          let body = '';
+          res.on('data', (chunk) => { body += chunk; });
+          res.on('end', () => {
+            if (res.statusCode === 401 || res.statusCode === 403) {
+              reject(
+                new Error(
+                  'GitHub Copilot subscription required.\n\n' +
+                  'Make sure your GitHub account has an active Copilot plan ' +
+                  '(Individual, Business, or Enterprise).'
+                )
+              );
+              return;
+            }
+            if (res.statusCode !== 200) {
+              reject(new Error(`Copilot token request failed (HTTP ${res.statusCode}): ${body.slice(0, 200)}`));
+              return;
+            }
+            try {
+              const data = JSON.parse(body) as { token: string };
+              resolve(data.token);
+            } catch {
+              reject(new Error('Unexpected response from GitHub Copilot API'));
+            }
+          });
+          res.on('error', reject);
+        }
+      );
+      req.on('error', reject);
+      req.end();
+    });
+
+    this.tokenCache = { token, expiresAt: Date.now() + 25 * 60 * 1000 };
+    return token;
   }
 
   /**
-   * Models surfaced in IronMic's UI. These are GitHub Models marketplace IDs
-   * — the same IDs `gh models list` returns. The `free` flag here only
-   * affects the UI label; entitlement is enforced by GitHub.
+   * Send a chat completion request and stream tokens via `onToken`.
+   * Messages should include the full conversation history.
    */
-  availableModels(): AIModel[] {
-    return [
-      { id: 'gpt-4o-mini', label: 'GPT-4o Mini', provider: 'copilot', free: true, description: 'Fast and free with GitHub Copilot' },
-      { id: 'gpt-4o', label: 'GPT-4o', provider: 'copilot', free: false, description: 'Multimodal flagship' },
-      { id: 'gpt-4.1-mini', label: 'GPT-4.1 Mini', provider: 'copilot', free: true, description: 'Free tier — fast and capable' },
-      { id: 'gpt-4.1', label: 'GPT-4.1', provider: 'copilot', free: false, description: 'Most capable GPT-4.1' },
-      { id: 'o3-mini', label: 'o3-mini', provider: 'copilot', free: false, description: 'Advanced reasoning' },
-      { id: 'claude-3-5-sonnet', label: 'Claude 3.5 Sonnet', provider: 'copilot', free: false, description: 'Anthropic via GitHub Models' },
-    ];
+  async sendMessageHTTP(
+    messages: Array<{ role: string; content: string }>,
+    model: string | undefined,
+    onToken: (token: string) => void,
+  ): Promise<string> {
+    let copilotToken: string;
+    try {
+      copilotToken = await this.getCopilotToken();
+    } catch (err) {
+      throw err;
+    }
+
+    const modelId = model || 'gpt-4o';
+    const body = JSON.stringify({
+      model: modelId,
+      messages,
+      stream: true,
+      max_tokens: 4096,
+    });
+
+    return new Promise((resolve, reject) => {
+      let fullText = '';
+
+      const req = https.request(
+        {
+          hostname: 'api.githubcopilot.com',
+          path: '/chat/completions',
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${copilotToken}`,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+            'User-Agent': 'IronMic/1.0',
+            'Editor-Version': 'vscode/1.94.0',
+            'Editor-Plugin-Version': 'copilot-chat/0.22.0',
+            'Copilot-Integration-Id': 'vscode-chat',
+            'OpenAI-Intent': 'conversation-panel',
+          },
+        },
+        (res) => {
+          if (res.statusCode === 401) {
+            // Token expired — bust cache so next call re-fetches
+            this.tokenCache = null;
+            reject(new Error('Copilot token expired. Please send your message again.'));
+            return;
+          }
+          if (res.statusCode !== 200) {
+            let errBody = '';
+            res.on('data', (chunk) => { errBody += chunk; });
+            res.on('end', () =>
+              reject(new Error(`Copilot API error ${res.statusCode}: ${errBody.slice(0, 300)}`))
+            );
+            return;
+          }
+
+          // Parse Server-Sent Events stream
+          let sseBuffer = '';
+          res.on('data', (chunk: Buffer) => {
+            sseBuffer += chunk.toString();
+            const lines = sseBuffer.split('\n');
+            sseBuffer = lines.pop() ?? '';
+
+            for (const line of lines) {
+              if (!line.startsWith('data: ')) continue;
+              const payload = line.slice(6).trim();
+              if (payload === '[DONE]') continue;
+              try {
+                const json = JSON.parse(payload) as { choices?: Array<{ delta?: { content?: string } }> };
+                const token = json.choices?.[0]?.delta?.content;
+                if (token) {
+                  fullText += token;
+                  onToken(token);
+                }
+              } catch { /* skip malformed SSE frames */ }
+            }
+          });
+
+          res.on('end', () => resolve(fullText));
+          res.on('error', reject);
+        }
+      );
+
+      req.on('error', reject);
+      req.write(body);
+      req.end();
+    });
   }
 
-  parseOutput(data: string): ParsedOutput {
-    const trimmed = data.trim();
-    if (!trimmed) return { type: 'text', content: '' };
-    // gh-models prints extension-not-installed errors with this exact prefix.
-    if (/extension .* not found/i.test(trimmed) || /unknown command "models"/i.test(trimmed)) {
-      return {
-        type: 'error',
-        content: 'GitHub Models extension not installed. Run: gh extension install github/gh-models',
-      };
+  /** Build a process env with common binary directories prepended to PATH. */
+  private augmentedEnv(): NodeJS.ProcessEnv {
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (process.platform !== 'win32') {
+      const home = process.env.HOME || '';
+      const extra = [
+        '/opt/homebrew/bin',
+        '/usr/local/bin',
+        `${home}/.local/bin`,
+        `${home}/bin`,
+      ].filter(Boolean);
+      const current = (process.env.PATH || '').split(':');
+      env.PATH = [...new Set([...extra, ...current])].join(':');
     }
-    if (/^error/i.test(trimmed) || /HTTP 4\d\d/.test(trimmed) || /HTTP 5\d\d/.test(trimmed)) {
-      return { type: 'error', content: trimmed };
-    }
-    return { type: 'text', content: trimmed };
+    return env;
   }
 }

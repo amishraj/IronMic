@@ -1,6 +1,29 @@
 import { execFileSync } from 'child_process';
 import type { ICLIAdapter, ParsedOutput, AIProvider, AIModel } from './types';
 
+/**
+ * Build a process environment with common binary directories prepended to PATH.
+ * Electron on macOS/Linux often launches with a minimal system PATH that
+ * omits Homebrew, npm global, and other user-installed locations.
+ */
+function buildAugmentedEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  if (process.platform !== 'win32') {
+    const home = process.env.HOME || '';
+    const extra = [
+      '/opt/homebrew/bin',       // Apple Silicon Homebrew
+      '/usr/local/bin',          // Intel Homebrew / manual installs
+      `${home}/.local/bin`,
+      `${home}/bin`,
+      `${home}/.volta/bin`,      // Volta node version manager
+      `${home}/.npm-global/bin`, // npm prefix override
+    ].filter(Boolean);
+    const current = (process.env.PATH || '').split(':');
+    env.PATH = [...new Set([...extra, ...current])].join(':');
+  }
+  return env;
+}
+
 export class ClaudeAdapter implements ICLIAdapter {
   name: AIProvider = 'claude';
 
@@ -18,6 +41,7 @@ export class ClaudeAdapter implements ICLIAdapter {
           encoding: 'utf-8',
           timeout: 5000,
           stdio: ['ignore', 'pipe', 'pipe'],
+          env: buildAugmentedEnv(),
         });
         const text = result.toLowerCase();
         return !text.includes('not logged in') && !text.includes('no api key');
@@ -48,6 +72,7 @@ export class ClaudeAdapter implements ICLIAdapter {
       const result = execFileSync(bin, ['--version'], {
         encoding: 'utf-8',
         timeout: 5000,
+        env: buildAugmentedEnv(),
       });
       const match = result.match(/(\d+\.\d+\.\d+)/);
       return match ? match[1] : null;
@@ -58,16 +83,39 @@ export class ClaudeAdapter implements ICLIAdapter {
 
   async getBinaryPath(): Promise<string | null> {
     const lookup = process.platform === 'win32' ? 'where' : 'which';
+    const augmentedEnv = buildAugmentedEnv();
     try {
       const out = execFileSync(lookup, ['claude'], {
         encoding: 'utf-8',
         timeout: 3000,
+        env: augmentedEnv,
       });
       const first = out.split(/\r?\n/).find((line) => line.trim().length > 0);
-      return first ? first.trim() : null;
-    } catch {
-      return null;
+      if (first) return first.trim();
+    } catch { /* fall through to direct path probes */ }
+
+    // Electron on macOS/Linux may launch without the user's full PATH.
+    // Check well-known locations before giving up.
+    const { existsSync } = require('fs') as typeof import('fs');
+    const candidates =
+      process.platform === 'win32'
+        ? [
+            `${process.env.LOCALAPPDATA}\\Programs\\claude\\claude.exe`,
+            `${process.env.APPDATA}\\npm\\claude.cmd`,
+          ]
+        : [
+            '/opt/homebrew/bin/claude',
+            '/usr/local/bin/claude',
+            '/usr/bin/claude',
+            `${process.env.HOME || ''}/.local/bin/claude`,
+            `${process.env.HOME || ''}/bin/claude`,
+            `${process.env.HOME || ''}/.volta/bin/claude`,
+            `${process.env.HOME || ''}/.npm-global/bin/claude`,
+          ];
+    for (const p of candidates) {
+      if (p && existsSync(p)) return p;
     }
+    return null;
   }
 
   buildArgs(prompt: string, continueSession: boolean, model?: string): string[] {
