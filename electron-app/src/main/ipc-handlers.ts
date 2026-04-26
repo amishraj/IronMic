@@ -19,6 +19,7 @@ import { meetingRoomClient } from './meeting-room-client';
 import { meetingNotesCollabServer } from './meeting-notes-collab-server';
 import { meetingNotesCollabClient } from './meeting-notes-collab-client';
 import { checkBlackHoleInstalled, installBlackHole, openAudioMidiSetup, broadcastInstallProgress } from './blackhole-setup';
+import { audioStream } from './audio-stream-manager';
 
 // ── Input validation helpers ──
 
@@ -67,11 +68,34 @@ function assertMaxLength(val: string, max: number, name: string): void {
 }
 
 export function registerIpcHandlers(): void {
-  // Audio
-  ipcMain.handle(IPC_CHANNELS.START_RECORDING, () => native.startRecording());
-  ipcMain.handle(IPC_CHANNELS.STOP_RECORDING, () => native.stopRecording());
+  // Audio — all callers must go through audioStream for exclusive ownership.
+  ipcMain.handle(IPC_CHANNELS.START_RECORDING, () => {
+    audioStream.acquire('dictation');
+    try {
+      native.startRecording();
+    } catch (err) {
+      audioStream.release('dictation');
+      throw err;
+    }
+  });
+  ipcMain.handle(IPC_CHANNELS.STOP_RECORDING, () => {
+    try {
+      return native.stopRecording();
+    } finally {
+      audioStream.release('dictation');
+    }
+  });
   ipcMain.handle(IPC_CHANNELS.IS_RECORDING, () => native.isRecording());
-  ipcMain.handle('ironmic:reset-recording', () => native.addon.resetRecording());
+  // reset-recording: clears both the Rust pipeline state and the ownership
+  // flag so a stuck stream can be recovered without restarting the app.
+  ipcMain.handle('ironmic:reset-recording', () => {
+    audioStream.forceReset();
+    if (typeof native.addon.resetRecording === 'function') {
+      native.addon.resetRecording();
+    } else if (typeof native.addon.resetPipelineState === 'function') {
+      native.addon.resetPipelineState();
+    }
+  });
 
   // Transcription — validate buffer size, convert Uint8Array to Buffer (sandbox sends Uint8Array)
   ipcMain.handle(IPC_CHANNELS.TRANSCRIBE, (_e, audioBuffer: any) => {
@@ -583,6 +607,12 @@ If the text is too short or unclear, output: ["General"]`;
     }
     return { ...recorderResult, liveSummary, liveInsufficient };
   });
+
+  // Returns the live recording state so the renderer can resync after a
+  // component remount (e.g. navigate away mid-meeting → navigate back).
+  ipcMain.handle('ironmic:get-meeting-recording-state', () =>
+    meetingRecorder.getState(),
+  );
 
   // ── Streaming dictation (near-real-time, chunked) ──
   ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_START, async () => {

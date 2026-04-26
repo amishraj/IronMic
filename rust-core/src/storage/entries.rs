@@ -115,57 +115,44 @@ impl EntryStore {
         get_entry_with_conn(&conn, id)
     }
 
-    /// Update an entry.
+    /// Update an entry. Builds a single UPDATE statement regardless of how many
+    /// fields are provided — O(1) round-trips instead of up to 6.
     pub fn update(&self, id: &str, updates: EntryUpdate) -> Result<Entry, IronMicError> {
         let now = Utc::now().to_rfc3339();
         let conn = self.db.conn();
 
-        if let Some(ref raw) = updates.raw_transcript {
-            conn.execute(
-                "UPDATE entries SET raw_transcript = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![raw, now, id],
-            )
-            .map_err(|e| IronMicError::Storage(format!("Failed to update entry: {e}")))?;
+        // Each element is (column_name, boxed value). updated_at is always set.
+        let mut sets: Vec<String> = vec!["updated_at = ?1".into()];
+        // rusqlite requires &dyn ToSql, so we hold owned values in a Vec<Box<dyn ToSql>>.
+        // ?1 = now, remaining params filled below, last param = id.
+        type BoxedSql = Box<dyn rusqlite::types::ToSql>;
+        let mut params: Vec<BoxedSql> = vec![Box::new(now)];
+        let mut idx: usize = 2;
+
+        macro_rules! push_col {
+            ($col:literal, $val:expr) => {{
+                sets.push(format!("{} = ?{}", $col, idx));
+                params.push(Box::new($val));
+                idx += 1;
+            }};
         }
 
-        if let Some(ref polished) = updates.polished_text {
-            conn.execute(
-                "UPDATE entries SET polished_text = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![polished, now, id],
-            )
-            .map_err(|e| IronMicError::Storage(format!("Failed to update entry: {e}")))?;
-        }
+        if let Some(v) = updates.raw_transcript   { push_col!("raw_transcript", v); }
+        if let Some(v) = updates.polished_text     { push_col!("polished_text",  v); }
+        if let Some(v) = updates.display_mode      { push_col!("display_mode",   v); }
+        if let Some(v) = updates.tags              { push_col!("tags",           v); }
+        if let Some(v) = updates.source_app        { push_col!("source_app",     v); }
 
-        if let Some(ref mode) = updates.display_mode {
-            conn.execute(
-                "UPDATE entries SET display_mode = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![mode, now, id],
-            )
-            .map_err(|e| IronMicError::Storage(format!("Failed to update entry: {e}")))?;
-        }
+        // id is the final bind parameter
+        params.push(Box::new(id.to_string()));
+        let sql = format!(
+            "UPDATE entries SET {} WHERE id = ?{}",
+            sets.join(", "),
+            idx
+        );
 
-        if let Some(ref tags) = updates.tags {
-            conn.execute(
-                "UPDATE entries SET tags = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![tags, now, id],
-            )
+        conn.execute(&sql, rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())))
             .map_err(|e| IronMicError::Storage(format!("Failed to update entry: {e}")))?;
-        }
-
-        if let Some(ref source_app) = updates.source_app {
-            conn.execute(
-                "UPDATE entries SET source_app = ?1, updated_at = ?2 WHERE id = ?3",
-                rusqlite::params![source_app, now, id],
-            )
-            .map_err(|e| IronMicError::Storage(format!("Failed to update entry: {e}")))?;
-        }
-
-        // Always bump timestamp
-        conn.execute(
-            "UPDATE entries SET updated_at = ?1 WHERE id = ?2",
-            rusqlite::params![now, id],
-        )
-        .map_err(|e| IronMicError::Storage(format!("Failed to update entry: {e}")))?;
 
         get_entry_with_conn(&conn, id)?
             .ok_or_else(|| IronMicError::Storage("Entry not found after update".into()))

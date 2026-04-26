@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, memo } from 'react';
 import { Pin, Archive, Trash2, Clock, Sparkles, MessageSquare } from 'lucide-react';
 import { RawPolishedToggle } from './RawPolishedToggle';
 import { PlaybackControls } from './PlaybackControls';
@@ -29,7 +29,7 @@ interface EntryCardProps {
   isPolishing?: boolean;
 }
 
-export function EntryCard({ entry, onDelete, onPin, onArchive, onPolish, onTagClick, isPolishing }: EntryCardProps) {
+function EntryCardInner({ entry, onDelete, onPin, onArchive, onPolish, onTagClick, isPolishing }: EntryCardProps) {
   const [displayMode, setDisplayMode] = useState<'raw' | 'polished'>(
     entry.polishedText ? 'polished' : 'raw'
   );
@@ -165,6 +165,19 @@ export function EntryCard({ entry, onDelete, onPin, onArchive, onPolish, onTagCl
     </Card>
   );
 }
+
+/**
+ * Stable memo comparator: only re-render when the entry's content changes or
+ * the polish state flips. Avoids O(n) re-renders across the entire Timeline
+ * when a single entry is updated.
+ */
+export const EntryCard = memo(EntryCardInner, (prev, next) =>
+  prev.entry.id === next.entry.id &&
+  prev.entry.updatedAt === next.entry.updatedAt &&
+  prev.entry.displayMode === next.entry.displayMode &&
+  prev.entry.isPinned === next.entry.isPinned &&
+  prev.isPolishing === next.isPolishing,
+);
 
 function ActionBtn({ onClick, icon, title, active, danger }: {
   onClick: () => void; icon: React.ReactNode; title: string; active?: boolean; danger?: boolean;

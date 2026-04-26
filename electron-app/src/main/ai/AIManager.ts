@@ -27,10 +27,23 @@ export class AIManager {
   private turnCount = 0;
   private activeProcess: ChildProcess | null = null;
 
-  /** Conversation history for the local LLM (managed in-app since there's no CLI session). */
-  private localHistory: Array<{ role: string; content: string }> = [];
-  /** Conversation history for Copilot HTTP sessions (no CLI session state). */
-  private copilotHistory: Array<{ role: string; content: string }> = [];
+  /**
+   * Per-context conversation history for local LLM and Copilot HTTP sessions.
+   * Keyed by contextKey (default: 'chat'). Isolating by context prevents chat
+   * history from bleeding into polish, summarize, or diarize calls.
+   */
+  private localHistories = new Map<string, Array<{ role: string; content: string }>>();
+  private copilotHistories = new Map<string, Array<{ role: string; content: string }>>();
+
+  private getLocalHistory(ctx: string): Array<{ role: string; content: string }> {
+    if (!this.localHistories.has(ctx)) this.localHistories.set(ctx, []);
+    return this.localHistories.get(ctx)!;
+  }
+
+  private getCopilotHistory(ctx: string): Array<{ role: string; content: string }> {
+    if (!this.copilotHistories.has(ctx)) this.copilotHistories.set(ctx, []);
+    return this.copilotHistories.get(ctx)!;
+  }
 
   private getAdapter(provider: AIProvider): IAIAdapter {
     if (provider === 'local') return this.local;
@@ -120,19 +133,23 @@ export class AIManager {
   /**
    * Send a message to the AI and stream the response.
    * Routes to CLI subprocess for copilot/claude, or Rust N-API for local.
+   * @param contextKey Isolates conversation history — use different keys for
+   *   chat vs. summarize vs. polish so contexts don't bleed into each other.
+   *   Defaults to 'chat' (the interactive user-facing conversation).
    */
   async sendMessage(
     prompt: string,
     provider: AIProvider,
     window: BrowserWindow | null,
     model?: string,
+    contextKey = 'chat',
   ): Promise<string> {
     if (provider === 'local') {
-      return this.sendLocalMessage(prompt, window, model);
+      return this.sendLocalMessage(prompt, window, model, contextKey);
     }
     const adapter = this.getAdapter(provider);
     if (this.isHTTPAdapter(adapter)) {
-      return this.sendHTTPMessage(prompt, provider, adapter, window, model);
+      return this.sendHTTPMessage(prompt, provider, adapter, window, model, contextKey);
     }
     return this.sendCLIMessage(prompt, provider, window, model);
   }
@@ -144,6 +161,7 @@ export class AIManager {
     prompt: string,
     window: BrowserWindow | null,
     model?: string,
+    contextKey = 'chat',
   ): Promise<string> {
     // Resolve the model ID to a LOCAL model. The renderer may pass a stale
     // model ID here — most commonly when the user previously chose a cloud
@@ -188,15 +206,15 @@ export class AIManager {
     const modelPath = getChatModelPath(modelId);
     const modelType = modelMeta.modelType;
 
-    this.localHistory.push({ role: 'user', content: prompt });
-
-    if (this.localHistory.length > MAX_HISTORY_MESSAGES) {
-      this.localHistory = this.localHistory.slice(-MAX_HISTORY_MESSAGES);
+    const localHistory = this.getLocalHistory(contextKey);
+    localHistory.push({ role: 'user', content: prompt });
+    if (localHistory.length > MAX_HISTORY_MESSAGES) {
+      localHistory.splice(0, localHistory.length - MAX_HISTORY_MESSAGES);
     }
 
     const messages = [
       { role: 'system', content: 'You are a helpful AI assistant running locally on the user\'s device. Be concise and helpful.' },
-      ...this.localHistory,
+      ...localHistory,
     ];
 
     if (window && !window.isDestroyed()) {
@@ -227,7 +245,7 @@ export class AIManager {
         window.webContents.send('ai:turn-end', { provider: 'local' });
       }
 
-      this.localHistory.push({ role: 'assistant', content: result });
+      this.getLocalHistory(contextKey).push({ role: 'assistant', content: result });
       this.turnCount++;
       return result;
     } catch (err: unknown) {
@@ -242,7 +260,7 @@ export class AIManager {
         window.webContents.send('ai:turn-end', { provider: 'local' });
       }
 
-      this.localHistory.pop();
+      this.getLocalHistory(contextKey).pop();
       throw new Error(`Local LLM error: ${errorMsg}`);
     }
   }
@@ -257,19 +275,21 @@ export class AIManager {
     adapter: IHTTPAdapter,
     window: BrowserWindow | null,
     model?: string,
+    contextKey = 'chat',
   ): Promise<string> {
     const auth = await this.checkAuth(provider);
     if (!auth.installed) throw new Error(`${provider} CLI (gh) is not installed`);
     if (!auth.authenticated) throw new Error(`${provider} is not authenticated. Run: gh auth login`);
 
-    this.copilotHistory.push({ role: 'user', content: prompt });
-    if (this.copilotHistory.length > MAX_HISTORY_MESSAGES) {
-      this.copilotHistory = this.copilotHistory.slice(-MAX_HISTORY_MESSAGES);
+    const copilotHistory = this.getCopilotHistory(contextKey);
+    copilotHistory.push({ role: 'user', content: prompt });
+    if (copilotHistory.length > MAX_HISTORY_MESSAGES) {
+      copilotHistory.splice(0, copilotHistory.length - MAX_HISTORY_MESSAGES);
     }
 
     const messages = [
       { role: 'system', content: 'You are a helpful AI assistant. Be concise and helpful.' },
-      ...this.copilotHistory,
+      ...copilotHistory,
     ];
 
     if (window && !window.isDestroyed()) {
@@ -287,7 +307,7 @@ export class AIManager {
         window.webContents.send('ai:turn-end', { provider });
       }
 
-      this.copilotHistory.push({ role: 'assistant', content: result });
+      this.getCopilotHistory(contextKey).push({ role: 'assistant', content: result });
       this.turnCount++;
       return result;
     } catch (err: unknown) {
@@ -296,7 +316,7 @@ export class AIManager {
         window.webContents.send('ai:output', { provider, type: 'error', content: errorMsg });
         window.webContents.send('ai:turn-end', { provider });
       }
-      this.copilotHistory.pop();
+      this.getCopilotHistory(contextKey).pop();
       throw new Error(errorMsg);
     }
   }
@@ -443,12 +463,12 @@ export class AIManager {
     }
   }
 
-  /** Reset turn count and conversation history (new conversation). */
+  /** Reset turn count and all conversation history contexts (new conversation). */
   resetSession(): void {
     this.cancel();
     this.turnCount = 0;
-    this.localHistory = [];
-    this.copilotHistory = [];
+    this.localHistories.clear();
+    this.copilotHistories.clear();
   }
 }
 

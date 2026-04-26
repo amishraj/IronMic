@@ -218,6 +218,27 @@ export const useDictationStore = create<DictationState>((set, get) => ({
 
 if (typeof window !== 'undefined' && (window as any).ironmic) {
   const api = (window as any).ironmic;
+
+  // Debounce DB persistence: fire at most once per 10 s during streaming, and
+  // always immediately on the final chunk. This reduces SQLite write load from
+  // ~1,440 writes/hour (every 2.5 s chunk) to ~360 writes/hour.
+  let dbWriteTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function schedulePersist(entryId: string, text: string, immediate: boolean): void {
+    if (dbWriteTimer) {
+      clearTimeout(dbWriteTimer);
+      dbWriteTimer = null;
+    }
+    const flush = () => {
+      void api.updateEntry(entryId, { rawTranscript: text }).catch(() => { /* best-effort */ });
+    };
+    if (immediate) {
+      flush();
+    } else {
+      dbWriteTimer = setTimeout(flush, 10_000);
+    }
+  }
+
   api.onDictationStreamState?.((s: { status: string; chunkCount: number }) => {
     if (s.status === 'idle' || s.status === 'recording' || s.status === 'stopping') {
       useDictationStore.setState({ status: s.status });
@@ -240,7 +261,7 @@ if (typeof window !== 'undefined' && (window as any).ironmic) {
     // overwrite with the richer HTML-derived text anyway.
     const { entryId } = useDictationStore.getState();
     if (entryId && appended) {
-      void api.updateEntry(entryId, { rawTranscript: appended }).catch(() => { /* best-effort */ });
+      schedulePersist(entryId, appended, payload.isFinal);
     }
   });
 }

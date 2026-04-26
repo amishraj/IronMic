@@ -26,6 +26,7 @@ import {
   sanitizeTranscribedText,
   transcribeWithTimeout,
 } from './transcribe-clean';
+import { audioStream } from './audio-stream-manager';
 
 /** Upper bound on how long we wait for a single Whisper transcribe call to
  *  return before moving on. If the native call hangs (happens occasionally
@@ -124,12 +125,19 @@ class MeetingRecorderManager {
     this.chunkIntervalMs = chunkIntervalS * 1000;
     this.segments = [];
 
-    // Start audio capture — use named device if available in compiled addon
-    if (deviceName && typeof native.addon.startRecordingFromDevice === 'function') {
-      await native.addon.startRecordingFromDevice(deviceName);
-    } else {
-      // Works with default mic and BlackHole (via OS aggregate device)
-      native.addon.startRecording();
+    // Claim the audio stream before starting capture.
+    audioStream.acquire('meeting');
+    try {
+      // Start audio capture — use named device if available in compiled addon
+      if (deviceName && typeof native.addon.startRecordingFromDevice === 'function') {
+        await native.addon.startRecordingFromDevice(deviceName);
+      } else {
+        // Works with default mic and BlackHole (via OS aggregate device)
+        native.addon.startRecording();
+      }
+    } catch (err) {
+      audioStream.release('meeting');
+      throw err;
     }
 
     const now = Date.now();
@@ -227,6 +235,7 @@ class MeetingRecorderManager {
       // never reached the restart branch in processChunk. Ignore errors —
       // stopRecording throws if no stream is active.
       try { native.addon.stopRecording(); } catch { /* expected if already stopped */ }
+      audioStream.release('meeting');
       this.state = {
         status: 'idle',
         sessionId: null,
