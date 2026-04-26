@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { ErrorBoundary } from './ErrorBoundary';
 import {
   Mic, Settings, List, Sparkles, StickyNote, Search, Home,
   ChevronLeft, ChevronRight, Volume2, PenTool, BarChart3, Users,
@@ -300,17 +301,28 @@ export function Layout() {
         {/* Content */}
         <div className="flex-1 overflow-hidden">
           {page === 'home' && <WelcomePage onNavigate={handleNavigate} />}
-          {page === 'main' && <Timeline />}
+          {page === 'main' && (
+            <ErrorBoundary label="Timeline">
+              <Timeline />
+            </ErrorBoundary>
+          )}
           {page === 'ai' && <AIChat />}
           {/* Notes IS the dictation experience — both routes render DictatePage
               so tray quick-actions and legacy nav both land users in the
               canonical entries-backed note surface. */}
-          {page === 'dictate' && <DictatePage />}
-          {page === 'notes' && <DictatePage />}
+          {(page === 'dictate' || page === 'notes') && (
+            <ErrorBoundary label="Notes">
+              <DictatePage />
+            </ErrorBoundary>
+          )}
           {page === 'listen' && <ListenPage />}
           {page === 'search' && <SearchPage />}
           {page === 'analytics' && <AnalyticsPage />}
-          {page === 'meetings' && <MeetingPage />}
+          {page === 'meetings' && (
+            <ErrorBoundary label="Meetings">
+              <MeetingPage />
+            </ErrorBoundary>
+          )}
           {page === 'settings' && <SettingsPanel />}
         </div>
       </div>

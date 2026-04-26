@@ -27,6 +27,7 @@ import {
   sanitizeTranscribedText,
   transcribeWithTimeout,
 } from './transcribe-clean';
+import { audioStream } from './audio-stream-manager';
 
 /** Same timeout rationale as MeetingRecorder — don't let a hung Whisper call
  *  stall the 2.5s chunk loop. Dictation chunks are smaller so the timeout is
@@ -74,13 +75,20 @@ class DictationStreamer {
     if (this.state.status !== 'idle') {
       throw new Error('Dictation is already active');
     }
-    // Start audio capture on the default mic.
-    try { native.addon.startRecording(); }
-    catch (err: any) {
-      // Handle "already recording" gracefully — reset + retry.
+    // Claim exclusive audio stream ownership before starting capture.
+    audioStream.acquire('streaming');
+    try {
+      native.addon.startRecording();
+    } catch (err: any) {
+      audioStream.release('streaming');
+      // Handle "already recording" — reset + retry once.
       if (err?.message?.includes('already')) {
         try { native.addon.resetPipelineState?.(); } catch { /* ignore */ }
-        native.addon.startRecording();
+        try {
+          native.addon.startRecording();
+        } catch (retryErr) {
+          throw retryErr;
+        }
       } else {
         throw err;
       }
@@ -124,6 +132,7 @@ class DictationStreamer {
       // Belt-and-braces: ensure the native recorder is stopped even if
       // processChunk(true) didn't reach the stop branch.
       try { native.addon.stopRecording(); } catch { /* already stopped */ }
+      audioStream.release('streaming');
       this.state = { status: 'idle', startedAt: null, chunkCount: 0 };
       this.pushState();
     }
