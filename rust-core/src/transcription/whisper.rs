@@ -296,6 +296,15 @@ impl WhisperEngine {
                 use_gpu = self.config.use_gpu,
                 "Whisper model loaded successfully"
             );
+
+            // Surface whisper.cpp's CPU-feature detection (AVX/AVX2/AVX512/F16C/
+            // FMA/NEON/Metal/CUDA/...) on first model load. On corporate
+            // Windows VDI / HVCI hosts, whisper.cpp can build with AVX-512
+            // forced and then silently fail or produce empty transcripts at
+            // inference time (see whisper.cpp #2928, #2175). Logging the
+            // detected flags makes it cheap to confirm or rule out.
+            let sysinfo = whisper_rs::print_system_info();
+            info!(target: "ironmic::whisper::sysinfo", system_info = %sysinfo, "whisper.cpp system info");
         }
 
         #[cfg(not(feature = "whisper"))]
@@ -317,7 +326,30 @@ impl WhisperEngine {
 
         #[cfg(feature = "whisper")]
         {
-            self.transcribe_with_whisper(samples)
+            self.transcribe_with_whisper(samples, /* short_chunk */ false)
+        }
+
+        #[cfg(not(feature = "whisper"))]
+        {
+            self.transcribe_stub(samples)
+        }
+    }
+
+    /// Transcribe a short (< 5s) PCM audio chunk to text. Forces single-segment
+    /// output, which gives Whisper a clearer hint that the entire buffer is
+    /// one continuous utterance and stops it from trying to find segment
+    /// boundaries inside ~40k samples. Used by the dictation streamer's
+    /// 2.5s chunk loop. **Do not call from meeting recording (10–60s chunks).**
+    pub fn transcribe_short(&self, samples: &[f32]) -> Result<String, IronMicError> {
+        if samples.is_empty() {
+            return Err(IronMicError::Processing(
+                "No audio samples to transcribe".into(),
+            ));
+        }
+
+        #[cfg(feature = "whisper")]
+        {
+            self.transcribe_with_whisper(samples, /* short_chunk */ true)
         }
 
         #[cfg(not(feature = "whisper"))]
@@ -327,7 +359,7 @@ impl WhisperEngine {
     }
 
     #[cfg(feature = "whisper")]
-    fn transcribe_with_whisper(&self, samples: &[f32]) -> Result<String, IronMicError> {
+    fn transcribe_with_whisper(&self, samples: &[f32], short_chunk: bool) -> Result<String, IronMicError> {
         use whisper_rs::FullParams;
         use whisper_rs::SamplingStrategy;
 
@@ -344,6 +376,33 @@ impl WhisperEngine {
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
         params.set_suppress_non_speech_tokens(true);
+
+        // ── Hardening for the audio paths that surfaced as Windows-only
+        // "I dictate, nothing appears" failures. Each setting cites a real
+        // upstream issue or known whisper.cpp default that bites us:
+        //
+        // - temperature_inc=0.0 disables Whisper's temperature-fallback path.
+        //   Default is 0.2, which on low-confidence segments emits hallucinated
+        //   text the sanitizer then drops to ''. Greedy + no fallback = stable.
+        // - no_speech_thold=0.3 (default 0.6) makes the "all silence"
+        //   classifier less trigger-happy on Windows mics that lack the AGC
+        //   macOS CoreAudio applies. Cite whisper.cpp #1724, Buzz #1109.
+        // - no_context=true and detect_language=false are belt-and-braces.
+        //   Defaults already favor us in whisper-rs 0.13.2 (fresh state per
+        //   call + language defaults to Some("en")), but if either side ever
+        //   drifts in an upgrade these explicit sets keep behavior pinned.
+        params.set_temperature(0.0);
+        params.set_temperature_inc(0.0);
+        params.set_no_speech_thold(0.3);
+        params.set_no_context(true);
+        params.set_detect_language(false);
+
+        // Force single-segment output for very short chunks (2.5s dictation
+        // streamer). MUST NOT be set for meeting chunks (10–60s) — those
+        // legitimately need Whisper to find segment boundaries.
+        if short_chunk {
+            params.set_single_segment(true);
+        }
 
         if let Some(ref lang) = self.config.language {
             params.set_language(Some(lang));
@@ -441,6 +500,12 @@ impl SharedWhisperEngine {
     pub fn transcribe(&self, samples: &[f32]) -> Result<String, IronMicError> {
         let engine = self.inner.lock().unwrap();
         engine.transcribe(samples)
+    }
+
+    /// Short-chunk transcription path. See `WhisperEngine::transcribe_short`.
+    pub fn transcribe_short(&self, samples: &[f32]) -> Result<String, IronMicError> {
+        let engine = self.inner.lock().unwrap();
+        engine.transcribe_short(samples)
     }
 
     pub fn dictionary(&self) -> Dictionary {
