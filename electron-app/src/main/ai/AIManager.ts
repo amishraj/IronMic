@@ -12,7 +12,8 @@ import { LocalLLMAdapter, getChatModelPath, resolveActiveChatModel } from './Loc
 import { llmSubprocess } from './LlmSubprocess';
 import { CHAT_LLM_MODELS } from '../../shared/constants';
 import { native } from '../native-bridge';
-import type { AIProvider, AuthStatus, AIAuthState, ChatMessage, ICLIAdapter, IHTTPAdapter, IAIAdapter, AIModel } from './types';
+import { getScopedSpawnEnv } from '../utils/shell-env';
+import type { AIProvider, AuthStatus, AIAuthState, ICLIAdapter, IAIAdapter, AIModel } from './types';
 
 const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
@@ -28,21 +29,15 @@ export class AIManager {
   private activeProcess: ChildProcess | null = null;
 
   /**
-   * Per-context conversation history for local LLM and Copilot HTTP sessions.
+   * Per-context conversation history for local LLM sessions.
    * Keyed by contextKey (default: 'chat'). Isolating by context prevents chat
    * history from bleeding into polish, summarize, or diarize calls.
    */
   private localHistories = new Map<string, Array<{ role: string; content: string }>>();
-  private copilotHistories = new Map<string, Array<{ role: string; content: string }>>();
 
   private getLocalHistory(ctx: string): Array<{ role: string; content: string }> {
     if (!this.localHistories.has(ctx)) this.localHistories.set(ctx, []);
     return this.localHistories.get(ctx)!;
-  }
-
-  private getCopilotHistory(ctx: string): Array<{ role: string; content: string }> {
-    if (!this.copilotHistories.has(ctx)) this.copilotHistories.set(ctx, []);
-    return this.copilotHistories.get(ctx)!;
   }
 
   private getAdapter(provider: AIProvider): IAIAdapter {
@@ -51,12 +46,7 @@ export class AIManager {
   }
 
   private getCLIAdapter(provider: AIProvider): ICLIAdapter {
-    // Only Claude is CLI-based; Copilot uses HTTP.
-    return this.claude;
-  }
-
-  private isHTTPAdapter(adapter: IAIAdapter): adapter is IHTTPAdapter {
-    return typeof (adapter as IHTTPAdapter).sendMessageHTTP === 'function';
+    return provider === 'copilot' ? this.copilot : this.claude;
   }
 
   /** Check auth status for all providers. Uses cache. */
@@ -146,10 +136,6 @@ export class AIManager {
   ): Promise<string> {
     if (provider === 'local') {
       return this.sendLocalMessage(prompt, window, model, contextKey);
-    }
-    const adapter = this.getAdapter(provider);
-    if (this.isHTTPAdapter(adapter)) {
-      return this.sendHTTPMessage(prompt, provider, adapter, window, model, contextKey);
     }
     return this.sendCLIMessage(prompt, provider, window, model);
   }
@@ -266,63 +252,7 @@ export class AIManager {
   }
 
   /**
-   * Send a message via HTTP (used by Copilot).
-   * Manages conversation history and streams tokens to the renderer window.
-   */
-  private async sendHTTPMessage(
-    prompt: string,
-    provider: AIProvider,
-    adapter: IHTTPAdapter,
-    window: BrowserWindow | null,
-    model?: string,
-    contextKey = 'chat',
-  ): Promise<string> {
-    const auth = await this.checkAuth(provider);
-    if (!auth.installed) throw new Error(`${provider} CLI (gh) is not installed`);
-    if (!auth.authenticated) throw new Error(`${provider} is not authenticated. Run: gh auth login`);
-
-    const copilotHistory = this.getCopilotHistory(contextKey);
-    copilotHistory.push({ role: 'user', content: prompt });
-    if (copilotHistory.length > MAX_HISTORY_MESSAGES) {
-      copilotHistory.splice(0, copilotHistory.length - MAX_HISTORY_MESSAGES);
-    }
-
-    const messages = [
-      { role: 'system', content: 'You are a helpful AI assistant. Be concise and helpful.' },
-      ...copilotHistory,
-    ];
-
-    if (window && !window.isDestroyed()) {
-      window.webContents.send('ai:turn-start', { provider });
-    }
-
-    try {
-      const result = await adapter.sendMessageHTTP(messages, model, (token) => {
-        if (window && !window.isDestroyed()) {
-          window.webContents.send('ai:output', { provider, type: 'text', content: token });
-        }
-      });
-
-      if (window && !window.isDestroyed()) {
-        window.webContents.send('ai:turn-end', { provider });
-      }
-
-      this.getCopilotHistory(contextKey).push({ role: 'assistant', content: result });
-      this.turnCount++;
-      return result;
-    } catch (err: unknown) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
-      if (window && !window.isDestroyed()) {
-        window.webContents.send('ai:output', { provider, type: 'error', content: errorMsg });
-        window.webContents.send('ai:turn-end', { provider });
-      }
-      this.getCopilotHistory(contextKey).pop();
-      throw new Error(errorMsg);
-    }
-  }
-
-  /**
-   * Send a message via CLI subprocess (Claude).
+   * Send a message via a provider-owned CLI subprocess.
    */
   private async sendCLIMessage(
     prompt: string,
@@ -334,15 +264,34 @@ export class AIManager {
     const auth = await this.checkAuth(provider);
 
     if (!auth.installed) {
+      if (provider === 'copilot') {
+        throw new Error(
+          'GitHub Copilot is not available.\n\n' +
+          'Install and authenticate either:\n' +
+          '  copilot\n\n' +
+          'or the GitHub Models CLI extension:\n' +
+          '  gh extension install https://github.com/github/gh-models'
+        );
+      }
       throw new Error(`${provider} CLI is not installed`);
     }
     if (!auth.authenticated) {
+      if (provider === 'copilot') {
+        throw new Error(
+          'GitHub Copilot is not authenticated.\n\n' +
+          'Verify one of these works in a terminal, then refresh IronMic:\n' +
+          '  copilot --prompt "hello"\n' +
+          '  gh models run openai/gpt-4o-mini "hello"'
+        );
+      }
       throw new Error(`${provider} CLI is not authenticated. Please log in.`);
     }
 
     const binary = auth.binaryPath!;
     const continueSession = this.turnCount > 0;
-    const args = adapter.buildArgs(prompt, continueSession, model);
+    const args = provider === 'copilot'
+      ? this.copilot.buildArgsForBinary(binary, prompt, continueSession, model)
+      : adapter.buildArgs(prompt, continueSession, model);
 
     if (process.env.NODE_ENV === 'development') {
       console.log(`[ai] Sending to ${provider}: ${binary} [${args.length} args, prompt_length=${prompt.length}]`);
@@ -354,36 +303,7 @@ export class AIManager {
         window.webContents.send('ai:turn-start', { provider });
       }
 
-      // Scoped environment — pass what each CLI needs, not the full process.env.
-      // The previous list was Unix-only (PATH, HOME, SHELL, XDG_*) which broke
-      // every Windows install: `gh` reads its auth state from
-      // %LOCALAPPDATA%\GitHub CLI\ and the gh-models extension also touches
-      // %APPDATA% / %USERPROFILE%. Without those forwarded, the child process
-      // sees an empty config dir and exits 1 with "not logged in", even though
-      // the auth-status check passes (that runs with the full env).
-      const scopedEnv: Record<string, string> = {
-        TERM: 'dumb',
-      };
-      const passthroughKeys = [
-        // POSIX
-        'PATH', 'HOME', 'USER', 'SHELL', 'LANG', 'LC_ALL', 'TMPDIR',
-        'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME',
-        // Windows — gh, claude, and most CLIs need these
-        'USERPROFILE', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA',
-        'HOMEDRIVE', 'HOMEPATH', 'SYSTEMROOT', 'SYSTEMDRIVE',
-        'TEMP', 'TMP', 'COMSPEC', 'PATHEXT', 'WINDIR',
-      ];
-      for (const key of passthroughKeys) {
-        if (process.env[key]) scopedEnv[key] = process.env[key]!;
-      }
-      // Auth tokens needed by CLIs
-      if (provider === 'claude' && process.env.ANTHROPIC_API_KEY) {
-        scopedEnv.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-      }
-      if (provider === 'copilot') {
-        if (process.env.GH_TOKEN) scopedEnv.GH_TOKEN = process.env.GH_TOKEN;
-        if (process.env.GITHUB_TOKEN) scopedEnv.GITHUB_TOKEN = process.env.GITHUB_TOKEN;
-      }
+      const scopedEnv = getScopedSpawnEnv(provider);
 
       // No shell:true — `gh.exe` and `claude` (or `claude.cmd`) are real
       // executables resolvable directly. shell:true would require escaping
@@ -468,7 +388,6 @@ export class AIManager {
     this.cancel();
     this.turnCount = 0;
     this.localHistories.clear();
-    this.copilotHistories.clear();
   }
 }
 

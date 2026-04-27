@@ -80,6 +80,7 @@ function createStubs(): Record<string, (...args: any[]) => any> {
       whisper: { loaded: false, name: 'whisper-large-v3-turbo', sizeBytes: 0 },
       llm: { loaded: false, name: 'mistral-7b-instruct-q4', sizeBytes: 0 },
     }),
+    loadWhisperModel: () => {},
     // Analytics stubs
     analyticsRecomputeToday: () => {},
     analyticsBackfill: async () => 0,
@@ -148,6 +149,7 @@ export const native = {
   getPipelineState(): string { return this.addon.getPipelineState(); },
   resetPipelineState(): void { this.addon.resetPipelineState(); },
   getModelStatus(): any { return this.addon.getModelStatus(); },
+  loadWhisperModel(): void { this.addon.loadWhisperModel(); },
 
   // Audio devices
   listAudioDevices(): string { return this.addon.listAudioDevices(); },

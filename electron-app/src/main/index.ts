@@ -9,6 +9,7 @@ import { createTray, destroyTray, updateTrayState } from './tray';
 import { ensureBundledVoices, ensureBundledTFJSModels } from './model-downloader';
 import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
 import { meetingRecorder } from './meeting-recorder';
+import { initShellEnv } from './utils/shell-env';
 
 // Set the models directory env var BEFORE the Rust addon loads.
 // In production, models go to the user's app-data directory (writable).
@@ -147,7 +148,8 @@ function registerGlobalHotkey(): void {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  await initShellEnv();
   blockAllNetworkRequests();
   registerIpcHandlers();
   createWindow();

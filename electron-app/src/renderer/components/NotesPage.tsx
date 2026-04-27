@@ -25,9 +25,12 @@ export function NotesPage() {
   const [tagInput, setTagInput] = useState('');
   const [collabOpen, setCollabOpen] = useState(false);
   const [collabActive, setCollabActive] = useState(false);
+  const [collabRole, setCollabRole] = useState<'host' | 'client' | null>(null);
   const [collabParticipantCount, setCollabParticipantCount] = useState(0);
   const [collabNoteId, setCollabNoteId] = useState<string | null>(null);
-  const collabActiveRef = useRef(false);
+  const collabNoteIdRef = useRef<string | null>(null);
+  const joinedLocalNoteIdRef = useRef<string | null>(null);
+  const applyingRemoteRef = useRef(false);
   const draftThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const titleRef = useRef<HTMLInputElement>(null);
@@ -40,48 +43,70 @@ export function NotesPage() {
     }
   }, [activeNoteId]);
 
-  // Apply remote saves from participants (and live host edits) into the local note store.
+  // Apply remote saves into the note that owns the session, even if the user
+  // has switched to a different note locally.
   useEffect(() => {
     const unsub = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
-      if (!activeNoteId) return;
-      updateNote(activeNoteId, { content: data?.notes ?? '' });
+      const targetNoteId = collabNoteIdRef.current;
+      if (!targetNoteId) return;
+      applyingRemoteRef.current = true;
+      updateNote(targetNoteId, { content: data?.notes ?? '' });
+      setTimeout(() => { applyingRemoteRef.current = false; }, 0);
     });
     return () => { unsub?.(); };
-  }, [activeNoteId, updateNote]);
+  }, [updateNote]);
 
   // Track live collab session state for the button indicator.
   useEffect(() => {
     const unsub = window.ironmic?.onMeetingCollabState?.((info: any) => {
-      const active = info?.active ?? false;
+      const isHost = typeof info?.active === 'boolean';
+      const active = Boolean(info?.active ?? info?.connected);
+      const role: 'host' | 'client' | null = active ? (isHost ? 'host' : 'client') : null;
       setCollabActive(active);
-      collabActiveRef.current = active;
+      setCollabRole(role);
       setCollabParticipantCount(info?.participants?.length ?? 0);
       const sid = info?.sessionId as string | null;
-      setCollabNoteId(sid?.startsWith('note:') ? sid.slice(5) : null);
+      const noteId = role === 'client'
+        ? joinedLocalNoteIdRef.current
+        : sid?.startsWith('note:') ? sid.slice(5) : null;
+      setCollabNoteId(noteId);
+      collabNoteIdRef.current = noteId;
     });
     return () => { unsub?.(); };
   }, []);
 
-  // Broadcast host keystrokes to participants as live draft (300 ms throttle).
+  // Broadcast edits for the note that owns the session. This is deliberately
+  // note-scoped: switching notes while hosting must not leak the new note into
+  // the existing session.
   useEffect(() => {
     if (!collabActive || !activeNote) return;
+    if (activeNote.id !== collabNoteId) return;
+    if (applyingRemoteRef.current) return;
     if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
     draftThrottleRef.current = setTimeout(() => {
       const name = (() => { try { return localStorage.getItem('ironmic-collab-display-name') || 'Host'; } catch { return 'Host'; } })();
-      window.ironmic?.meetingCollabNotifySaved?.(activeNote.content, name)?.catch(() => {});
+      if (collabRole === 'host') {
+        window.ironmic?.meetingCollabNotifySaved?.(activeNote.content, name)?.catch(() => {});
+      } else if (collabRole === 'client') {
+        window.ironmic?.meetingCollabSaveNotes?.(activeNote.content)?.catch(() => {});
+      }
     }, 300);
     return () => { if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current); };
-  }, [activeNote?.content, collabActive]);
+  }, [activeNote?.id, activeNote?.content, collabActive, collabNoteId, collabRole]);
 
   // Apply incoming draft content when we're a participant.
   useEffect(() => {
     const unsub = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
-      if (collabActiveRef.current) return; // we're the host, ignore
-      if (!activeNoteId) return;
-      if (data?.content != null) updateNote(activeNoteId, { content: String(data.content) });
+      const targetNoteId = collabNoteIdRef.current;
+      if (!targetNoteId) return;
+      if (data?.content != null) {
+        applyingRemoteRef.current = true;
+        updateNote(targetNoteId, { content: String(data.content) });
+        setTimeout(() => { applyingRemoteRef.current = false; }, 0);
+      }
     });
     return () => { unsub?.(); };
-  }, [activeNoteId, updateNote]);
+  }, [updateNote]);
 
   // Auto-stop when the last participant leaves while the modal is closed.
   useEffect(() => {
@@ -269,6 +294,7 @@ export function NotesPage() {
               active={activeNoteId === note.id}
               notebook={notebooks.find((nb) => nb.id === note.notebookId)}
               isCollabLive={collabActive && collabNoteId === note.id}
+              collabParticipantCount={collabParticipantCount}
               onClick={() => setActiveNote(note.id)}
               onDelete={() => deleteNote(note.id)}
               onPin={() => updateNote(note.id, { isPinned: !note.isPinned })}
@@ -411,6 +437,11 @@ export function NotesPage() {
             // Land the joined content as a new local note so the viewer has
             // something to edit; subsequent saves flow back over the socket.
             const id = createNote();
+            joinedLocalNoteIdRef.current = id;
+            collabNoteIdRef.current = id;
+            setCollabNoteId(id);
+            setCollabActive(true);
+            setCollabRole('client');
             updateNote(id, { title: 'Shared note', content: notes });
           }}
           onClose={() => setCollabOpen(false)}
@@ -420,8 +451,9 @@ export function NotesPage() {
   );
 }
 
-function NoteListItem({ note, active, notebook, isCollabLive, onClick, onDelete, onPin }: {
+function NoteListItem({ note, active, notebook, isCollabLive, collabParticipantCount = 0, onClick, onDelete, onPin }: {
   note: Note; active: boolean; notebook?: Notebook; isCollabLive?: boolean;
+  collabParticipantCount?: number;
   onClick: () => void; onDelete: () => void; onPin: () => void;
 }) {
   const preview = note.content.slice(0, 80).replace(/\n/g, ' ') || 'Empty note';
@@ -444,7 +476,7 @@ function NoteListItem({ note, active, notebook, isCollabLive, onClick, onDelete,
             {isCollabLive && (
               <span className="flex items-center gap-0.5 text-[9px] font-medium text-green-400 bg-green-500/10 border border-green-500/20 px-1.5 py-0.5 rounded-full shrink-0 leading-none">
                 <span className="w-1 h-1 rounded-full bg-green-400 animate-pulse" />
-                Live
+                {collabParticipantCount > 0 ? `${collabParticipantCount} in` : 'Live'}
               </span>
             )}
           </div>
