@@ -70,7 +70,9 @@ class MeetingNotesCollabClientManager {
     this.displayName = opts.displayName.slice(0, 64).trim() || 'Viewer';
 
     return new Promise((resolve, reject) => {
-      const url = `ws://${opts.hostIp}:${opts.hostPort}`;
+      // Bracket IPv6 literals (containing ":") for the WebSocket URL.
+      const host = opts.hostIp.includes(':') ? `[${opts.hostIp}]` : opts.hostIp;
+      const url = `ws://${host}:${opts.hostPort}`;
       const ws = new WebSocket(url, { handshakeTimeout: 8000 });
       this.ws = ws;
 

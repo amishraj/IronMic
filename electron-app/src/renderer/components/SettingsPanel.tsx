@@ -291,11 +291,18 @@ function AIAssistSettings() {
                     <span className="font-medium">{label}</span>
                     <span className="block text-[10px] mt-0.5 opacity-70">{sub}</span>
                     {auth && (
-                      <span className={`block text-[10px] mt-1 ${auth.authenticated ? 'text-iron-success' : 'text-iron-warning'}`}>
-                        {value === 'local'
-                          ? (auth.authenticated ? '● Model ready' : '○ Download a model')
-                          : (auth.authenticated ? '● Connected' : auth.installed ? '○ Not logged in' : '○ Not installed')}
-                      </span>
+                      <>
+                        <span className={`block text-[10px] mt-1 ${auth.authenticated ? 'text-iron-success' : 'text-iron-warning'}`}>
+                          {value === 'local'
+                            ? (auth.authenticated ? '● Model ready' : '○ Download a model')
+                            : (auth.authenticated ? '● Connected' : auth.installed ? '○ Not logged in' : '○ Not installed')}
+                        </span>
+                        {value !== 'local' && auth.binaryPath && (
+                          <span className="block text-[9px] mt-0.5 text-iron-text-muted truncate" title={auth.binaryPath}>
+                            {auth.binaryPath}
+                          </span>
+                        )}
+                      </>
                     )}
                   </button>
                 );
@@ -931,11 +938,6 @@ function SecuritySettings() {
 // ═══════════════════════════════════════════
 
 function VoiceAISettings() {
-  const { getSetting, setSetting } = useSettingsStore();
-  const [vadEnabled, setVadEnabled] = useState(true);
-  const [vadSensitivity, setVadSensitivity] = useState(0.5);
-  const [turnDetectionMode, setTurnDetectionMode] = useState('push-to-talk');
-  const [turnTimeout, setTurnTimeout] = useState(3000);
   const [voiceRoutingEnabled, setVoiceRoutingEnabled] = useState(false);
   const [meetingModeEnabled, setMeetingModeEnabled] = useState(false);
   const [intentEnabled, setIntentEnabled] = useState(false);
@@ -953,10 +955,6 @@ function VoiceAISettings() {
       const val = (key: string, fallback: string) =>
         ironmic.getSetting(key).then((v: string | null) => v ?? fallback);
 
-      setVadEnabled((await val('vad_enabled', 'true')) === 'true');
-      setVadSensitivity(parseFloat(await val('vad_sensitivity', '0.5')));
-      setTurnDetectionMode(await val('turn_detection_mode', 'push-to-talk'));
-      setTurnTimeout(parseInt(await val('turn_detection_timeout_ms', '3000'), 10));
       setVoiceRoutingEnabled((await val('voice_routing_enabled', 'false')) === 'true');
       setMeetingModeEnabled((await val('meeting_mode_enabled', 'false')) === 'true');
       setIntentEnabled((await val('intent_classification_enabled', 'false')) === 'true');
@@ -989,84 +987,6 @@ function VoiceAISettings() {
           <div className="text-xs text-iron-text-muted mb-3">
             All ML processing runs entirely on your device. No data leaves this machine.
           </div>
-
-          {/* VAD */}
-          <SettingRow
-            icon={Mic}
-            title="Voice Activity Detection"
-            description="Filter silence and noise before transcription for faster processing"
-            control={
-              <Toggle
-                checked={vadEnabled}
-                onChange={(v) => { setVadEnabled(v); update('vad_enabled', String(v)); }}
-              />
-            }
-          />
-          {vadEnabled && (
-            <div className="ml-10 space-y-2">
-              <label className="text-xs text-iron-text-secondary">Sensitivity: {vadSensitivity.toFixed(1)}</label>
-              <input
-                type="range" min="0" max="1" step="0.1"
-                value={vadSensitivity}
-                onChange={(e) => {
-                  const v = parseFloat(e.target.value);
-                  setVadSensitivity(v);
-                  update('vad_sensitivity', String(v));
-                }}
-                className="w-full accent-iron-accent"
-              />
-              <div className="flex justify-between text-[10px] text-iron-text-muted">
-                <span>Less sensitive</span>
-                <span>More sensitive</span>
-              </div>
-            </div>
-          )}
-
-          <div className="border-t border-iron-border" />
-
-          {/* Turn Detection */}
-          <SettingRow
-            icon={Volume2}
-            title="Turn Detection Mode"
-            description="How IronMic detects when you're done speaking"
-            control={
-              <select
-                value={turnDetectionMode}
-                onChange={(e) => {
-                  setTurnDetectionMode(e.target.value);
-                  update('turn_detection_mode', e.target.value);
-                }}
-                className="text-xs bg-iron-surface border border-iron-border rounded px-2 py-1 text-iron-text"
-              >
-                <option value="push-to-talk">Push to Talk</option>
-                <option value="auto-detect">Auto Detect</option>
-                <option value="always-listening">Always Listening</option>
-              </select>
-            }
-          />
-          {turnDetectionMode !== 'push-to-talk' && (
-            <div className="ml-10 space-y-2">
-              <label className="text-xs text-iron-text-secondary">Silence timeout: {(turnTimeout / 1000).toFixed(1)}s</label>
-              <input
-                type="range" min="1000" max="10000" step="500"
-                value={turnTimeout}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value, 10);
-                  setTurnTimeout(v);
-                  update('turn_detection_timeout_ms', String(v));
-                }}
-                className="w-full accent-iron-accent"
-              />
-            </div>
-          )}
-          {turnDetectionMode === 'always-listening' && (
-            <div className="ml-10 p-2 bg-yellow-500/10 rounded text-xs text-yellow-400 flex items-center gap-2">
-              <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-              Microphone will stay active. A red indicator will be shown at all times.
-            </div>
-          )}
-
-          <div className="border-t border-iron-border" />
 
           {/* Voice Routing */}
           <SettingRow

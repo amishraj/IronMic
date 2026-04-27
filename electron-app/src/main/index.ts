@@ -187,7 +187,55 @@ app.whenReady().then(async () => {
   try { startMeetingAppDetection(); } catch (err) {
     console.warn('[meeting-app-detector] Failed to start:', err);
   }
+
+  // Whisper readiness check.  The first transcription call lazily loads the
+  // model, which on Windows can take 10s+ for large-v3-turbo and surfaces any
+  // path/feature errors only at that point — long after the user pressed the
+  // hotkey.  Pre-loading at startup turns that into an immediate, visible
+  // failure with a clear path forward.
+  try {
+    const features = native.nativeFeatures();
+    const status = native.getModelStatus();
+    console.log('[whisper] Native feature flags:', features);
+    console.log('[whisper] Model status at startup:', status);
+
+    if (!features.whisper) {
+      const msg = features.stub
+        ? 'IronMic could not load its native module. Reinstall the app from the GitHub release.'
+        : 'This build was compiled without Whisper support. Rebuild with --features whisper or reinstall from the GitHub release.';
+      console.error('[whisper]', msg);
+      sendWhisperFailure(msg, /* permanent */ true);
+    } else {
+      // Load eagerly off the critical path — don't block the UI.
+      void (async () => {
+        try {
+          native.loadWhisperModel();
+          console.log('[whisper] Model pre-loaded successfully');
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error('[whisper] Pre-load failed:', message);
+          sendWhisperFailure(message, false);
+        }
+      })();
+    }
+  } catch (err) {
+    console.warn('[whisper] Readiness probe failed (non-fatal):', err);
+  }
 });
+
+function sendWhisperFailure(message: string, permanent: boolean): void {
+  const payload = { message, permanent };
+  // Renderer may not be ready yet — retry once after a short delay.
+  const send = () => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send('ironmic:whisper-load-failed', payload);
+      }
+    }
+  };
+  send();
+  setTimeout(send, 3000);
+}
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {

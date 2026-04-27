@@ -232,6 +232,22 @@ mod napi_exports {
         WHISPER_ENGINE.load_model().map_err(napi::Error::from)
     }
 
+    /// Compile-time feature flags of this addon.  Electron reads this at
+    /// startup so a stub binary (e.g. Whisper omitted from the Cargo features)
+    /// can be detected before the user attempts to dictate.
+    #[napi]
+    pub fn native_features() -> napi::Result<String> {
+        let json = serde_json::json!({
+            "whisper": cfg!(feature = "whisper"),
+            "metal": cfg!(feature = "metal"),
+            "llm": cfg!(feature = "llm"),
+            "tts": cfg!(feature = "tts"),
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        });
+        serde_json::to_string(&json).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
     /// Polish raw transcript text using the local LLM subprocess.
     /// Note: actual LLM inference happens in the ironmic-llm binary.
     /// This stub returns text unchanged — Electron routes through LlmSubprocess instead.

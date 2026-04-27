@@ -490,19 +490,49 @@ If the text is too short or unclear, output: ["General"]`;
 
   // ── Manual Model Import ──
 
-  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL, () => {
+  // After a successful Whisper-model import we reload the engine and clear
+  // any "model missing" banner the renderer may be showing. Without this, the
+  // user has to restart the app for the just-imported model to actually be
+  // picked up — which is exactly the failure mode that makes "I uploaded the
+  // model but dictation still doesn't work" feel unsolvable.
+  const isWhisperModel = (modelId?: string) => !!modelId && (modelId === 'whisper-large-v3-turbo' || modelId.startsWith('whisper-'));
+  const refreshWhisperAfterImport = (result: any) => {
+    if (!result || !isWhisperModel(result.modelId)) return result;
+    void Promise.resolve().then(() => {
+      try {
+        native.loadWhisperModel();
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            // Empty payload acts as "clear the banner" when the renderer sees
+            // permanent === false and message blank.
+            win.webContents.send('ironmic:whisper-load-failed', { message: '', permanent: false });
+          }
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            win.webContents.send('ironmic:whisper-load-failed', { message, permanent: false });
+          }
+        }
+      }
+    });
+    return result;
+  };
+
+  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL, async () => {
     const window = BrowserWindow.getFocusedWindow();
-    return importModelFile(window);
+    return refreshWhisperAfterImport(await importModelFile(window));
   });
   ipcMain.handle('ironmic:get-importable-models', () => {
     return JSON.stringify(getImportableModels());
   });
-  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL_FROM_PATH, (_event, filePath: string, sectionFilter: string) => {
-    return importModelFromPath(filePath, sectionFilter);
+  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL_FROM_PATH, async (_event, filePath: string, sectionFilter: string) => {
+    return refreshWhisperAfterImport(await importModelFromPath(filePath, sectionFilter));
   });
-  ipcMain.handle(IPC_CHANNELS.IMPORT_MULTI_PART_MODEL, () => {
+  ipcMain.handle(IPC_CHANNELS.IMPORT_MULTI_PART_MODEL, async () => {
     const window = BrowserWindow.getFocusedWindow();
-    return importMultiPartModel(window);
+    return refreshWhisperAfterImport(await importMultiPartModel(window));
   });
   ipcMain.handle(IPC_CHANNELS.OPEN_EXTERNAL, (_event, url: string) => {
     // Only allow opening known model download domains

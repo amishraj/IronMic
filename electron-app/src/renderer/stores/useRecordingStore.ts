@@ -2,7 +2,6 @@ import { create } from 'zustand';
 import { useTtsStore } from './useTtsStore';
 import { useAiChatStore } from './useAiChatStore';
 import { useToastStore } from './useToastStore';
-import { vadService } from '../services/tfjs/VADService';
 import type { PipelineState, TranscriptionResult, VoiceState } from '../types';
 
 interface RecordingStore {
@@ -68,30 +67,6 @@ async function handleRecordingAction(
       try { await useTtsStore.getState().stop(); } catch { /* ignore */ }
       set({ state: 'recording', error: null, voiceState: 'unknown', vadActive: false });
 
-      // Start VAD alongside recording — but ONLY in turn-detection modes that
-      // actually need it (auto-detect, always-listening). For default
-      // push-to-talk, opening a second mic stream via getUserMedia + Web Audio
-      // contends with Rust/cpal on Windows WASAPI and macOS CoreAudio, causing
-      // empty captures and "dictation hangs" symptoms. The skip-if-empty
-      // optimization VAD provided isn't worth that cost in push-to-talk where
-      // the user is explicitly framing the recording.
-      try {
-        const vadEnabled = await api.getSetting('vad_enabled');
-        const turnMode = (await api.getSetting('turn_detection_mode')) || 'push-to-talk';
-        const needsVad = vadEnabled !== 'false' && turnMode !== 'push-to-talk';
-        if (needsVad) {
-          const sensitivity = parseFloat((await api.getSetting('vad_sensitivity')) || '0.5');
-          vadService.setSensitivity(sensitivity);
-          await vadService.start();
-          set({ vadActive: true });
-          vadService.onVoiceStateChange((voiceState) => {
-            set({ voiceState });
-          });
-        }
-      } catch (vadErr) {
-        console.warn('[recording] VAD failed to start (non-fatal):', vadErr);
-      }
-
       try {
         await api.startRecording();
       } catch (startErr: any) {
@@ -121,20 +96,7 @@ async function handleRecordingAction(
   // ── STOP RECORDING + PROCESS ──
   if (state === 'recording') {
     try {
-      set({ state: 'processing', voiceState: 'unknown' });
-
-      // Stop VAD and check speech detection
-      const vadResult = vadService.isActive() ? vadService.stop() : null;
-      set({ vadActive: false });
-
-      // If VAD detected insufficient speech, skip transcription entirely
-      if (vadResult && !vadResult.hasSufficientSpeech) {
-        console.log(`[recording] VAD: insufficient speech (${vadResult.totalSpeechMs}ms) — skipping transcription`);
-        try { await api.stopRecording(); } catch { /* discard audio */ }
-        set({ state: 'idle', lastResult: null, error: null });
-        window.dispatchEvent(new CustomEvent('ironmic:dictation-empty'));
-        return;
-      }
+      set({ state: 'processing', voiceState: 'unknown', vadActive: false });
 
       let audioBuffer: Buffer;
       try {

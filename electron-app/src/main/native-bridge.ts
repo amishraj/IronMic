@@ -81,6 +81,15 @@ function createStubs(): Record<string, (...args: any[]) => any> {
       llm: { loaded: false, name: 'mistral-7b-instruct-q4', sizeBytes: 0 },
     }),
     loadWhisperModel: () => {},
+    nativeFeatures: () => JSON.stringify({
+      whisper: false,
+      metal: false,
+      llm: false,
+      tts: false,
+      platform: process.platform,
+      arch: process.arch,
+      stub: true,
+    }),
     // Analytics stubs
     analyticsRecomputeToday: () => {},
     analyticsBackfill: async () => 0,
@@ -150,6 +159,14 @@ export const native = {
   resetPipelineState(): void { this.addon.resetPipelineState(); },
   getModelStatus(): any { return this.addon.getModelStatus(); },
   loadWhisperModel(): void { this.addon.loadWhisperModel(); },
+  nativeFeatures(): { whisper: boolean; metal: boolean; llm: boolean; tts: boolean; platform: string; arch: string; stub?: boolean } {
+    if (typeof this.addon.nativeFeatures !== 'function') {
+      // Older addon binary — assume nothing is wired.
+      return { whisper: false, metal: false, llm: false, tts: false, platform: process.platform, arch: process.arch, stub: true };
+    }
+    try { return JSON.parse(this.addon.nativeFeatures()); }
+    catch { return { whisper: false, metal: false, llm: false, tts: false, platform: process.platform, arch: process.arch, stub: true }; }
+  },
 
   // Audio devices
   listAudioDevices(): string { return this.addon.listAudioDevices(); },

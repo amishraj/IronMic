@@ -345,10 +345,14 @@ function JoinPanel({
   const handleJoin = async () => {
     setError(null);
     const trimmed = invite.trim();
-    // Expected format: "ip:port|sessionCode"
-    const match = trimmed.match(/^([^:]+):(\d+)\|([A-Z0-9]+)$/);
+    // Accepts:
+    //   IPv4:  "192.168.1.5:54321|ABC123DEF456"
+    //   IPv6:  "[2601:abc::1]:54321|ABC123DEF456"
+    const ipv6 = trimmed.match(/^\[([^\]]+)\]:(\d+)\|([A-Z0-9]+)$/);
+    const ipv4 = ipv6 ? null : trimmed.match(/^([^:|]+):(\d+)\|([A-Z0-9]+)$/);
+    const match = ipv6 ?? ipv4;
     if (!match) {
-      setError('Invite should look like "192.168.1.5:54321|ABC123DEF456".');
+      setError('Invite should look like "192.168.1.5:54321|ABC123DEF456" or "[2601:abc::1]:54321|ABC123DEF456".');
       return;
     }
     const name = displayName.trim() || 'Viewer';
