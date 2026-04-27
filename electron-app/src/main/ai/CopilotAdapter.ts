@@ -110,12 +110,22 @@ export class CopilotAdapter implements ICLIAdapter {
     const resolved = await resolveInShell('copilot');
     if (resolved) return resolved;
 
+    const npmPrefix = this.npmGlobalPrefix();
     const candidates =
       process.platform === 'win32'
         ? [
             join(process.env.APPDATA || '', 'npm', 'copilot.cmd'),
             join(process.env.APPDATA || '', 'npm', 'copilot.exe'),
+            // npm v9+ scoped binstub layout
+            join(process.env.APPDATA || '', 'npm', 'node_modules', '@github', 'copilot', 'bin', 'copilot.cmd'),
             join(process.env.LOCALAPPDATA || '', 'Programs', 'copilot', 'copilot.exe'),
+            ...(npmPrefix
+              ? [
+                  join(npmPrefix, 'copilot.cmd'),
+                  join(npmPrefix, 'copilot.exe'),
+                  join(npmPrefix, 'node_modules', '@github', 'copilot', 'bin', 'copilot.cmd'),
+                ]
+              : []),
           ]
         : [
             '/opt/homebrew/bin/copilot',
@@ -123,6 +133,7 @@ export class CopilotAdapter implements ICLIAdapter {
             '/usr/bin/copilot',
             join(process.env.HOME || homedir(), '.local', 'bin', 'copilot'),
             join(process.env.HOME || homedir(), 'bin', 'copilot'),
+            ...(npmPrefix ? [join(npmPrefix, 'bin', 'copilot')] : []),
           ];
 
     return candidates.find((candidate) => candidate && existsSync(candidate)) || null;
@@ -136,6 +147,7 @@ export class CopilotAdapter implements ICLIAdapter {
       process.platform === 'win32'
         ? [
             'C:\\Program Files\\GitHub CLI\\gh.exe',
+            'C:\\Program Files (x86)\\GitHub CLI\\gh.exe',
             join(process.env.LOCALAPPDATA || '', 'Programs', 'GitHub CLI', 'gh.exe'),
           ]
         : [
@@ -146,6 +158,24 @@ export class CopilotAdapter implements ICLIAdapter {
           ];
 
     return candidates.find((candidate) => candidate && existsSync(candidate)) || null;
+  }
+
+  /** Cache npm's global prefix so we only shell out once per process. */
+  private cachedNpmPrefix: string | null | undefined = undefined;
+  private npmGlobalPrefix(): string | null {
+    if (this.cachedNpmPrefix !== undefined) return this.cachedNpmPrefix;
+    try {
+      const out = execFileSync(process.platform === 'win32' ? 'npm.cmd' : 'npm', ['prefix', '-g'], {
+        encoding: 'utf-8',
+        timeout: 3000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: getSpawnEnv(),
+      }).trim();
+      this.cachedNpmPrefix = out || null;
+    } catch {
+      this.cachedNpmPrefix = null;
+    }
+    return this.cachedNpmPrefix;
   }
 
   private isCopilotCliAuthenticated(): boolean {

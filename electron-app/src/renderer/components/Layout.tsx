@@ -60,6 +60,7 @@ export function Layout() {
   const [sidebarExpanded, setSidebarExpanded] = useState(true);
   const [sessionTimeout, setSessionTimeout] = useState('off');
   const [micVisualState, setMicVisualState] = useState<'idle' | 'recording' | 'processing' | 'success'>('idle');
+  const [whisperFailure, setWhisperFailure] = useState<{ message: string; permanent: boolean } | null>(null);
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { state: recordingState } = useRecordingStore();
   const isGranolaRecording = useMeetingStore(s => s.isGranolaRecording);
@@ -178,14 +179,14 @@ export function Layout() {
       });
     };
     const emptyHandler = () => {
-      const currentPage = pageRef.current;
-      if (!['main', 'dictate'].includes(currentPage)) {
-        useToastStore.getState().show({
-          message: 'No speech detected. Try again — make sure your mic is working.',
-          type: 'info',
-          durationMs: 5000,
-        });
-      }
+      // Always show — silent failures on Windows look identical to "the app froze"
+      // when audio is captured but Whisper returns nothing.  A short toast tells
+      // the user the pipeline ran end-to-end.
+      useToastStore.getState().show({
+        message: 'No speech detected. Try again — speak a bit louder or check your mic.',
+        type: 'info',
+        durationMs: 5000,
+      });
     };
 
     window.addEventListener('ironmic:dictation-complete', handler);
@@ -205,6 +206,23 @@ export function Layout() {
     };
     window.addEventListener('ironmic:navigate', handler);
     return () => window.removeEventListener('ironmic:navigate', handler);
+  }, []);
+
+  // ── Whisper readiness banner ──
+  // Surface model-load failures (file missing, feature flag off, build is a
+  // stub) immediately, instead of waiting for the user's first dictation to
+  // bubble a generic "Transcription failed" toast.
+  useEffect(() => {
+    const unsub = window.ironmic?.onWhisperLoadFailed?.((data) => {
+      // Empty message + non-permanent means "clear the banner" (sent after a
+      // successful import reload). Treat that as a dismiss.
+      if (!data.message && !data.permanent) {
+        setWhisperFailure(null);
+        return;
+      }
+      setWhisperFailure(data);
+    });
+    return () => { unsub?.(); };
   }, []);
 
   // ── Tray / notification quick actions ──
@@ -295,6 +313,32 @@ export function Layout() {
             <RecordingIndicator />
           </div>
         </div>
+
+        {/* Whisper load failure banner — sticky until resolved */}
+        {whisperFailure && (
+          <div
+            className="px-4 py-2 text-xs flex items-center gap-3 bg-red-500/15 border-b border-red-500/30 text-red-200"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
+            <span className="font-medium shrink-0">Dictation unavailable:</span>
+            <span className="flex-1 truncate" title={whisperFailure.message}>{whisperFailure.message}</span>
+            <button
+              onClick={() => setPage('settings')}
+              className="px-2 py-0.5 text-[10px] font-medium rounded bg-red-500/20 hover:bg-red-500/30 transition-colors shrink-0"
+            >
+              Open Settings
+            </button>
+            {!whisperFailure.permanent && (
+              <button
+                onClick={() => setWhisperFailure(null)}
+                className="text-red-200/70 hover:text-red-200 shrink-0"
+                title="Dismiss"
+              >
+                ×
+              </button>
+            )}
+          </div>
+        )}
 
         {page === 'main' && <GpuPrompt />}
 

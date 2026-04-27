@@ -5,6 +5,7 @@ import {
 } from 'lucide-react';
 import { Card } from './ui';
 import { useNotesStore, type Note, type Notebook } from '../stores/useNotesStore';
+import { useToastStore } from '../stores/useToastStore';
 import { NotesCollaborateModal } from './NotesCollaborateModal';
 
 export function NotesPage() {
@@ -29,9 +30,15 @@ export function NotesPage() {
   const [collabParticipantCount, setCollabParticipantCount] = useState(0);
   const [collabNoteId, setCollabNoteId] = useState<string | null>(null);
   const collabNoteIdRef = useRef<string | null>(null);
+  const collabRoleRef = useRef<'host' | 'client' | null>(null);
   const joinedLocalNoteIdRef = useRef<string | null>(null);
-  const applyingRemoteRef = useRef(false);
+  // Content the last received remote update applied to the editor.  We skip
+  // outbound broadcasts when the editor matches this string — deterministic,
+  // no timer race with React 18 effect timing.
+  const lastRemoteContentRef = useRef<string | null>(null);
   const draftThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useToastStore((s) => s.show);
 
   const titleRef = useRef<HTMLInputElement>(null);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -43,70 +50,102 @@ export function NotesPage() {
     }
   }, [activeNoteId]);
 
-  // Apply remote saves into the note that owns the session, even if the user
-  // has switched to a different note locally.
+  // Apply remote saves & drafts into the note that owns the session, even if
+  // the user has switched to a different note locally.  We capture the
+  // applied content in lastRemoteContentRef so the broadcast effect knows to
+  // skip echoing it back — replaces the prior setTimeout-based race.
   useEffect(() => {
-    const unsub = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
+    const applyRemote = (raw: any) => {
       const targetNoteId = collabNoteIdRef.current;
       if (!targetNoteId) return;
-      applyingRemoteRef.current = true;
-      updateNote(targetNoteId, { content: data?.notes ?? '' });
-      setTimeout(() => { applyingRemoteRef.current = false; }, 0);
+      const content = String(raw ?? '');
+      lastRemoteContentRef.current = content;
+      updateNote(targetNoteId, { content });
+    };
+    const unsubSaved = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
+      applyRemote(data?.notes);
     });
-    return () => { unsub?.(); };
+    const unsubDraft = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
+      if (data?.content != null) applyRemote(data.content);
+    });
+    return () => { unsubSaved?.(); unsubDraft?.(); };
   }, [updateNote]);
 
-  // Track live collab session state for the button indicator.
+  // Track live collab session state for the button indicator.  Trust the
+  // server-supplied sessionNoteId when present (defence in depth) and fall
+  // back to parsing it out of sessionId for older payloads.
   useEffect(() => {
     const unsub = window.ironmic?.onMeetingCollabState?.((info: any) => {
-      const isHost = typeof info?.active === 'boolean';
       const active = Boolean(info?.active ?? info?.connected);
-      const role: 'host' | 'client' | null = active ? (isHost ? 'host' : 'client') : null;
+      // Server payload has `active`; client payload has `connected`.
+      const role: 'host' | 'client' | null = active
+        ? (info?.active != null ? 'host' : 'client')
+        : null;
       setCollabActive(active);
       setCollabRole(role);
+      collabRoleRef.current = role;
       setCollabParticipantCount(info?.participants?.length ?? 0);
       const sid = info?.sessionId as string | null;
+      const serverNoteId = (info?.sessionNoteId as string | null) ?? null;
       const noteId = role === 'client'
         ? joinedLocalNoteIdRef.current
-        : sid?.startsWith('note:') ? sid.slice(5) : null;
+        : (serverNoteId ?? (sid?.startsWith('note:') ? sid.slice(5) : null));
       setCollabNoteId(noteId);
       collabNoteIdRef.current = noteId;
+      if (!active) lastRemoteContentRef.current = null;
     });
     return () => { unsub?.(); };
   }, []);
 
-  // Broadcast edits for the note that owns the session. This is deliberately
-  // note-scoped: switching notes while hosting must not leak the new note into
-  // the existing session.
+  // Surface firewall failures (Mac/Win) to the user as a non-blocking toast.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabFirewallWarning?.((data: { message: string }) => {
+      showToast({ message: data.message, type: 'info', durationMs: 12000 });
+    });
+    return () => { unsub?.(); };
+  }, [showToast]);
+
+  // Broadcast edits for the note that owns the session.  Note-scoped: switching
+  // notes while hosting must not leak the new note into the existing session.
+  // Two paths:
+  //   • draft: 80ms throttle, fire-and-forget, lets the peer feel typing live
+  //   • save:  1.2s debounce, persists & bumps version
   useEffect(() => {
     if (!collabActive || !activeNote) return;
     if (activeNote.id !== collabNoteId) return;
-    if (applyingRemoteRef.current) return;
-    if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
-    draftThrottleRef.current = setTimeout(() => {
-      const name = (() => { try { return localStorage.getItem('ironmic-collab-display-name') || 'Host'; } catch { return 'Host'; } })();
-      if (collabRole === 'host') {
+    // Skip echoes — content already came from the wire.
+    if (lastRemoteContentRef.current === activeNote.content) return;
+
+    const name = (() => {
+      try { return localStorage.getItem('ironmic-collab-display-name') || 'Host'; }
+      catch { return 'Host'; }
+    })();
+    const sendDraft = () => {
+      if (collabRoleRef.current === 'host') {
+        window.ironmic?.meetingCollabNotifyDraft?.(activeNote.content, name)?.catch(() => {});
+      } else if (collabRoleRef.current === 'client') {
+        window.ironmic?.meetingCollabSendDraft?.(activeNote.content)?.catch(() => {});
+      }
+    };
+    const sendSave = () => {
+      if (collabRoleRef.current === 'host') {
         window.ironmic?.meetingCollabNotifySaved?.(activeNote.content, name)?.catch(() => {});
-      } else if (collabRole === 'client') {
+      } else if (collabRoleRef.current === 'client') {
         window.ironmic?.meetingCollabSaveNotes?.(activeNote.content)?.catch(() => {});
       }
-    }, 300);
-    return () => { if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current); };
-  }, [activeNote?.id, activeNote?.content, collabActive, collabNoteId, collabRole]);
+    };
 
-  // Apply incoming draft content when we're a participant.
-  useEffect(() => {
-    const unsub = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
-      const targetNoteId = collabNoteIdRef.current;
-      if (!targetNoteId) return;
-      if (data?.content != null) {
-        applyingRemoteRef.current = true;
-        updateNote(targetNoteId, { content: String(data.content) });
-        setTimeout(() => { applyingRemoteRef.current = false; }, 0);
-      }
-    });
-    return () => { unsub?.(); };
-  }, [updateNote]);
+    if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
+    draftThrottleRef.current = setTimeout(sendDraft, 80);
+
+    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    saveDebounceRef.current = setTimeout(sendSave, 1200);
+
+    return () => {
+      if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
+      if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    };
+  }, [activeNote?.id, activeNote?.content, collabActive, collabNoteId]);
 
   // Auto-stop when the last participant leaves while the modal is closed.
   useEffect(() => {

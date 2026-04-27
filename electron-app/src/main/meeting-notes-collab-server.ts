@@ -35,7 +35,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { exec } from 'child_process';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { BrowserWindow } from 'electron';
+import { app, BrowserWindow } from 'electron';
 import { native } from './native-bridge';
 
 export interface CollabParticipant {
@@ -47,11 +47,13 @@ export interface CollabParticipant {
 export interface CollabServerInfo {
   active: boolean;
   sessionId: string | null;
+  /** Note id this session is scoped to (derived from sessionId "note:<id>"). */
+  sessionNoteId: string | null;
   hostName: string | null;
   ip: string | null;
   port: number | null;
   sessionCode: string | null;
-  /** Invite string for sharing: "ip:port|sessionCode" */
+  /** Invite string for sharing: "ip:port|sessionCode" (IPv6 wrapped in brackets). */
   inviteString: string | null;
   participants: CollabParticipant[];
   version: number;
@@ -69,10 +71,14 @@ class MeetingNotesCollabServerManager {
   private participants: Map<string, CollabParticipant> = new Map();
 
   private sessionId: string | null = null;
+  /** Derived from sessionId "note:<id>"; the note this session edits. */
+  private sessionNoteId: string | null = null;
   private hostName: string | null = null;
   private sessionCode: string | null = null;
   private boundIp: string | null = null;
   private boundPort: number | null = null;
+  /** True when the bound address is IPv6 — invite string wraps in brackets. */
+  private boundIsIpv6: boolean = false;
   private firewallRuleName: string | null = null;
 
   private currentNotes: string = '';
@@ -83,16 +89,18 @@ class MeetingNotesCollabServerManager {
   isActive(): boolean { return this.wss !== null; }
 
   getInfo(): CollabServerInfo {
+    const host = this.boundIsIpv6 ? `[${this.boundIp}]` : this.boundIp;
     return {
       active: this.isActive(),
       sessionId: this.sessionId,
+      sessionNoteId: this.sessionNoteId,
       hostName: this.hostName,
       ip: this.boundIp,
       port: this.boundPort,
       sessionCode: this.sessionCode,
       inviteString:
-        this.boundIp && this.boundPort && this.sessionCode
-          ? `${this.boundIp}:${this.boundPort}|${this.sessionCode}`
+        host && this.boundPort && this.sessionCode
+          ? `${host}:${this.boundPort}|${this.sessionCode}`
           : null,
       participants: Array.from(this.participants.values()),
       version: this.version,
@@ -115,22 +123,31 @@ class MeetingNotesCollabServerManager {
     }
 
     this.sessionId = opts.sessionId;
+    this.sessionNoteId = opts.sessionId.startsWith('note:')
+      ? opts.sessionId.slice(5)
+      : null;
     this.hostName = (opts.hostName || 'Host').slice(0, 64);
     this.currentNotes = opts.notes;
     this.version = opts.version ?? 0;
     this.sessionCode = this.generateCode();
 
-    const ip = this.detectLanIp();
-    if (!ip) {
+    const detected = this.detectLanAddress();
+    if (!detected) {
       throw new Error(
-        'Could not detect a LAN IPv4 address. ' +
+        'Could not detect a LAN address. ' +
         'Make sure you are connected to a local network.',
       );
     }
-    this.boundIp = ip;
+    this.boundIp = detected.address;
+    this.boundIsIpv6 = detected.family === 'IPv6';
+
+    // Bind to dual-stack (::) so v4 and v6 clients both connect when an
+    // IPv6 address is what the host advertises. For v4-only hosts the
+    // 0.0.0.0 bind is fine.
+    const bindHost = this.boundIsIpv6 ? '::' : '0.0.0.0';
 
     await new Promise<void>((resolve, reject) => {
-      const wss = new WebSocketServer({ host: '0.0.0.0', port: 0 });
+      const wss = new WebSocketServer({ host: bindHost, port: 0 });
       wss.once('listening', () => {
         const addr = wss.address();
         if (typeof addr === 'object' && addr) this.boundPort = addr.port;
@@ -141,7 +158,10 @@ class MeetingNotesCollabServerManager {
       wss.on('connection', (ws: WebSocket) => this.handleConnection(ws));
     });
 
-    if (this.boundPort) this.addWindowsFirewallRule(this.boundPort);
+    if (this.boundPort) {
+      this.addWindowsFirewallRule(this.boundPort);
+      this.addMacFirewallRule();
+    }
     this.pushStateToRenderer();
     return this.getInfo();
   }
@@ -158,10 +178,12 @@ class MeetingNotesCollabServerManager {
     this.clients.clear();
     this.participants.clear();
     this.sessionId = null;
+    this.sessionNoteId = null;
     this.hostName = null;
     this.sessionCode = null;
     this.boundIp = null;
     this.boundPort = null;
+    this.boundIsIpv6 = false;
     this.version = 0;
     this.pushStateToRenderer();
   }
@@ -222,6 +244,7 @@ class MeetingNotesCollabServerManager {
       this.send(state.socket, {
         type: 'welcome',
         sessionId: this.sessionId,
+        sessionNoteId: this.sessionNoteId,
         notes: this.currentNotes,
         version: this.version,
         participants: Array.from(this.participants.values()),
@@ -361,9 +384,12 @@ class MeetingNotesCollabServerManager {
       (err) => {
         if (err) {
           console.warn(
-            `[NotesCollabServer] Could not add Windows Firewall rule for port ${port}. ` +
-            'Participants on other machines may see EHOSTUNREACH. ' +
-            'Allow IronMic through Windows Firewall manually if needed.',
+            `[NotesCollabServer] Could not add Windows Firewall rule for port ${port}: ${err.message}`,
+          );
+          this.notifyFirewallIssue(
+            'Windows Firewall blocked IronMic from auto-allowing collaboration. ' +
+            'Open Windows Security \u2192 Firewall & network protection \u2192 ' +
+            'Allow an app through firewall, then enable IronMic on Private networks.',
           );
         } else {
           console.info(`[NotesCollabServer] Windows Firewall rule added: ${name}`);
@@ -379,33 +405,79 @@ class MeetingNotesCollabServerManager {
     exec(`netsh advfirewall firewall delete rule name="${name}"`, () => {});
   }
 
-  private detectLanIp(): string | null {
+  /**
+   * macOS application firewall is per-app, not per-port. Adding the running
+   * IronMic binary as an allowed app + unblocking it covers inbound LAN
+   * connections. Requires the firewall daemon to be enabled; failures are
+   * non-fatal and surfaced to the renderer.
+   */
+  private addMacFirewallRule(): void {
+    if (process.platform !== 'darwin') return;
+    const appPath = app.getPath('exe');
+    const fw = '/usr/libexec/ApplicationFirewall/socketfilterfw';
+    exec(`"${fw}" --add "${appPath}" && "${fw}" --unblockapp "${appPath}"`, (err) => {
+      if (err) {
+        // socketfilterfw needs root for --add. We try anyway in case the
+        // user pre-approved IronMic; surface a hint if it failed.
+        this.notifyFirewallIssue(
+          'macOS Firewall may block participants from reaching this Mac. ' +
+          'Open System Settings \u2192 Network \u2192 Firewall \u2192 Options, ' +
+          'add IronMic and set it to Allow incoming connections.',
+        );
+      }
+    });
+  }
+
+  private notifyFirewallIssue(message: string): void {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send('ironmic:meeting-collab-firewall-warning', { message });
+      }
+    }
+  }
+
+  /**
+   * Pick the best LAN address to advertise. Prefer IPv4 (better firewall
+   * support, simpler UX) and fall back to non-link-local IPv6 if no IPv4
+   * is available. Skips loopback, virtual, VPN, and link-local addresses.
+   */
+  private detectLanAddress(): { address: string; family: 'IPv4' | 'IPv6' } | null {
     const ifaces = os.networkInterfaces();
-    const candidates: Array<{ name: string; address: string }> = [];
+    type Cand = { name: string; address: string; family: 'IPv4' | 'IPv6' };
+    const candidates: Cand[] = [];
     const virtualInterfacePattern = /(loopback|virtual|vmware|virtualbox|vbox|hyper-v|vethernet|wsl|docker|bluetooth|tailscale|zerotier|utun|awdl|bridge|tunnel|vpn)/i;
     for (const name of Object.keys(ifaces)) {
       if (/^(lo|docker|veth|tun|tap|utun|bridge|llw|awdl|anpi)/i.test(name)) continue;
       if (virtualInterfacePattern.test(name)) continue;
       for (const addr of ifaces[name] ?? []) {
-        if (addr.family !== 'IPv4' || addr.internal) continue;
-        if (addr.address.startsWith('169.254.')) continue;
-        candidates.push({ name, address: addr.address });
+        if (addr.internal) continue;
+        if (addr.family === 'IPv4') {
+          if (addr.address.startsWith('169.254.')) continue;
+          candidates.push({ name, address: addr.address, family: 'IPv4' });
+        } else if (addr.family === 'IPv6') {
+          // skip link-local and unique-local fc00::/7? keep ULA, drop fe80
+          if (addr.address.toLowerCase().startsWith('fe80')) continue;
+          candidates.push({ name, address: addr.address.split('%')[0], family: 'IPv6' });
+        }
       }
     }
     candidates.sort((a, b) => {
-      const score = (candidate: { name: string; address: string }) => {
-        const name = candidate.name.toLowerCase();
-        const ip = candidate.address;
+      const score = (c: Cand) => {
         let s = 100;
-        if (/(wi-?fi|wlan|wireless|ethernet|en\d+|eth\d+)/i.test(name)) s -= 20;
-        if (ip.startsWith('192.168.')) s -= 6;
-        else if (ip.startsWith('10.')) s -= 5;
-        else if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) s -= 4;
+        if (c.family === 'IPv4') s -= 50; // strongly prefer IPv4
+        const nm = c.name.toLowerCase();
+        if (/(wi-?fi|wlan|wireless|ethernet|en\d+|eth\d+)/i.test(nm)) s -= 20;
+        if (c.family === 'IPv4') {
+          if (c.address.startsWith('192.168.')) s -= 6;
+          else if (c.address.startsWith('10.')) s -= 5;
+          else if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(c.address)) s -= 4;
+        }
         return s;
       };
       return score(a) - score(b);
     });
-    return candidates[0]?.address ?? null;
+    const best = candidates[0];
+    return best ? { address: best.address, family: best.family } : null;
   }
 
   private generateCode(): string {

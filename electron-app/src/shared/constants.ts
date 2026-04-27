@@ -207,6 +207,7 @@ export const IPC_CHANNELS = {
   MEETING_COLLAB_DRAFT: 'ironmic:meeting-collab-draft',              // main → renderer push
   MEETING_COLLAB_ENDED: 'ironmic:meeting-collab-ended',              // main → renderer push
   MEETING_COLLAB_WELCOME: 'ironmic:meeting-collab-welcome',          // main → renderer push (on join)
+  MEETING_COLLAB_FIREWALL_WARNING: 'ironmic:meeting-collab-firewall-warning', // main → renderer push
 
   // TF.js Infrastructure
   GET_MODELS_DIR: 'ironmic:get-models-dir',

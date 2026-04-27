@@ -212,6 +212,7 @@ declare global {
       meetingCollabStart: (sessionId: string, hostName: string, notes: string, version?: number) => Promise<any>;
       meetingCollabStop: () => Promise<{ ok: boolean }>;
       meetingCollabNotifySaved: (notes: string, savedBy: string) => Promise<{ ok: boolean }>;
+      meetingCollabNotifyDraft: (content: string, senderName: string) => Promise<{ ok: boolean }>;
       meetingCollabJoin: (opts: { hostIp: string; hostPort: number; sessionCode: string; displayName: string }) => Promise<any>;
       meetingCollabLeave: () => Promise<{ ok: boolean }>;
       meetingCollabSaveNotes: (content: string) => Promise<{ ok: boolean }>;
@@ -220,6 +221,8 @@ declare global {
       onMeetingCollabNotesUpdated: (callback: (data: any) => void) => () => void;
       onMeetingCollabDraft: (callback: (data: any) => void) => () => void;
       onMeetingCollabEnded: (callback: () => void) => () => void;
+      onMeetingCollabFirewallWarning: (callback: (data: { message: string }) => void) => () => void;
+      onWhisperLoadFailed: (callback: (data: { message: string; permanent: boolean }) => void) => () => void;
       // Processing-state notification (fire-and-forget, renderer → main)
       notifyProcessingState: (isActive: boolean) => void;
     };

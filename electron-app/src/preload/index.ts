@@ -372,6 +372,18 @@ const api = {
     ipcRenderer.on('ironmic:meeting-collab-ended', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-collab-ended', handler);
   },
+  onMeetingCollabFirewallWarning: (callback: (data: { message: string }) => void) => {
+    const handler = (_event: any, data: { message: string }) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-firewall-warning', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-firewall-warning', handler);
+  },
+
+  // ── Whisper readiness ──
+  onWhisperLoadFailed: (callback: (data: { message: string; permanent: boolean }) => void) => {
+    const handler = (_event: any, data: { message: string; permanent: boolean }) => callback(data);
+    ipcRenderer.on('ironmic:whisper-load-failed', handler);
+    return () => ipcRenderer.removeListener('ironmic:whisper-load-failed', handler);
+  },
 };
 
 contextBridge.exposeInMainWorld('ironmic', api);
