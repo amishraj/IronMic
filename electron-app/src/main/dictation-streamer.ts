@@ -26,8 +26,10 @@ import {
   isAudioSilent,
   sanitizeTranscribedText,
   transcribeWithTimeout,
+  computeRmsPcm16,
 } from './transcribe-clean';
 import { audioStream } from './audio-stream-manager';
+import { debugLog } from './debug-log';
 
 /** Same timeout rationale as MeetingRecorder — don't let a hung Whisper call
  *  stall the 2.5s chunk loop. Dictation chunks are smaller so the timeout is
@@ -85,13 +87,16 @@ class DictationStreamer {
         this.whisperReady = true;
       }
       native.addon.startRecording();
+      debugLog('capture.start', { owner: 'streaming', success: true });
     } catch (err: any) {
+      debugLog('capture.start', { owner: 'streaming', success: false, error: err?.message ?? String(err) });
       audioStream.release('streaming');
       // Handle "already recording" — reset + retry once.
       if (err?.message?.includes('already')) {
         try { native.addon.resetPipelineState?.(); } catch { /* ignore */ }
         try {
           native.addon.startRecording();
+          debugLog('capture.start', { owner: 'streaming', success: true, retried: true });
         } catch (retryErr) {
           throw retryErr;
         }
@@ -160,8 +165,16 @@ class DictationStreamer {
         audioBuffer = isFinal || typeof native.addon.drainRecordingBuffer !== 'function'
           ? native.addon.stopRecording()
           : native.addon.drainRecordingBuffer();
-      } catch (err) {
+        debugLog('capture.drained', {
+          chunkIndex: this.chunkIndex,
+          byteLength: audioBuffer.length,
+          rms: computeRmsPcm16(audioBuffer),
+          isFinal,
+          path: isFinal ? 'stopRecording' : 'drainRecordingBuffer',
+        });
+      } catch (err: any) {
         console.warn('[DictationStreamer] Failed to drain recording chunk:', err);
+        debugLog('capture.drained', { chunkIndex: this.chunkIndex, isFinal, error: err?.message ?? String(err) });
         return;
       }
 
@@ -188,11 +201,25 @@ class DictationStreamer {
 
       // Timeout-guarded transcribe so a hung Whisper call can't freeze the
       // 2.5s chunk loop. On timeout we drop the chunk and carry on.
-      const rawText = await transcribeWithTimeout(
-        Promise.resolve(native.addon.transcribe(audioBuffer)),
-        this.chunkIndex === 0 ? FIRST_TRANSCRIBE_TIMEOUT_MS : TRANSCRIBE_TIMEOUT_MS,
-        'DictationStreamer.transcribe',
-      );
+      // Prefer transcribe_short (forces single-segment) when the rebuilt addon
+      // exposes it; older addons fall back to plain transcribe.
+      const transcribeFn = typeof native.addon.transcribeShort === 'function'
+        ? native.addon.transcribeShort
+        : native.addon.transcribe;
+      const whisperStart = Date.now();
+      debugLog('whisper.in', { chunkIndex: this.chunkIndex, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000, short: transcribeFn === native.addon.transcribeShort });
+      let rawText: string | null = null;
+      try {
+        rawText = await transcribeWithTimeout(
+          Promise.resolve(transcribeFn(audioBuffer)),
+          this.chunkIndex === 0 ? FIRST_TRANSCRIBE_TIMEOUT_MS : TRANSCRIBE_TIMEOUT_MS,
+          'DictationStreamer.transcribe',
+        );
+        debugLog('whisper.raw', { chunkIndex: this.chunkIndex, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart });
+      } catch (err: any) {
+        debugLog('whisper.error', { chunkIndex: this.chunkIndex, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
+        throw err;
+      }
       if (rawText == null) {
         if (isFinal) this.emitChunk('', true);
         return;
@@ -219,6 +246,7 @@ class DictationStreamer {
       text,
       isFinal,
     };
+    debugLog('chunk.emit', payload);
     const w = BrowserWindow.getAllWindows()[0];
     if (w && !w.isDestroyed()) {
       w.webContents.send(IPC_CHANNELS.DICTATION_STREAM_CHUNK, payload);

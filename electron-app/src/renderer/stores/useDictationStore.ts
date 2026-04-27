@@ -252,7 +252,13 @@ if (typeof window !== 'undefined' && (window as any).ironmic) {
     }
   });
   api.onDictationStreamChunk?.((payload: { index: number; text: string; isFinal: boolean }) => {
-    if (!payload.text) return;
+    if (!payload.text) {
+      // eslint-disable-next-line no-console
+      console.log('[ironmic:dictation] empty chunk dropped', payload);
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.log('[ironmic:dictation] chunk applied', payload);
     const prev = useDictationStore.getState();
     const appended = (prev.fullText + ' ' + payload.text).replace(/\s+/g, ' ').trim();
     useDictationStore.setState({

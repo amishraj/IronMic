@@ -51,6 +51,7 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     stopRecording: () => Buffer.alloc(0),
     isRecording: () => false,
     transcribe: async () => '[stub transcription]',
+    transcribeShort: async () => '[stub transcription short]',
     polishText: async (text: string) => text,
     createEntry: (entry: any) => ({ id: 'stub-id', ...entry, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), displayMode: 'polished', isPinned: false, isArchived: false, tags: null }),
     getEntry: () => null,

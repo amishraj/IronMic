@@ -48,9 +48,22 @@ export function InputSettings() {
   const chunksRef = useRef<Blob[]>([]);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
 
+  // Debug logging toggle — pipes capture/silence-gate/whisper/sanitize/emit
+  // events to the renderer DevTools console (and main-process stdout). Off by
+  // default; flip on to diagnose "I dictated and nothing appeared" issues.
+  const [debugLogging, setDebugLogging] = useState(false);
+
   useEffect(() => {
     loadDeviceInfo();
+    (window as any).ironmic?.getSetting?.('debug_audio_logging').then((v: string | null) => {
+      setDebugLogging(v === 'true' || v === '1');
+    });
     return () => stopMonitoring();
+  }, []);
+
+  const toggleDebugLogging = useCallback(async (next: boolean) => {
+    setDebugLogging(next);
+    await (window as any).ironmic?.setSetting?.('debug_audio_logging', next ? 'true' : 'false');
   }, []);
 
   async function loadDeviceInfo() {
@@ -458,6 +471,36 @@ export function InputSettings() {
               </p>
             )}
           </div>
+        </div>
+      </Card>
+
+      {/* Debug audio logging — for diagnosing dictation issues */}
+      <Card variant="default" padding="md">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex items-start gap-2.5 flex-1">
+            <Info className="w-4 h-4 text-iron-text-muted flex-shrink-0 mt-0.5" />
+            <div className="text-xs text-iron-text-muted leading-relaxed">
+              <p className="text-sm font-medium text-iron-text">Debug audio logging</p>
+              <p className="mt-1">
+                Pipes capture / silence-gate / whisper / sanitize / emit events to the renderer DevTools
+                console (View → Toggle Developer Tools). Also bypasses the silence gate so you can see what
+                Whisper actually returns on quiet chunks. Leave off in normal use.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={() => toggleDebugLogging(!debugLogging)}
+            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors flex-shrink-0 ${
+              debugLogging ? 'bg-iron-accent' : 'bg-iron-border'
+            }`}
+            aria-label="Toggle debug audio logging"
+          >
+            <span
+              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                debugLogging ? 'translate-x-6' : 'translate-x-1'
+              }`}
+            />
+          </button>
         </div>
       </Card>
 

@@ -224,6 +224,9 @@ export const IPC_CHANNELS = {
   MODEL_DOWNLOAD_PROGRESS: 'ironmic:model-download-progress',
   NOTIFICATION_NEW: 'ironmic:notification-new',
   WORKFLOW_DISCOVERED: 'ironmic:workflow-discovered',
+
+  // Debug logs (main → renderer push, gated on debug_audio_logging setting)
+  DEBUG_LOG: 'ironmic:debug-log',
 } as const;
 
 // ── Model hosting on GitHub Releases ──

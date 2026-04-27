@@ -388,5 +388,14 @@ const api = {
 
 contextBridge.exposeInMainWorld('ironmic', api);
 
+// ── Debug audio pipeline logs (gated in main on `debug_audio_logging` setting) ──
+// Emits `[ironmic:debug] <stage>` lines to the renderer DevTools console so the
+// user can see exactly which hop drops a chunk (capture → silence-gate → whisper
+// → sanitize → emit → recv). Self-installing — no API surface needed.
+ipcRenderer.on('ironmic:debug-log', (_event, payload: { stage: string; data: any; t: number }) => {
+  // eslint-disable-next-line no-console
+  console.log(`[ironmic:debug] ${payload.stage}`, payload.data);
+});
+
 // Type declaration for the renderer
 export type IronMicAPI = typeof api;

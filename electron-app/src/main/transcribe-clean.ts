@@ -25,13 +25,30 @@
  * RMS threshold below which we treat a chunk as silence and skip Whisper.
  *
  * Interpretation: RMS is computed on normalized [-1.0, +1.0] samples, so
- * 0.005 ≈ -46 dBFS. Typical room noise in a quiet office is -50 to -40 dBFS;
- * soft speech is around -30 to -20 dBFS. 0.005 is conservative — it passes
- * anything a human would call "audible speech" while rejecting pure room
- * tone and HVAC hum. Tuned manually; if users report missed quiet speech,
- * bump down to 0.003.
+ * 0.0015 ≈ -56 dBFS. macOS CoreAudio applies adaptive AGC by default; Windows
+ * WASAPI shared mode does not, so the same speaker at the same volume can
+ * produce chunk RMS ~0.05 on a Mac and ~0.002–0.004 on a Windows mic. The
+ * older 0.005 (-46 dBFS) threshold passed Mac speech but dropped most Windows
+ * speech, which surfaced as "I dictate, nothing appears, app finishes silent."
+ * 0.0015 is in the ballpark used by the whisper.cpp ecosystem (Buzz, vibe).
+ * If users report missed very quiet speech, bump further down to 0.001.
  */
-const RMS_SILENCE_THRESHOLD = 0.005;
+const RMS_SILENCE_THRESHOLD = 0.0015;
+
+// Used by isAudioSilent() to bypass the gate when the user has flipped the
+// debug toggle in Settings. Lets the user see what Whisper actually returns
+// on a "rejected" chunk in one test run, instead of needing two.
+import { native } from './native-bridge';
+import { debugLog } from './debug-log';
+
+function debugBypassesSilenceGate(): boolean {
+  try {
+    const v = native.getSetting?.('debug_audio_logging');
+    return v === 'true' || v === '1';
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Compute RMS energy of a PCM16 audio buffer. Buffer format assumption:
@@ -62,8 +79,18 @@ export function computeRmsPcm16(buf: Buffer): number {
 
 /** Returns true if the audio buffer is below the silence floor. */
 export function isAudioSilent(buf: Buffer): boolean {
-  if (!buf || buf.length < 500) return true;
-  return computeRmsPcm16(buf) < RMS_SILENCE_THRESHOLD;
+  if (!buf || buf.length < 500) {
+    debugLog('silence-gate', { rms: 0, threshold: RMS_SILENCE_THRESHOLD, byteLength: buf?.length ?? 0, dropped: true, reason: 'buffer-too-small' });
+    return true;
+  }
+  const rms = computeRmsPcm16(buf);
+  const wouldDrop = rms < RMS_SILENCE_THRESHOLD;
+  // When debug logging is on, bypass the gate so the user can see the raw
+  // Whisper output for low-RMS chunks they were never expecting to be dropped.
+  // Two birds: confirms the gate was the bug AND shows what Whisper would say.
+  const dropped = wouldDrop && !debugBypassesSilenceGate();
+  debugLog('silence-gate', { rms, threshold: RMS_SILENCE_THRESHOLD, byteLength: buf.length, dropped, bypassed: wouldDrop && !dropped });
+  return dropped;
 }
 
 // ── Text sanitization ─────────────────────────────────────────────────────
@@ -78,6 +105,12 @@ export function isAudioSilent(buf: Buffer): boolean {
  * substring matches. "Thanks for watching." as a whole chunk → drop. But
  * "I said thanks for watching the demo" → keep — real content.
  */
+// Rule: drop only what Whisper INVENTS on silence, not what a user might
+// genuinely say. Single-word legitimate utterances ("ok", "yeah", "thanks",
+// "you", "bye", "right", "so", "hmm", filler-words) were removed because they
+// are routinely real input — the previous list silently swallowed them and
+// surfaced as "I said 'ok' and nothing happened." Keep the long phrases
+// Whisper synthesizes on silence ("Thanks for watching.") and bracket markers.
 const EXACT_HALLUCINATIONS = new Set<string>([
   'thanks for watching.',
   'thanks for watching',
@@ -87,32 +120,9 @@ const EXACT_HALLUCINATIONS = new Set<string>([
   'thanks for listening',
   'thank you.',
   'thank you',
-  'thanks.',
-  'thanks',
-  'you',
   '.',
   '..',
   '...',
-  'bye.',
-  'bye!',
-  'bye',
-  'ok.',
-  'okay.',
-  'ok',
-  'okay',
-  'mm-hmm.',
-  'mm hmm.',
-  'uh-huh.',
-  'um.',
-  'uh.',
-  'hmm.',
-  'hmm',
-  'so.',
-  'so',
-  'yeah.',
-  'yeah',
-  'right.',
-  'right',
   // Whisper's synthetic markers — usually on silent clips
   '[blank_audio]',
   '[silence]',
@@ -125,8 +135,6 @@ const EXACT_HALLUCINATIONS = new Set<string>([
   // Common mistranscriptions of ambient noise as narration
   'the end.',
   'the end',
-  'you know.',
-  'you know',
 ]);
 
 /**
@@ -183,26 +191,45 @@ function collapseRepetitions(s: string): string {
  * set (by which point we've normalized away the noise markers).
  */
 export function sanitizeTranscribedText(raw: string): string {
-  if (!raw) return '';
+  if (!raw) {
+    debugLog('sanitize', { rawText: raw, sanitizedText: '', droppedReason: 'empty-input' });
+    return '';
+  }
   const trimmed = raw.trim();
-  if (!trimmed) return '';
+  if (!trimmed) {
+    debugLog('sanitize', { rawText: raw, sanitizedText: '', droppedReason: 'whitespace-only' });
+    return '';
+  }
 
   // Strip bracketed markers in the middle of text.
   let cleaned = stripBracketedMarkers(trimmed);
-  if (!cleaned) return '';
+  if (!cleaned) {
+    debugLog('sanitize', { rawText: raw, sanitizedText: '', droppedReason: 'bracket-only' });
+    return '';
+  }
 
   // Collapse Whisper repetition loops.
   cleaned = collapseRepetitions(cleaned);
-  if (!cleaned) return '';
+  if (!cleaned) {
+    debugLog('sanitize', { rawText: raw, sanitizedText: '', droppedReason: 'repetition-loop' });
+    return '';
+  }
 
   // Exact-match hallucination filter.
   const key = cleaned.toLowerCase();
-  if (EXACT_HALLUCINATIONS.has(key)) return '';
+  if (EXACT_HALLUCINATIONS.has(key)) {
+    debugLog('sanitize', { rawText: raw, sanitizedText: '', droppedReason: 'exact-hallucination', matched: key });
+    return '';
+  }
 
   // Very short output (< 2 word characters) on any non-trivial chunk is
   // almost certainly a mistranscription of noise. Drop.
-  if (cleaned.replace(/[^a-z0-9]/gi, '').length < 2) return '';
+  if (cleaned.replace(/[^a-z0-9]/gi, '').length < 2) {
+    debugLog('sanitize', { rawText: raw, sanitizedText: '', droppedReason: 'too-short', cleaned });
+    return '';
+  }
 
+  debugLog('sanitize', { rawText: raw, sanitizedText: cleaned });
   return cleaned;
 }
 
