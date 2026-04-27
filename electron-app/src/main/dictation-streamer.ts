@@ -33,6 +33,7 @@ import { audioStream } from './audio-stream-manager';
  *  stall the 2.5s chunk loop. Dictation chunks are smaller so the timeout is
  *  tighter — 12s is well beyond legitimate transcribe time for 2.5s audio. */
 const TRANSCRIBE_TIMEOUT_MS = 12_000;
+const FIRST_TRANSCRIBE_TIMEOUT_MS = 120_000;
 
 export interface DictationChunkEvent {
   /** Monotonically increasing index, starting at 0 for the first chunk. */
@@ -62,6 +63,7 @@ class DictationStreamer {
     chunkCount: 0,
   };
   private fullText = '';
+  private whisperReady = false;
 
   isActive(): boolean {
     return this.state.status !== 'idle';
@@ -78,6 +80,10 @@ class DictationStreamer {
     // Claim exclusive audio stream ownership before starting capture.
     audioStream.acquire('streaming');
     try {
+      if (!this.whisperReady && typeof native.addon.loadWhisperModel === 'function') {
+        native.addon.loadWhisperModel();
+        this.whisperReady = true;
+      }
       native.addon.startRecording();
     } catch (err: any) {
       audioStream.release('streaming');
@@ -151,13 +157,15 @@ class DictationStreamer {
     try {
       let audioBuffer: Buffer;
       try {
-        audioBuffer = native.addon.stopRecording();
+        audioBuffer = isFinal || typeof native.addon.drainRecordingBuffer !== 'function'
+          ? native.addon.stopRecording()
+          : native.addon.drainRecordingBuffer();
       } catch (err) {
-        console.warn('[DictationStreamer] stopRecording mid-chunk failed:', err);
+        console.warn('[DictationStreamer] Failed to drain recording chunk:', err);
         return;
       }
 
-      if (!isFinal) {
+      if (!isFinal && typeof native.addon.drainRecordingBuffer !== 'function') {
         // Immediately restart to keep capture gap-free.
         try { native.addon.startRecording(); }
         catch (err) {
@@ -182,7 +190,7 @@ class DictationStreamer {
       // 2.5s chunk loop. On timeout we drop the chunk and carry on.
       const rawText = await transcribeWithTimeout(
         Promise.resolve(native.addon.transcribe(audioBuffer)),
-        TRANSCRIBE_TIMEOUT_MS,
+        this.chunkIndex === 0 ? FIRST_TRANSCRIBE_TIMEOUT_MS : TRANSCRIBE_TIMEOUT_MS,
         'DictationStreamer.transcribe',
       );
       if (rawText == null) {

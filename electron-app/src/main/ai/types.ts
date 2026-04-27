@@ -45,15 +45,6 @@ export interface ICLIAdapter extends IAIAdapter {
   parseOutput(data: string): ParsedOutput;
 }
 
-/** Extended adapter interface for HTTP-based providers (Copilot). */
-export interface IHTTPAdapter extends IAIAdapter {
-  sendMessageHTTP(
-    messages: Array<{ role: string; content: string }>,
-    model: string | undefined,
-    onToken: (token: string) => void,
-  ): Promise<string>;
-}
-
 export interface AIModel {
   id: string;
   label: string;

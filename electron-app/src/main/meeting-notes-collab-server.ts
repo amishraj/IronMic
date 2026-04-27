@@ -338,7 +338,7 @@ class MeetingNotesCollabServerManager {
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed()) {
         win.webContents.send('ironmic:meeting-collab-notes-updated', {
-          notes, savedBy, version: this.version,
+          notes, savedBy, version: this.version, sessionId: this.sessionId,
         });
       }
     }
@@ -381,21 +381,31 @@ class MeetingNotesCollabServerManager {
 
   private detectLanIp(): string | null {
     const ifaces = os.networkInterfaces();
-    const candidates: string[] = [];
+    const candidates: Array<{ name: string; address: string }> = [];
+    const virtualInterfacePattern = /(loopback|virtual|vmware|virtualbox|vbox|hyper-v|vethernet|wsl|docker|bluetooth|tailscale|zerotier|utun|awdl|bridge|tunnel|vpn)/i;
     for (const name of Object.keys(ifaces)) {
       if (/^(lo|docker|veth|tun|tap|utun|bridge|llw|awdl|anpi)/i.test(name)) continue;
+      if (virtualInterfacePattern.test(name)) continue;
       for (const addr of ifaces[name] ?? []) {
         if (addr.family !== 'IPv4' || addr.internal) continue;
         if (addr.address.startsWith('169.254.')) continue;
-        candidates.push(addr.address);
+        candidates.push({ name, address: addr.address });
       }
     }
     candidates.sort((a, b) => {
-      const score = (ip: string) =>
-        ip.startsWith('192.168.') ? 0 : ip.startsWith('10.') ? 1 : 2;
+      const score = (candidate: { name: string; address: string }) => {
+        const name = candidate.name.toLowerCase();
+        const ip = candidate.address;
+        let s = 100;
+        if (/(wi-?fi|wlan|wireless|ethernet|en\d+|eth\d+)/i.test(name)) s -= 20;
+        if (ip.startsWith('192.168.')) s -= 6;
+        else if (ip.startsWith('10.')) s -= 5;
+        else if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(ip)) s -= 4;
+        return s;
+      };
       return score(a) - score(b);
     });
-    return candidates[0] ?? null;
+    return candidates[0]?.address ?? null;
   }
 
   private generateCode(): string {

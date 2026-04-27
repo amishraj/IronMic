@@ -219,6 +219,19 @@ mod napi_exports {
         Ok(transcript)
     }
 
+    /// Explicitly load the active Whisper model.
+    ///
+    /// The first transcription on Windows can legitimately spend a long time
+    /// mapping a large GGML model before any inference happens. Keeping model
+    /// load as a separate call lets Electron warm the model before starting the
+    /// chunk loop, instead of timing out and dropping the user's first words.
+    #[napi]
+    pub fn load_whisper_model() -> napi::Result<()> {
+        init_tracing();
+        info!("loadWhisperModel called from N-API");
+        WHISPER_ENGINE.load_model().map_err(napi::Error::from)
+    }
+
     /// Polish raw transcript text using the local LLM subprocess.
     /// Note: actual LLM inference happens in the ironmic-llm binary.
     /// This stub returns text unchanged — Electron routes through LlmSubprocess instead.
