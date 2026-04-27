@@ -140,6 +140,8 @@ async function handleRecordingAction(
 
       // If nothing was heard, skip everything
       if (!rawTranscript.trim()) {
+        // eslint-disable-next-line no-console
+        console.warn('[ironmic:dictation] empty single-shot transcript — Whisper returned no text', { audioBytes: audioBuffer.length });
         set({ state: 'idle', lastResult: null, error: null });
         window.dispatchEvent(new CustomEvent('ironmic:dictation-empty'));
         return;

@@ -25,8 +25,10 @@ import {
   isAudioSilent,
   sanitizeTranscribedText,
   transcribeWithTimeout,
+  computeRmsPcm16,
 } from './transcribe-clean';
 import { audioStream } from './audio-stream-manager';
+import { debugLog } from './debug-log';
 
 /** Upper bound on how long we wait for a single Whisper transcribe call to
  *  return before moving on. If the native call hangs (happens occasionally
@@ -135,7 +137,9 @@ class MeetingRecorderManager {
         // Works with default mic and BlackHole (via OS aggregate device)
         native.addon.startRecording();
       }
-    } catch (err) {
+      debugLog('capture.start', { owner: 'meeting', deviceName: deviceName ?? null, success: true });
+    } catch (err: any) {
+      debugLog('capture.start', { owner: 'meeting', deviceName: deviceName ?? null, success: false, error: err?.message ?? String(err) });
       audioStream.release('meeting');
       throw err;
     }
@@ -274,8 +278,16 @@ class MeetingRecorderManager {
       let audioBuffer: Buffer;
       try {
         audioBuffer = native.addon.stopRecording();
-      } catch (err) {
+        debugLog('capture.drained', {
+          owner: 'meeting',
+          chunkIndex: segmentCount,
+          byteLength: audioBuffer.length,
+          rms: computeRmsPcm16(audioBuffer),
+          isFinal,
+        });
+      } catch (err: any) {
         console.warn('[MeetingRecorder] Failed to stop for chunk drain:', err);
+        debugLog('capture.drained', { owner: 'meeting', chunkIndex: segmentCount, isFinal, error: err?.message ?? String(err) });
         return;
       }
 
@@ -309,11 +321,20 @@ class MeetingRecorderManager {
       // drop this chunk and keep recording rather than stalling the whole
       // session. The orphan native call will eventually complete and its
       // output is simply discarded.
-      const rawText = await transcribeWithTimeout(
-        Promise.resolve(native.addon.transcribe(audioBuffer)),
-        TRANSCRIBE_TIMEOUT_MS,
-        'MeetingRecorder.transcribe',
-      );
+      const whisperStart = Date.now();
+      debugLog('whisper.in', { owner: 'meeting', chunkIndex: segmentCount, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000 });
+      let rawText: string | null = null;
+      try {
+        rawText = await transcribeWithTimeout(
+          Promise.resolve(native.addon.transcribe(audioBuffer)),
+          TRANSCRIBE_TIMEOUT_MS,
+          'MeetingRecorder.transcribe',
+        );
+        debugLog('whisper.raw', { owner: 'meeting', chunkIndex: segmentCount, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart });
+      } catch (err: any) {
+        debugLog('whisper.error', { owner: 'meeting', chunkIndex: segmentCount, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
+        throw err;
+      }
       if (rawText == null) return;
 
       // ── Text hygiene ──
@@ -454,6 +475,7 @@ class MeetingRecorderManager {
   }
 
   private pushSegmentToRenderer(segment: TranscriptSegment): void {
+    debugLog('chunk.emit', { owner: 'meeting', segmentId: segment.id, textLength: segment.text.length, start_ms: segment.start_ms, end_ms: segment.end_ms });
     const windows = BrowserWindow.getAllWindows();
     if (windows.length > 0) {
       windows[0].webContents.send(IPC_CHANNELS.MEETING_SEGMENT_READY, segment);

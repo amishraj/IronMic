@@ -20,6 +20,8 @@ import { meetingNotesCollabServer } from './meeting-notes-collab-server';
 import { meetingNotesCollabClient } from './meeting-notes-collab-client';
 import { checkBlackHoleInstalled, installBlackHole, openAudioMidiSetup, broadcastInstallProgress } from './blackhole-setup';
 import { audioStream } from './audio-stream-manager';
+import { debugLog, invalidateDebugLogCache } from './debug-log';
+import { computeRmsPcm16 } from './transcribe-clean';
 
 // ── Input validation helpers ──
 
@@ -57,6 +59,8 @@ const ALLOWED_SETTING_KEYS = new Set([
   'meeting_collab_display_name',
   // Notebooks — JSON array of {id,name,createdAt}
   'notebooks',
+  // Debug toggle for the audio pipeline log channel (renderer DevTools)
+  'debug_audio_logging',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -73,14 +77,25 @@ export function registerIpcHandlers(): void {
     audioStream.acquire('dictation');
     try {
       native.startRecording();
-    } catch (err) {
+      debugLog('capture.start', { owner: 'dictation', success: true });
+    } catch (err: any) {
+      debugLog('capture.start', { owner: 'dictation', success: false, error: err?.message ?? String(err) });
       audioStream.release('dictation');
       throw err;
     }
   });
   ipcMain.handle(IPC_CHANNELS.STOP_RECORDING, () => {
     try {
-      return native.stopRecording();
+      const buf = native.stopRecording();
+      debugLog('capture.drained', {
+        owner: 'dictation',
+        chunkIndex: 0,
+        byteLength: buf.length,
+        rms: computeRmsPcm16(buf),
+        isFinal: true,
+        path: 'stopRecording',
+      });
+      return buf;
     } finally {
       audioStream.release('dictation');
     }
@@ -98,7 +113,7 @@ export function registerIpcHandlers(): void {
   });
 
   // Transcription — validate buffer size, convert Uint8Array to Buffer (sandbox sends Uint8Array)
-  ipcMain.handle(IPC_CHANNELS.TRANSCRIBE, (_e, audioBuffer: any) => {
+  ipcMain.handle(IPC_CHANNELS.TRANSCRIBE, async (_e, audioBuffer: any) => {
     if (!Buffer.isBuffer(audioBuffer) && !(audioBuffer instanceof Uint8Array)) {
       throw new Error('audioBuffer must be a Buffer or Uint8Array');
     }
@@ -106,7 +121,16 @@ export function registerIpcHandlers(): void {
       throw new Error(`Audio buffer too large: ${audioBuffer.length} bytes (max ${MAX_AUDIO_BUFFER_SIZE})`);
     }
     const buf = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
-    return native.transcribe(buf);
+    const start = Date.now();
+    debugLog('whisper.in', { owner: 'single-shot', byteLength: buf.length, durationSec: buf.length / 2 / 16000 });
+    try {
+      const text = await native.transcribe(buf);
+      debugLog('whisper.raw', { owner: 'single-shot', rawText: text, length: text?.length ?? 0, latencyMs: Date.now() - start });
+      return text;
+    } catch (err: any) {
+      debugLog('whisper.error', { owner: 'single-shot', message: err?.message ?? String(err), latencyMs: Date.now() - start });
+      throw err;
+    }
   });
   ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, async (_e, rawText: string) => {
     // Route through the actual LLM subprocess when available.
@@ -198,7 +222,11 @@ export function registerIpcHandlers(): void {
     // the user adds more notebooks. Give it headroom.
     const maxLen = key === 'notebooks' ? 64_000 : MAX_SETTING_VALUE_LENGTH;
     assertMaxLength(value, maxLen, 'setting value');
-    return native.setSetting(key, value);
+    const result = native.setSetting(key, value);
+    // The debug-log helper caches the toggle state to avoid a SQLite hit on
+    // every audio chunk; invalidate when the user flips it in Settings.
+    if (key === 'debug_audio_logging') invalidateDebugLogCache();
+    return result;
   });
 
   // Clipboard
