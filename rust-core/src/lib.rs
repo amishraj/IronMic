@@ -219,6 +219,42 @@ mod napi_exports {
         Ok(transcript)
     }
 
+    /// Transcribe a SHORT (< 5s) PCM audio buffer (16kHz mono i16 little-endian).
+    /// Forces single-segment Whisper output for the dictation streamer's 2.5s
+    /// chunk loop. **Do not call from meeting recording** (10–60s chunks).
+    #[napi]
+    pub async fn transcribe_short(audio_buffer: Buffer) -> napi::Result<String> {
+        init_tracing();
+        info!("transcribeShort called from N-API");
+
+        let whisper = WHISPER_ENGINE.clone();
+
+        if !whisper.is_loaded() {
+            whisper.load_model().map_err(napi::Error::from)?;
+        }
+
+        let bytes: &[u8] = &audio_buffer;
+        if bytes.len() % 2 != 0 {
+            return Err(napi::Error::from_reason(
+                "Audio buffer must contain 16-bit samples (even byte count)",
+            ));
+        }
+
+        let mut samples: Vec<f32> = Vec::with_capacity(bytes.len() / 2);
+        for chunk in bytes.chunks_exact(2) {
+            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+            samples.push(sample as f32 / i16::MAX as f32);
+        }
+
+        let transcript = whisper
+            .transcribe_short(&samples)
+            .map_err(napi::Error::from)?;
+
+        samples.fill(0.0);
+
+        Ok(transcript)
+    }
+
     /// Explicitly load the active Whisper model.
     ///
     /// The first transcription on Windows can legitimately spend a long time
