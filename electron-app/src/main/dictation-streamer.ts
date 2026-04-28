@@ -218,7 +218,15 @@ class DictationStreamer {
       const useShort = !isFinal && typeof native.addon.transcribeShort === 'function';
       const transcribeFn = useShort ? native.addon.transcribeShort : native.addon.transcribe;
       const whisperStart = Date.now();
-      debugLog('whisper.in', { chunkIndex: this.chunkIndex, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000, short: useShort, isFinal });
+      // Capture the active engine kind so each per-chunk log makes it
+      // immediately obvious which speech-recognition model produced the
+      // text. Falls back to 'unknown' if the older Rust addon doesn't
+      // export getTranscriptionEngine yet.
+      const engineKind = (() => {
+        try { return native.getTranscriptionEngine?.() ?? 'unknown'; }
+        catch { return 'unknown'; }
+      })();
+      debugLog('whisper.in', { engine: engineKind, chunkIndex: this.chunkIndex, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000, short: useShort, isFinal });
       let rawText: string | null = null;
       try {
         rawText = await transcribeWithTimeout(
@@ -226,9 +234,9 @@ class DictationStreamer {
           this.chunkIndex === 0 ? FIRST_TRANSCRIBE_TIMEOUT_MS : TRANSCRIBE_TIMEOUT_MS,
           'DictationStreamer.transcribe',
         );
-        debugLog('whisper.raw', { chunkIndex: this.chunkIndex, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart });
+        debugLog('whisper.raw', { engine: engineKind, chunkIndex: this.chunkIndex, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart });
       } catch (err: any) {
-        debugLog('whisper.error', { chunkIndex: this.chunkIndex, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
+        debugLog('whisper.error', { engine: engineKind, chunkIndex: this.chunkIndex, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
         throw err;
       }
       if (rawText == null) {

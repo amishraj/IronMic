@@ -357,7 +357,11 @@ class MeetingRecorderManager {
       // session. The orphan native call will eventually complete and its
       // output is simply discarded.
       const whisperStart = Date.now();
-      debugLog('whisper.in', { owner: 'meeting', chunkIndex: segmentCount, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000 });
+      const engineKind = (() => {
+        try { return native.getTranscriptionEngine?.() ?? 'unknown'; }
+        catch { return 'unknown'; }
+      })();
+      debugLog('whisper.in', { engine: engineKind, owner: 'meeting', chunkIndex: segmentCount, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000 });
       let rawText: string | null = null;
       try {
         rawText = await transcribeWithTimeout(
@@ -365,9 +369,9 @@ class MeetingRecorderManager {
           TRANSCRIBE_TIMEOUT_MS,
           'MeetingRecorder.transcribe',
         );
-        debugLog('whisper.raw', { owner: 'meeting', chunkIndex: segmentCount, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart });
+        debugLog('whisper.raw', { engine: engineKind, owner: 'meeting', chunkIndex: segmentCount, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart });
       } catch (err: any) {
-        debugLog('whisper.error', { owner: 'meeting', chunkIndex: segmentCount, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
+        debugLog('whisper.error', { engine: engineKind, owner: 'meeting', chunkIndex: segmentCount, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
         throw err;
       }
       if (rawText == null) return;

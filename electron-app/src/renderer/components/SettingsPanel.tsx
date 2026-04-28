@@ -15,11 +15,11 @@ import {
   Mic, Route, Users, Search, Bell, Workflow, Sliders,
 } from 'lucide-react';
 
-type SettingsTab = 'general' | 'input' | 'speech' | 'ai' | 'models' | 'data' | 'security' | 'voice-ai';
+type SettingsTab = 'general' | 'audio' | 'speech' | 'ai' | 'models' | 'data' | 'security' | 'voice-ai';
 
 const TABS: { id: SettingsTab; label: string; icon: typeof Settings }[] = [
   { id: 'general', label: 'General', icon: Settings },
-  { id: 'input', label: 'Input', icon: Mic },
+  { id: 'audio', label: 'Audio', icon: Mic },
   { id: 'speech', label: 'Speech', icon: Volume2 },
   { id: 'ai', label: 'AI Assist', icon: Sparkles },
   { id: 'voice-ai', label: 'Voice AI', icon: Brain },
@@ -60,7 +60,7 @@ export function SettingsPanel() {
       <div className="flex-1 overflow-y-auto">
         <div className="p-6 max-w-lg mx-auto space-y-6 pb-16">
           {tab === 'general' && <GeneralSettings />}
-          {tab === 'input' && <InputSettings />}
+          {tab === 'audio' && <InputSettings />}
           {tab === 'speech' && <SpeechSettings />}
           {tab === 'ai' && <AIAssistSettings />}
           {tab === 'models' && <ModelManager />}

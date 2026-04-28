@@ -130,13 +130,17 @@ export function registerIpcHandlers(): void {
     }
     const buf = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
     const start = Date.now();
-    debugLog('whisper.in', { owner: 'single-shot', byteLength: buf.length, durationSec: buf.length / 2 / 16000 });
+    const engineKind = (() => {
+      try { return native.getTranscriptionEngine?.() ?? 'unknown'; }
+      catch { return 'unknown'; }
+    })();
+    debugLog('whisper.in', { engine: engineKind, owner: 'single-shot', byteLength: buf.length, durationSec: buf.length / 2 / 16000 });
     try {
       const text = await native.transcribe(buf);
-      debugLog('whisper.raw', { owner: 'single-shot', rawText: text, length: text?.length ?? 0, latencyMs: Date.now() - start });
+      debugLog('whisper.raw', { engine: engineKind, owner: 'single-shot', rawText: text, length: text?.length ?? 0, latencyMs: Date.now() - start });
       return text;
     } catch (err: any) {
-      debugLog('whisper.error', { owner: 'single-shot', message: err?.message ?? String(err), latencyMs: Date.now() - start });
+      debugLog('whisper.error', { engine: engineKind, owner: 'single-shot', message: err?.message ?? String(err), latencyMs: Date.now() - start });
       throw err;
     }
   });

@@ -1,10 +1,11 @@
-import { useState, useEffect } from 'react';
-import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu, Info } from 'lucide-react';
+import { useState, useEffect, useCallback } from 'react';
+import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu, Info, Star, Globe, Gauge, Mic } from 'lucide-react';
 import { Card, Toggle, Badge, Button } from './ui';
 import { ModelImportSection } from './ModelImportBanner';
 import { useDictationStore } from '../stores/useDictationStore';
 import { useMeetingStore } from '../stores/useMeetingStore';
 import { useToastStore } from '../stores/useToastStore';
+import { TRANSCRIPTION_ENGINES, DEFAULT_TRANSCRIPTION_ENGINE, type TranscriptionEngineMeta } from '../../shared/constants';
 
 /** True if any mic-owning pipeline is active. Used to lock settings that
  *  would tear down the Whisper engine or audio device mid-recording and
@@ -69,6 +70,15 @@ export function ModelManager() {
   const [refreshKey, setRefreshKey] = useState(0);
   const micBusy = useMicBusy();
 
+  // ── Unified transcription engine state (Phase 1 redesign) ──
+  // The active engine is the source of truth for which speech-recognition
+  // backend handles dictation + meetings. `engineReadiness` tracks whether
+  // each engine's model files are downloaded and ready to use.
+  const [activeEngine, setActiveEngine] = useState<string>(DEFAULT_TRANSCRIPTION_ENGINE);
+  const [engineReadiness, setEngineReadiness] = useState<Record<string, boolean>>({});
+  const [downloadingEngine, setDownloadingEngine] = useState<string | null>(null);
+  const [engineError, setEngineError] = useState<string | null>(null);
+
   const handleAnyImport = () => {
     loadState();
     setRefreshKey(k => k + 1);
@@ -94,7 +104,72 @@ export function ModelManager() {
       const gpuOn = await window.ironmic.isGpuEnabled();
       setGpuEnabled(gpuOn);
     } catch (err) { console.error('Failed to check GPU enabled:', err); }
+
+    // Unified engine state — the active backend across Moonshine + Whisper.
+    try {
+      const [active, list] = await Promise.all([
+        window.ironmic.getTranscriptionEngine(),
+        window.ironmic.listTranscriptionEngines(),
+      ]);
+      setActiveEngine(active);
+      const readiness: Record<string, boolean> = {};
+      for (const meta of TRANSCRIPTION_ENGINES) {
+        const found = list.find((e) => e.kind === meta.id);
+        readiness[meta.id] = found?.isReady ?? false;
+      }
+      setEngineReadiness(readiness);
+    } catch (err) {
+      console.warn('[ModelManager] Failed to load transcription engines:', err);
+    }
   };
+
+  /**
+   * Switch the active speech recognition model. Downloads the engine's model
+   * files first if missing, then persists the `transcription_engine` setting
+   * (which the SET_SETTING handler in Rust uses to swap the active engine).
+   *
+   * Locked out while a recording is in flight — same hazard as the legacy
+   * Whisper-only handleSelectModel: the engine layer reloads its model on
+   * swap, which would corrupt an in-flight transcription.
+   */
+  const switchEngine = useCallback(async (engineId: string) => {
+    setEngineError(null);
+    if (engineId === activeEngine) return;
+    if (micBusy) {
+      useToastStore.getState().show({
+        type: 'info',
+        message: 'Stop the current recording before changing the speech recognition model.',
+        durationMs: 5000,
+      });
+      return;
+    }
+    const isReady = engineReadiness[engineId] ?? false;
+    if (!isReady) {
+      setDownloadingEngine(engineId);
+      try {
+        await window.ironmic.downloadTranscriptionEngine(engineId);
+        setEngineReadiness((prev) => ({ ...prev, [engineId]: true }));
+      } catch (err: any) {
+        console.error('[ModelManager] Engine download failed:', err);
+        setEngineError(ipcErrorMessage(err, 'Engine download failed'));
+        setDownloadingEngine(null);
+        return;
+      }
+      setDownloadingEngine(null);
+    }
+    try {
+      await window.ironmic.setSetting('transcription_engine', engineId);
+      setActiveEngine(engineId);
+      // Keep the legacy currentModel in sync for any UI that still reads it.
+      if (engineId.startsWith('whisper-')) {
+        const id = engineId === 'whisper-large-v3-turbo' ? 'large-v3-turbo' : engineId.replace('whisper-', '');
+        setCurrentModel(id);
+      }
+    } catch (err: any) {
+      console.error('[ModelManager] Engine switch failed:', err);
+      setEngineError(ipcErrorMessage(err, 'Engine switch failed'));
+    }
+  }, [activeEngine, engineReadiness, micBusy]);
 
   useEffect(() => {
     loadState();
@@ -176,19 +251,6 @@ export function ModelManager() {
         <h3 className="text-sm font-semibold text-iron-text">AI Models</h3>
       </div>
 
-      {/* Phase 1 redesign pointer — Moonshine lives in the engine selector,
-          not here. This banner saves users from hunting for it. */}
-      <div className="flex items-start gap-2 text-xs text-iron-text-muted bg-iron-surface/50 border border-iron-border px-3 py-2 rounded-lg">
-        <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-iron-accent" />
-        <p className="leading-relaxed">
-          Looking for a faster transcription engine? IronMic now supports
-          {' '}<strong className="text-iron-text">Moonshine</strong>{' '}
-          (~16× faster than Whisper on CPU, English only). Switch in
-          {' '}<strong className="text-iron-text">Settings → Audio → Transcription Engine</strong>.
-          The Whisper variants below remain the fallback for multilingual transcription.
-        </p>
-      </div>
-
       {error && (
         <div className="flex items-start gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
           <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
@@ -255,99 +317,16 @@ export function ModelManager() {
         </Card>
       )}
 
-      {/* ── Speech Recognition Models ── */}
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
-            Speech Recognition Model
-          </p>
-          {currentModel && models.find(m => m.id === currentModel)?.downloaded && (
-            <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
-              {models.find(m => m.id === currentModel)?.name || currentModel}
-            </span>
-          )}
-        </div>
-
-        {models.map((model) => {
-          const isActive = model.id === currentModel;
-          const isDownloading = downloading === model.id;
-
-          return (
-            <div
-              key={model.id}
-              onClick={() => model.downloaded && handleSelectModel(model.id)}
-              className={`relative p-3 rounded-xl border transition-all duration-150 ${
-                isActive
-                  ? 'border-iron-accent/30 bg-iron-accent/5 shadow-glow'
-                  : model.downloaded
-                  ? 'border-iron-border hover:border-iron-border-hover cursor-pointer'
-                  : 'border-dashed border-iron-border'
-              }`}
-            >
-              <div className="flex items-start justify-between">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <p className="text-sm font-medium text-iron-text">{model.name}</p>
-                    {isActive && <Badge variant="accent">Active</Badge>}
-                  </div>
-                  <p className="text-xs text-iron-text-muted mt-0.5">{model.description}</p>
-                  <div className="flex items-center gap-3 mt-2">
-                    <span className="text-[11px] text-iron-text-muted">{formatBytes(model.sizeBytes)}</span>
-                    <span className="text-[11px] text-iron-text-muted">Speed: {model.speedLabel}</span>
-                    <span className="text-[11px] text-iron-text-muted">Accuracy: {model.accuracyLabel}</span>
-                  </div>
-                </div>
-
-                <div className="ml-3 flex-shrink-0">
-                  {model.downloaded ? (
-                    isActive ? (
-                      <Check className="w-4 h-4 text-iron-accent-light" />
-                    ) : (
-                      <span className="text-[11px] text-iron-text-muted">Ready</span>
-                    )
-                  ) : isDownloading ? (
-                    <Loader2 className="w-4 h-4 animate-spin text-iron-accent" />
-                  ) : (
-                    <Button
-                      size="sm"
-                      icon={<Download className="w-3 h-3" />}
-                      onClick={(e) => { e.stopPropagation(); handleDownload(model); }}
-                    >
-                      Download
-                    </Button>
-                  )}
-                </div>
-              </div>
-
-              {isDownloading && progress && (
-                <div className="mt-2.5">
-                  <div className="w-full h-1 bg-iron-surface-active rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-gradient-accent rounded-full transition-all duration-300"
-                      style={{ width: `${progress.percent}%` }}
-                    />
-                  </div>
-                  <p className="text-[10px] text-iron-text-muted mt-1">
-                    {progress.status === 'fallback'
-                      ? 'Primary source unavailable, trying fallback...'
-                      : progress.status === 'verifying'
-                      ? 'Verifying integrity...'
-                      : `${formatBytes(progress.downloaded)} / ${formatBytes(progress.total)} (${progress.percent}%)`}
-                  </p>
-                </div>
-              )}
-            </div>
-          );
-        })}
-
-        {/* Always-visible import for Whisper */}
-        <ModelImportSection
-          sectionLabel="Speech Recognition"
-          filter="whisper"
-          onImported={handleAnyImport}
-          highlightOnError={downloadFailed}
-        />
-      </div>
+      {/* ── Speech Recognition Model (unified — Moonshine + Whisper) ── */}
+      <SpeechRecognitionModelSection
+        activeEngine={activeEngine}
+        engineReadiness={engineReadiness}
+        downloadingEngine={downloadingEngine}
+        engineError={engineError}
+        onSwitch={switchEngine}
+        onImported={handleAnyImport}
+        downloadFailed={downloadFailed}
+      />
 
       {/* ── Text Cleanup Model ── */}
       <div className="space-y-2">
@@ -356,6 +335,208 @@ export function ModelManager() {
 
       {/* ── Chat Models ── */}
       <ChatModelsSection refreshKey={refreshKey} onImported={handleAnyImport} />
+    </div>
+  );
+}
+
+/**
+ * Unified Speech Recognition Model picker — Phase 1 redesign.
+ *
+ * Shows all transcription engines (Moonshine + Whisper) in two grouped
+ * sections. The active engine appears at the top with a "Currently Using"
+ * header. Default (Moonshine Base) gets a "Default ★" badge so first-time
+ * users know what to expect.
+ *
+ * Whisper engines have an explicit warning about CPU latency on machines
+ * without GPU/BLAS acceleration — addressing the original Windows VDI bug
+ * that triggered this whole redesign.
+ */
+function SpeechRecognitionModelSection({
+  activeEngine,
+  engineReadiness,
+  downloadingEngine,
+  engineError,
+  onSwitch,
+  onImported,
+  downloadFailed,
+}: {
+  activeEngine: string;
+  engineReadiness: Record<string, boolean>;
+  downloadingEngine: string | null;
+  engineError: string | null;
+  onSwitch: (engineId: string) => void;
+  onImported: () => void;
+  downloadFailed: boolean;
+}) {
+  const moonshineEngines = TRANSCRIPTION_ENGINES.filter((e) => e.family === 'moonshine');
+  const whisperEngines = TRANSCRIPTION_ENGINES.filter((e) => e.family === 'whisper');
+  const activeMeta = TRANSCRIPTION_ENGINES.find((e) => e.id === activeEngine);
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Mic className="w-4 h-4 text-iron-accent-light" />
+          <p className="text-sm font-semibold text-iron-text">Speech Recognition Model</p>
+        </div>
+        {activeMeta && (
+          <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
+            Currently using: {activeMeta.label}
+          </span>
+        )}
+      </div>
+
+      <p className="text-xs text-iron-text-muted leading-relaxed">
+        The model that turns your speech into text. Used for both dictation and meeting transcription.
+        Moonshine is faster on machines without a GPU; Whisper handles non-English audio.
+      </p>
+
+      {engineError && (
+        <div className="flex items-start gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
+          <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+          <div className="whitespace-pre-wrap break-all">{engineError}</div>
+        </div>
+      )}
+
+      {/* ── Moonshine group (recommended) ── */}
+      <div className="space-y-2">
+        <div className="flex items-center gap-2 mt-3">
+          <Zap className="w-3.5 h-3.5 text-iron-accent" />
+          <p className="text-[11px] font-semibold text-iron-text uppercase tracking-wider">
+            Moonshine — Fast, English only
+          </p>
+        </div>
+        <p className="text-[11px] text-iron-text-muted leading-relaxed">
+          ONNX-based. Designed for short-form dictation. Runs at ~150 ms per chunk on a typical CPU
+          with no GPU or BLAS dependency — no VDI hangs.
+        </p>
+        {moonshineEngines.map((meta) => (
+          <EngineRow
+            key={meta.id}
+            meta={meta}
+            isActive={meta.id === activeEngine}
+            isReady={engineReadiness[meta.id] ?? false}
+            isDownloading={downloadingEngine === meta.id}
+            isDefault={meta.id === DEFAULT_TRANSCRIPTION_ENGINE}
+            onClick={() => onSwitch(meta.id)}
+          />
+        ))}
+      </div>
+
+      {/* ── Whisper group (multilingual fallback) ── */}
+      <div className="space-y-2">
+        <div className="flex items-center gap-2 mt-3">
+          <Globe className="w-3.5 h-3.5 text-iron-text-muted" />
+          <p className="text-[11px] font-semibold text-iron-text uppercase tracking-wider">
+            Whisper — Multilingual, slower on CPU
+          </p>
+        </div>
+        <div className="flex items-start gap-2 text-[11px] text-iron-warning bg-iron-warning/10 border border-iron-warning/20 px-2.5 py-1.5 rounded-lg leading-relaxed">
+          <AlertCircle className="w-3 h-3 flex-shrink-0 mt-0.5" />
+          <p>
+            <strong>Latency warning:</strong> Whisper is significantly slower than Moonshine on machines
+            without GPU acceleration or BLAS. Expect 3–30 seconds per chunk on a Windows VDI. Choose only
+            if you need a language Moonshine doesn't support, or have a GPU.
+          </p>
+        </div>
+        {whisperEngines.map((meta) => (
+          <EngineRow
+            key={meta.id}
+            meta={meta}
+            isActive={meta.id === activeEngine}
+            isReady={engineReadiness[meta.id] ?? false}
+            isDownloading={downloadingEngine === meta.id}
+            isDefault={false}
+            onClick={() => onSwitch(meta.id)}
+          />
+        ))}
+      </div>
+
+      {/* Manual import — covers both Whisper and Moonshine when set up */}
+      <ModelImportSection
+        sectionLabel="Speech Recognition"
+        filter="whisper"
+        onImported={onImported}
+        highlightOnError={downloadFailed}
+      />
+    </div>
+  );
+}
+
+/** Single row in the unified Speech Recognition Model picker. */
+function EngineRow({
+  meta,
+  isActive,
+  isReady,
+  isDownloading,
+  isDefault,
+  onClick,
+}: {
+  meta: TranscriptionEngineMeta;
+  isActive: boolean;
+  isReady: boolean;
+  isDownloading: boolean;
+  isDefault: boolean;
+  onClick: () => void;
+}) {
+  const clickable = !isActive && !isDownloading;
+  return (
+    <div
+      onClick={clickable ? onClick : undefined}
+      className={`relative p-3 rounded-xl border transition-all duration-150 ${
+        isActive
+          ? 'border-iron-accent/40 bg-iron-accent/5 shadow-glow'
+          : isReady
+          ? 'border-iron-border hover:border-iron-border-hover cursor-pointer'
+          : 'border-dashed border-iron-border hover:border-iron-border-hover cursor-pointer'
+      } ${isDownloading ? 'opacity-70 cursor-wait' : ''}`}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <p className="text-sm font-medium text-iron-text">{meta.label}</p>
+            {isActive && <Badge variant="accent">Active</Badge>}
+            {isDefault && !isActive && (
+              <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-iron-success/10 text-iron-success border border-iron-success/20">
+                <Star className="w-2.5 h-2.5" />
+                Default
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-iron-text-muted mt-0.5 leading-tight">{meta.description}</p>
+          <div className="flex items-center gap-3 mt-2 text-[11px] text-iron-text-muted">
+            <span className="flex items-center gap-1">
+              <Gauge className="w-3 h-3" />
+              {meta.latencyHint}
+            </span>
+            <span>{meta.sizeLabel}</span>
+            <span>{meta.languages[0] === 'multilingual' ? '99 languages' : 'English'}</span>
+          </div>
+        </div>
+
+        <div className="ml-2 flex-shrink-0">
+          {isActive ? (
+            <Check className="w-4 h-4 text-iron-accent-light" />
+          ) : isDownloading ? (
+            <Loader2 className="w-4 h-4 animate-spin text-iron-accent" />
+          ) : isReady ? (
+            <Button
+              size="sm"
+              onClick={(e) => { e.stopPropagation(); onClick(); }}
+            >
+              Switch
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              icon={<Download className="w-3 h-3" />}
+              onClick={(e) => { e.stopPropagation(); onClick(); }}
+            >
+              Download
+            </Button>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
