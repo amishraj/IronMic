@@ -3,10 +3,12 @@
  * Security: input validation on high-risk channels.
  */
 
-import { ipcMain, BrowserWindow } from 'electron';
-import { IPC_CHANNELS, MODEL_FILES } from '../shared/constants';
+import { ipcMain, BrowserWindow, shell } from 'electron';
+import * as fs from 'fs';
+import * as path from 'path';
+import { IPC_CHANNELS, MODEL_FILES, TRANSCRIPTION_ENGINES } from '../shared/constants';
 import { native } from './native-bridge';
-import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine } from './model-downloader';
+import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine, ensureBundledMoonshineBase, isMoonshineBundleAvailable } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath, resolveActiveChatModel } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
@@ -79,6 +81,77 @@ function assertString(val: unknown, name: string): asserts val is string {
 
 function assertMaxLength(val: string, max: number, name: string): void {
   if (val.length > max) throw new Error(`${name} exceeds maximum length (${max})`);
+}
+
+// ── Model management helpers ──
+// Resolve the user-data models dir the same way model-downloader does. Reading
+// the env var directly avoids exporting a private path resolver.
+function resolveModelsDirForIpc(): string {
+  return process.env.IRONMIC_MODELS_DIR || '';
+}
+
+interface EngineFileEntry {
+  /** Relative path under the models dir (e.g. "moonshine-base/encoder_model.onnx") */
+  relativePath: string;
+  /** Absolute filesystem path, or '' if the models dir is not yet set */
+  absolutePath: string;
+}
+
+function getEngineFiles(engineId: string): EngineFileEntry[] {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta) throw new Error(`Unknown engine: ${engineId}`);
+  const modelsDir = resolveModelsDirForIpc();
+  return meta.modelFileKeys.map((key) => {
+    const rel = MODEL_FILES[key];
+    if (!rel) throw new Error(`Engine ${engineId} references unknown model file key: ${key}`);
+    return {
+      relativePath: rel,
+      absolutePath: modelsDir ? path.join(modelsDir, rel) : '',
+    };
+  });
+}
+
+function assertEngineNotActive(engineId: string, action: string): void {
+  let active: string;
+  try {
+    active = native.getTranscriptionEngine();
+  } catch (err: any) {
+    throw new Error(`Cannot ${action}: failed to read active engine (${err?.message ?? err})`);
+  }
+  if (engineId === active) {
+    throw new Error(
+      `Cannot ${action} the active engine. Switch to another engine in Settings first.`,
+    );
+  }
+}
+
+function deleteEngineFilesImpl(engineId: string): { deleted: number; restoredBundle: boolean } {
+  assertEngineNotActive(engineId, 'delete');
+  const files = getEngineFiles(engineId);
+  let deleted = 0;
+  for (const f of files) {
+    if (!f.absolutePath) continue;
+    try {
+      if (fs.existsSync(f.absolutePath)) {
+        fs.unlinkSync(f.absolutePath);
+        deleted += 1;
+      }
+    } catch (err) {
+      console.warn(`[model-mgmt] Failed to delete ${f.absolutePath}:`, err);
+    }
+  }
+  // For the bundled default engine, immediately restore from app resources
+  // so packaged builds don't leave the user without a working engine.
+  let restoredBundle = false;
+  if (engineId === 'moonshine-base') {
+    try {
+      const status = ensureBundledMoonshineBase();
+      restoredBundle = status === 'copied';
+    } catch (err) {
+      console.warn('[model-mgmt] Failed to restore bundled Moonshine after delete:', err);
+    }
+  }
+  return { deleted, restoredBundle };
 }
 
 export function registerIpcHandlers(): void {
@@ -571,6 +644,64 @@ If the text is too short or unclear, output: ["General"]`;
 
   ipcMain.handle(IPC_CHANNELS.GET_MODELS_DIR, () => {
     return process.env.IRONMIC_MODELS_DIR || '';
+  });
+
+  // ── Model management (delete / redownload / disk usage / open folder) ──
+
+  // Open the models folder in Finder/Explorer. Create it first since it may
+  // not exist on a fresh install before any download has happened.
+  ipcMain.handle(IPC_CHANNELS.OPEN_MODELS_DIRECTORY, async () => {
+    const dir = resolveModelsDirForIpc();
+    if (!dir) throw new Error('Models directory is not configured');
+    fs.mkdirSync(dir, { recursive: true });
+    const result = await shell.openPath(dir);
+    if (result) throw new Error(result); // shell.openPath returns '' on success
+    return { ok: true, path: dir };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.GET_ENGINE_DISK_USAGE, (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    const files = getEngineFiles(engineId);
+    let totalBytes = 0;
+    const entries = files.map((f) => {
+      let bytes = 0;
+      let exists = false;
+      if (f.absolutePath) {
+        try {
+          const st = fs.statSync(f.absolutePath);
+          if (st.isFile()) {
+            bytes = st.size;
+            exists = true;
+          }
+        } catch { /* missing file → bytes=0, exists=false */ }
+      }
+      totalBytes += bytes;
+      return { relativePath: f.relativePath, bytes, exists };
+    });
+    const result: {
+      totalBytes: number;
+      files: Array<{ relativePath: string; bytes: number; exists: boolean }>;
+      bundledAvailable?: boolean;
+    } = { totalBytes, files: entries };
+    if (engineId === 'moonshine-base') {
+      result.bundledAvailable = isMoonshineBundleAvailable();
+    }
+    return result;
+  });
+
+  ipcMain.handle(IPC_CHANNELS.DELETE_ENGINE_FILES, (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    return deleteEngineFilesImpl(engineId);
+  });
+
+  // Re-download begins by deleting the existing files, so it must also reject
+  // when invoked against the active engine — re-using deleteEngineFilesImpl
+  // gives us that guard for free.
+  ipcMain.handle(IPC_CHANNELS.REDOWNLOAD_ENGINE, async (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    deleteEngineFilesImpl(engineId);
+    const window = BrowserWindow.getFocusedWindow();
+    return downloadTranscriptionEngine(engineId, window);
   });
 
   // ── Manual Model Import ──

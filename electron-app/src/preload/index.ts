@@ -256,6 +256,12 @@ const api = {
   // ── TF.js Infrastructure ──
   getModelsDir: () => ipcRenderer.invoke('ironmic:get-models-dir'),
 
+  // ── Model management (delete / redownload / disk usage / open folder) ──
+  openModelsDirectory: () => ipcRenderer.invoke('ironmic:open-models-directory'),
+  getEngineDiskUsage: (engineId: string) => ipcRenderer.invoke('ironmic:get-engine-disk-usage', engineId),
+  deleteEngineFiles: (engineId: string) => ipcRenderer.invoke('ironmic:delete-engine-files', engineId),
+  redownloadEngine: (engineId: string) => ipcRenderer.invoke('ironmic:redownload-engine', engineId),
+
   // Manual model import
   importModel: () => ipcRenderer.invoke('ironmic:import-model'),
   getImportableModels: () => ipcRenderer.invoke('ironmic:get-importable-models'),

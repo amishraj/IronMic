@@ -135,6 +135,8 @@ The user speaks, IronMic transcribes via Whisper, optionally polishes via a loca
 
 Total bundled model size: ~6 GB. Distributed as part of the installer.
 
+**Moonshine Base (default speech recognition engine)** is bundled in `electron-builder.config.js` `extraResources` and copied from `process.resourcesPath/models/moonshine-base/` to the writable user-data models dir on first launch — no network required for the default dictation flow. See `ensureBundledMoonshineBase()` in `electron-app/src/main/model-downloader.ts`.
+
 ---
 
 ## Data Model (SQLite Schema)

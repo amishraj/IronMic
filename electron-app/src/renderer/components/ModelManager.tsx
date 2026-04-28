@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu, Info, Star, Globe, Gauge, Mic } from 'lucide-react';
+import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu, Info, Star, Globe, Gauge, Mic, FolderOpen, RefreshCw, Trash2, RotateCcw } from 'lucide-react';
 import { Card, Toggle, Badge, Button } from './ui';
 import { ModelImportSection } from './ModelImportBanner';
 import { useDictationStore } from '../stores/useDictationStore';
@@ -79,6 +79,17 @@ export function ModelManager() {
   const [downloadingEngine, setDownloadingEngine] = useState<string | null>(null);
   const [engineError, setEngineError] = useState<string | null>(null);
 
+  // ── Model management state (delete / redownload / disk usage / open folder) ──
+  // Sizes are populated alongside readiness so the row can show "146 MB" next
+  // to "Ready". `moonshineBundleAvailable` tells us whether the installer
+  // shipped a bundled copy — only set on packaged builds.
+  const [engineSizes, setEngineSizes] = useState<Record<string, number>>({});
+  const [moonshineBundleAvailable, setMoonshineBundleAvailable] = useState<boolean | undefined>(undefined);
+  const [modelsDir, setModelsDir] = useState<string>('');
+  // Tracks which row is currently running a delete/redownload so we can show
+  // a spinner on the right button without freezing the rest of the UI.
+  const [pendingAction, setPendingAction] = useState<string | null>(null);
+
   const handleAnyImport = () => {
     loadState();
     setRefreshKey(k => k + 1);
@@ -105,6 +116,15 @@ export function ModelManager() {
       setGpuEnabled(gpuOn);
     } catch (err) { console.error('Failed to check GPU enabled:', err); }
 
+    // Models directory — surfaced in the UI so users (especially on Windows)
+    // don't have to hunt for %APPDATA%\IronMic\models.
+    try {
+      const dir = await window.ironmic.getModelsDir();
+      setModelsDir(dir || '');
+    } catch (err) {
+      console.warn('[ModelManager] Failed to read models dir:', err);
+    }
+
     // Unified engine state — the active backend across Moonshine + Whisper.
     // Readiness must match what the import section shows ("Ready" vs not).
     // We can't trust listTranscriptionEngines for this: older Rust addons may
@@ -113,17 +133,26 @@ export function ModelManager() {
     try {
       const active = await window.ironmic.getTranscriptionEngine();
       setActiveEngine(active);
-      const checks = await Promise.all(
+      const usages = await Promise.all(
         TRANSCRIPTION_ENGINES.map(async (meta) => {
           try {
-            const ready = await window.ironmic.isTranscriptionEngineReady(meta.id);
-            return [meta.id, ready] as const;
+            const usage = await window.ironmic.getEngineDiskUsage(meta.id);
+            const allFilesExist = usage.files.length > 0 && usage.files.every((f) => f.exists);
+            return {
+              id: meta.id,
+              ready: allFilesExist,
+              size: usage.totalBytes,
+              bundledAvailable: usage.bundledAvailable,
+            };
           } catch {
-            return [meta.id, false] as const;
+            return { id: meta.id, ready: false, size: 0, bundledAvailable: undefined };
           }
         }),
       );
-      setEngineReadiness(Object.fromEntries(checks));
+      setEngineReadiness(Object.fromEntries(usages.map((u) => [u.id, u.ready])));
+      setEngineSizes(Object.fromEntries(usages.map((u) => [u.id, u.size])));
+      const moonshine = usages.find((u) => u.id === 'moonshine-base');
+      setMoonshineBundleAvailable(moonshine?.bundledAvailable);
     } catch (err) {
       console.warn('[ModelManager] Failed to load transcription engines:', err);
     }
@@ -185,6 +214,81 @@ export function ModelManager() {
       setEngineError(ipcErrorMessage(err, 'Engine switch failed'));
     }
   }, [activeEngine, micBusy]);
+
+  const handleOpenFolder = useCallback(async () => {
+    setEngineError(null);
+    try {
+      await window.ironmic.openModelsDirectory();
+    } catch (err: any) {
+      console.error('[ModelManager] Failed to open models folder:', err);
+      setEngineError(ipcErrorMessage(err, 'Failed to open models folder'));
+    }
+  }, []);
+
+  // Delete an engine's files. For Moonshine Base on a packaged build the
+  // bundled copy gets restored automatically — confirm dialog explains that
+  // disk usage will not change in that case.
+  const deleteEngine = useCallback(async (engineId: string) => {
+    if (engineId === activeEngine) {
+      useToastStore.getState().show({
+        type: 'info',
+        message: 'Switch to another engine before deleting this one.',
+        durationMs: 4000,
+      });
+      return;
+    }
+    const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+    if (!meta) return;
+    const isMoonshineRestore = engineId === 'moonshine-base' && moonshineBundleAvailable === true;
+    const message = isMoonshineRestore
+      ? `Restore the bundled copy of ${meta.label}?\n\nThis engine ships with the installer, so the bundled copy will be re-applied automatically and disk usage will not change.`
+      : `Delete ${meta.label}? You can re-download it later from this screen.`;
+    if (!window.confirm(message)) return;
+
+    setEngineError(null);
+    setPendingAction(`delete:${engineId}`);
+    try {
+      await window.ironmic.deleteEngineFiles(engineId);
+      await loadState();
+    } catch (err: any) {
+      console.error('[ModelManager] Engine delete failed:', err);
+      setEngineError(ipcErrorMessage(err, 'Delete failed'));
+    } finally {
+      setPendingAction(null);
+    }
+  }, [activeEngine, moonshineBundleAvailable]);
+
+  // Re-download wipes the existing files first, so it shares the active-engine
+  // guard with delete. The download itself fires progress events that the
+  // existing onModelDownloadProgress listener picks up to refresh state.
+  const redownloadEngine = useCallback(async (engineId: string) => {
+    if (engineId === activeEngine) {
+      useToastStore.getState().show({
+        type: 'info',
+        message: 'Switch to another engine before re-downloading this one.',
+        durationMs: 4000,
+      });
+      return;
+    }
+    const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+    if (!meta) return;
+    if (!window.confirm(`Re-download ${meta.label}? Existing files will be removed first.`)) return;
+
+    setEngineError(null);
+    setPendingAction(`redownload:${engineId}`);
+    setDownloadingEngine(engineId);
+    try {
+      await window.ironmic.redownloadEngine(engineId);
+      // Synthetic 'complete' progress event triggers loadState via the
+      // existing listener; nothing else to do here.
+    } catch (err: any) {
+      console.error('[ModelManager] Engine re-download failed:', err);
+      setEngineError(ipcErrorMessage(err, 'Re-download failed'));
+      setDownloadingEngine(null);
+    } finally {
+      setPendingAction(null);
+    }
+  }, [activeEngine]);
 
   useEffect(() => {
     loadState();
@@ -336,10 +440,17 @@ export function ModelManager() {
       <SpeechRecognitionModelSection
         activeEngine={activeEngine}
         engineReadiness={engineReadiness}
+        engineSizes={engineSizes}
+        moonshineBundleAvailable={moonshineBundleAvailable}
+        modelsDir={modelsDir}
         downloadingEngine={downloadingEngine}
         engineError={engineError}
+        pendingAction={pendingAction}
         onSwitch={switchEngine}
         onDownload={downloadEngine}
+        onDelete={deleteEngine}
+        onRedownload={redownloadEngine}
+        onOpenFolder={handleOpenFolder}
         onImported={handleAnyImport}
         downloadFailed={downloadFailed}
       />
@@ -358,19 +469,33 @@ export function ModelManager() {
 function SpeechRecognitionModelSection({
   activeEngine,
   engineReadiness,
+  engineSizes,
+  moonshineBundleAvailable,
+  modelsDir,
   downloadingEngine,
   engineError,
+  pendingAction,
   onSwitch,
   onDownload,
+  onDelete,
+  onRedownload,
+  onOpenFolder,
   onImported,
   downloadFailed,
 }: {
   activeEngine: string;
   engineReadiness: Record<string, boolean>;
+  engineSizes: Record<string, number>;
+  moonshineBundleAvailable: boolean | undefined;
+  modelsDir: string;
   downloadingEngine: string | null;
   engineError: string | null;
+  pendingAction: string | null;
   onSwitch: (engineId: string) => void;
   onDownload: (engineId: string) => void;
+  onDelete: (engineId: string) => void;
+  onRedownload: (engineId: string) => void;
+  onOpenFolder: () => void;
   onImported: () => void;
   downloadFailed: boolean;
 }) {
@@ -394,6 +519,34 @@ function SpeechRecognitionModelSection({
         The engine that turns your voice into text. Used for dictation and meeting transcription.
       </p>
 
+      {/* Models folder location — surfaces where files actually live so users
+          (especially on Windows) can find them without hunting through AppData. */}
+      {modelsDir && (
+        <Card variant="default" padding="md">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex-1 min-w-0">
+              <p className="text-[11px] font-medium text-iron-text-muted uppercase tracking-wider">
+                Models folder
+              </p>
+              <p
+                className="text-xs font-mono text-iron-text-secondary truncate mt-0.5"
+                title={modelsDir}
+              >
+                {modelsDir}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              icon={<FolderOpen className="w-3 h-3" />}
+              onClick={onOpenFolder}
+            >
+              Open folder
+            </Button>
+          </div>
+        </Card>
+      )}
+
       {engineError && (
         <div className="flex items-start gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
           <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
@@ -414,10 +567,15 @@ function SpeechRecognitionModelSection({
           meta={meta}
           isActive={meta.id === activeEngine}
           isReady={engineReadiness[meta.id] ?? false}
+          sizeBytes={engineSizes[meta.id] ?? 0}
+          bundledAvailable={meta.id === 'moonshine-base' ? moonshineBundleAvailable : undefined}
           isDownloading={downloadingEngine === meta.id}
           isDefault={meta.id === DEFAULT_TRANSCRIPTION_ENGINE}
+          pendingAction={pendingAction}
           onSwitch={() => onSwitch(meta.id)}
           onDownload={() => onDownload(meta.id)}
+          onDelete={() => onDelete(meta.id)}
+          onRedownload={() => onRedownload(meta.id)}
         />
       ))}
 
@@ -434,10 +592,15 @@ function SpeechRecognitionModelSection({
           meta={meta}
           isActive={meta.id === activeEngine}
           isReady={engineReadiness[meta.id] ?? false}
+          sizeBytes={engineSizes[meta.id] ?? 0}
+          bundledAvailable={undefined}
           isDownloading={downloadingEngine === meta.id}
           isDefault={false}
+          pendingAction={pendingAction}
           onSwitch={() => onSwitch(meta.id)}
           onDownload={() => onDownload(meta.id)}
+          onDelete={() => onDelete(meta.id)}
+          onRedownload={() => onRedownload(meta.id)}
         />
       ))}
 
@@ -455,26 +618,48 @@ function EngineRow({
   meta,
   isActive,
   isReady,
+  sizeBytes,
+  bundledAvailable,
   isDownloading,
   isDefault,
+  pendingAction,
   onSwitch,
   onDownload,
+  onDelete,
+  onRedownload,
 }: {
   meta: TranscriptionEngineMeta;
   isActive: boolean;
   isReady: boolean;
+  sizeBytes: number;
+  bundledAvailable: boolean | undefined;
   isDownloading: boolean;
   isDefault: boolean;
+  pendingAction: string | null;
   onSwitch: () => void;
   onDownload: () => void;
+  onDelete: () => void;
+  onRedownload: () => void;
 }) {
+  // For Moonshine on a packaged build, "Delete" can't actually free disk
+  // space — the bundled copy is restored automatically on next launch.
+  // Surface that as "Restore bundled copy" so the action matches reality.
+  const isMoonshineBundled = meta.id === 'moonshine-base' && bundledAvailable === true;
+  const deleteLabel = isMoonshineBundled ? 'Restore bundled copy' : 'Delete';
+  const deleteIcon = isMoonshineBundled ? <RotateCcw className="w-3 h-3" /> : <Trash2 className="w-3 h-3" />;
+  const deletePending = pendingAction === `delete:${meta.id}`;
+  const redownloadPending = pendingAction === `redownload:${meta.id}`;
+
   return (
     <Card variant="default" padding="md">
-      <div className="flex items-start justify-between">
+      <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <p className="text-sm font-medium text-iron-text">{meta.label}</p>
             <span className="text-[10px] text-iron-text-muted">{meta.sizeLabel}</span>
+            {isReady && sizeBytes > 0 && (
+              <span className="text-[10px] text-iron-text-muted">· {formatBytes(sizeBytes)} on disk</span>
+            )}
             {isDefault && !isActive && (
               <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-iron-surface-active text-iron-text-secondary">
                 <Star className="w-2.5 h-2.5" />
@@ -486,7 +671,7 @@ function EngineRow({
             {meta.description} · {meta.latencyHint} · {meta.languages[0] === 'multilingual' ? '99 languages' : 'English only'}
           </p>
         </div>
-        <div className="ml-3 flex-shrink-0">
+        <div className="ml-1 flex-shrink-0 flex items-center gap-1.5">
           {isActive ? (
             <Badge variant="success">Active</Badge>
           ) : isDownloading ? (
@@ -497,6 +682,32 @@ function EngineRow({
             <Button size="sm" icon={<Download className="w-3 h-3" />} onClick={onDownload}>
               Download
             </Button>
+          )}
+          {/* Re-download / Delete buttons appear for downloaded, non-active engines.
+              They're hidden for the active engine because the model is loaded
+              into Rust memory and removing files mid-flight would crash on the
+              next transcription. The user is told to switch first. */}
+          {isReady && !isActive && !isDownloading && (
+            <>
+              <button
+                type="button"
+                onClick={onRedownload}
+                disabled={redownloadPending}
+                title="Re-download (delete and fetch again)"
+                className="p-1.5 rounded text-iron-text-muted hover:text-iron-text hover:bg-iron-surface-active disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {redownloadPending ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
+              </button>
+              <button
+                type="button"
+                onClick={onDelete}
+                disabled={deletePending}
+                title={deleteLabel}
+                className="p-1.5 rounded text-iron-text-muted hover:text-iron-danger hover:bg-iron-danger/10 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              >
+                {deletePending ? <Loader2 className="w-3 h-3 animate-spin" /> : deleteIcon}
+              </button>
+            </>
           )}
         </div>
       </div>

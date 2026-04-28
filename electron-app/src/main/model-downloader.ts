@@ -210,6 +210,32 @@ export function ensureBundledVoices(): void {
 }
 
 /**
+ * Status returned by {@link ensureBundledMoonshineBase}. The values are
+ * stable strings so the main process can log a single line and the UI
+ * (renderer) can branch on them later without re-deriving state.
+ */
+export type MoonshineBundleStatus =
+  | 'copied'             // user-data was missing/incomplete; freshly copied from resources
+  | 'already-present'    // all 3 files exist in user-data and are non-empty
+  | 'incomplete-bundle'  // resources/models/moonshine-base exists but is missing files
+  | 'bundle-missing';    // dev mode or unpackaged run — no bundled directory at all
+
+const MOONSHINE_FILES = ['encoder_model.onnx', 'decoder_model_merged.onnx', 'tokenizer.json'];
+
+function allFilesPresent(dir: string): boolean {
+  for (const f of MOONSHINE_FILES) {
+    const p = path.join(dir, f);
+    if (!fs.existsSync(p)) return false;
+    try {
+      if (fs.statSync(p).size === 0) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Ensure bundled Moonshine Base ONNX files are copied to the models directory.
  *
  * Moonshine Base is the default transcription engine and ships with the
@@ -218,43 +244,53 @@ export function ensureBundledVoices(): void {
  * to the writable userData models dir so the Rust loader (which reads from
  * IRONMIC_MODELS_DIR) can open them.
  *
- * Idempotent: returns early if the decoder is already in place. Silent
- * graceful degradation: in dev mode (or any build where the bundle is missing)
- * this is a no-op — files come from rust-core/models/moonshine-base/ directly
- * via IRONMIC_MODELS_DIR, and the user can also re-fetch via the Download
- * button or import flow.
+ * Idempotent and re-entrant: returns a {@link MoonshineBundleStatus} so the
+ * caller can log exactly what happened. Verifies *all three* files are present
+ * and non-empty in user data; checking only the decoder sentinel hid partial
+ * directories that then failed at engine load time.
  */
-export function ensureBundledMoonshineBase(): void {
+export function ensureBundledMoonshineBase(): MoonshineBundleStatus {
   const destDir = path.join(resolveModelsDir(), 'moonshine-base');
-  // Decoder is the heaviest of the three (~159 MB) — using it as the sentinel
-  // means a partial dev-time copy of just encoder+tokenizer doesn't fool us
-  // into thinking the bundle is complete.
-  const sentinel = path.join(destDir, 'decoder_model_merged.onnx');
-  if (fs.existsSync(sentinel)) return;
+  if (allFilesPresent(destDir)) return 'already-present';
 
   // Dev mode: no resourcesPath, files come from rust-core/models directly.
-  if (!process.resourcesPath) return;
+  if (!process.resourcesPath) return 'bundle-missing';
 
   const bundledDir = path.join(process.resourcesPath, 'models', 'moonshine-base');
-  if (!fs.existsSync(bundledDir)) return;
+  if (!fs.existsSync(bundledDir)) return 'bundle-missing';
+  if (!allFilesPresent(bundledDir)) return 'incomplete-bundle';
 
   fs.mkdirSync(destDir, { recursive: true });
-  const required = ['encoder_model.onnx', 'decoder_model_merged.onnx', 'tokenizer.json'];
   let copied = 0;
-  for (const file of required) {
+  for (const file of MOONSHINE_FILES) {
     const src = path.join(bundledDir, file);
     const dest = path.join(destDir, file);
-    if (!fs.existsSync(src)) {
-      console.warn(`[model-downloader] Bundled Moonshine file missing: ${src}`);
-      continue;
+    // Re-copy if missing OR present-but-empty (covers a previous half-write).
+    let needsCopy = !fs.existsSync(dest);
+    if (!needsCopy) {
+      try { needsCopy = fs.statSync(dest).size === 0; } catch { needsCopy = true; }
     }
-    if (fs.existsSync(dest)) continue;
+    if (!needsCopy) continue;
     fs.copyFileSync(src, dest);
     copied += 1;
   }
   if (copied > 0) {
     console.log(`[model-downloader] Copied ${copied} bundled Moonshine Base files to ${destDir}`);
   }
+  return 'copied';
+}
+
+/**
+ * True when the packaged app shipped with all 3 Moonshine Base files in
+ * `process.resourcesPath/models/moonshine-base/`. False in dev mode and on
+ * installers that lost their bundled copy. The renderer uses this to decide
+ * whether "Delete" should read "Restore bundled copy" instead.
+ */
+export function isMoonshineBundleAvailable(): boolean {
+  if (!process.resourcesPath) return false;
+  const bundledDir = path.join(process.resourcesPath, 'models', 'moonshine-base');
+  if (!fs.existsSync(bundledDir)) return false;
+  return allFilesPresent(bundledDir);
 }
 
 /** Validate a URL is HTTPS and points to an allowed domain */

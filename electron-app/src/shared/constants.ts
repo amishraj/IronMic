@@ -298,6 +298,12 @@ export const IPC_CHANNELS = {
   // TF.js Infrastructure
   GET_MODELS_DIR: 'ironmic:get-models-dir',
 
+  // Model management (delete / redownload / disk usage / open folder)
+  OPEN_MODELS_DIRECTORY: 'ironmic:open-models-directory',
+  GET_ENGINE_DISK_USAGE: 'ironmic:get-engine-disk-usage',
+  DELETE_ENGINE_FILES: 'ironmic:delete-engine-files',
+  REDOWNLOAD_ENGINE: 'ironmic:redownload-engine',
+
   // Manual model import
   IMPORT_MODEL: 'ironmic:import-model',
   IMPORT_MODEL_FROM_PATH: 'ironmic:import-model-from-path',

@@ -317,7 +317,7 @@ export function Layout() {
         {/* Whisper load failure banner — sticky until resolved */}
         {whisperFailure && (
           <div
-            className="px-4 py-2 text-xs flex items-center gap-3 bg-red-500/15 border-b border-red-500/30 text-red-200"
+            className="px-4 py-2 text-xs flex items-center gap-3 bg-red-500/15 border-b border-red-500/30 text-red-800 dark:text-red-200"
             style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
           >
             <span className="font-medium shrink-0">Dictation unavailable:</span>
@@ -331,7 +331,7 @@ export function Layout() {
             {!whisperFailure.permanent && (
               <button
                 onClick={() => setWhisperFailure(null)}
-                className="text-red-200/70 hover:text-red-200 shrink-0"
+                className="text-red-800/70 hover:text-red-800 dark:text-red-200/70 dark:hover:text-red-200 shrink-0"
                 title="Dismiss"
               >
                 ×

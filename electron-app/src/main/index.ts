@@ -168,8 +168,25 @@ app.whenReady().then(async () => {
 
   // Copy bundled Moonshine Base (default transcription engine) to user data
   // on first launch. Must run before the engine pre-load below so the Rust
-  // loader finds the files where it expects them.
-  try { ensureBundledMoonshineBase(); } catch (err) {
+  // loader finds the files where it expects them. Log the result on a single
+  // line so debugging "did the bundle work?" doesn't require digging.
+  try {
+    const status = ensureBundledMoonshineBase();
+    switch (status) {
+      case 'copied':
+        console.log('[startup] Moonshine Base: bundled copy restored from app resources');
+        break;
+      case 'already-present':
+        console.log('[startup] Moonshine Base: already present in user data');
+        break;
+      case 'incomplete-bundle':
+        console.warn('[startup] Moonshine Base: bundled directory is incomplete — user must download');
+        break;
+      case 'bundle-missing':
+        console.log('[startup] Moonshine Base: no bundled copy (dev mode or unpackaged) — user must download');
+        break;
+    }
+  } catch (err) {
     console.warn('[startup] Failed to copy bundled Moonshine Base:', err);
   }
 

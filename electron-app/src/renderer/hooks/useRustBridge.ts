@@ -188,6 +188,15 @@ declare global {
       saveFileDialog: (content: string, defaultName: string, filters: any[]) => Promise<string | null>;
       // TF.js Infrastructure
       getModelsDir: () => Promise<string>;
+      // Model management
+      openModelsDirectory: () => Promise<{ ok: boolean; path: string }>;
+      getEngineDiskUsage: (engineId: string) => Promise<{
+        totalBytes: number;
+        files: Array<{ relativePath: string; bytes: number; exists: boolean }>;
+        bundledAvailable?: boolean;
+      }>;
+      deleteEngineFiles: (engineId: string) => Promise<{ deleted: number; restoredBundle: boolean }>;
+      redownloadEngine: (engineId: string) => Promise<void>;
       // Model import
       importModel: () => Promise<any>;
       getImportableModels: () => Promise<any>;

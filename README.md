@@ -154,7 +154,9 @@ xattr -cr /Applications/IronMic.app
 
 Then right-click IronMic → **Open** → **Open** on first launch to confirm.
 
-After installing, open IronMic and go to **Settings > Models** to download the speech recognition model (~1.5 GB). The app will walk you through setup on first launch.
+The default speech recognition engine — **Moonshine Base** (~146 MB, English) — ships with the installer and is ready to use on first launch. No download required to start dictating.
+
+If you need multilingual transcription, open **Settings > Models** to download a Whisper variant (Base/Small/Medium/Large). The Text Cleanup LLM (~4.4 GB, optional) is also downloaded from there. Use the **Open folder** button on that page to see exactly where models live on disk.
 
 > Models run entirely on your machine. Nothing is sent externally.
 
@@ -194,10 +196,12 @@ npx concurrently "npx vite" "sleep 3 && npx electron ."
 
 ### Download Models
 
-Models are downloaded through the Settings UI inside the app:
-- **Whisper large-v3-turbo** (~1.5 GB) — speech recognition
-- **Mistral 7B Instruct Q4** (~4.4 GB) — text cleanup
-- **Kokoro 82M** (~163 MB + ~7.5 MB voices) — text-to-speech
+The default speech recognition engine — **Moonshine Base** (~146 MB) — is bundled with the installer and copied to the user-data models folder on first launch (no network required). Other models are downloaded through the Settings UI inside the app:
+- **Whisper Base / Small / Medium / Large-v3-turbo** (147 MB – 1.5 GB) — multilingual speech recognition
+- **Mistral 7B Instruct Q4** (~4.4 GB) — text cleanup (optional)
+- **Kokoro 82M** (~163 MB + ~7.5 MB voices) — text-to-speech (bundled with installer too)
+
+You can see the on-disk path and open it in your file browser via **Settings > Models > Open folder**. Each downloaded engine has Re-download and Delete buttons; the Moonshine Base "Restore bundled copy" action re-applies the shipped files without re-downloading.
 
 ## Running Tests
 
