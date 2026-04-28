@@ -17,6 +17,10 @@ electron-app/release/
 rust-core/models/*.bin
 rust-core/models/*.onnx
 rust-core/models/*.gguf
+rust-core/models/**/*.bin
+rust-core/models/**/*.onnx
+rust-core/models/**/*.gguf
+rust-core/models/**/*.json
 rust-core/models/voices/*.bin
 
 # OS files
