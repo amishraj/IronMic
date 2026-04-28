@@ -11,8 +11,12 @@ Write-Host "Building IronMic Rust core (Windows)..."
 Write-Host "Platform: Windows $([System.Environment]::OSVersion.Version)"
 Write-Host ""
 
-# Build the N-API addon with whisper (no metal — Metal is Apple-only).
-cargo build --release --features napi-export,whisper,tts
+# Build the N-API addon with whisper + engine-multi (no metal — Metal is Apple-only).
+# engine-multi is REQUIRED for Moonshine (the default engine on Windows); without
+# it, build_engine() returns NullEngine and dictation fails at transcribe time
+# with "Engine 'moonshine-base' is not available". transcribe-rs reuses the same
+# ort/ndarray versions tts already pulls in, so there is no dependency conflict.
+cargo build --release --features napi-export,whisper,tts,engine-multi
 
 Write-Host ""
 Write-Host "Building LLM binary..."

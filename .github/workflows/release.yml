@@ -14,13 +14,13 @@ jobs:
         include:
           - os: macos-latest
             rust-target: aarch64-apple-darwin
-            cargo-features: '--features metal,tts'
+            cargo-features: '--features metal,tts,engine-multi'
           - os: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
-            cargo-features: '--features whisper,tts'
+            cargo-features: '--features whisper,tts,engine-multi'
           - os: windows-latest
             rust-target: x86_64-pc-windows-msvc
-            cargo-features: '--features whisper,tts'
+            cargo-features: '--features whisper,tts,engine-multi'
     steps:
       - uses: actions/checkout@v4
 
