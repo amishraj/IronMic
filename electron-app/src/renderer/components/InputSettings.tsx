@@ -38,6 +38,9 @@ export function InputSettings() {
   const animFrameRef = useRef<number | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
+  // Whisper thread count
+  const [whisperThreads, setWhisperThreads] = useState<number>(4);
+
   // Test recording
   const [testRecording, setTestRecording] = useState(false);
   const [testAudioUrl, setTestAudioUrl] = useState<string | null>(null);
@@ -48,22 +51,16 @@ export function InputSettings() {
   const chunksRef = useRef<Blob[]>([]);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
 
-  // Debug logging toggle — pipes capture/silence-gate/whisper/sanitize/emit
-  // events to the renderer DevTools console (and main-process stdout). Off by
-  // default; flip on to diagnose "I dictated and nothing appeared" issues.
-  const [debugLogging, setDebugLogging] = useState(false);
-
   useEffect(() => {
     loadDeviceInfo();
-    (window as any).ironmic?.getSetting?.('debug_audio_logging').then((v: string | null) => {
-      setDebugLogging(v === 'true' || v === '1');
-    });
+    // Load whisper_threads setting (default 4 if not set)
+    window.ironmic.getSetting('whisper_threads').then((val: string | null) => {
+      if (val !== null) {
+        const n = parseInt(val, 10);
+        if (!isNaN(n) && n >= 1 && n <= 16) setWhisperThreads(n);
+      }
+    }).catch(() => {});
     return () => stopMonitoring();
-  }, []);
-
-  const toggleDebugLogging = useCallback(async (next: boolean) => {
-    setDebugLogging(next);
-    await (window as any).ironmic?.setSetting?.('debug_audio_logging', next ? 'true' : 'false');
   }, []);
 
   async function loadDeviceInfo() {
@@ -474,34 +471,32 @@ export function InputSettings() {
         </div>
       </Card>
 
-      {/* Debug audio logging — for diagnosing dictation issues */}
+      {/* Whisper Threads */}
       <Card variant="default" padding="md">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-start gap-2.5 flex-1">
-            <Info className="w-4 h-4 text-iron-text-muted flex-shrink-0 mt-0.5" />
-            <div className="text-xs text-iron-text-muted leading-relaxed">
-              <p className="text-sm font-medium text-iron-text">Debug audio logging</p>
-              <p className="mt-1">
-                Pipes capture / silence-gate / whisper / sanitize / emit events to the renderer DevTools
-                console (View → Toggle Developer Tools). Also bypasses the silence gate so you can see what
-                Whisper actually returns on quiet chunks. Leave off in normal use.
-              </p>
-            </div>
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-sm font-medium text-iron-text">Whisper Threads</p>
+            <p className="text-xs text-iron-text-muted mt-0.5 leading-relaxed">
+              Number of CPU threads for speech recognition (1–16). Default 4 works for most machines.
+              Reduce to 1–2 on corporate VDIs or shared machines if dictation hangs on the first use.
+            </p>
           </div>
-          <button
-            onClick={() => toggleDebugLogging(!debugLogging)}
-            className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors flex-shrink-0 ${
-              debugLogging ? 'bg-iron-accent' : 'bg-iron-border'
-            }`}
-            aria-label="Toggle debug audio logging"
-          >
-            <span
-              className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                debugLogging ? 'translate-x-6' : 'translate-x-1'
-              }`}
-            />
-          </button>
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={whisperThreads}
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              if (!isNaN(n) && n >= 1 && n <= 16) {
+                setWhisperThreads(n);
+                window.ironmic.setSetting('whisper_threads', String(n)).catch(() => {});
+              }
+            }}
+            className="w-16 px-2 py-1 text-sm bg-iron-surface border border-iron-border rounded text-iron-text text-center focus:outline-none focus:ring-1 focus:ring-iron-accent"
+          />
         </div>
+        <p className="text-[11px] text-iron-text-muted mt-2">Takes effect after restarting IronMic.</p>
       </Card>
 
       {/* Tips */}

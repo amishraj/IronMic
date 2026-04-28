@@ -5,6 +5,7 @@
 import { app, BrowserWindow, session, globalShortcut, nativeImage, dialog } from 'electron';
 import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
+import { debugLog } from './debug-log';
 import { createTray, destroyTray, updateTrayState } from './tray';
 import { ensureBundledVoices, ensureBundledTFJSModels } from './model-downloader';
 import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
@@ -209,8 +210,28 @@ app.whenReady().then(async () => {
       // Load eagerly off the critical path — don't block the UI.
       void (async () => {
         try {
+          // Apply user-configured thread count before the model loads.
+          // Default is min(4, num_cpus) in Rust; users on VDI machines can
+          // reduce this to 1–2 in Settings → Audio → Whisper Threads.
+          const threadsSetting = native.getSetting('whisper_threads');
+          if (threadsSetting) {
+            const n = parseInt(threadsSetting, 10);
+            if (!isNaN(n) && n >= 1 && n <= 16) {
+              native.setWhisperNThreads(n);
+              console.log(`[whisper] Thread count set to ${n} from settings`);
+            }
+          }
           native.loadWhisperModel();
           console.log('[whisper] Model pre-loaded successfully');
+          // Log CPU feature flags to DevTools so AVX/AVX512 issues are
+          // visible without checking the terminal. E.g.:
+          //   [ironmic:debug] whisper.sysinfo {system_info: "AVX = 1 | AVX512 = 0 | ..."}
+          try {
+            const sysinfo = native.getWhisperSystemInfo();
+            debugLog('whisper.sysinfo', { system_info: sysinfo });
+          } catch (siErr) {
+            console.warn('[whisper] getWhisperSystemInfo failed:', siErr);
+          }
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
           console.error('[whisper] Pre-load failed:', message);

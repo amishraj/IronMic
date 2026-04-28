@@ -82,6 +82,8 @@ function createStubs(): Record<string, (...args: any[]) => any> {
       llm: { loaded: false, name: 'mistral-7b-instruct-q4', sizeBytes: 0 },
     }),
     loadWhisperModel: () => {},
+    getWhisperSystemInfo: () => '[stub: system info not available]',
+    setWhisperNThreads: (_n: number) => {},
     nativeFeatures: () => JSON.stringify({
       whisper: false,
       metal: false,
@@ -160,6 +162,16 @@ export const native = {
   resetPipelineState(): void { this.addon.resetPipelineState(); },
   getModelStatus(): any { return this.addon.getModelStatus(); },
   loadWhisperModel(): void { this.addon.loadWhisperModel(); },
+  getWhisperSystemInfo(): string {
+    return typeof this.addon.getWhisperSystemInfo === 'function'
+      ? this.addon.getWhisperSystemInfo()
+      : '[getWhisperSystemInfo not available in this build]';
+  },
+  setWhisperNThreads(n: number): void {
+    if (typeof this.addon.setWhisperNThreads === 'function') {
+      this.addon.setWhisperNThreads(n);
+    }
+  },
   nativeFeatures(): { whisper: boolean; metal: boolean; llm: boolean; tts: boolean; platform: string; arch: string; stub?: boolean } {
     if (typeof this.addon.nativeFeatures !== 'function') {
       // Older addon binary — assume nothing is wired.

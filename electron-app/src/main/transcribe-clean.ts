@@ -35,20 +35,7 @@
  */
 const RMS_SILENCE_THRESHOLD = 0.0015;
 
-// Used by isAudioSilent() to bypass the gate when the user has flipped the
-// debug toggle in Settings. Lets the user see what Whisper actually returns
-// on a "rejected" chunk in one test run, instead of needing two.
-import { native } from './native-bridge';
 import { debugLog } from './debug-log';
-
-function debugBypassesSilenceGate(): boolean {
-  try {
-    const v = native.getSetting?.('debug_audio_logging');
-    return v === 'true' || v === '1';
-  } catch {
-    return false;
-  }
-}
 
 /**
  * Compute RMS energy of a PCM16 audio buffer. Buffer format assumption:
@@ -84,12 +71,8 @@ export function isAudioSilent(buf: Buffer): boolean {
     return true;
   }
   const rms = computeRmsPcm16(buf);
-  const wouldDrop = rms < RMS_SILENCE_THRESHOLD;
-  // When debug logging is on, bypass the gate so the user can see the raw
-  // Whisper output for low-RMS chunks they were never expecting to be dropped.
-  // Two birds: confirms the gate was the bug AND shows what Whisper would say.
-  const dropped = wouldDrop && !debugBypassesSilenceGate();
-  debugLog('silence-gate', { rms, threshold: RMS_SILENCE_THRESHOLD, byteLength: buf.length, dropped, bypassed: wouldDrop && !dropped });
+  const dropped = rms < RMS_SILENCE_THRESHOLD;
+  debugLog('silence-gate', { rms, threshold: RMS_SILENCE_THRESHOLD, byteLength: buf.length, dropped });
   return dropped;
 }
 
@@ -252,6 +235,7 @@ export function transcribeWithTimeout<T>(
       if (settled) return;
       settled = true;
       console.warn(`[${label}] Timed out after ${timeoutMs}ms — dropping chunk`);
+      debugLog('whisper.timeout', { label, timeoutMs });
       resolve(null);
     }, timeoutMs);
     promise.then(
