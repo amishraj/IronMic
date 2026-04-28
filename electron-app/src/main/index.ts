@@ -10,8 +10,7 @@ import { createTray, destroyTray, updateTrayState } from './tray';
 import {
   ensureBundledVoices,
   ensureBundledTFJSModels,
-  isTranscriptionEngineReady,
-  downloadTranscriptionEngine,
+  ensureBundledMoonshineBase,
 } from './model-downloader';
 import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
 import { meetingRecorder } from './meeting-recorder';
@@ -167,6 +166,13 @@ app.whenReady().then(async () => {
     console.warn('[startup] Failed to copy bundled voices:', err);
   }
 
+  // Copy bundled Moonshine Base (default transcription engine) to user data
+  // on first launch. Must run before the engine pre-load below so the Rust
+  // loader finds the files where it expects them.
+  try { ensureBundledMoonshineBase(); } catch (err) {
+    console.warn('[startup] Failed to copy bundled Moonshine Base:', err);
+  }
+
   // Extract bundled TF.js ML models to user data on first launch
   try { ensureBundledTFJSModels(); } catch (err) {
     console.warn('[startup] Failed to extract bundled TF.js models:', err);
@@ -215,80 +221,27 @@ app.whenReady().then(async () => {
       // Load eagerly off the critical path — don't block the UI.
       void (async () => {
         try {
-          // ── Phase 1: select active transcription engine ──
-          // Read user's `transcription_engine` setting and apply it before
-          // the model loads. Default is moonshine-base on fresh installs;
-          // the Rust side will fall back to its DEFAULT_ENGINE if the
-          // setting is missing or invalid.
-          const engineSetting = native.getSetting('transcription_engine');
-          if (engineSetting) {
-            try {
-              native.setTranscriptionEngine(engineSetting);
-              console.log(`[engine] Active transcription engine: ${engineSetting}`);
-              debugLog('engine.startup', { kind: engineSetting, source: 'settings' });
-            } catch (engineErr) {
-              console.warn(
-                `[engine] setTranscriptionEngine('${engineSetting}') failed; ` +
-                  `falling back to Rust default. Error:`,
-                engineErr,
-              );
-              debugLog('engine.startup', {
-                kind: engineSetting,
-                source: 'settings',
-                error: String(engineErr),
-              });
-            }
-          } else {
-            // First launch / pre-Phase-1 install — adopt the Moonshine default.
-            try {
-              native.setTranscriptionEngine('moonshine-base');
-              native.setSetting('transcription_engine', 'moonshine-base');
-              debugLog('engine.startup', { kind: 'moonshine-base', source: 'default-migration' });
-            } catch {
-              // Older Rust addon — ignore; falls back to Whisper path.
-            }
-          }
-
-          // Background-fetch Moonshine-base on first launch so the default
-          // engine is actually usable. Without this, fresh installs show
-          // "Download" on Moonshine and can't switch to it via the UI on
-          // a flaky network. We try once per install (tracked via setting)
-          // and never overwrite a user's explicit engine choice.
+          // ── Force Moonshine Base as the active engine on every launch ──
+          // Policy: Moonshine Base is the always-on default. It ships bundled
+          // with the installer (electron-builder.config.js extraResources +
+          // ensureBundledMoonshineBase above), so it is always available.
+          // The persisted `transcription_engine` setting is overwritten on
+          // every launch, which means a user's in-session Switch to Whisper
+          // (or any other engine) lasts only for that session — the next
+          // launch returns to Moonshine Base. This is intentional and matches
+          // the product policy that Moonshine is the primary engine.
           try {
-            const attempted = native.getSetting('moonshine_autodownload_attempted');
-            if (attempted !== 'true' && !isTranscriptionEngineReady('moonshine-base')) {
-              const wasUnset = !engineSetting;
-              void (async () => {
-                try {
-                  console.log('[engine] Auto-downloading Moonshine base in background…');
-                  await downloadTranscriptionEngine('moonshine-base', mainWindow);
-                  native.setSetting('moonshine_autodownload_attempted', 'true');
-                  // Promote Moonshine to active only if the user hasn't
-                  // explicitly chosen another engine. Existing whisper-*
-                  // selections are preserved — user can click "Switch" in
-                  // Settings → Speech Recognition Model now that the files
-                  // are on disk.
-                  if (wasUnset) {
-                    try {
-                      native.setTranscriptionEngine('moonshine-base');
-                      native.setSetting('transcription_engine', 'moonshine-base');
-                      debugLog('engine.startup', {
-                        kind: 'moonshine-base',
-                        source: 'auto-download-promote',
-                      });
-                    } catch (promoteErr) {
-                      console.warn('[engine] Promote to moonshine-base after auto-download failed:', promoteErr);
-                    }
-                  }
-                  console.log('[engine] Moonshine base ready.');
-                } catch (dlErr) {
-                  // Don't mark attempted=true on failure — retry next launch.
-                  console.warn('[engine] Moonshine auto-download failed (will retry next launch):', dlErr);
-                }
-              })();
-            }
-          } catch (autoErr) {
-            console.warn('[engine] Moonshine auto-download bootstrap failed:', autoErr);
+            native.setTranscriptionEngine('moonshine-base');
+            native.setSetting('transcription_engine', 'moonshine-base');
+            console.log('[engine] Active transcription engine: moonshine-base (forced default)');
+            debugLog('engine.startup', { kind: 'moonshine-base', source: 'forced-default' });
+          } catch (engineErr) {
+            console.warn('[engine] Force-default to moonshine-base failed:', engineErr);
+            debugLog('engine.startup', {
+              kind: 'moonshine-base',
+              source: 'forced-default',
+              error: String(engineErr),
+            });
           }
 
           // Apply user-configured thread count before the model loads.

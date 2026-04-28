@@ -193,6 +193,7 @@ declare global {
       getImportableModels: () => Promise<any>;
       importModelFromPath: (filePath: string, sectionFilter: string) => Promise<any>;
       importMultiPartModel: () => Promise<any>;
+      importMoonshineEngine: (engineId: string) => Promise<{ modelId: string; label: string; fileCount: number } | null>;
       openExternal: (url: string) => Promise<void>;
       // Events
       onAiOutput: (callback: (data: any) => void) => () => void;

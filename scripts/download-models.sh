@@ -29,8 +29,11 @@ WHISPER_MODEL="$MODELS_DIR/whisper-large-v3-turbo.bin"
 
 LLM_MODEL="$MODELS_DIR/mistral-7b-instruct-q4_k_m.gguf"
 
-# HuggingFace base URLs for Moonshine ONNX exports
-MOONSHINE_HF_BASE="https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/base"
+# HuggingFace base URL for Moonshine ONNX exports.
+# IMPORTANT: the canonical path requires `/float`. Without it HuggingFace
+# returns "Entry not found" (404) for every file. Must stay in sync with
+# MOONSHINE_HF_BASE in electron-app/src/shared/constants.ts.
+MOONSHINE_HF_BASE="https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/base/float"
 
 echo "IronMic Model Downloader"
 echo "========================"
@@ -62,9 +65,13 @@ download_moonshine_file() {
     fi
 }
 
-download_moonshine_file "encoder_model.onnx" "$MOONSHINE_ENCODER" || true
-download_moonshine_file "decoder_model_merged.onnx" "$MOONSHINE_DECODER" || true
-download_moonshine_file "tokenizer.json" "$MOONSHINE_TOKENIZER" || true
+# Note: no `|| true` — set -e is in effect, and a failed Moonshine download
+# (e.g. typo in URL) MUST abort the script. The previous "fail-soft" behavior
+# masked broken URLs because tail-piped curl always returned 0, which is how
+# this whole class of bug shipped.
+download_moonshine_file "encoder_model.onnx" "$MOONSHINE_ENCODER"
+download_moonshine_file "decoder_model_merged.onnx" "$MOONSHINE_DECODER"
+download_moonshine_file "tokenizer.json" "$MOONSHINE_TOKENIZER"
 
 echo ""
 

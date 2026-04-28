@@ -138,6 +138,29 @@ export function ModelManager() {
    * Whisper-only handleSelectModel: the engine layer reloads its model on
    * swap, which would corrupt an in-flight transcription.
    */
+  // Download the model files for an engine without changing the active engine.
+  // Mirrors the Chat Models / Whisper download flow: clicking "Download" just
+  // fetches the files and flips the row to "Switch". Switching is a separate
+  // user action (matches the rest of the page).
+  const downloadEngine = useCallback(async (engineId: string) => {
+    setEngineError(null);
+    setDownloadingEngine(engineId);
+    try {
+      await window.ironmic.downloadTranscriptionEngine(engineId);
+      // Synthetic 'complete' from the main process triggers loadState via the
+      // existing progress listener, so the row will flip to "Switch" on its own.
+    } catch (err: any) {
+      console.error('[ModelManager] Engine download failed:', err);
+      setEngineError(ipcErrorMessage(err, 'Engine download failed'));
+    } finally {
+      setDownloadingEngine(null);
+    }
+  }, []);
+
+  // Switch the active engine. Requires the engine to already be downloaded —
+  // the EngineRow only renders the "Switch" button when isReady=true, so this
+  // path never has to download. Same lock-out hazard as Whisper model swap:
+  // mid-recording reload would corrupt the in-flight transcription.
   const switchEngine = useCallback(async (engineId: string) => {
     setEngineError(null);
     if (engineId === activeEngine) return;
@@ -149,42 +172,19 @@ export function ModelManager() {
       });
       return;
     }
-    // Always do a live disk check rather than trusting the cached map.
-    // The cached map can be stale on first load (e.g. models were previously
-    // imported via another code path and the list IPC returned wrong data).
-    let isReady = false;
-    try {
-      isReady = await window.ironmic.isTranscriptionEngineReady(engineId);
-    } catch {
-      isReady = engineReadiness[engineId] ?? false;
-    }
-    if (!isReady) {
-      setDownloadingEngine(engineId);
-      try {
-        await window.ironmic.downloadTranscriptionEngine(engineId);
-      } catch (err: any) {
-        console.error('[ModelManager] Engine download failed:', err);
-        setEngineError(ipcErrorMessage(err, 'Engine download failed'));
-        setDownloadingEngine(null);
-        return;
-      }
-      setDownloadingEngine(null);
-    }
     try {
       await window.ironmic.setSetting('transcription_engine', engineId);
       setActiveEngine(engineId);
-      // Keep the legacy currentModel in sync for any UI that still reads it.
       if (engineId.startsWith('whisper-')) {
         const id = engineId === 'whisper-large-v3-turbo' ? 'large-v3-turbo' : engineId.replace('whisper-', '');
         setCurrentModel(id);
       }
-      // Refresh from disk so every other row shows current truth.
       loadState();
     } catch (err: any) {
       console.error('[ModelManager] Engine switch failed:', err);
       setEngineError(ipcErrorMessage(err, 'Engine switch failed'));
     }
-  }, [activeEngine, engineReadiness, micBusy]);
+  }, [activeEngine, micBusy]);
 
   useEffect(() => {
     loadState();
@@ -339,6 +339,7 @@ export function ModelManager() {
         downloadingEngine={downloadingEngine}
         engineError={engineError}
         onSwitch={switchEngine}
+        onDownload={downloadEngine}
         onImported={handleAnyImport}
         downloadFailed={downloadFailed}
       />
@@ -360,6 +361,7 @@ function SpeechRecognitionModelSection({
   downloadingEngine,
   engineError,
   onSwitch,
+  onDownload,
   onImported,
   downloadFailed,
 }: {
@@ -368,6 +370,7 @@ function SpeechRecognitionModelSection({
   downloadingEngine: string | null;
   engineError: string | null;
   onSwitch: (engineId: string) => void;
+  onDownload: (engineId: string) => void;
   onImported: () => void;
   downloadFailed: boolean;
 }) {
@@ -413,7 +416,8 @@ function SpeechRecognitionModelSection({
           isReady={engineReadiness[meta.id] ?? false}
           isDownloading={downloadingEngine === meta.id}
           isDefault={meta.id === DEFAULT_TRANSCRIPTION_ENGINE}
-          onClick={() => onSwitch(meta.id)}
+          onSwitch={() => onSwitch(meta.id)}
+          onDownload={() => onDownload(meta.id)}
         />
       ))}
 
@@ -432,7 +436,8 @@ function SpeechRecognitionModelSection({
           isReady={engineReadiness[meta.id] ?? false}
           isDownloading={downloadingEngine === meta.id}
           isDefault={false}
-          onClick={() => onSwitch(meta.id)}
+          onSwitch={() => onSwitch(meta.id)}
+          onDownload={() => onDownload(meta.id)}
         />
       ))}
 
@@ -452,14 +457,16 @@ function EngineRow({
   isReady,
   isDownloading,
   isDefault,
-  onClick,
+  onSwitch,
+  onDownload,
 }: {
   meta: TranscriptionEngineMeta;
   isActive: boolean;
   isReady: boolean;
   isDownloading: boolean;
   isDefault: boolean;
-  onClick: () => void;
+  onSwitch: () => void;
+  onDownload: () => void;
 }) {
   return (
     <Card variant="default" padding="md">
@@ -485,9 +492,9 @@ function EngineRow({
           ) : isDownloading ? (
             <Loader2 className="w-4 h-4 animate-spin text-iron-accent" />
           ) : isReady ? (
-            <Button size="sm" onClick={onClick}>Switch</Button>
+            <Button size="sm" onClick={onSwitch}>Switch</Button>
           ) : (
-            <Button size="sm" icon={<Download className="w-3 h-3" />} onClick={onClick}>
+            <Button size="sm" icon={<Download className="w-3 h-3" />} onClick={onDownload}>
               Download
             </Button>
           )}

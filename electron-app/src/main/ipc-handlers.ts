@@ -6,7 +6,7 @@
 import { ipcMain, BrowserWindow } from 'electron';
 import { IPC_CHANNELS, MODEL_FILES } from '../shared/constants';
 import { native } from './native-bridge';
-import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady } from './model-downloader';
+import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath, resolveActiveChatModel } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
@@ -65,9 +65,11 @@ const ALLOWED_SETTING_KEYS = new Set([
   // Reduce on VDI / shared machines if first-transcription hangs.
   'whisper_threads',
   // Phase 1 engine swap: which transcription engine is active.
-  // Values: 'moonshine-tiny' | 'moonshine-base' (default) | 'whisper-base' |
+  // Values: 'moonshine-base' (default, bundled) | 'whisper-base' |
   // 'whisper-small' | 'whisper-medium' | 'whisper-large-v3-turbo'.
-  // Persisted in SQLite; read at startup before the first transcribe call.
+  // Persisted in SQLite, but every launch overrides this to 'moonshine-base'
+  // (see main/index.ts engine-startup block) — so user switches via this
+  // setting last only for the current session.
   'transcription_engine',
 ]);
 
@@ -616,6 +618,25 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle(IPC_CHANNELS.IMPORT_MULTI_PART_MODEL, async () => {
     const window = BrowserWindow.getFocusedWindow();
     return refreshWhisperAfterImport(await importMultiPartModel(window));
+  });
+  // Moonshine engines: same end-to-end flow as Whisper import — open dialog,
+  // copy files, then reload the active engine so the user can `Switch` to it
+  // without restarting the app.
+  ipcMain.handle('ironmic:import-moonshine-engine', async (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    const window = BrowserWindow.getFocusedWindow();
+    const result = await importMoonshineEngine(window, engineId);
+    if (result) {
+      // If the user is already on this engine, reload it so the freshly-imported
+      // files take effect immediately. Otherwise leave their current engine alone.
+      try {
+        const active = native.getTranscriptionEngine();
+        if (active === engineId) native.loadWhisperModel();
+      } catch (err) {
+        console.warn('[ipc] Engine reload after Moonshine import failed:', err);
+      }
+    }
+    return result;
   });
   ipcMain.handle(IPC_CHANNELS.OPEN_EXTERNAL, (_event, url: string) => {
     // Only allow opening known model download domains

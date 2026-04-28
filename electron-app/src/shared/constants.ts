@@ -39,16 +39,6 @@ export interface TranscriptionEngineMeta {
 
 export const TRANSCRIPTION_ENGINES: TranscriptionEngineMeta[] = [
   {
-    id: 'moonshine-tiny',
-    label: 'Moonshine Tiny',
-    description: 'Fastest. Use on slow / shared / VDI machines.',
-    latencyHint: '~70 ms / chunk',
-    sizeLabel: '~52 MB',
-    languages: ['en'],
-    family: 'moonshine',
-    modelFileKeys: ['moonshine-tiny-encoder', 'moonshine-tiny-decoder', 'moonshine-tiny-tokenizer'],
-  },
-  {
     id: 'moonshine-base',
     label: 'Moonshine Base',
     description: 'Balanced. Better accuracy than Whisper Tiny at 1/10th the latency. Default.',
@@ -330,11 +320,14 @@ export const IPC_CHANNELS = {
 export const MODELS_RELEASE_TAG = 'models-v1';
 export const MODELS_BASE_URL = `https://github.com/greenpioneersolutions/IronMic/releases/download/${MODELS_RELEASE_TAG}`;
 
-// Moonshine ONNX exports — three files per variant (encoder, decoder, tokenizer).
-// Hosted at HuggingFace UsefulSensors/moonshine-{tiny,base}, mirrored to the
-// IronMic GitHub Releases under the models-v2 tag for reliability.
-const MOONSHINE_HF_TINY = 'https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/tiny';
-const MOONSHINE_HF_BASE = 'https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/base';
+// Moonshine ONNX exports — three files (encoder, decoder, tokenizer) for the
+// Base variant. Hosted at HuggingFace UsefulSensors/moonshine.
+//
+// IMPORTANT: the canonical path includes `/float/`. Without it HuggingFace
+// returns "Entry not found" — the absence of that segment broke every Moonshine
+// download/import link before this fix. Tiny is unavailable upstream
+// (its tokenizer.json is 404 even at /float/) and is no longer supported.
+const MOONSHINE_HF_BASE = 'https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/base/float';
 
 /** Primary download URLs (GitHub Release assets) */
 export const MODEL_URLS: Record<string, string> = {
@@ -342,11 +335,9 @@ export const MODEL_URLS: Record<string, string> = {
   'whisper-medium': `${MODELS_BASE_URL}/ggml-medium.bin`,
   'whisper-small': `${MODELS_BASE_URL}/ggml-small.bin`,
   'whisper-base': `${MODELS_BASE_URL}/ggml-base.bin`,
-  // Moonshine — primary is HuggingFace because the IronMic models-v1 release
-  // doesn't host them yet. When models-v2 ships, swap these to MODELS_BASE_URL.
-  'moonshine-tiny-encoder': `${MOONSHINE_HF_TINY}/encoder_model.onnx`,
-  'moonshine-tiny-decoder': `${MOONSHINE_HF_TINY}/decoder_model_merged.onnx`,
-  'moonshine-tiny-tokenizer': `${MOONSHINE_HF_TINY}/tokenizer.json`,
+  // Moonshine Base — HuggingFace is canonical. Bundled with the installer too
+  // (electron-builder.config.js extraResources) so the default engine is
+  // available with zero network access on first launch.
   'moonshine-base-encoder': `${MOONSHINE_HF_BASE}/encoder_model.onnx`,
   'moonshine-base-decoder': `${MOONSHINE_HF_BASE}/decoder_model_merged.onnx`,
   'moonshine-base-tokenizer': `${MOONSHINE_HF_BASE}/tokenizer.json`,
@@ -368,9 +359,6 @@ export const MODEL_FALLBACK_URLS: Record<string, string> = {
   'whisper-small': 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin',
   'whisper-base': 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
   // Moonshine — fallback identical to primary because HuggingFace IS the canonical host.
-  'moonshine-tiny-encoder': `${MOONSHINE_HF_TINY}/encoder_model.onnx`,
-  'moonshine-tiny-decoder': `${MOONSHINE_HF_TINY}/decoder_model_merged.onnx`,
-  'moonshine-tiny-tokenizer': `${MOONSHINE_HF_TINY}/tokenizer.json`,
   'moonshine-base-encoder': `${MOONSHINE_HF_BASE}/encoder_model.onnx`,
   'moonshine-base-decoder': `${MOONSHINE_HF_BASE}/decoder_model_merged.onnx`,
   'moonshine-base-tokenizer': `${MOONSHINE_HF_BASE}/tokenizer.json`,
@@ -394,9 +382,6 @@ export const MODEL_FILES: Record<string, string> = {
   // MoonshineModel::load() expects a *directory* containing all three files.
   // The relative-to-models-dir path includes the subdirectory so the download
   // lands in the right place.
-  'moonshine-tiny-encoder': 'moonshine-tiny/encoder_model.onnx',
-  'moonshine-tiny-decoder': 'moonshine-tiny/decoder_model_merged.onnx',
-  'moonshine-tiny-tokenizer': 'moonshine-tiny/tokenizer.json',
   'moonshine-base-encoder': 'moonshine-base/encoder_model.onnx',
   'moonshine-base-decoder': 'moonshine-base/decoder_model_merged.onnx',
   'moonshine-base-tokenizer': 'moonshine-base/tokenizer.json',
@@ -422,9 +407,6 @@ export const MODEL_CHECKSUMS: Record<string, string> = {
   // We deliberately leave these empty initially because the HuggingFace files
   // can be re-uploaded; once we mirror them to the IronMic GitHub Release the
   // hashes will be pinned.
-  'moonshine-tiny-encoder': '',
-  'moonshine-tiny-decoder': '',
-  'moonshine-tiny-tokenizer': '',
   'moonshine-base-encoder': '',
   'moonshine-base-decoder': '',
   'moonshine-base-tokenizer': '',

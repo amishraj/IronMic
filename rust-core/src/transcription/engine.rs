@@ -51,13 +51,11 @@ fn models_dir() -> PathBuf {
 /// Identifies an engine + model variant.
 ///
 /// String form (used by N-API and the Electron settings store):
-/// - `moonshine-tiny` — ~52 MB, fastest, English only
-/// - `moonshine-base` — ~146 MB, balanced, English only (default)
+/// - `moonshine-base` — ~146 MB, balanced, English only (default; bundled)
 /// - `whisper-large-v3-turbo` — 1.5 GB, highest accuracy, multilingual
 /// - `whisper-medium`, `whisper-small`, `whisper-base` — multilingual variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineKind {
-    MoonshineTiny,
     MoonshineBase,
     WhisperLargeV3Turbo,
     WhisperMedium,
@@ -70,7 +68,6 @@ impl EngineKind {
     /// settings table under `transcription_engine`.
     pub fn as_str(self) -> &'static str {
         match self {
-            EngineKind::MoonshineTiny => "moonshine-tiny",
             EngineKind::MoonshineBase => "moonshine-base",
             EngineKind::WhisperLargeV3Turbo => "whisper-large-v3-turbo",
             EngineKind::WhisperMedium => "whisper-medium",
@@ -81,7 +78,6 @@ impl EngineKind {
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "moonshine-tiny" => Some(EngineKind::MoonshineTiny),
             "moonshine-base" => Some(EngineKind::MoonshineBase),
             "whisper-large-v3-turbo" => Some(EngineKind::WhisperLargeV3Turbo),
             "whisper-medium" => Some(EngineKind::WhisperMedium),
@@ -94,10 +90,7 @@ impl EngineKind {
     /// True if this kind is a Moonshine variant (regardless of compile-time
     /// feature flags).
     pub fn is_moonshine(self) -> bool {
-        matches!(
-            self,
-            EngineKind::MoonshineTiny | EngineKind::MoonshineBase
-        )
+        matches!(self, EngineKind::MoonshineBase)
     }
 
     /// True if this kind is a Whisper variant.
@@ -109,7 +102,6 @@ impl EngineKind {
     /// for the Settings UI dropdown.
     pub fn all() -> &'static [EngineKind] {
         &[
-            EngineKind::MoonshineTiny,
             EngineKind::MoonshineBase,
             EngineKind::WhisperLargeV3Turbo,
             EngineKind::WhisperMedium,
@@ -171,8 +163,9 @@ mod moonshine_adapter {
 
     impl MoonshineAdapter {
         pub fn new(kind: EngineKind) -> Self {
+            // Only MoonshineBase exists today. The constructor still takes
+            // EngineKind to keep the call sites uniform with whisper variants.
             let variant = match kind {
-                EngineKind::MoonshineTiny => MoonshineVariant::Tiny,
                 EngineKind::MoonshineBase => MoonshineVariant::Base,
                 _ => MoonshineVariant::Base, // unreachable in practice
             };
@@ -184,7 +177,7 @@ mod moonshine_adapter {
         }
 
         fn model_dir(&self) -> PathBuf {
-            // Layout: <models_dir>/moonshine-tiny/{encoder_model.onnx,
+            // Layout: <models_dir>/moonshine-base/{encoder_model.onnx,
             // decoder_model_merged.onnx, tokenizer.json}
             //
             // transcribe-rs's MoonshineModel::load expects the directory
@@ -485,7 +478,6 @@ mod tests {
 
     #[test]
     fn engine_kind_is_moonshine() {
-        assert!(EngineKind::MoonshineTiny.is_moonshine());
         assert!(EngineKind::MoonshineBase.is_moonshine());
         assert!(!EngineKind::WhisperBase.is_moonshine());
         assert!(EngineKind::WhisperBase.is_whisper());

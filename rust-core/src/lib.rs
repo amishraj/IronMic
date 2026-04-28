@@ -274,7 +274,7 @@ mod napi_exports {
     /// next `transcribe()` call (or eagerly via `loadWhisperModel()`).
     ///
     /// Accepts the kind as a string matching [`EngineKind::as_str`]:
-    /// `"moonshine-tiny"`, `"moonshine-base"`, `"whisper-large-v3-turbo"`,
+    /// `"moonshine-base"`, `"whisper-large-v3-turbo"`,
     /// `"whisper-medium"`, `"whisper-small"`, `"whisper-base"`.
     #[napi]
     pub fn set_transcription_engine(kind: String) -> napi::Result<()> {

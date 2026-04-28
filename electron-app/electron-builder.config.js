@@ -33,22 +33,16 @@ module.exports = {
       to: 'models/voices/',
       filter: ['*.bin'],
     },
-    // Phase 1 — bundle Moonshine Base ONNX so first-run dictation works
-    // offline without a download. The build pipeline (or developer running
-    // scripts/download-models.sh) populates this directory with three files:
+    // Bundle Moonshine Base ONNX so the default engine is usable offline
+    // on first launch. scripts/package.sh runs scripts/download-models.sh
+    // first and verifies the three files are present before invoking
+    // electron-builder, so this directory is guaranteed to exist at package
+    // time. ensureBundledMoonshineBase() in main copies them to userData on
+    // first run.
     //   encoder_model.onnx, decoder_model_merged.onnx, tokenizer.json
-    // The glob filter means electron-builder silently skips this entry if
-    // the directory doesn't exist — runtime download-on-demand kicks in.
     {
       from: '../rust-core/models/moonshine-base/',
       to: 'models/moonshine-base/',
-      filter: ['*.onnx', '*.json'],
-    },
-    // Optional Moonshine Tiny — included only if pre-downloaded. Smaller
-    // than Base; fastest engine. Most users won't bundle this.
-    {
-      from: '../rust-core/models/moonshine-tiny/',
-      to: 'models/moonshine-tiny/',
       filter: ['*.onnx', '*.json'],
     },
     // TF.js ML models — tar.gz archives extracted on first launch

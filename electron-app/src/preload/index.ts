@@ -261,6 +261,7 @@ const api = {
   getImportableModels: () => ipcRenderer.invoke('ironmic:get-importable-models'),
   importModelFromPath: (filePath: string, sectionFilter: string) => ipcRenderer.invoke('ironmic:import-model-from-path', filePath, sectionFilter),
   importMultiPartModel: () => ipcRenderer.invoke('ironmic:import-multi-part-model'),
+  importMoonshineEngine: (engineId: string) => ipcRenderer.invoke('ironmic:import-moonshine-engine', engineId),
   openExternal: (url: string) => ipcRenderer.invoke('ironmic:open-external', url),
 
   // Events from main process
