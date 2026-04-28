@@ -176,6 +176,19 @@ export function ModelManager() {
         <h3 className="text-sm font-semibold text-iron-text">AI Models</h3>
       </div>
 
+      {/* Phase 1 redesign pointer — Moonshine lives in the engine selector,
+          not here. This banner saves users from hunting for it. */}
+      <div className="flex items-start gap-2 text-xs text-iron-text-muted bg-iron-surface/50 border border-iron-border px-3 py-2 rounded-lg">
+        <Info className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-iron-accent" />
+        <p className="leading-relaxed">
+          Looking for a faster transcription engine? IronMic now supports
+          {' '}<strong className="text-iron-text">Moonshine</strong>{' '}
+          (~16× faster than Whisper on CPU, English only). Switch in
+          {' '}<strong className="text-iron-text">Settings → Audio → Transcription Engine</strong>.
+          The Whisper variants below remain the fallback for multilingual transcription.
+        </p>
+      </div>
+
       {error && (
         <div className="flex items-start gap-2 text-xs text-iron-danger bg-iron-danger/10 border border-iron-danger/20 px-3 py-2 rounded-lg">
           <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />

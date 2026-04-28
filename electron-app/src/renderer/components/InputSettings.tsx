@@ -4,8 +4,9 @@
  */
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Mic, MicOff, RefreshCw, CheckCircle, AlertTriangle, XCircle, Volume2, Play, Square, Info } from 'lucide-react';
+import { Mic, MicOff, RefreshCw, CheckCircle, AlertTriangle, XCircle, Volume2, Play, Square, Info, Cpu, Download, Loader2 } from 'lucide-react';
 import { Card, Badge } from './ui';
+import { TRANSCRIPTION_ENGINES, DEFAULT_TRANSCRIPTION_ENGINE } from '../../shared/constants';
 
 interface AudioDevice {
   id: string;
@@ -42,6 +43,14 @@ export function InputSettings() {
   // VDI / corporate machines should keep this low; desktop CPUs can raise it.
   const [whisperThreads, setWhisperThreads] = useState<number>(2);
 
+  // Transcription engine state — Phase 1 multi-engine selector.
+  // We track the active engine separately from "ready" status so the UI can
+  // show a "Download required" badge for engines whose models aren't on disk.
+  const [activeEngine, setActiveEngine] = useState<string>(DEFAULT_TRANSCRIPTION_ENGINE);
+  const [engineReadiness, setEngineReadiness] = useState<Record<string, boolean>>({});
+  const [downloadingEngine, setDownloadingEngine] = useState<string | null>(null);
+  const [engineSwitchError, setEngineSwitchError] = useState<string | null>(null);
+
   // Test recording
   const [testRecording, setTestRecording] = useState(false);
   const [testAudioUrl, setTestAudioUrl] = useState<string | null>(null);
@@ -61,8 +70,60 @@ export function InputSettings() {
         if (!isNaN(n) && n >= 1 && n <= 16) setWhisperThreads(n);
       }
     }).catch(() => {});
+    // Load transcription engine state.
+    void loadEngineState();
     return () => stopMonitoring();
   }, []);
+
+  /** Pull active engine + per-engine "ready to use" status from main. */
+  async function loadEngineState() {
+    try {
+      const [active, list] = await Promise.all([
+        window.ironmic.getTranscriptionEngine(),
+        window.ironmic.listTranscriptionEngines(),
+      ]);
+      setActiveEngine(active);
+      const readiness: Record<string, boolean> = {};
+      for (const meta of TRANSCRIPTION_ENGINES) {
+        const found = list.find((e) => e.kind === meta.id);
+        readiness[meta.id] = found?.isReady ?? false;
+      }
+      setEngineReadiness(readiness);
+    } catch (err) {
+      console.warn('[InputSettings] Failed to load transcription engines:', err);
+    }
+  }
+
+  /**
+   * Switch the active transcription engine. If the target engine's model
+   * files aren't downloaded yet, fetch them first (with progress UI), then
+   * persist the setting and notify Rust to swap.
+   */
+  const switchEngine = useCallback(async (engineId: string) => {
+    setEngineSwitchError(null);
+    if (engineId === activeEngine) return;
+    const isReady = engineReadiness[engineId] ?? false;
+    if (!isReady) {
+      setDownloadingEngine(engineId);
+      try {
+        await window.ironmic.downloadTranscriptionEngine(engineId);
+        setEngineReadiness((prev) => ({ ...prev, [engineId]: true }));
+      } catch (err: any) {
+        console.error('[InputSettings] Engine download failed:', err);
+        setEngineSwitchError(`Download failed: ${err?.message ?? String(err)}`);
+        setDownloadingEngine(null);
+        return;
+      }
+      setDownloadingEngine(null);
+    }
+    try {
+      await window.ironmic.setSetting('transcription_engine', engineId);
+      setActiveEngine(engineId);
+    } catch (err: any) {
+      console.error('[InputSettings] Engine switch failed:', err);
+      setEngineSwitchError(`Switch failed: ${err?.message ?? String(err)}`);
+    }
+  }, [activeEngine, engineReadiness]);
 
   async function loadDeviceInfo() {
     setRefreshing(true);
@@ -466,6 +527,79 @@ export function InputSettings() {
               <p className="text-[11px] text-red-400 flex items-center gap-1.5">
                 <AlertTriangle className="w-3 h-3" />
                 {testPlaybackError}
+              </p>
+            )}
+          </div>
+        </div>
+      </Card>
+
+      {/* Transcription Engine — Phase 1 multi-engine selector */}
+      <Card variant="default" padding="md">
+        <div className="flex items-start gap-2.5">
+          <Cpu className="w-4 h-4 text-iron-accent flex-shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-medium text-iron-text">Transcription Engine</p>
+            <p className="text-xs text-iron-text-muted mt-0.5 leading-relaxed mb-3">
+              Speech-to-text backend. Moonshine is purpose-built for fast on-device dictation
+              (English only, no GPU/BLAS required). Whisper variants are slower but multilingual.
+            </p>
+            <div className="space-y-2">
+              {TRANSCRIPTION_ENGINES.map((meta) => {
+                const isActive = activeEngine === meta.id;
+                const isReady = engineReadiness[meta.id] ?? false;
+                const isDownloading = downloadingEngine === meta.id;
+                return (
+                  <button
+                    key={meta.id}
+                    type="button"
+                    disabled={isDownloading}
+                    onClick={() => switchEngine(meta.id)}
+                    className={`w-full text-left rounded border px-3 py-2 transition-colors ${
+                      isActive
+                        ? 'border-iron-accent bg-iron-accent/10'
+                        : 'border-iron-border hover:border-iron-text-muted hover:bg-iron-surface'
+                    } ${isDownloading ? 'opacity-60 cursor-wait' : ''}`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className={`text-xs font-medium ${isActive ? 'text-iron-accent' : 'text-iron-text'}`}>
+                            {meta.label}
+                          </span>
+                          {isActive && (
+                            <Badge variant="success">Active</Badge>
+                          )}
+                          {!isReady && !isDownloading && (
+                            <Badge variant="warning">Download required</Badge>
+                          )}
+                          {isDownloading && (
+                            <span className="text-[11px] text-iron-text-muted flex items-center gap-1">
+                              <Loader2 className="w-3 h-3 animate-spin" />
+                              Downloading…
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[11px] text-iron-text-muted mt-0.5 leading-tight">
+                          {meta.description}
+                        </p>
+                        <div className="flex items-center gap-3 mt-1 text-[10px] text-iron-text-muted">
+                          <span>{meta.latencyHint}</span>
+                          <span>•</span>
+                          <span>{meta.sizeLabel}</span>
+                        </div>
+                      </div>
+                      {!isReady && !isActive && (
+                        <Download className="w-3.5 h-3.5 text-iron-text-muted flex-shrink-0" />
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+            {engineSwitchError && (
+              <p className="text-[11px] text-red-400 mt-2 flex items-center gap-1.5">
+                <AlertTriangle className="w-3 h-3" />
+                {engineSwitchError}
               </p>
             )}
           </div>

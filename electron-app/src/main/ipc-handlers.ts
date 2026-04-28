@@ -6,7 +6,7 @@
 import { ipcMain, BrowserWindow } from 'electron';
 import { IPC_CHANNELS, MODEL_FILES } from '../shared/constants';
 import { native } from './native-bridge';
-import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel } from './model-downloader';
+import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath, resolveActiveChatModel } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
@@ -64,6 +64,11 @@ const ALLOWED_SETTING_KEYS = new Set([
   // Whisper thread count override — default is min(4, num_cpus).
   // Reduce on VDI / shared machines if first-transcription hangs.
   'whisper_threads',
+  // Phase 1 engine swap: which transcription engine is active.
+  // Values: 'moonshine-tiny' | 'moonshine-base' (default) | 'whisper-base' |
+  // 'whisper-small' | 'whisper-medium' | 'whisper-large-v3-turbo'.
+  // Persisted in SQLite; read at startup before the first transcribe call.
+  'transcription_engine',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -229,7 +234,42 @@ export function registerIpcHandlers(): void {
     // The debug-log helper caches the toggle state to avoid a SQLite hit on
     // every audio chunk; invalidate when the user flips it in Settings.
     if (key === 'debug_audio_logging') invalidateDebugLogCache();
+    // When the user picks a different transcription engine, push the change
+    // to Rust immediately so the next dictate/meeting chunk uses the new
+    // engine. The model itself loads lazily on the first transcribe call.
+    if (key === 'transcription_engine') {
+      try {
+        native.setTranscriptionEngine(value);
+        debugLog('engine.swap', { kind: value });
+      } catch (err: any) {
+        debugLog('engine.swap', { kind: value, error: err?.message ?? String(err) });
+        throw err;
+      }
+    }
     return result;
+  });
+
+  // ── Transcription engine management (Phase 1) ──
+  // Renderer queries the available engines + their download status to render
+  // the dropdown in InputSettings. Returns: Array<{ kind, isActive, isLoaded, isReady }>
+  // where isReady = "all required model files are downloaded".
+  ipcMain.handle('ironmic:list-transcription-engines', () => {
+    const fromRust = native.listAvailableEngines();
+    return fromRust.map((entry) => ({
+      ...entry,
+      isReady: isTranscriptionEngineReady(entry.kind),
+    }));
+  });
+  ipcMain.handle('ironmic:get-transcription-engine', () => native.getTranscriptionEngine());
+  // Download all model files for an engine (e.g. Moonshine = encoder + decoder + tokenizer).
+  ipcMain.handle('ironmic:download-transcription-engine', async (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    const window = BrowserWindow.getFocusedWindow();
+    return downloadTranscriptionEngine(engineId, window);
+  });
+  ipcMain.handle('ironmic:is-transcription-engine-ready', (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    return isTranscriptionEngineReady(engineId);
   });
 
   // Clipboard

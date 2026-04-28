@@ -18,6 +18,16 @@ metal = ["whisper", "whisper-rs/metal"]
 llm = ["dep:llama-cpp-2"]
 llm-bin = ["dep:llama-cpp-2"]
 tts = ["dep:ort", "dep:ndarray"]
+# engine-multi: Moonshine ONNX backend via transcribe-rs.
+# Adds the alternative transcription engine that runs on ONNX Runtime's
+# MLAS / DirectML kernels — no BLAS dependency, ~16x faster than whisper.cpp
+# on a Windows VDI without GPU acceleration. transcribe-rs's "onnx" feature
+# pulls in the same `ort = "=2.0.0-rc.12"` and `ndarray = "0.17"` we already
+# use for the Kokoro TTS pipeline, so there is no version conflict. We
+# deliberately omit transcribe-rs's "whisper-cpp" feature because IronMic
+# already links whisper.cpp via the existing `whisper-rs` crate; pulling
+# in a second whisper.cpp would create duplicate symbols.
+engine-multi = ["dep:transcribe-rs"]
 
 [[bin]]
 name = "ironmic-llm"
@@ -44,6 +54,7 @@ whisper-rs = { version = "0.13", optional = true }
 llama-cpp-2 = { version = "0.1", optional = true }
 ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
 ndarray = { version = "0.17", optional = true }
+transcribe-rs = { version = "0.3", features = ["onnx"], optional = true }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }

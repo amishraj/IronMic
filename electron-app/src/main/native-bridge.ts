@@ -84,6 +84,12 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     loadWhisperModel: () => {},
     getWhisperSystemInfo: () => '[stub: system info not available]',
     setWhisperNThreads: (_n: number) => {},
+    // Engine management — Moonshine + Whisper multi-engine layer
+    setTranscriptionEngine: (_kind: string) => {},
+    getTranscriptionEngine: () => 'moonshine-base',
+    listAvailableEngines: () => JSON.stringify([
+      { kind: 'moonshine-base', isActive: true, isLoaded: false },
+    ]),
     nativeFeatures: () => JSON.stringify({
       whisper: false,
       metal: false,
@@ -170,6 +176,37 @@ export const native = {
   setWhisperNThreads(n: number): void {
     if (typeof this.addon.setWhisperNThreads === 'function') {
       this.addon.setWhisperNThreads(n);
+    }
+  },
+
+  // ── Multi-engine transcription (Phase 1 redesign) ──
+  // setTranscriptionEngine swaps the active backend at runtime.
+  // The next transcribe() call lazy-loads the new model.
+  setTranscriptionEngine(kind: string): void {
+    if (typeof this.addon.setTranscriptionEngine === 'function') {
+      this.addon.setTranscriptionEngine(kind);
+    } else {
+      console.warn(
+        '[native-bridge] setTranscriptionEngine not available in this build — ' +
+          'Rust addon predates the engine-multi feature. Continuing with default Whisper engine.',
+      );
+    }
+  },
+  getTranscriptionEngine(): string {
+    if (typeof this.addon.getTranscriptionEngine === 'function') {
+      return this.addon.getTranscriptionEngine();
+    }
+    return 'moonshine-base';
+  },
+  listAvailableEngines(): Array<{ kind: string; isActive: boolean; isLoaded: boolean }> {
+    if (typeof this.addon.listAvailableEngines !== 'function') {
+      return [{ kind: 'moonshine-base', isActive: true, isLoaded: false }];
+    }
+    try {
+      return JSON.parse(this.addon.listAvailableEngines());
+    } catch (err) {
+      console.warn('[native-bridge] listAvailableEngines parse failed:', err);
+      return [];
     }
   },
   nativeFeatures(): { whisper: boolean; metal: boolean; llm: boolean; tts: boolean; platform: string; arch: string; stub?: boolean } {

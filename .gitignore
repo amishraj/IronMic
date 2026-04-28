@@ -3,6 +3,7 @@ node_modules/
 
 # Rust build artifacts
 rust-core/target/
+rust-core/target-redesign/
 
 # Electron build output
 electron-app/dist/

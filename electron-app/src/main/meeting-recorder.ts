@@ -30,12 +30,21 @@ import {
 import { audioStream } from './audio-stream-manager';
 import { debugLog } from './debug-log';
 
-/** Upper bound on how long we wait for a single Whisper transcribe call to
- *  return before moving on. If the native call hangs (happens occasionally
- *  with large models + GPU init), we drop the chunk rather than letting the
- *  whole chunk loop freeze. Picked at 35s: legitimate 15s-chunk + turbo-v3
- *  Whisper transcribe is <10s on CPU, ~2s on GPU — 35s is very generous. */
-const TRANSCRIBE_TIMEOUT_MS = 35_000;
+/** Upper bound on how long we wait for a single transcribe call to return
+ *  before moving on. If the native call hangs (rare under Moonshine ONNX,
+ *  more common with Whisper on CPU-bound VDIs), we drop the chunk rather
+ *  than letting the whole chunk loop freeze. The orphan native call may
+ *  still complete in C++; we just discard its result.
+ *
+ *  20s comfortably covers Moonshine Base on a 15s meeting chunk (~300 ms)
+ *  and Whisper Small on the same chunk (~5–15s on VDI). Whisper Medium /
+ *  Large v3 Turbo users on a slow CPU may want to lower the meeting
+ *  chunk_interval_s to 8–10s instead of bumping this back up.
+ *
+ *  Note: Moonshine is trained for ≤30s utterances. We clamp the renderer-side
+ *  meeting_chunk_interval_s to 25s when Moonshine is the active engine,
+ *  in startMeetingRecording below. */
+const TRANSCRIBE_TIMEOUT_MS = 20_000;
 
 export interface TranscriptSegment {
   id: string;
@@ -124,7 +133,33 @@ class MeetingRecorderManager {
       throw new Error('Meeting recording is already active');
     }
 
-    this.chunkIntervalMs = chunkIntervalS * 1000;
+    // Moonshine cap: the model is trained for ≤30 s utterances and produces
+    // truncated transcripts on longer chunks. If the active engine is a
+    // Moonshine variant, clamp the chunk interval to 25 s so the user gets
+    // a clear behavior (rather than mysteriously cut-off transcripts) and
+    // log a warning when the cap kicks in. Whisper engines have no such
+    // limit and use the user's full configured interval.
+    let effectiveChunkIntervalS = chunkIntervalS;
+    try {
+      const activeEngine = native.getTranscriptionEngine?.() ?? '';
+      if (activeEngine.startsWith('moonshine-') && chunkIntervalS > 25) {
+        debugLog('engine.chunk-clamp', {
+          requestedSec: chunkIntervalS,
+          clampedSec: 25,
+          engine: activeEngine,
+          reason: 'moonshine-30s-training-window',
+        });
+        console.warn(
+          `[MeetingRecorder] Moonshine engine active — clamping chunk_interval_s ` +
+            `from ${chunkIntervalS}s to 25s. Switch to a Whisper engine in ` +
+            `Settings → Audio → Transcription Engine for longer chunks.`,
+        );
+        effectiveChunkIntervalS = 25;
+      }
+    } catch {
+      // getTranscriptionEngine missing on older Rust addon — skip the clamp.
+    }
+    this.chunkIntervalMs = effectiveChunkIntervalS * 1000;
     this.segments = [];
 
     // Claim the audio stream before starting capture.

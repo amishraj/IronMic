@@ -56,6 +56,12 @@ const api = {
   isGpuEnabled: () => ipcRenderer.invoke('ironmic:is-gpu-enabled'),
   setGpuEnabled: (enabled: boolean) => ipcRenderer.invoke('ironmic:set-gpu-enabled', enabled),
 
+  // Multi-engine transcription (Phase 1) — Moonshine + Whisper selection
+  listTranscriptionEngines: () => ipcRenderer.invoke('ironmic:list-transcription-engines'),
+  getTranscriptionEngine: () => ipcRenderer.invoke('ironmic:get-transcription-engine'),
+  downloadTranscriptionEngine: (engineId: string) => ipcRenderer.invoke('ironmic:download-transcription-engine', engineId),
+  isTranscriptionEngineReady: (engineId: string) => ipcRenderer.invoke('ironmic:is-transcription-engine-ready', engineId),
+
   // TTS
   synthesizeText: (text: string) => ipcRenderer.invoke('ironmic:synthesize-text', text),
   ttsPlay: () => ipcRenderer.invoke('ironmic:tts-play'),

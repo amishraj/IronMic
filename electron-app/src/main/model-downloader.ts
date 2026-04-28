@@ -23,6 +23,7 @@ import { execSync } from 'child_process';
 import {
   MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
   MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS, TFJS_MODELS,
+  TRANSCRIPTION_ENGINES,
 } from '../shared/constants';
 
 /**
@@ -116,6 +117,45 @@ export function getModelsStatus() {
     };
   }
   return result;
+}
+
+/**
+ * Check whether all model files required by a transcription engine are present.
+ *
+ * Moonshine engines need three files (encoder + decoder + tokenizer); Whisper
+ * engines need one. Returns false on the first missing file; the UI can use
+ * this to gate the engine selector dropdown ("Download required" badge).
+ */
+export function isTranscriptionEngineReady(engineId: string): boolean {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta) return false;
+  return meta.modelFileKeys.every((key) => isModelDownloaded(key));
+}
+
+/**
+ * Download every file required by a transcription engine, sequentially.
+ *
+ * For Moonshine variants, this fetches encoder + decoder + tokenizer into
+ * `models/<engine-id>/`. Idempotent — already-downloaded files are skipped.
+ * Throws on the first failure.
+ */
+export async function downloadTranscriptionEngine(
+  engineId: string,
+  window: BrowserWindow | null,
+): Promise<void> {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta) {
+    throw new Error(`Unknown transcription engine: ${engineId}`);
+  }
+  for (const key of meta.modelFileKeys) {
+    if (isModelDownloaded(key)) {
+      console.log(`[model-downloader] ${key} already present, skipping`);
+      continue;
+    }
+    console.log(`[model-downloader] Downloading ${key} for engine '${engineId}'`);
+    await downloadModel(key, window);
+  }
+  console.log(`[model-downloader] Engine '${engineId}' fully downloaded`);
 }
 
 export function isTtsModelReady(): boolean {
@@ -606,7 +646,12 @@ export async function downloadModel(
     const expectedHash = MODEL_CHECKSUMS[model];
     const fallbackUrl = MODEL_FALLBACK_URLS[model];
 
+    // Ensure both the models root and the *parent dir of destPath* exist.
+    // The latter matters for models like Moonshine that live in a
+    // subdirectory (e.g. `moonshine-tiny/encoder_model.onnx`) — without
+    // this, createWriteStream throws ENOENT on the missing subdir.
     fs.mkdirSync(resolveModelsDir(), { recursive: true });
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
 
     console.log(`[model-downloader] Starting download: ${model}`);
     console.log(`[model-downloader] Destination: ${destPath}`);

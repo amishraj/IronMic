@@ -210,9 +210,43 @@ app.whenReady().then(async () => {
       // Load eagerly off the critical path — don't block the UI.
       void (async () => {
         try {
+          // ── Phase 1: select active transcription engine ──
+          // Read user's `transcription_engine` setting and apply it before
+          // the model loads. Default is moonshine-base on fresh installs;
+          // the Rust side will fall back to its DEFAULT_ENGINE if the
+          // setting is missing or invalid.
+          const engineSetting = native.getSetting('transcription_engine');
+          if (engineSetting) {
+            try {
+              native.setTranscriptionEngine(engineSetting);
+              console.log(`[engine] Active transcription engine: ${engineSetting}`);
+              debugLog('engine.startup', { kind: engineSetting, source: 'settings' });
+            } catch (engineErr) {
+              console.warn(
+                `[engine] setTranscriptionEngine('${engineSetting}') failed; ` +
+                  `falling back to Rust default. Error:`,
+                engineErr,
+              );
+              debugLog('engine.startup', {
+                kind: engineSetting,
+                source: 'settings',
+                error: String(engineErr),
+              });
+            }
+          } else {
+            // First launch / pre-Phase-1 install — adopt the Moonshine default.
+            try {
+              native.setTranscriptionEngine('moonshine-base');
+              native.setSetting('transcription_engine', 'moonshine-base');
+              debugLog('engine.startup', { kind: 'moonshine-base', source: 'default-migration' });
+            } catch {
+              // Older Rust addon — ignore; falls back to Whisper path.
+            }
+          }
+
           // Apply user-configured thread count before the model loads.
-          // Default is min(4, num_cpus) in Rust; users on VDI machines can
-          // reduce this to 1–2 in Settings → Audio → Whisper Threads.
+          // Only meaningful for Whisper engines; Moonshine uses ORT's intra-op
+          // pool which is governed separately. Harmless to call regardless.
           const threadsSetting = native.getSetting('whisper_threads');
           if (threadsSetting) {
             const n = parseInt(threadsSetting, 10);
@@ -221,11 +255,14 @@ app.whenReady().then(async () => {
               console.log(`[whisper] Thread count set to ${n} from settings`);
             }
           }
+          // loadWhisperModel now loads the *active* engine's model (despite
+          // the legacy name kept for backwards compatibility).
           native.loadWhisperModel();
-          console.log('[whisper] Model pre-loaded successfully');
+          console.log('[engine] Active engine model pre-loaded successfully');
           // Log CPU feature flags to DevTools so AVX/AVX512 issues are
           // visible without checking the terminal. E.g.:
           //   [ironmic:debug] whisper.sysinfo {system_info: "AVX = 1 | AVX512 = 0 | ..."}
+          // (Whisper-specific; Moonshine doesn't expose equivalent metadata.)
           try {
             const sysinfo = native.getWhisperSystemInfo();
             debugLog('whisper.sysinfo', { system_info: sysinfo });
@@ -234,7 +271,7 @@ app.whenReady().then(async () => {
           }
         } catch (err: unknown) {
           const message = err instanceof Error ? err.message : String(err);
-          console.error('[whisper] Pre-load failed:', message);
+          console.error('[engine] Pre-load failed:', message);
           sendWhisperFailure(message, false);
         }
       })();

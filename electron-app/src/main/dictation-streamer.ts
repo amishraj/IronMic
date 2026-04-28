@@ -34,12 +34,15 @@ import { debugLog } from './debug-log';
 /** Same timeout rationale as MeetingRecorder — don't let a hung Whisper call
  *  stall the 2.5s chunk loop. Dictation chunks are smaller so the timeout is
  *  tighter — 12s is well beyond legitimate transcribe time for 2.5s audio. */
-const TRANSCRIBE_TIMEOUT_MS = 12_000;
-// 60s on the first chunk — covers slow VDI machines doing pure-CPU
-// inference of large-v3-turbo without BLAS. If you still hit this
-// timeout repeatedly, switch to whisper-base or whisper-small in
-// Settings → Models. The model is the actual bottleneck on slow CPUs.
-const FIRST_TRANSCRIBE_TIMEOUT_MS = 60_000;
+const TRANSCRIBE_TIMEOUT_MS = 8_000;
+// 20s on the first chunk — covers Moonshine ONNX session warm-up (~1–3s on
+// a slow VDI) plus Whisper users on small/base models (the active engine is
+// selectable via Settings → Audio → Transcription Engine). If you hit this
+// repeatedly, you're probably on a Whisper engine on a CPU without BLAS —
+// switch to Moonshine Base, which transcribes a 2.5s clip in ~150ms even on
+// a contended VDI. Pre-Phase-1 the value was 120s for Whisper Large v3 Turbo;
+// the new default engine doesn't need that headroom.
+const FIRST_TRANSCRIBE_TIMEOUT_MS = 20_000;
 
 export interface DictationChunkEvent {
   /** Monotonically increasing index, starting at 0 for the first chunk. */

@@ -19,6 +19,7 @@ mod napi_exports {
     use crate::audio::capture::CaptureEngine;
     use crate::audio::processor;
     use crate::transcription::dictionary::Dictionary;
+    use crate::transcription::engine::{self, EngineKind};
     use crate::transcription::whisper::{SharedWhisperEngine, WhisperConfig, WhisperEngine};
 
     /// Global capture engine, protected by a mutex.
@@ -182,72 +183,64 @@ mod napi_exports {
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
-    /// Transcribe a PCM audio buffer (16kHz mono i16 little-endian) to text.
-    #[napi]
-    pub async fn transcribe(audio_buffer: Buffer) -> napi::Result<String> {
-        init_tracing();
-        info!("transcribe called from N-API");
-
-        let whisper = WHISPER_ENGINE.clone();
-
-        // Load model if not already loaded
-        if !whisper.is_loaded() {
-            whisper.load_model().map_err(napi::Error::from)?;
-        }
-
-        // Convert i16 LE bytes back to f32 samples
-        let bytes: &[u8] = &audio_buffer;
+    /// Convert little-endian i16 PCM bytes into f32 samples in [-1, 1].
+    /// Shared by `transcribe()` and `transcribe_short()`. Returns an error if
+    /// the buffer length is odd (not aligned to i16 boundary).
+    fn pcm16_to_f32(bytes: &[u8]) -> napi::Result<Vec<f32>> {
         if bytes.len() % 2 != 0 {
             return Err(napi::Error::from_reason(
                 "Audio buffer must contain 16-bit samples (even byte count)",
             ));
         }
-
         let mut samples: Vec<f32> = Vec::with_capacity(bytes.len() / 2);
         for chunk in bytes.chunks_exact(2) {
             let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
             samples.push(sample as f32 / i16::MAX as f32);
         }
+        Ok(samples)
+    }
 
-        let transcript = whisper
-            .transcribe(&samples)
+    /// Transcribe a PCM audio buffer (16kHz mono i16 little-endian) to text.
+    ///
+    /// Routes through the active transcription engine selected by
+    /// `setTranscriptionEngine()` or by the user's `transcription_engine`
+    /// setting. Defaults to Moonshine Base on a fresh install.
+    #[napi]
+    pub async fn transcribe(audio_buffer: Buffer) -> napi::Result<String> {
+        init_tracing();
+        info!("transcribe called from N-API");
+
+        let bytes: &[u8] = &audio_buffer;
+        let mut samples = pcm16_to_f32(bytes)?;
+
+        let transcript = engine::transcribe_active(&samples, /* short */ false)
             .map_err(napi::Error::from)?;
 
-        // Zero the sample buffer
+        // Zero the sample buffer (privacy guarantee — audio leaves no
+        // residual heap allocation that could be inspected later).
         samples.fill(0.0);
 
         Ok(transcript)
     }
 
     /// Transcribe a SHORT (< 5s) PCM audio buffer (16kHz mono i16 little-endian).
-    /// Forces single-segment Whisper output for the dictation streamer's 2.5s
-    /// chunk loop. **Do not call from meeting recording** (10–60s chunks).
+    ///
+    /// `short` is a hint that's only honored by the Whisper engine (forces
+    /// `single_segment=true` for the dictation streamer's 2.5s chunk loop).
+    /// Moonshine ignores it because Moonshine is already short-form-optimized.
+    ///
+    /// **Do not call from meeting recording** (10–60s chunks) when running on
+    /// Whisper — `single_segment` makes long buffers slower. Meeting recorder
+    /// uses `transcribe()` instead.
     #[napi]
     pub async fn transcribe_short(audio_buffer: Buffer) -> napi::Result<String> {
         init_tracing();
         info!("transcribeShort called from N-API");
 
-        let whisper = WHISPER_ENGINE.clone();
-
-        if !whisper.is_loaded() {
-            whisper.load_model().map_err(napi::Error::from)?;
-        }
-
         let bytes: &[u8] = &audio_buffer;
-        if bytes.len() % 2 != 0 {
-            return Err(napi::Error::from_reason(
-                "Audio buffer must contain 16-bit samples (even byte count)",
-            ));
-        }
+        let mut samples = pcm16_to_f32(bytes)?;
 
-        let mut samples: Vec<f32> = Vec::with_capacity(bytes.len() / 2);
-        for chunk in bytes.chunks_exact(2) {
-            let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-            samples.push(sample as f32 / i16::MAX as f32);
-        }
-
-        let transcript = whisper
-            .transcribe_short(&samples)
+        let transcript = engine::transcribe_active(&samples, /* short */ true)
             .map_err(napi::Error::from)?;
 
         samples.fill(0.0);
@@ -255,17 +248,68 @@ mod napi_exports {
         Ok(transcript)
     }
 
-    /// Explicitly load the active Whisper model.
+    /// Explicitly load the active transcription engine's model.
     ///
-    /// The first transcription on Windows can legitimately spend a long time
+    /// Despite the legacy name (kept for Electron compatibility), this loads
+    /// whichever engine is currently active — Moonshine, Whisper, etc. The
+    /// first transcription on Windows can legitimately spend a long time
     /// mapping a large GGML model before any inference happens. Keeping model
     /// load as a separate call lets Electron warm the model before starting the
     /// chunk loop, instead of timing out and dropping the user's first words.
+    ///
+    /// Electron should call `setTranscriptionEngine()` first if the user has
+    /// a non-default engine setting, then call this to warm it up.
     #[napi]
     pub fn load_whisper_model() -> napi::Result<()> {
         init_tracing();
-        info!("loadWhisperModel called from N-API");
-        WHISPER_ENGINE.load_model().map_err(napi::Error::from)
+        info!(
+            engine = engine::active_engine_kind().as_str(),
+            "loadWhisperModel called from N-API (loads active engine)"
+        );
+        engine::load_active_engine().map_err(napi::Error::from)
+    }
+
+    /// Switch the active transcription engine. Drops the old engine's loaded
+    /// model and constructs a fresh one. The new model loads lazily on the
+    /// next `transcribe()` call (or eagerly via `loadWhisperModel()`).
+    ///
+    /// Accepts the kind as a string matching [`EngineKind::as_str`]:
+    /// `"moonshine-tiny"`, `"moonshine-base"`, `"whisper-large-v3-turbo"`,
+    /// `"whisper-medium"`, `"whisper-small"`, `"whisper-base"`.
+    #[napi]
+    pub fn set_transcription_engine(kind: String) -> napi::Result<()> {
+        init_tracing();
+        info!(%kind, "setTranscriptionEngine called from N-API");
+        let parsed = EngineKind::from_str(&kind).ok_or_else(|| {
+            napi::Error::from_reason(format!("Unknown transcription engine kind: '{}'", kind))
+        })?;
+        engine::set_active_engine(parsed).map_err(napi::Error::from)
+    }
+
+    /// Return the currently active transcription engine kind as a string.
+    #[napi]
+    pub fn get_transcription_engine() -> String {
+        engine::active_engine_kind().as_str().to_string()
+    }
+
+    /// Return a JSON array of available engine kinds for the Settings UI.
+    /// Each entry is `{"kind": "...", "isLoaded": bool}`. The `isLoaded`
+    /// flag only reflects the *active* engine; other entries report `false`.
+    #[napi]
+    pub fn list_available_engines() -> String {
+        let active = engine::active_engine_kind();
+        let active_loaded = engine::is_active_engine_loaded();
+        let entries: Vec<serde_json::Value> = EngineKind::all()
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "kind": k.as_str(),
+                    "isActive": *k == active,
+                    "isLoaded": *k == active && active_loaded,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(entries).to_string()
     }
 
     /// Override the Whisper thread count before the model is loaded.

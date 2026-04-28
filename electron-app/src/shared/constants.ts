@@ -5,6 +5,101 @@ export const DB_NAME = 'ironmic.db';
 export const WHISPER_MODEL_NAME = 'whisper-large-v3-turbo';
 export const LLM_MODEL_NAME = 'mistral-7b-instruct-q4';
 
+/**
+ * Default transcription engine for new installs and upgrades from pre-Phase-1.
+ *
+ * Moonshine Base: ~146 MB ONNX model, ~150 ms latency per dictation chunk on
+ * a typical Windows VDI without BLAS/GPU. Beats Whisper Tiny on accuracy
+ * (6.65% vs 12.81% WER) at a fraction of Whisper Large v3 Turbo's size.
+ * English only — users needing multilingual transcription should switch to
+ * a Whisper variant in Settings → Audio → Transcription Engine.
+ */
+export const DEFAULT_TRANSCRIPTION_ENGINE = 'moonshine-base';
+
+/**
+ * Registry of supported transcription engines for the Settings UI dropdown.
+ * The `id` matches the Rust `EngineKind::as_str()` and is what gets persisted
+ * in the SQLite settings table under `transcription_engine`.
+ */
+export interface TranscriptionEngineMeta {
+  id: string;
+  label: string;
+  /** Sub-label / tagline shown under the name in the dropdown. */
+  description: string;
+  /** Approximate first-chunk latency on a slow Windows VDI without GPU. */
+  latencyHint: string;
+  sizeLabel: string;
+  /** BCP-47 language code(s). 'en' = English only. */
+  languages: string[];
+  /** Backend family — affects which other settings apply. */
+  family: 'moonshine' | 'whisper';
+  /** Model registry keys whose files must all be present to use this engine. */
+  modelFileKeys: string[];
+}
+
+export const TRANSCRIPTION_ENGINES: TranscriptionEngineMeta[] = [
+  {
+    id: 'moonshine-tiny',
+    label: 'Moonshine Tiny',
+    description: 'Fastest. Use on slow / shared / VDI machines.',
+    latencyHint: '~70 ms / chunk',
+    sizeLabel: '~52 MB',
+    languages: ['en'],
+    family: 'moonshine',
+    modelFileKeys: ['moonshine-tiny-encoder', 'moonshine-tiny-decoder', 'moonshine-tiny-tokenizer'],
+  },
+  {
+    id: 'moonshine-base',
+    label: 'Moonshine Base',
+    description: 'Balanced. Better accuracy than Whisper Tiny at 1/10th the latency. Default.',
+    latencyHint: '~150 ms / chunk',
+    sizeLabel: '~146 MB',
+    languages: ['en'],
+    family: 'moonshine',
+    modelFileKeys: ['moonshine-base-encoder', 'moonshine-base-decoder', 'moonshine-base-tokenizer'],
+  },
+  {
+    id: 'whisper-base',
+    label: 'Whisper Base (multilingual)',
+    description: 'For non-English dictation. Slower than Moonshine on machines without BLAS/GPU.',
+    latencyHint: '~3–8 s / chunk on VDI',
+    sizeLabel: '~147 MB',
+    languages: ['multilingual'],
+    family: 'whisper',
+    modelFileKeys: ['whisper-base'],
+  },
+  {
+    id: 'whisper-small',
+    label: 'Whisper Small (multilingual)',
+    description: 'Higher accuracy multilingual. Best Whisper option for non-VDI machines.',
+    latencyHint: '~5–15 s / chunk on VDI',
+    sizeLabel: '~488 MB',
+    languages: ['multilingual'],
+    family: 'whisper',
+    modelFileKeys: ['whisper-small'],
+  },
+  {
+    id: 'whisper-medium',
+    label: 'Whisper Medium (multilingual)',
+    description: 'High-accuracy multilingual. Slow on CPU.',
+    latencyHint: '~10–30 s / chunk on VDI',
+    sizeLabel: '~769 MB',
+    languages: ['multilingual'],
+    family: 'whisper',
+    modelFileKeys: ['whisper-medium'],
+  },
+  {
+    id: 'whisper-large-v3-turbo',
+    label: 'Whisper Large v3 Turbo (multilingual)',
+    description: 'Highest accuracy. Recommended only with GPU acceleration.',
+    latencyHint: '~30+ s / chunk on VDI',
+    sizeLabel: '~1.5 GB',
+    languages: ['multilingual'],
+    family: 'whisper',
+    modelFileKeys: ['whisper'],
+  },
+];
+
 export const DEFAULT_SETTINGS = {
   hotkey_record: DEFAULT_HOTKEY,
   llm_cleanup_enabled: 'true',
@@ -12,6 +107,7 @@ export const DEFAULT_SETTINGS = {
   theme: 'system',
   whisper_model: WHISPER_MODEL_NAME,
   llm_model: LLM_MODEL_NAME,
+  transcription_engine: DEFAULT_TRANSCRIPTION_ENGINE,
 } as const;
 
 export const IPC_CHANNELS = {
@@ -234,12 +330,26 @@ export const IPC_CHANNELS = {
 export const MODELS_RELEASE_TAG = 'models-v1';
 export const MODELS_BASE_URL = `https://github.com/greenpioneersolutions/IronMic/releases/download/${MODELS_RELEASE_TAG}`;
 
+// Moonshine ONNX exports — three files per variant (encoder, decoder, tokenizer).
+// Hosted at HuggingFace UsefulSensors/moonshine-{tiny,base}, mirrored to the
+// IronMic GitHub Releases under the models-v2 tag for reliability.
+const MOONSHINE_HF_TINY = 'https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/tiny';
+const MOONSHINE_HF_BASE = 'https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/base';
+
 /** Primary download URLs (GitHub Release assets) */
 export const MODEL_URLS: Record<string, string> = {
   whisper: `${MODELS_BASE_URL}/whisper-large-v3-turbo.bin`,
   'whisper-medium': `${MODELS_BASE_URL}/ggml-medium.bin`,
   'whisper-small': `${MODELS_BASE_URL}/ggml-small.bin`,
   'whisper-base': `${MODELS_BASE_URL}/ggml-base.bin`,
+  // Moonshine — primary is HuggingFace because the IronMic models-v1 release
+  // doesn't host them yet. When models-v2 ships, swap these to MODELS_BASE_URL.
+  'moonshine-tiny-encoder': `${MOONSHINE_HF_TINY}/encoder_model.onnx`,
+  'moonshine-tiny-decoder': `${MOONSHINE_HF_TINY}/decoder_model_merged.onnx`,
+  'moonshine-tiny-tokenizer': `${MOONSHINE_HF_TINY}/tokenizer.json`,
+  'moonshine-base-encoder': `${MOONSHINE_HF_BASE}/encoder_model.onnx`,
+  'moonshine-base-decoder': `${MOONSHINE_HF_BASE}/decoder_model_merged.onnx`,
+  'moonshine-base-tokenizer': `${MOONSHINE_HF_BASE}/tokenizer.json`,
   llm: `${MODELS_BASE_URL}/mistral-7b-instruct-q4_k_m.gguf`,
   'llm-chat-llama3': `${MODELS_BASE_URL}/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`,
   'llm-chat-phi3': `${MODELS_BASE_URL}/Phi-3-mini-4k-instruct-Q4_K_M.gguf`,
@@ -257,6 +367,13 @@ export const MODEL_FALLBACK_URLS: Record<string, string> = {
   'whisper-medium': 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin',
   'whisper-small': 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin',
   'whisper-base': 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
+  // Moonshine — fallback identical to primary because HuggingFace IS the canonical host.
+  'moonshine-tiny-encoder': `${MOONSHINE_HF_TINY}/encoder_model.onnx`,
+  'moonshine-tiny-decoder': `${MOONSHINE_HF_TINY}/decoder_model_merged.onnx`,
+  'moonshine-tiny-tokenizer': `${MOONSHINE_HF_TINY}/tokenizer.json`,
+  'moonshine-base-encoder': `${MOONSHINE_HF_BASE}/encoder_model.onnx`,
+  'moonshine-base-decoder': `${MOONSHINE_HF_BASE}/decoder_model_merged.onnx`,
+  'moonshine-base-tokenizer': `${MOONSHINE_HF_BASE}/tokenizer.json`,
   llm: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf',
   'llm-chat-llama3': 'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
   'llm-chat-phi3': 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf',
@@ -273,6 +390,16 @@ export const MODEL_FILES: Record<string, string> = {
   'whisper-medium': 'ggml-medium.bin',
   'whisper-small': 'ggml-small.bin',
   'whisper-base': 'ggml-base.bin',
+  // Moonshine paths use a subdirectory layout because transcribe-rs's
+  // MoonshineModel::load() expects a *directory* containing all three files.
+  // The relative-to-models-dir path includes the subdirectory so the download
+  // lands in the right place.
+  'moonshine-tiny-encoder': 'moonshine-tiny/encoder_model.onnx',
+  'moonshine-tiny-decoder': 'moonshine-tiny/decoder_model_merged.onnx',
+  'moonshine-tiny-tokenizer': 'moonshine-tiny/tokenizer.json',
+  'moonshine-base-encoder': 'moonshine-base/encoder_model.onnx',
+  'moonshine-base-decoder': 'moonshine-base/decoder_model_merged.onnx',
+  'moonshine-base-tokenizer': 'moonshine-base/tokenizer.json',
   llm: 'mistral-7b-instruct-q4_k_m.gguf',
   'llm-chat-llama3': 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
   'llm-chat-phi3': 'Phi-3-mini-4k-instruct-q4.gguf',
@@ -291,6 +418,16 @@ export const MODEL_CHECKSUMS: Record<string, string> = {
   'whisper-medium': '',
   'whisper-small': '',
   'whisper-base': '',
+  // Moonshine — checksums populated on first verified download (see model-downloader.ts).
+  // We deliberately leave these empty initially because the HuggingFace files
+  // can be re-uploaded; once we mirror them to the IronMic GitHub Release the
+  // hashes will be pinned.
+  'moonshine-tiny-encoder': '',
+  'moonshine-tiny-decoder': '',
+  'moonshine-tiny-tokenizer': '',
+  'moonshine-base-encoder': '',
+  'moonshine-base-decoder': '',
+  'moonshine-base-tokenizer': '',
   llm: '3e0039fd0273fcbebb49228943b17831aadd55cbcbf56f0af00499be2040ccf9',
   'llm-chat-llama3': '', // Will be populated when model is uploaded to GitHub Releases
   'llm-chat-phi3': '', // Will be populated when model is uploaded to GitHub Releases

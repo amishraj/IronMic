@@ -51,6 +51,11 @@ declare global {
       isGpuAvailable: () => Promise<boolean>;
       isGpuEnabled: () => Promise<boolean>;
       setGpuEnabled: (enabled: boolean) => Promise<void>;
+      // Multi-engine transcription (Phase 1) — Moonshine + Whisper
+      listTranscriptionEngines: () => Promise<Array<{ kind: string; isActive: boolean; isLoaded: boolean; isReady: boolean }>>;
+      getTranscriptionEngine: () => Promise<string>;
+      downloadTranscriptionEngine: (engineId: string) => Promise<void>;
+      isTranscriptionEngineReady: (engineId: string) => Promise<boolean>;
       // TTS
       synthesizeText: (text: string) => Promise<string>;
       ttsPlay: () => Promise<void>;
