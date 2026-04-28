@@ -116,7 +116,14 @@ impl Default for WhisperConfig {
             model_path: default_model_path(),
             language: Some("en".to_string()),
             translate: false,
-            n_threads: num_cpus(),
+            // Cap at 4 threads by default. Corporate VDIs advertise many vCPUs
+            // but those cores are heavily time-shared; whisper.cpp launching
+            // more threads than ~4 causes extreme context-switch thrashing on
+            // the first inference call (which also maps the model into memory),
+            // producing multi-minute hangs on Windows that surface as
+            // "[whisper.raw] null/timeout" in the DevTools log.
+            // Users can raise this in Settings → Audio → Whisper Threads.
+            n_threads: num_cpus().min(4),
             use_gpu: false,
         }
     }
@@ -197,6 +204,14 @@ impl WhisperEngine {
         {
             self._loaded
         }
+    }
+
+    /// Override the number of CPU threads used for inference.
+    ///
+    /// Must be called BEFORE `load_model()`. Has no effect once the model is
+    /// already loaded (callers should check `is_loaded()` first).
+    pub fn set_n_threads(&mut self, n: u32) {
+        self.config.n_threads = n.max(1).min(16);
     }
 
     /// Change the active model. Unloads the current model — call load_model() after.
@@ -521,6 +536,17 @@ impl SharedWhisperEngine {
     pub fn remove_dictionary_word(&self, word: &str) -> bool {
         let engine = self.inner.lock().unwrap();
         engine.dictionary().remove_word(word)
+    }
+
+    /// Override thread count before loading the model.
+    ///
+    /// No-op if the engine is already loaded. Call this from Electron before
+    /// `loadWhisperModel()` to apply a user-configured `whisper_threads` setting.
+    pub fn set_n_threads(&self, n: u32) {
+        let mut engine = self.inner.lock().unwrap();
+        if !engine.is_loaded() {
+            engine.set_n_threads(n);
+        }
     }
 
     pub fn model_path(&self) -> PathBuf {

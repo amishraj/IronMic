@@ -35,7 +35,7 @@ import { debugLog } from './debug-log';
  *  stall the 2.5s chunk loop. Dictation chunks are smaller so the timeout is
  *  tighter — 12s is well beyond legitimate transcribe time for 2.5s audio. */
 const TRANSCRIBE_TIMEOUT_MS = 12_000;
-const FIRST_TRANSCRIBE_TIMEOUT_MS = 120_000;
+const FIRST_TRANSCRIBE_TIMEOUT_MS = 30_000;
 
 export interface DictationChunkEvent {
   /** Monotonically increasing index, starting at 0 for the first chunk. */

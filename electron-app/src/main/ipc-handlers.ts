@@ -61,6 +61,9 @@ const ALLOWED_SETTING_KEYS = new Set([
   'notebooks',
   // Debug toggle for the audio pipeline log channel (renderer DevTools)
   'debug_audio_logging',
+  // Whisper thread count override — default is min(4, num_cpus).
+  // Reduce on VDI / shared machines if first-transcription hangs.
+  'whisper_threads',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {

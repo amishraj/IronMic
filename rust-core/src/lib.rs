@@ -268,6 +268,37 @@ mod napi_exports {
         WHISPER_ENGINE.load_model().map_err(napi::Error::from)
     }
 
+    /// Override the Whisper thread count before the model is loaded.
+    ///
+    /// Call this from Electron *before* `loadWhisperModel()` to apply a
+    /// user-configured `whisper_threads` setting. No-op if the model is
+    /// already loaded (takes effect on next app start in that case).
+    #[napi]
+    pub fn set_whisper_n_threads(n: u32) -> napi::Result<()> {
+        init_tracing();
+        info!(n, "setWhisperNThreads called from N-API");
+        WHISPER_ENGINE.set_n_threads(n);
+        Ok(())
+    }
+
+    /// Return the whisper.cpp system info string (CPU features, backend).
+    ///
+    /// Electron calls this at startup and logs it via `debugLog('whisper.sysinfo')`
+    /// so AVX / AVX-512 issues are visible in the renderer DevTools console without
+    /// requiring terminal access. Example output:
+    ///   "AVX = 1 | AVX2 = 1 | AVX512 = 0 | F16C = 1 | FP16_VA = 0 | ..."
+    #[napi]
+    pub fn get_whisper_system_info() -> String {
+        #[cfg(feature = "whisper")]
+        {
+            whisper_rs::print_system_info().to_string()
+        }
+        #[cfg(not(feature = "whisper"))]
+        {
+            "whisper feature not compiled".to_string()
+        }
+    }
+
     /// Compile-time feature flags of this addon.  Electron reads this at
     /// startup so a stub binary (e.g. Whisper omitted from the Cargo features)
     /// can be detected before the user attempts to dictate.
