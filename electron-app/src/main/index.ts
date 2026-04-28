@@ -7,7 +7,12 @@ import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
 import { debugLog } from './debug-log';
 import { createTray, destroyTray, updateTrayState } from './tray';
-import { ensureBundledVoices, ensureBundledTFJSModels } from './model-downloader';
+import {
+  ensureBundledVoices,
+  ensureBundledTFJSModels,
+  isTranscriptionEngineReady,
+  downloadTranscriptionEngine,
+} from './model-downloader';
 import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
 import { meetingRecorder } from './meeting-recorder';
 import { initShellEnv } from './utils/shell-env';
@@ -242,6 +247,48 @@ app.whenReady().then(async () => {
             } catch {
               // Older Rust addon — ignore; falls back to Whisper path.
             }
+          }
+
+          // Background-fetch Moonshine-base on first launch so the default
+          // engine is actually usable. Without this, fresh installs show
+          // "Download" on Moonshine and can't switch to it via the UI on
+          // a flaky network. We try once per install (tracked via setting)
+          // and never overwrite a user's explicit engine choice.
+          try {
+            const attempted = native.getSetting('moonshine_autodownload_attempted');
+            if (attempted !== 'true' && !isTranscriptionEngineReady('moonshine-base')) {
+              const wasUnset = !engineSetting;
+              void (async () => {
+                try {
+                  console.log('[engine] Auto-downloading Moonshine base in background…');
+                  await downloadTranscriptionEngine('moonshine-base', mainWindow);
+                  native.setSetting('moonshine_autodownload_attempted', 'true');
+                  // Promote Moonshine to active only if the user hasn't
+                  // explicitly chosen another engine. Existing whisper-*
+                  // selections are preserved — user can click "Switch" in
+                  // Settings → Speech Recognition Model now that the files
+                  // are on disk.
+                  if (wasUnset) {
+                    try {
+                      native.setTranscriptionEngine('moonshine-base');
+                      native.setSetting('transcription_engine', 'moonshine-base');
+                      debugLog('engine.startup', {
+                        kind: 'moonshine-base',
+                        source: 'auto-download-promote',
+                      });
+                    } catch (promoteErr) {
+                      console.warn('[engine] Promote to moonshine-base after auto-download failed:', promoteErr);
+                    }
+                  }
+                  console.log('[engine] Moonshine base ready.');
+                } catch (dlErr) {
+                  // Don't mark attempted=true on failure — retry next launch.
+                  console.warn('[engine] Moonshine auto-download failed (will retry next launch):', dlErr);
+                }
+              })();
+            }
+          } catch (autoErr) {
+            console.warn('[engine] Moonshine auto-download bootstrap failed:', autoErr);
           }
 
           // Apply user-configured thread count before the model loads.

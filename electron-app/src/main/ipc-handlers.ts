@@ -145,40 +145,48 @@ export function registerIpcHandlers(): void {
     }
   });
   ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, async (_e, rawText: string) => {
-    // Route through the actual LLM subprocess when available.
-    // Rust's polish_text() is a stub (returns input unchanged) because
-    // llama.cpp inference lives in the separate ironmic-llm binary to
-    // avoid ggml symbol collisions with whisper.cpp.
-    if (llmSubprocess.isAvailable()) {
-      // Honor user's configured LLM from settings (ai_local_model / ai_model);
-      // fall back to first downloaded if nothing is set.
-      const resolved = resolveActiveChatModel(native);
-      if (resolved) {
-        try {
-          // Hard timeout: 5 minutes per LLM call. Without this, a hung subprocess
-          // causes note generation to block indefinitely (e.g. after app restart
-          // or if the ironmic-llm binary stalls mid-inference).
-          const LLM_TIMEOUT_MS = 5 * 60 * 1000;
-          const timeoutPromise = new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error(`LLM call timed out after ${LLM_TIMEOUT_MS / 1000}s`)), LLM_TIMEOUT_MS)
-          );
-          return await Promise.race([
-            llmSubprocess.chatComplete({
-              modelPath: resolved.modelPath,
-              modelType: resolved.modelType,
-              messages: [{ role: 'user', content: rawText }],
-              maxTokens: 2048,
-              temperature: 0.3,
-            }),
-            timeoutPromise,
-          ]);
-        } catch (err) {
-          console.error('[polishText] LLM subprocess error, falling back to stub:', err);
-        }
-      }
+    // llama.cpp inference lives in the separate ironmic-llm binary to avoid
+    // ggml symbol collisions with whisper.cpp. The N-API addon's polishText
+    // is a no-op stub.
+    //
+    // Three states the user can be in:
+    //   1. No chat model downloaded         → no LLM at all, return input
+    //                                          unchanged (caller treats this
+    //                                          as "already clean").
+    //   2. Chat model present + binary present → run the subprocess.
+    //   3. Chat model present + binary missing → throw a clear error so the
+    //                                          UI shows what's wrong instead
+    //                                          of silently returning a stub.
+    const resolved = resolveActiveChatModel(native);
+    if (!resolved) {
+      // State 1: user hasn't set up local LLM at all.
+      return native.polishText(rawText);
     }
-    // Fallback: return unchanged (stub)
-    return native.polishText(rawText);
+    if (!llmSubprocess.isAvailable()) {
+      // State 3: model is downloaded so the user *expects* polish to work,
+      // but the binary isn't built. Surface the real error to the renderer
+      // — the UI will show a toast with this message.
+      throw new Error(
+        'Local LLM binary (ironmic-llm) is missing. Rebuild with: ' +
+          'cargo build --release --bin ironmic-llm --features llm-bin',
+      );
+    }
+    // State 2: run the subprocess with a hard timeout so a hung process
+    // doesn't block indefinitely.
+    const LLM_TIMEOUT_MS = 5 * 60 * 1000;
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error(`LLM call timed out after ${LLM_TIMEOUT_MS / 1000}s`)), LLM_TIMEOUT_MS),
+    );
+    return await Promise.race([
+      llmSubprocess.chatComplete({
+        modelPath: resolved.modelPath,
+        modelType: resolved.modelType,
+        messages: [{ role: 'user', content: rawText }],
+        maxTokens: 2048,
+        temperature: 0.3,
+      }),
+      timeoutPromise,
+    ]);
   });
 
   // ── Processing state tracking (for quit-confirmation) ──

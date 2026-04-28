@@ -106,18 +106,24 @@ export function ModelManager() {
     } catch (err) { console.error('Failed to check GPU enabled:', err); }
 
     // Unified engine state — the active backend across Moonshine + Whisper.
+    // Readiness must match what the import section shows ("Ready" vs not).
+    // We can't trust listTranscriptionEngines for this: older Rust addons may
+    // not expose every kind, and the renderer's `find` would silently default
+    // missing kinds to `false`. Probe each engine directly against disk.
     try {
-      const [active, list] = await Promise.all([
-        window.ironmic.getTranscriptionEngine(),
-        window.ironmic.listTranscriptionEngines(),
-      ]);
+      const active = await window.ironmic.getTranscriptionEngine();
       setActiveEngine(active);
-      const readiness: Record<string, boolean> = {};
-      for (const meta of TRANSCRIPTION_ENGINES) {
-        const found = list.find((e) => e.kind === meta.id);
-        readiness[meta.id] = found?.isReady ?? false;
-      }
-      setEngineReadiness(readiness);
+      const checks = await Promise.all(
+        TRANSCRIPTION_ENGINES.map(async (meta) => {
+          try {
+            const ready = await window.ironmic.isTranscriptionEngineReady(meta.id);
+            return [meta.id, ready] as const;
+          } catch {
+            return [meta.id, false] as const;
+          }
+        }),
+      );
+      setEngineReadiness(Object.fromEntries(checks));
     } catch (err) {
       console.warn('[ModelManager] Failed to load transcription engines:', err);
     }
@@ -143,12 +149,19 @@ export function ModelManager() {
       });
       return;
     }
-    const isReady = engineReadiness[engineId] ?? false;
+    // Always do a live disk check rather than trusting the cached map.
+    // The cached map can be stale on first load (e.g. models were previously
+    // imported via another code path and the list IPC returned wrong data).
+    let isReady = false;
+    try {
+      isReady = await window.ironmic.isTranscriptionEngineReady(engineId);
+    } catch {
+      isReady = engineReadiness[engineId] ?? false;
+    }
     if (!isReady) {
       setDownloadingEngine(engineId);
       try {
         await window.ironmic.downloadTranscriptionEngine(engineId);
-        setEngineReadiness((prev) => ({ ...prev, [engineId]: true }));
       } catch (err: any) {
         console.error('[ModelManager] Engine download failed:', err);
         setEngineError(ipcErrorMessage(err, 'Engine download failed'));
@@ -165,6 +178,8 @@ export function ModelManager() {
         const id = engineId === 'whisper-large-v3-turbo' ? 'large-v3-turbo' : engineId.replace('whisper-', '');
         setCurrentModel(id);
       }
+      // Refresh from disk so every other row shows current truth.
+      loadState();
     } catch (err: any) {
       console.error('[ModelManager] Engine switch failed:', err);
       setEngineError(ipcErrorMessage(err, 'Engine switch failed'));
@@ -339,18 +354,6 @@ export function ModelManager() {
   );
 }
 
-/**
- * Unified Speech Recognition Model picker — Phase 1 redesign.
- *
- * Shows all transcription engines (Moonshine + Whisper) in two grouped
- * sections. The active engine appears at the top with a "Currently Using"
- * header. Default (Moonshine Base) gets a "Default ★" badge so first-time
- * users know what to expect.
- *
- * Whisper engines have an explicit warning about CPU latency on machines
- * without GPU/BLAS acceleration — addressing the original Windows VDI bug
- * that triggered this whole redesign.
- */
 function SpeechRecognitionModelSection({
   activeEngine,
   engineReadiness,
@@ -373,22 +376,19 @@ function SpeechRecognitionModelSection({
   const activeMeta = TRANSCRIPTION_ENGINES.find((e) => e.id === activeEngine);
 
   return (
-    <div className="space-y-3">
+    <div className="space-y-2">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Mic className="w-4 h-4 text-iron-accent-light" />
-          <p className="text-sm font-semibold text-iron-text">Speech Recognition Model</p>
-        </div>
+        <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
+          Speech Recognition Model
+        </p>
         {activeMeta && (
           <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
-            Currently using: {activeMeta.label}
+            {activeMeta.label} — Active
           </span>
         )}
       </div>
-
-      <p className="text-xs text-iron-text-muted leading-relaxed">
-        The model that turns your speech into text. Used for both dictation and meeting transcription.
-        Moonshine is faster on machines without a GPU; Whisper handles non-English audio.
+      <p className="text-xs text-iron-text-muted">
+        The engine that turns your voice into text. Used for dictation and meeting transcription.
       </p>
 
       {engineError && (
@@ -398,61 +398,44 @@ function SpeechRecognitionModelSection({
         </div>
       )}
 
-      {/* ── Moonshine group (recommended) ── */}
-      <div className="space-y-2">
-        <div className="flex items-center gap-2 mt-3">
-          <Zap className="w-3.5 h-3.5 text-iron-accent" />
-          <p className="text-[11px] font-semibold text-iron-text uppercase tracking-wider">
-            Moonshine — Fast, English only
-          </p>
-        </div>
-        <p className="text-[11px] text-iron-text-muted leading-relaxed">
-          ONNX-based. Designed for short-form dictation. Runs at ~150 ms per chunk on a typical CPU
-          with no GPU or BLAS dependency — no VDI hangs.
+      {/* Moonshine group */}
+      <div className="flex items-center gap-2 pt-1">
+        <Zap className="w-3 h-3 text-iron-accent" />
+        <p className="text-[11px] font-medium text-iron-text-muted">
+          Moonshine — fast, English only. No GPU required.
         </p>
-        {moonshineEngines.map((meta) => (
-          <EngineRow
-            key={meta.id}
-            meta={meta}
-            isActive={meta.id === activeEngine}
-            isReady={engineReadiness[meta.id] ?? false}
-            isDownloading={downloadingEngine === meta.id}
-            isDefault={meta.id === DEFAULT_TRANSCRIPTION_ENGINE}
-            onClick={() => onSwitch(meta.id)}
-          />
-        ))}
       </div>
+      {moonshineEngines.map((meta) => (
+        <EngineRow
+          key={meta.id}
+          meta={meta}
+          isActive={meta.id === activeEngine}
+          isReady={engineReadiness[meta.id] ?? false}
+          isDownloading={downloadingEngine === meta.id}
+          isDefault={meta.id === DEFAULT_TRANSCRIPTION_ENGINE}
+          onClick={() => onSwitch(meta.id)}
+        />
+      ))}
 
-      {/* ── Whisper group (multilingual fallback) ── */}
-      <div className="space-y-2">
-        <div className="flex items-center gap-2 mt-3">
-          <Globe className="w-3.5 h-3.5 text-iron-text-muted" />
-          <p className="text-[11px] font-semibold text-iron-text uppercase tracking-wider">
-            Whisper — Multilingual, slower on CPU
-          </p>
-        </div>
-        <div className="flex items-start gap-2 text-[11px] text-iron-warning bg-iron-warning/10 border border-iron-warning/20 px-2.5 py-1.5 rounded-lg leading-relaxed">
-          <AlertCircle className="w-3 h-3 flex-shrink-0 mt-0.5" />
-          <p>
-            <strong>Latency warning:</strong> Whisper is significantly slower than Moonshine on machines
-            without GPU acceleration or BLAS. Expect 3–30 seconds per chunk on a Windows VDI. Choose only
-            if you need a language Moonshine doesn't support, or have a GPU.
-          </p>
-        </div>
-        {whisperEngines.map((meta) => (
-          <EngineRow
-            key={meta.id}
-            meta={meta}
-            isActive={meta.id === activeEngine}
-            isReady={engineReadiness[meta.id] ?? false}
-            isDownloading={downloadingEngine === meta.id}
-            isDefault={false}
-            onClick={() => onSwitch(meta.id)}
-          />
-        ))}
+      {/* Whisper group */}
+      <div className="flex items-center gap-2 pt-2">
+        <Globe className="w-3 h-3 text-iron-text-muted" />
+        <p className="text-[11px] font-medium text-iron-text-muted">
+          Whisper — multilingual. Slower on CPU without GPU/BLAS.
+        </p>
       </div>
+      {whisperEngines.map((meta) => (
+        <EngineRow
+          key={meta.id}
+          meta={meta}
+          isActive={meta.id === activeEngine}
+          isReady={engineReadiness[meta.id] ?? false}
+          isDownloading={downloadingEngine === meta.id}
+          isDefault={false}
+          onClick={() => onSwitch(meta.id)}
+        />
+      ))}
 
-      {/* Manual import — covers both Whisper and Moonshine when set up */}
       <ModelImportSection
         sectionLabel="Speech Recognition"
         filter="whisper"
@@ -463,7 +446,6 @@ function SpeechRecognitionModelSection({
   );
 }
 
-/** Single row in the unified Speech Recognition Model picker. */
 function EngineRow({
   meta,
   isActive,
@@ -479,65 +461,39 @@ function EngineRow({
   isDefault: boolean;
   onClick: () => void;
 }) {
-  const clickable = !isActive && !isDownloading;
   return (
-    <div
-      onClick={clickable ? onClick : undefined}
-      className={`relative p-3 rounded-xl border transition-all duration-150 ${
-        isActive
-          ? 'border-iron-accent/40 bg-iron-accent/5 shadow-glow'
-          : isReady
-          ? 'border-iron-border hover:border-iron-border-hover cursor-pointer'
-          : 'border-dashed border-iron-border hover:border-iron-border-hover cursor-pointer'
-      } ${isDownloading ? 'opacity-70 cursor-wait' : ''}`}
-    >
-      <div className="flex items-start justify-between gap-3">
+    <Card variant="default" padding="md">
+      <div className="flex items-start justify-between">
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-1.5 flex-wrap">
+          <div className="flex items-center gap-2 flex-wrap">
             <p className="text-sm font-medium text-iron-text">{meta.label}</p>
-            {isActive && <Badge variant="accent">Active</Badge>}
+            <span className="text-[10px] text-iron-text-muted">{meta.sizeLabel}</span>
             {isDefault && !isActive && (
-              <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-iron-success/10 text-iron-success border border-iron-success/20">
+              <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-iron-surface-active text-iron-text-secondary">
                 <Star className="w-2.5 h-2.5" />
                 Default
               </span>
             )}
           </div>
-          <p className="text-xs text-iron-text-muted mt-0.5 leading-tight">{meta.description}</p>
-          <div className="flex items-center gap-3 mt-2 text-[11px] text-iron-text-muted">
-            <span className="flex items-center gap-1">
-              <Gauge className="w-3 h-3" />
-              {meta.latencyHint}
-            </span>
-            <span>{meta.sizeLabel}</span>
-            <span>{meta.languages[0] === 'multilingual' ? '99 languages' : 'English'}</span>
-          </div>
+          <p className="text-xs text-iron-text-muted mt-0.5">
+            {meta.description} · {meta.latencyHint} · {meta.languages[0] === 'multilingual' ? '99 languages' : 'English only'}
+          </p>
         </div>
-
-        <div className="ml-2 flex-shrink-0">
+        <div className="ml-3 flex-shrink-0">
           {isActive ? (
-            <Check className="w-4 h-4 text-iron-accent-light" />
+            <Badge variant="success">Active</Badge>
           ) : isDownloading ? (
             <Loader2 className="w-4 h-4 animate-spin text-iron-accent" />
           ) : isReady ? (
-            <Button
-              size="sm"
-              onClick={(e) => { e.stopPropagation(); onClick(); }}
-            >
-              Switch
-            </Button>
+            <Button size="sm" onClick={onClick}>Switch</Button>
           ) : (
-            <Button
-              size="sm"
-              icon={<Download className="w-3 h-3" />}
-              onClick={(e) => { e.stopPropagation(); onClick(); }}
-            >
+            <Button size="sm" icon={<Download className="w-3 h-3" />} onClick={onClick}>
               Download
             </Button>
           )}
         </div>
       </div>
-    </div>
+    </Card>
   );
 }
 

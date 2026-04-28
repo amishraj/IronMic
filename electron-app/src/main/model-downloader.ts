@@ -147,15 +147,29 @@ export async function downloadTranscriptionEngine(
   if (!meta) {
     throw new Error(`Unknown transcription engine: ${engineId}`);
   }
+  let anyDownloaded = false;
   for (const key of meta.modelFileKeys) {
     if (isModelDownloaded(key)) {
       console.log(`[model-downloader] ${key} already present, skipping`);
       continue;
     }
+    anyDownloaded = true;
     console.log(`[model-downloader] Downloading ${key} for engine '${engineId}'`);
     await downloadModel(key, window);
   }
   console.log(`[model-downloader] Engine '${engineId}' fully downloaded`);
+  // If all files were already present (no actual download happened), the
+  // per-file progress events were never sent — so send a synthetic 'complete'
+  // now so the renderer's progress listener fires and refreshes model state.
+  if (!anyDownloaded && window && !window.isDestroyed()) {
+    window.webContents.send('ironmic:model-download-progress', {
+      model: engineId,
+      downloaded: 1,
+      total: 1,
+      status: 'complete',
+      percent: 100,
+    });
+  }
 }
 
 export function isTtsModelReady(): boolean {
