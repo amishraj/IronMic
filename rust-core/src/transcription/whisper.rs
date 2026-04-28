@@ -116,14 +116,16 @@ impl Default for WhisperConfig {
             model_path: default_model_path(),
             language: Some("en".to_string()),
             translate: false,
-            // Cap at 4 threads by default. Corporate VDIs advertise many vCPUs
+            // Cap at 2 threads by default. Corporate VDIs advertise many vCPUs
             // but those cores are heavily time-shared; whisper.cpp launching
-            // more threads than ~4 causes extreme context-switch thrashing on
+            // more threads than ~2 causes extreme context-switch thrashing on
             // the first inference call (which also maps the model into memory),
             // producing multi-minute hangs on Windows that surface as
-            // "[whisper.raw] null/timeout" in the DevTools log.
-            // Users can raise this in Settings → Audio → Whisper Threads.
-            n_threads: num_cpus().min(4),
+            // "[whisper.raw] null/timeout" in the DevTools log. On a real
+            // desktop CPU users can raise this in Settings → Audio → Whisper
+            // Threads (up to 16). The default is intentionally conservative
+            // because too-many-threads hurts; too-few-threads is just slow.
+            n_threads: num_cpus().min(2),
             use_gpu: false,
         }
     }

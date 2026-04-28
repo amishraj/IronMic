@@ -38,8 +38,9 @@ export function InputSettings() {
   const animFrameRef = useRef<number | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
-  // Whisper thread count
-  const [whisperThreads, setWhisperThreads] = useState<number>(4);
+  // Whisper thread count — default 2 matches the Rust default cap.
+  // VDI / corporate machines should keep this low; desktop CPUs can raise it.
+  const [whisperThreads, setWhisperThreads] = useState<number>(2);
 
   // Test recording
   const [testRecording, setTestRecording] = useState(false);
@@ -477,8 +478,9 @@ export function InputSettings() {
           <div className="min-w-0">
             <p className="text-sm font-medium text-iron-text">Whisper Threads</p>
             <p className="text-xs text-iron-text-muted mt-0.5 leading-relaxed">
-              Number of CPU threads for speech recognition (1–16). Default 4 works for most machines.
-              Reduce to 1–2 on corporate VDIs or shared machines if dictation hangs on the first use.
+              Number of CPU threads for speech recognition (1–16). Default 2 is safe for VDI and shared machines.
+              Raise to 4–8 on dedicated desktop CPUs for faster transcription. If dictation still times out,
+              switch to a smaller model in Settings → Models.
             </p>
           </div>
           <input

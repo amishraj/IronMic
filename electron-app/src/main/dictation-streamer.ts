@@ -35,7 +35,11 @@ import { debugLog } from './debug-log';
  *  stall the 2.5s chunk loop. Dictation chunks are smaller so the timeout is
  *  tighter — 12s is well beyond legitimate transcribe time for 2.5s audio. */
 const TRANSCRIBE_TIMEOUT_MS = 12_000;
-const FIRST_TRANSCRIBE_TIMEOUT_MS = 30_000;
+// 60s on the first chunk — covers slow VDI machines doing pure-CPU
+// inference of large-v3-turbo without BLAS. If you still hit this
+// timeout repeatedly, switch to whisper-base or whisper-small in
+// Settings → Models. The model is the actual bottleneck on slow CPUs.
+const FIRST_TRANSCRIBE_TIMEOUT_MS = 60_000;
 
 export interface DictationChunkEvent {
   /** Monotonically increasing index, starting at 0 for the first chunk. */
@@ -201,13 +205,17 @@ class DictationStreamer {
 
       // Timeout-guarded transcribe so a hung Whisper call can't freeze the
       // 2.5s chunk loop. On timeout we drop the chunk and carry on.
-      // Prefer transcribe_short (forces single-segment) when the rebuilt addon
-      // exposes it; older addons fall back to plain transcribe.
-      const transcribeFn = typeof native.addon.transcribeShort === 'function'
-        ? native.addon.transcribeShort
-        : native.addon.transcribe;
+      //
+      // transcribe_short forces single_segment=true, which is correct for
+      // streaming 2.5s chunks but WRONG for the final flush at stop time —
+      // that buffer can be 10–30s of remaining audio, and forcing one giant
+      // segment makes Whisper much slower (and on slow CPUs, hits the
+      // timeout). Final chunks must use plain transcribe(), which lets
+      // whisper.cpp internally chunk the audio.
+      const useShort = !isFinal && typeof native.addon.transcribeShort === 'function';
+      const transcribeFn = useShort ? native.addon.transcribeShort : native.addon.transcribe;
       const whisperStart = Date.now();
-      debugLog('whisper.in', { chunkIndex: this.chunkIndex, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000, short: transcribeFn === native.addon.transcribeShort });
+      debugLog('whisper.in', { chunkIndex: this.chunkIndex, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000, short: useShort, isFinal });
       let rawText: string | null = null;
       try {
         rawText = await transcribeWithTimeout(
