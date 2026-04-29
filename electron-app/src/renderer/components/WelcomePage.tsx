@@ -81,9 +81,9 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
           required: false,
         },
         llm: {
-          downloaded: files.llm?.downloaded || false,
-          sizeLabel: '~4.4 GB',
-          name: 'Mistral 7B Instruct',
+          downloaded: files['llm-chat-phi3']?.downloaded || files.llm?.downloaded || false,
+          sizeLabel: '~2.2 GB',
+          name: 'Phi-3 Mini',
           purpose: 'Text Cleanup',
           required: false,
         },
@@ -390,18 +390,17 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
             <div className="space-y-3">
               <ModelCard
                 name="Whisper large-v3-turbo"
-                purpose="Speech Recognition — converts your voice to text"
+                purpose="Optional multilingual speech recognition"
                 size="~1.5 GB"
                 downloaded={models.whisper?.downloaded || false}
-                detail="This is the core engine. Without it, dictation won't work. It's OpenAI's most accurate speech recognition model, running locally via whisper.cpp."
-                required
+                detail="Moonshine Base is bundled for default English dictation. Whisper is optional for multilingual coverage and higher accuracy on GPU-capable machines."
               />
               <ModelCard
-                name="Mistral 7B Instruct (Q4)"
+                name="Phi-3 Mini Q4"
                 purpose="Text Cleanup — polishes raw transcriptions"
-                size="~4.4 GB"
+                size="~2.2 GB"
                 downloaded={models.llm?.downloaded || false}
-                detail="Removes filler words (um, uh, like), fixes grammar, and cleans up your speech into polished text. Recommended if you have 16+ GB RAM."
+                detail="Removes filler words (um, uh, like), fixes grammar, and cleans up your speech into polished text. Bundled in enterprise baseline builds."
               />
               <ModelCard
                 name="Kokoro 82M (TTS)"

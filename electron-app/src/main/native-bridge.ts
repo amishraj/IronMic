@@ -79,7 +79,7 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     resetPipelineState: () => {},
     getModelStatus: () => ({
       whisper: { loaded: false, name: 'whisper-large-v3-turbo', sizeBytes: 0 },
-      llm: { loaded: false, name: 'mistral-7b-instruct-q4', sizeBytes: 0 },
+      llm: { loaded: false, name: 'phi-3-mini-q4', sizeBytes: 0 },
     }),
     loadWhisperModel: () => {},
     getWhisperSystemInfo: () => '[stub: system info not available]',

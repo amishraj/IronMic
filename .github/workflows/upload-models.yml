@@ -25,6 +25,13 @@ jobs:
 
       # ── Download models from HuggingFace (one-time trusted fetch) ──
 
+      - name: Download Moonshine Base
+        run: |
+          MOONSHINE_BASE="https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/base/float"
+          curl -L --fail -o models/moonshine-base-encoder_model.onnx "${MOONSHINE_BASE}/encoder_model.onnx"
+          curl -L --fail -o models/moonshine-base-decoder_model_merged.onnx "${MOONSHINE_BASE}/decoder_model_merged.onnx"
+          curl -L --fail -o models/moonshine-base-tokenizer.json "${MOONSHINE_BASE}/tokenizer.json"
+
       - name: Download Whisper large-v3-turbo
         run: curl -L --fail -o models/whisper-large-v3-turbo.bin "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
 
@@ -170,6 +177,11 @@ jobs:
           echo "Verifying TTS model..."
           echo "ba4527a874b42b21e35f468c10d326fdff3c7fc8cac1f85e9eb6c0dfc35c334a  models/kokoro-v1.0-fp16.onnx" | sha256sum -c -
 
+          echo "Verifying Moonshine Base..."
+          echo "153e128e7abd64a74ee47f2c3f585c3171c4d46cbb368b032827934c4e01e779  models/moonshine-base-encoder_model.onnx" | sha256sum -c -
+          echo "58778763ca8438963190244d6b26572bdca2cedec56a4b91e828f3f2d69ef3c5  models/moonshine-base-decoder_model_merged.onnx" | sha256sum -c -
+          echo "ad3a2ceb0e84e4da57451d86fa337f8116dcff5f5d106434f8aa0b0de89718b9  models/moonshine-base-tokenizer.json" | sha256sum -c -
+
       - name: Compute and display all checksums
         run: |
           echo "=== All model checksums ==="
@@ -221,6 +233,9 @@ jobs:
               'whisper-medium': 'models/ggml-medium.bin',
               'whisper-small': 'models/ggml-small.bin',
               'whisper-base': 'models/ggml-base.bin',
+              'moonshine-base-encoder': 'models/moonshine-base-encoder_model.onnx',
+              'moonshine-base-decoder': 'models/moonshine-base-decoder_model_merged.onnx',
+              'moonshine-base-tokenizer': 'models/moonshine-base-tokenizer.json',
               'tts-model': 'models/kokoro-v1.0-fp16.onnx',
               'voices': 'models/voices.tar.gz',
               'tfjs-vad-silero': 'models/tfjs-vad-silero.tar.gz',
@@ -305,6 +320,9 @@ jobs:
         run: |
           gh release upload "${{ inputs.release_tag }}" --clobber \
             models/manifest.json \
+            models/moonshine-base-encoder_model.onnx \
+            models/moonshine-base-decoder_model_merged.onnx \
+            models/moonshine-base-tokenizer.json \
             models/whisper-large-v3-turbo.bin \
             models/ggml-medium.bin \
             models/ggml-small.bin \

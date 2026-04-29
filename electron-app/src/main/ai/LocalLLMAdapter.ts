@@ -8,7 +8,7 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import type { IAIAdapter, AIModel, AIProvider } from './types';
-import { CHAT_LLM_MODELS, MODEL_FILES } from '../../shared/constants';
+import { BASELINE_LOCAL_LLM_MODEL_ID, CHAT_LLM_MODELS, MODEL_FILES } from '../../shared/constants';
 import { llmSubprocess } from './LlmSubprocess';
 
 /** Resolve the models directory (same env var used by Rust core). */
@@ -63,7 +63,7 @@ export function resolveActiveChatModel(
   }
 
   // 2. Fall back to the default priority order
-  for (const id of ['llm', 'llm-chat-llama3', 'llm-chat-phi3']) {
+  for (const id of [BASELINE_LOCAL_LLM_MODEL_ID, 'llm', 'llm-chat-llama3']) {
     if (!candidates.includes(id)) candidates.push(id);
   }
 

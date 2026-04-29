@@ -45,6 +45,13 @@ module.exports = {
       to: 'models/moonshine-base/',
       filter: ['*.onnx', '*.json'],
     },
+    // Bundle Phi-3 Mini as the baseline local LLM for enterprise installs.
+    // scripts/package.sh verifies this file exists before electron-builder
+    // runs; ensureBundledPhi3Mini() copies it to userData/models on first run.
+    {
+      from: '../rust-core/models/Phi-3-mini-4k-instruct-q4.gguf',
+      to: 'models/Phi-3-mini-4k-instruct-q4.gguf',
+    },
     // TF.js ML models — tar.gz archives extracted on first launch
     {
       from: 'resources/ml-models/',

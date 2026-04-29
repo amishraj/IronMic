@@ -11,13 +11,11 @@ echo "  IronMic — Full Build Pipeline"
 echo "=========================================="
 echo ""
 
-# Step 1: Stage Moonshine Base + verify presence.
-# The default transcription engine MUST ship in the installer. We run
+# Step 1: Stage baseline models + verify presence.
+# Moonshine Base and Phi-3 Mini MUST ship in the baseline installer. We run
 # download-models.sh (idempotent — skips files already on disk) and then
-# verify each of the three required filenames exists with non-zero size.
-# Without this guarantee, electron-builder silently skips a missing
-# `extraResources` `from` directory and produces a Moonshine-less installer.
-echo "[1/4] Staging Moonshine Base for bundling..."
+# verify required files exist with non-zero size before electron-builder runs.
+echo "[1/4] Staging baseline models for bundling..."
 ./scripts/download-models.sh
 MOONSHINE_DIR="$ROOT/rust-core/models/moonshine-base"
 REQUIRED_FILES=(
@@ -39,6 +37,18 @@ for f in "${REQUIRED_FILES[@]}"; do
     fi
 done
 echo "  All 3 Moonshine Base files present in $MOONSHINE_DIR"
+PHI3_MODEL="$ROOT/rust-core/models/Phi-3-mini-4k-instruct-q4.gguf"
+if [ ! -s "$PHI3_MODEL" ]; then
+    echo ""
+    echo "ERROR: required baseline LLM is missing or empty:"
+    echo "       $PHI3_MODEL"
+    echo "       The packaged installer would ship without local cleanup/chat."
+    echo ""
+    echo "       Re-run scripts/download-models.sh or set IRONMIC_MODEL_BASE_URL"
+    echo "       to your approved internal model mirror."
+    exit 1
+fi
+echo "  Phi-3 Mini present: $PHI3_MODEL"
 echo ""
 
 # Step 2: Build Rust

@@ -30,7 +30,7 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 - **Voice-to-clipboard** — Press a global hotkey, speak, press again. Polished text lands in your clipboard, ready to paste anywhere.
 - **Voice-to-note** — Dictate directly into a rich text editor (TipTap/ProseMirror) with formatting, headings, lists, code blocks, and more.
 - **Whisper large-v3-turbo** — State-of-the-art local speech recognition with GPU acceleration (Metal on macOS).
-- **LLM text cleanup** — A local Mistral 7B model removes filler words, fixes grammar, and preserves your meaning. Toggleable per-entry.
+- **LLM text cleanup** — A bundled local Phi-3 Mini model removes filler words, fixes grammar, and preserves your meaning. Toggleable per-entry.
 - **Custom dictionary** — Add domain-specific terms, names, and jargon to improve transcription accuracy.
 
 ### Text-to-Speech Read-Back
@@ -77,8 +77,8 @@ IronMic includes 5 TensorFlow.js-powered ML features that learn from your usage 
 - **Productivity comparison** — Period-over-period metrics.
 
 ### Model Management
-- **In-app downloads** — Download Whisper, LLM, and TTS models directly from Settings.
-- **Manual model import** — If downloads are blocked by a corporate proxy, download models in your browser and import them into IronMic with a file picker. The app validates and copies them to the right location.
+- **In-app downloads** — Download optional Whisper, LLM, and TTS models directly from Settings.
+- **Manual model import** — Import model files from GitHub Releases, a browser download, or a company-approved mirror. The app validates and copies them to the right location.
 - **HTTP proxy support** — Configure a proxy in Settings > Security for corporate networks (HTTP/HTTPS/SOCKS5).
 - **Multiple Whisper sizes** — Switch between tiny, base, small, medium, and large models.
 - **GPU acceleration** — Detect and enable Metal (macOS) or CUDA for faster inference.
@@ -154,9 +154,9 @@ xattr -cr /Applications/IronMic.app
 
 Then right-click IronMic → **Open** → **Open** on first launch to confirm.
 
-The default speech recognition engine — **Moonshine Base** (~146 MB, English) — ships with the installer and is ready to use on first launch. No download required to start dictating.
+The default speech recognition engine — **Moonshine Base** (~146 MB, English) — ships with the installer and is ready to use on first launch. Enterprise baseline builds also ship with **Phi-3 Mini Q4** (~2.2 GB) for offline cleanup/chat.
 
-If you need multilingual transcription, open **Settings > Models** to download a Whisper variant (Base/Small/Medium/Large). The Text Cleanup LLM (~4.4 GB, optional) is also downloaded from there. Use the **Open folder** button on that page to see exactly where models live on disk.
+If you need multilingual transcription, open **Settings > Models** to download a Whisper variant (Base/Small/Medium/Large). Larger LLMs such as Mistral remain optional. Use the **Open folder** button on that page to see exactly where models live on disk.
 
 > Models run entirely on your machine. Nothing is sent externally.
 
@@ -196,9 +196,9 @@ npx concurrently "npx vite" "sleep 3 && npx electron ."
 
 ### Download Models
 
-The default speech recognition engine — **Moonshine Base** (~146 MB) — is bundled with the installer and copied to the user-data models folder on first launch (no network required). Other models are downloaded through the Settings UI inside the app:
+The default speech recognition engine — **Moonshine Base** (~146 MB) — and baseline local LLM — **Phi-3 Mini Q4** (~2.2 GB) — are bundled with the installer and copied to the user-data models folder on first launch (no network required). Other models are downloaded through the Settings UI inside the app:
 - **Whisper Base / Small / Medium / Large-v3-turbo** (147 MB – 1.5 GB) — multilingual speech recognition
-- **Mistral 7B Instruct Q4** (~4.4 GB) — text cleanup (optional)
+- **Mistral 7B Instruct Q4** (~4.4 GB) — larger text cleanup/chat model (optional)
 - **Kokoro 82M** (~163 MB + ~7.5 MB voices) — text-to-speech (bundled with installer too)
 
 You can see the on-disk path and open it in your file browser via **Settings > Models > Open folder**. Each downloaded engine has Re-download and Delete buttons; the Moonshine Base "Restore bundled copy" action re-applies the shipped files without re-downloading.
@@ -221,7 +221,7 @@ npx vite build
 
 These are hard architectural constraints, not policies:
 
-1. **No network calls.** All outbound requests blocked. Model downloads are the only exception, triggered explicitly by you.
+1. **No network calls for baseline use.** All outbound requests blocked during normal operation. Optional model downloads are the only exception, triggered explicitly by you.
 2. **Audio never hits disk.** Mic input lives in memory only. Buffers explicitly zeroed after use.
 3. **No telemetry.** No analytics, crash reporting, or usage tracking.
 4. **Local-only storage.** Single SQLite file in your app data directory.
@@ -306,7 +306,7 @@ We publish a comprehensive, code-referenced self-audit that verifies every secur
 
 **[Read the full audit](AUDIT.md)**
 
-The audit covers: network isolation, audio zero-on-drop, model download integrity (SHA-256 + HTTPS + domain validation), HuggingFace source verification, Electron sandbox configuration, IPC validation, environment variable scoping, SQL injection protection, XSS prevention, and more.
+The audit covers: network isolation, audio zero-on-drop, model download integrity (SHA-256 + HTTPS + domain validation), mirrored model source verification, Electron sandbox configuration, IPC validation, environment variable scoping, SQL injection protection, XSS prevention, and more.
 
 We encourage you to verify our claims. If you don't trust our self-audit, please engage an independent security professional to review the codebase. We welcome it.
 

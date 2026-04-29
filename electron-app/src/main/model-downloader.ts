@@ -4,6 +4,7 @@
  * when the user explicitly clicks a download button.
  *
  * Models are hosted on GitHub Releases (primary) with HuggingFace fallback.
+ * Baseline enterprise models are mirrored and bundled.
  * The LLM model is split into multiple parts (exceeds GitHub 2 GB limit).
  *
  * Security:
@@ -89,7 +90,7 @@ async function applySessionProxy(): Promise<void> {
   await session.defaultSession.setProxy({ proxyRules: proxyUrl });
 }
 
-/** Max retries before falling back to HuggingFace */
+/** Max retries before trying a configured fallback URL */
 const MAX_RETRIES = 3;
 
 function getModelPath(model: string): string {
@@ -277,6 +278,44 @@ export function ensureBundledMoonshineBase(): MoonshineBundleStatus {
   if (copied > 0) {
     console.log(`[model-downloader] Copied ${copied} bundled Moonshine Base files to ${destDir}`);
   }
+  return 'copied';
+}
+
+export type BaselineLlmBundleStatus =
+  | 'copied'
+  | 'already-present'
+  | 'bundle-missing';
+
+/**
+ * Ensure bundled Phi-3 Mini is copied to the writable models directory.
+ *
+ * The baseline enterprise build includes this GGUF in app resources so local
+ * cleanup/chat works without HuggingFace or any first-run download.
+ */
+export function ensureBundledPhi3Mini(): BaselineLlmBundleStatus {
+  const rel = MODEL_FILES['llm-chat-phi3'];
+  if (!rel) return 'bundle-missing';
+
+  const destPath = path.join(resolveModelsDir(), rel);
+  try {
+    if (fs.existsSync(destPath) && fs.statSync(destPath).size > 0) {
+      return 'already-present';
+    }
+  } catch { /* fall through and try bundled copy */ }
+
+  if (!process.resourcesPath) return 'bundle-missing';
+
+  const bundledPath = path.join(process.resourcesPath, 'models', rel);
+  if (!fs.existsSync(bundledPath)) return 'bundle-missing';
+  try {
+    if (fs.statSync(bundledPath).size === 0) return 'bundle-missing';
+  } catch {
+    return 'bundle-missing';
+  }
+
+  fs.mkdirSync(path.dirname(destPath), { recursive: true });
+  fs.copyFileSync(bundledPath, destPath);
+  console.log(`[model-downloader] Copied bundled Phi-3 Mini to ${destPath}`);
   return 'copied';
 }
 
@@ -513,7 +552,7 @@ async function downloadFile(
 }
 
 /**
- * Download a single file with retry + HuggingFace fallback.
+ * Download a single file with retry + optional fallback.
  */
 async function downloadWithFallback(
   url: string,
@@ -598,8 +637,12 @@ async function downloadMultiPartModel(
   // We estimate based on the known model size
   const partPaths: string[] = [];
   let downloadedTotal = 0;
-  // Rough estimate: use known size from constants or 0
-  const estimatedTotal = 4_400_000_000; // ~4.4 GB for LLM
+  const estimatedTotals: Record<string, number> = {
+    llm: 4_400_000_000,
+    'llm-chat-llama3': 4_700_000_000,
+    'llm-chat-phi3': 2_200_000_000,
+  };
+  const estimatedTotal = estimatedTotals[model] || 4_400_000_000;
 
   function sendProgress(downloaded: number, total: number, status: string, errorDetail?: string) {
     if (window && !window.isDestroyed()) {
@@ -630,8 +673,8 @@ async function downloadMultiPartModel(
       }
     };
 
-    // No fallback for individual parts — fallback is for the whole model
-    // (HuggingFace has the full file, not parts)
+    // No fallback for individual parts — if configured, fallback is for the
+    // whole model rather than one shard.
     try {
       await downloadFile(partUrl, partPath, partProgress);
       const partSize = fs.statSync(partPath).size;
@@ -643,10 +686,10 @@ async function downloadMultiPartModel(
       // Clean up any downloaded parts
       for (const p of partPaths) { cleanupTemp(p); }
 
-      // Try HuggingFace fallback for the whole file
+      // Try configured fallback for the whole file
       const fallbackUrl = MODEL_FALLBACK_URLS[model];
       if (fallbackUrl) {
-        console.log(`[model-downloader] Part download failed, trying HuggingFace fallback for full file...`);
+        console.log(`[model-downloader] Part download failed, trying fallback for full file...`);
         sendProgress(0, 0, 'fallback');
         const tempPath = destPath + '.downloading';
         try {
@@ -760,7 +803,7 @@ export async function downloadModel(
     );
 
     if (usedFallback) {
-      console.log(`[model-downloader] Downloaded ${model} from fallback source (HuggingFace)`);
+      console.log(`[model-downloader] Downloaded ${model} from fallback source`);
     }
 
     // Verify integrity
@@ -928,7 +971,7 @@ export function ensureBundledTFJSModels(): void {
 /**
  * Known importable model files.
  * Download URLs default to GitHub Releases (same as auto-download primary).
- * For multi-part models, downloadUrl points to HuggingFace (single complete file).
+ * For multi-part models, parts[] points to GitHub Release shards.
  */
 const IMPORTABLE_FILES: Record<string, { modelId: string; label: string; downloadUrl: string }> = {
   // Whisper — single files on GitHub Releases
@@ -937,7 +980,8 @@ const IMPORTABLE_FILES: Record<string, { modelId: string; label: string; downloa
   'ggml-medium.bin': { modelId: 'whisper-medium', label: 'Whisper Medium', downloadUrl: `${MODELS_BASE_URL}/ggml-medium.bin` },
   'ggml-small.bin': { modelId: 'whisper-small', label: 'Whisper Small', downloadUrl: `${MODELS_BASE_URL}/ggml-small.bin` },
   'ggml-base.bin': { modelId: 'whisper-base', label: 'Whisper Base', downloadUrl: `${MODELS_BASE_URL}/ggml-base.bin` },
-  // LLM — multi-part on GitHub, so point to HuggingFace for single-file import
+  // LLM — multi-part on GitHub Releases. Single-file imports are still accepted
+  // if the user obtains a complete GGUF through an approved mirror.
   'mistral-7b-instruct-v0.2.Q4_K_M.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
   'mistral-7b-instruct-q4_k_m.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
   'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf': { modelId: 'llm-chat-llama3', label: 'Llama 3.1 8B Instruct', downloadUrl: 'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf' },
@@ -1036,7 +1080,7 @@ export async function importModelFile(
 
   const result = await dialog.showOpenDialog(dialogWindow!, {
     title: 'Import Model File',
-    message: 'Select a model file (.bin, .gguf, .onnx) that you downloaded from HuggingFace',
+    message: 'Select a model file (.bin, .gguf, .onnx) from your browser, release asset, or company mirror',
     filters: [
       { name: 'Model Files', extensions: ['bin', 'gguf', 'onnx'] },
       { name: 'All Files', extensions: ['*'] },
@@ -1308,7 +1352,7 @@ export async function importModelFromPath(
  * Import a Moonshine engine (3 files: encoder + decoder + tokenizer).
  *
  * Moonshine ships as a directory of three artifacts that must be co-located.
- * The user downloads them from HuggingFace (links shown in the import UI),
+ * The user downloads them from the release/mirror links shown in the import UI,
  * then picks all three at once in a multi-select dialog. We classify each
  * file by name and copy it to the engine's subdirectory (e.g.
  * `models/moonshine-base/encoder_model.onnx`). The destination filenames are

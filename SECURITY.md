@@ -45,7 +45,7 @@ default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline';
 `unsafe-inline` for styles is required by the CSS framework (Tailwind). Script execution is restricted to `'self'` only.
 
 ### The One Exception: Model Downloads
-When you explicitly click "Download" in Settings, the app fetches model files from HuggingFace over HTTPS. This is the **only** network code in the entire application, isolated to a single file (`model-downloader.ts`). See "Model Download Security" below.
+When you explicitly click "Download" in Settings, the app fetches optional model files from IronMic-controlled GitHub Release assets over HTTPS, with HuggingFace as a public-app fallback. This is the **only** network code in the entire application, isolated to a single file (`model-downloader.ts`). Baseline Moonshine + Phi-3 installs require no runtime download. Enterprise packagers can stage the same assets from an internal mirror before building the installer. See "Model Download Security" below.
 
 ---
 
@@ -111,7 +111,7 @@ Model files are large binary blobs (90 MB to 4.4 GB) loaded directly into infere
 
 1. **HTTPS enforced.** HTTP URLs are rejected outright. All downloads use TLS.
 
-2. **Domain validation.** Downloads and redirects are only permitted to `*.huggingface.co`. Redirects to any other domain are rejected.
+2. **Domain validation.** Downloads and redirects are only permitted to GitHub Release asset domains or HuggingFace model domains. Redirects to any other domain are rejected.
 
 3. **SHA-256 integrity verification.** Every model file is verified against a known-good SHA-256 hash after download. If the hash doesn't match, the file is deleted and the download fails with a clear error.
 
@@ -123,10 +123,12 @@ Model files are large binary blobs (90 MB to 4.4 GB) loaded directly into infere
 
 | Model | Source | Size |
 |-------|--------|------|
-| Whisper large-v3-turbo | `huggingface.co/ggerganov/whisper.cpp` | ~1.5 GB |
-| Mistral 7B Instruct Q4 | `huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF` | ~4.4 GB |
-| Kokoro 82M TTS (fp16) | `huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX` | ~163 MB |
-| Kokoro voice files (15) | Same repo, `voices/` directory | ~500 KB each |
+| Moonshine Base | Bundled + IronMic `models-v1` release mirror | ~240 MB |
+| Phi-3 Mini Q4 | Bundled + IronMic `models-v1` release mirror | ~2.2 GB |
+| Whisper large-v3-turbo | IronMic `models-v1` release mirror | ~1.5 GB |
+| Mistral 7B Instruct Q4 | IronMic `models-v1` release mirror | ~4.4 GB |
+| Kokoro 82M TTS (fp16) | IronMic `models-v1` release mirror | ~163 MB |
+| Kokoro voice files (15) | Bundled with installer | ~500 KB each |
 
 ---
 

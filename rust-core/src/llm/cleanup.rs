@@ -9,7 +9,7 @@ use crate::llm::chat::{ChatMessage, ChatModel};
 use crate::llm::prompts;
 
 /// Default model filename.
-const DEFAULT_MODEL_FILENAME: &str = "mistral-7b-instruct-q4_k_m.gguf";
+const DEFAULT_MODEL_FILENAME: &str = "Phi-3-mini-4k-instruct-q4.gguf";
 
 /// Resolve the default model path.
 pub fn default_model_path() -> std::path::PathBuf {
@@ -535,7 +535,7 @@ mod tests {
         let engine = LlmEngine::with_defaults();
         let shared = SharedLlmEngine::new(engine);
         let path = shared.model_path();
-        assert!(path.ends_with("models/mistral-7b-instruct-q4_k_m.gguf"));
+        assert!(path.ends_with("models/Phi-3-mini-4k-instruct-q4.gguf"));
         assert!(path.is_absolute());
     }
 

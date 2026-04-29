@@ -3,7 +3,8 @@ export const APP_NAME = 'IronMic';
 export const DB_NAME = 'ironmic.db';
 
 export const WHISPER_MODEL_NAME = 'whisper-large-v3-turbo';
-export const LLM_MODEL_NAME = 'mistral-7b-instruct-q4';
+export const LLM_MODEL_NAME = 'phi-3-mini-q4';
+export const BASELINE_LOCAL_LLM_MODEL_ID = 'llm-chat-phi3';
 
 /**
  * Default transcription engine for new installs and upgrades from pre-Phase-1.
@@ -326,14 +327,6 @@ export const IPC_CHANNELS = {
 
 export const MODELS_RELEASE_TAG = 'models-v1';
 export const MODELS_BASE_URL = `https://github.com/greenpioneersolutions/IronMic/releases/download/${MODELS_RELEASE_TAG}`;
-
-// Moonshine ONNX exports — three files (encoder, decoder, tokenizer) for the
-// Base variant. Hosted at HuggingFace UsefulSensors/moonshine.
-//
-// IMPORTANT: the canonical path includes `/float/`. Without it HuggingFace
-// returns "Entry not found" — the absence of that segment broke every Moonshine
-// download/import link before this fix. Tiny is unavailable upstream
-// (its tokenizer.json is 404 even at /float/) and is no longer supported.
 const MOONSHINE_HF_BASE = 'https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/base/float';
 
 /** Primary download URLs (GitHub Release assets) */
@@ -342,15 +335,14 @@ export const MODEL_URLS: Record<string, string> = {
   'whisper-medium': `${MODELS_BASE_URL}/ggml-medium.bin`,
   'whisper-small': `${MODELS_BASE_URL}/ggml-small.bin`,
   'whisper-base': `${MODELS_BASE_URL}/ggml-base.bin`,
-  // Moonshine Base — HuggingFace is canonical. Bundled with the installer too
-  // (electron-builder.config.js extraResources) so the default engine is
-  // available with zero network access on first launch.
-  'moonshine-base-encoder': `${MOONSHINE_HF_BASE}/encoder_model.onnx`,
-  'moonshine-base-decoder': `${MOONSHINE_HF_BASE}/decoder_model_merged.onnx`,
-  'moonshine-base-tokenizer': `${MOONSHINE_HF_BASE}/tokenizer.json`,
+  // Moonshine Base — mirrored to IronMic releases and bundled with the
+  // installer so enterprise installs never need HuggingFace at runtime.
+  'moonshine-base-encoder': `${MODELS_BASE_URL}/moonshine-base-encoder_model.onnx`,
+  'moonshine-base-decoder': `${MODELS_BASE_URL}/moonshine-base-decoder_model_merged.onnx`,
+  'moonshine-base-tokenizer': `${MODELS_BASE_URL}/moonshine-base-tokenizer.json`,
   llm: `${MODELS_BASE_URL}/mistral-7b-instruct-q4_k_m.gguf`,
   'llm-chat-llama3': `${MODELS_BASE_URL}/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`,
-  'llm-chat-phi3': `${MODELS_BASE_URL}/Phi-3-mini-4k-instruct-Q4_K_M.gguf`,
+  'llm-chat-phi3': `${MODELS_BASE_URL}/Phi-3-mini-4k-instruct-q4.gguf`,
   'tts-model': `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx`,
   // TF.js ML models (v1.1.0) — tar.gz archives containing model.json + weight shards
   'tfjs-vad-silero': `${MODELS_BASE_URL}/tfjs-vad-silero.tar.gz`,
@@ -359,13 +351,12 @@ export const MODEL_URLS: Record<string, string> = {
   'tfjs-meeting-detector': `${MODELS_BASE_URL}/tfjs-meeting-detector.tar.gz`,
 };
 
-/** Fallback URLs (HuggingFace) — used if GitHub download fails after retries */
+/** Fallback URLs (HuggingFace) — used if GitHub download fails after retries. */
 export const MODEL_FALLBACK_URLS: Record<string, string> = {
   whisper: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin',
   'whisper-medium': 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin',
   'whisper-small': 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin',
   'whisper-base': 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin',
-  // Moonshine — fallback identical to primary because HuggingFace IS the canonical host.
   'moonshine-base-encoder': `${MOONSHINE_HF_BASE}/encoder_model.onnx`,
   'moonshine-base-decoder': `${MOONSHINE_HF_BASE}/decoder_model_merged.onnx`,
   'moonshine-base-tokenizer': `${MOONSHINE_HF_BASE}/tokenizer.json`,
@@ -410,13 +401,9 @@ export const MODEL_CHECKSUMS: Record<string, string> = {
   'whisper-medium': '',
   'whisper-small': '',
   'whisper-base': '',
-  // Moonshine — checksums populated on first verified download (see model-downloader.ts).
-  // We deliberately leave these empty initially because the HuggingFace files
-  // can be re-uploaded; once we mirror them to the IronMic GitHub Release the
-  // hashes will be pinned.
-  'moonshine-base-encoder': '',
-  'moonshine-base-decoder': '',
-  'moonshine-base-tokenizer': '',
+  'moonshine-base-encoder': '153e128e7abd64a74ee47f2c3f585c3171c4d46cbb368b032827934c4e01e779',
+  'moonshine-base-decoder': '58778763ca8438963190244d6b26572bdca2cedec56a4b91e828f3f2d69ef3c5',
+  'moonshine-base-tokenizer': 'ad3a2ceb0e84e4da57451d86fa337f8116dcff5f5d106434f8aa0b0de89718b9',
   llm: '3e0039fd0273fcbebb49228943b17831aadd55cbcbf56f0af00499be2040ccf9',
   'llm-chat-llama3': '', // Will be populated when model is uploaded to GitHub Releases
   'llm-chat-phi3': '', // Will be populated when model is uploaded to GitHub Releases
@@ -464,6 +451,15 @@ export interface ChatLlmModelMeta {
 
 export const CHAT_LLM_MODELS: ChatLlmModelMeta[] = [
   {
+    id: 'llm-chat-phi3',
+    label: 'Phi-3 Mini 3.8B',
+    sizeLabel: '~2.2 GB',
+    modelType: 'phi3',
+    reusesPolishModel: false,
+    description: 'Bundled baseline for local cleanup and chat',
+    compatible: true,
+  },
+  {
     id: 'llm',
     label: 'Mistral 7B Instruct',
     sizeLabel: '~4.4 GB',
@@ -479,15 +475,6 @@ export const CHAT_LLM_MODELS: ChatLlmModelMeta[] = [
     modelType: 'llama3',
     reusesPolishModel: false,
     description: 'Strong instruction following, multilingual',
-    compatible: true,
-  },
-  {
-    id: 'llm-chat-phi3',
-    label: 'Phi-3 Mini 3.8B',
-    sizeLabel: '~2.2 GB',
-    modelType: 'phi3',
-    reusesPolishModel: false,
-    description: 'Smallest and fastest option',
     compatible: true,
   },
 ];

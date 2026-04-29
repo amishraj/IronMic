@@ -11,6 +11,7 @@ import {
   ensureBundledVoices,
   ensureBundledTFJSModels,
   ensureBundledMoonshineBase,
+  ensureBundledPhi3Mini,
 } from './model-downloader';
 import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
 import { meetingRecorder } from './meeting-recorder';
@@ -188,6 +189,25 @@ app.whenReady().then(async () => {
     }
   } catch (err) {
     console.warn('[startup] Failed to copy bundled Moonshine Base:', err);
+  }
+
+  // Copy bundled baseline LLM to user data on first launch. Phi-3 Mini is the
+  // enterprise baseline for local cleanup/chat; larger models remain optional.
+  try {
+    const status = ensureBundledPhi3Mini();
+    switch (status) {
+      case 'copied':
+        console.log('[startup] Phi-3 Mini: bundled copy restored from app resources');
+        break;
+      case 'already-present':
+        console.log('[startup] Phi-3 Mini: already present in user data');
+        break;
+      case 'bundle-missing':
+        console.log('[startup] Phi-3 Mini: no bundled copy (dev mode or unpackaged) — user can import/download');
+        break;
+    }
+  } catch (err) {
+    console.warn('[startup] Failed to copy bundled Phi-3 Mini:', err);
   }
 
   // Extract bundled TF.js ML models to user data on first launch
