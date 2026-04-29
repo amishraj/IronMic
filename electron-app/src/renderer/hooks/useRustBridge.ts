@@ -16,7 +16,11 @@ declare global {
       resetRecording: () => Promise<void>;
       // Transcription
       transcribe: (audioBuffer: Buffer) => Promise<string>;
-      polishText: (rawText: string) => Promise<string>;
+      polishText: (rawText: string, opts?: { requireModel?: boolean }) => Promise<string>;
+      polishTextDetailed: (
+        rawText: string,
+        opts?: { requireModel?: boolean },
+      ) => Promise<{ text: string; providerUsed: 'claude' | 'copilot' | 'local' }>;
       // Entries
       createEntry: (entry: NewEntry) => Promise<Entry>;
       getEntry: (id: string) => Promise<Entry | null>;

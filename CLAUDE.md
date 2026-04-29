@@ -512,6 +512,8 @@ These are hard architectural constraints, not policies:
 
 6. **Reproducible builds.** CI builds are deterministic and verifiable. Users can build from source.
 
+**One explicit, opt-in exception: cloud polishing.** The `polish_allow_cloud` setting (default `false`, surfaced in Settings → Security & Privacy with a warning callout and a confirmation dialog) lets users route the *polish* pass through an authenticated Claude or Copilot CLI for higher-quality cleanups. When it is on AND a cloud CLI is authenticated, transcript text is sent to that CLI; the toggle in Notes/Timeline shows a "via Claude" / "via Copilot" / "via local" badge so the user always sees where each polish ran. Authentication of a cloud provider does NOT auto-enable this setting — the user must consciously turn it on. With the default off, polish stays strictly on-device. No other feature uses cloud APIs.
+
 ---
 
 ## Development Workflow

@@ -8,6 +8,7 @@ import { Card } from './ui';
 import { useEntryStore } from '../stores/useEntryStore';
 import { useAiChatStore } from '../stores/useAiChatStore';
 import { useNotesStore } from '../stores/useNotesStore';
+import { TRANSCRIPTION_ENGINES } from '../../shared/constants';
 import micIdleImg from '../assets/mic-idle.png';
 
 interface ModelInfo {
@@ -35,6 +36,10 @@ interface SearchResult {
 
 export function WelcomePage({ onNavigate }: WelcomePageProps) {
   const [models, setModels] = useState<Record<string, ModelInfo>>({});
+  // null = still loading; distinguishes "loading" from "definitely missing"
+  // so the warning block doesn't flash during first paint. Bundled Moonshine
+  // Base means this should normally resolve to true on a fresh install.
+  const [hasAnyTranscriptionEngine, setHasAnyTranscriptionEngine] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
   const [hotkey, setHotkey] = useState('Cmd+Shift+V');
   const [searchQuery, setSearchQuery] = useState('');
@@ -64,12 +69,16 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
 
       const files = status?.files || {};
       setModels({
+        // Whisper is no longer marked required: Moonshine Base ships bundled
+        // and is the default engine, so a fresh install can dictate without
+        // downloading anything. Whisper stays in the optional-features list
+        // for users who want multilingual coverage.
         whisper: {
           downloaded: files.whisper?.downloaded || false,
           sizeLabel: '~1.5 GB',
           name: 'Whisper large-v3-turbo',
           purpose: 'Speech Recognition',
-          required: true,
+          required: false,
         },
         llm: {
           downloaded: files.llm?.downloaded || false,
@@ -86,6 +95,25 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
           required: false,
         },
       });
+
+      // Probe whether any transcription engine (Moonshine variants OR Whisper
+      // variants) actually has its model files on disk. This is the real gate
+      // for "can the user dictate right now?" — it replaces the old
+      // missingWhisper check, which incorrectly assumed Whisper was required.
+      // Mirrors ModelManager.loadState so the two pages agree on readiness.
+      try {
+        const engineUsages = await Promise.all(
+          TRANSCRIPTION_ENGINES.map((meta) =>
+            window.ironmic.getEngineDiskUsage(meta.id).catch(() => null),
+          ),
+        );
+        const anyReady = engineUsages.some(
+          (u) => u && u.files.length > 0 && u.files.every((f: any) => f.exists),
+        );
+        setHasAnyTranscriptionEngine(anyReady);
+      } catch {
+        setHasAnyTranscriptionEngine(false);
+      }
     } catch { /* ignore */ }
     setLoading(false);
   }
@@ -138,13 +166,17 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
     }
   };
 
-  const allRequired = Object.values(models).filter((m) => m.required);
-  const requiredReady = allRequired.every((m) => m.downloaded);
-  const anyReady = Object.values(models).some((m) => m.downloaded);
   const hasContent = (entryCount ?? 0) > 0 || sessions.length > 0 || notes.length > 0;
-  const isBrandNew = !anyReady && !hasContent;
-  const isFirstTime = !anyReady;
-  const missingWhisper = !models.whisper?.downloaded;
+  // The new gate: can the user actually dictate right now? Driven by the
+  // canonical engine list (Moonshine + Whisper variants) rather than the
+  // local `models` object, which only tracks Whisper / LLM / TTS for the
+  // optional-features panel. `hasAnyTranscriptionEngine === null` means
+  // we're still probing — treat as "not first-time" so we don't flash the
+  // warning during initial render.
+  const engineReady = hasAnyTranscriptionEngine === true;
+  const noEngineConfirmed = hasAnyTranscriptionEngine === false;
+  const isBrandNew = noEngineConfirmed && !hasContent;
+  const isFirstTime = noEngineConfirmed;
   const missingOptional = Object.entries(models).filter(([, m]) => !m.required && !m.downloaded);
   const hasMissingOptional = !isFirstTime && missingOptional.length > 0;
 
@@ -170,38 +202,34 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
           </p>
         </div>
 
-        {/* Brand new: Getting Started steps */}
+        {/* Brand new: Getting Started steps. Moonshine Base ships bundled,
+            so on a fresh install the user can dictate immediately —
+            Step 1 is "try it," not "download a model." */}
         {isBrandNew && (
           <div className="mb-10">
             <h2 className="text-base font-semibold text-iron-text mb-4">Getting Started</h2>
             <div className="space-y-3">
               <StepCard
                 step={1}
-                title="Download the speech recognition model"
-                description="This is the only model you need to start dictating. It converts your voice to text using Whisper, running entirely on your machine."
-                action={missingWhisper ? { label: 'Go to Settings', onClick: () => onNavigate('settings') } : undefined}
-                done={!missingWhisper}
-                highlight={missingWhisper}
+                title="Try your first dictation"
+                description={`Press ${hotkey} from anywhere on your computer, speak, then press it again. Your speech is transcribed and copied to your clipboard — ready to paste.`}
+                action={engineReady ? { label: 'Open Dictate', onClick: () => onNavigate('dictate') } : undefined}
+                done={hasContent}
+                disabled={!engineReady}
               />
               <StepCard
                 step={2}
-                title="Try your first dictation"
-                description={`Press ${hotkey} from anywhere on your computer, speak, then press it again. Your speech is transcribed and copied to your clipboard — ready to paste.`}
-                action={!missingWhisper ? { label: 'Open Dictate', onClick: () => onNavigate('dictate') } : undefined}
-                done={hasContent}
-                disabled={missingWhisper}
-              />
-              <StepCard
-                step={3}
                 title="Explore optional features"
-                description="Text cleanup polishes your raw transcriptions. Text-to-speech reads text back to you. Both are optional downloads in Settings."
+                description="Text cleanup polishes your raw transcriptions. Text-to-speech reads text back to you. Whisper adds multilingual support. All optional downloads in Settings."
                 action={{ label: 'View in Settings', onClick: () => onNavigate('settings') }}
               />
             </div>
           </div>
         )}
 
-        {/* First-time but not brand new (models missing, but has some content somehow) */}
+        {/* No transcription engine available at all — should never happen on
+            a normal install since Moonshine Base is bundled. Surface as a
+            recoverable error rather than a "first-run" nudge. */}
         {isFirstTime && !isBrandNew && (
           <div className="mb-10">
             <Card variant="highlighted" padding="md">
@@ -210,10 +238,10 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
                   <AlertTriangle className="w-4.5 h-4.5 text-iron-warning" />
                 </div>
                 <div className="flex-1">
-                  <p className="text-sm font-medium text-iron-text">Models needed</p>
+                  <p className="text-sm font-medium text-iron-text">No speech recognition engine available</p>
                   <p className="text-xs text-iron-text-muted mt-1 leading-relaxed">
-                    IronMic needs the speech recognition model to transcribe your voice.
-                    Download it in Settings to start dictating.
+                    This shouldn&apos;t happen on a normal install — Moonshine Base ships with IronMic.
+                    Try restarting the app, or download an engine from Settings as a workaround.
                   </p>
                   <button
                     onClick={() => onNavigate('settings')}
@@ -228,8 +256,10 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
           </div>
         )}
 
-        {/* Returning user: missing Whisper warning */}
-        {!isFirstTime && missingWhisper && (
+        {/* Returning user, no engine available — same recoverable-error UX
+            as the !isBrandNew branch above. The block below the original
+            "missing Whisper" warning is gone; Whisper is now optional. */}
+        {!isFirstTime && noEngineConfirmed && (
           <div className="mb-6">
             <Card variant="highlighted" padding="md">
               <div className="flex items-start gap-3">
@@ -237,16 +267,16 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
                   <AlertTriangle className="w-4.5 h-4.5 text-iron-warning" />
                 </div>
                 <div className="flex-1">
-                  <p className="text-sm font-medium text-iron-text">Speech recognition model missing</p>
+                  <p className="text-sm font-medium text-iron-text">No speech recognition engine available</p>
                   <p className="text-xs text-iron-text-muted mt-0.5">
-                    Dictation won't work without the Whisper model. Download it in Settings to get started.
+                    Moonshine Base ships with IronMic and should already be in place. Try restarting the app, or download an engine from Settings as a workaround.
                   </p>
                   <button
                     onClick={() => onNavigate('settings')}
                     className="mt-2 flex items-center gap-1.5 text-xs font-medium text-iron-accent-light hover:underline"
                   >
                     <Download className="w-3.5 h-3.5" />
-                    Download now
+                    Open Settings
                   </button>
                 </div>
               </div>
@@ -342,7 +372,7 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
               {isFirstTime ? 'Features' : 'Quick Start'}
             </h2>
             <div className="grid grid-cols-2 gap-3">
-              <QuickAction icon={Mic} title="Dictate" description={`Press ${hotkey} anywhere to record`} onClick={() => onNavigate('dictate')} color="accent" disabled={!requiredReady} />
+              <QuickAction icon={Mic} title="Dictate" description={`Press ${hotkey} anywhere to record`} onClick={() => onNavigate('dictate')} color="accent" disabled={!engineReady} />
               <QuickAction icon={Sparkles} title="AI Assistant" description="Chat with a local AI" onClick={() => onNavigate('ai')} color="purple" />
               <QuickAction icon={Volume2} title="Listen" description="Hear text read aloud" onClick={() => onNavigate('listen')} color="emerald" disabled={!models.tts?.downloaded} />
               <QuickAction icon={Brain} title="Notes" description="Organize thoughts in notebooks" onClick={() => onNavigate('notes')} color="amber" />
@@ -409,8 +439,9 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
           </div>
         )}
 
-        {/* Returning user: gentle nudge for optional models */}
-        {hasMissingOptional && !missingWhisper && (
+        {/* Returning user: gentle nudge for optional models. Suppressed when
+            no engine is available — that's a different (more urgent) banner. */}
+        {hasMissingOptional && engineReady && (
           <div className="mb-8">
             <Card variant="default" padding="md">
               <div className="flex items-start gap-3">

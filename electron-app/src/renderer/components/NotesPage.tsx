@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Plus, Search, StickyNote, FolderOpen, Pin, Trash2, Tag, ChevronRight,
-  BookOpen, MoreHorizontal, X, Hash, Pencil, Check, Users,
+  BookOpen, MoreHorizontal, X, Hash, Pencil, Check, Users, Sparkles, Loader2,
 } from 'lucide-react';
 import { Card } from './ui';
 import { useNotesStore, type Note, type Notebook } from '../stores/useNotesStore';
@@ -13,8 +13,12 @@ export function NotesPage() {
     notebooks, activeNoteId, activeNotebookId, searchQuery,
     createNote, updateNote, deleteNote, setActiveNote,
     createNotebook, renameNotebook, deleteNotebook, setActiveNotebook,
-    setSearchQuery, filteredNotes,
+    setSearchQuery, filteredNotes, polishNote,
   } = useNotesStore();
+  // Per-note "Draft" / "Saved" indicator. Subscribe narrowly so the pill
+  // updates without re-rendering the whole page on every keystroke.
+  const noteSaveStatus = useNotesStore((s) => s.noteSaveStatus);
+  const polishingIds = useNotesStore((s) => s.polishingIds);
 
   const notes = filteredNotes();
   const activeNote = useNotesStore((s) => s.getNote(activeNoteId || ''));
@@ -357,6 +361,54 @@ export function NotesPage() {
                   className="flex-1 text-xl font-bold bg-transparent text-iron-text placeholder:text-iron-text-muted/50 focus:outline-none"
                 />
                 {(() => {
+                  // Polish button — sits to the left of Collaborate per the
+                  // intended toolbar order. Three states: idle (run polish),
+                  // polishing (spinner pill, button disabled), and
+                  // already-polished (opens the re-polish/toggle dialog).
+                  const isPolishing = polishingIds.has(activeNote.id);
+                  const hasPolished = !!activeNote.polishedContent;
+                  const handlePolish = () => {
+                    if (isPolishing) return;
+                    if (hasPolished) {
+                      // Toggle displayMode in place — replaces what the
+                      // (now-removed) NotePolishDialog used to do.
+                      updateNote(activeNote.id, {
+                        displayMode: activeNote.displayMode === 'polished' ? 'raw' : 'polished',
+                      });
+                    } else {
+                      polishNote(activeNote.id);
+                    }
+                  };
+                  if (isPolishing) {
+                    return (
+                      <span
+                        className="flex items-center gap-1 text-[10px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-1.5 py-1 rounded shrink-0"
+                        title="Running local LLM…"
+                      >
+                        <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                        Polishing…
+                      </span>
+                    );
+                  }
+                  return (
+                    <button
+                      onClick={handlePolish}
+                      title={
+                        hasPolished
+                          ? 'View raw or re-polish this note'
+                          : 'Polish this note with the local LLM'
+                      }
+                      className={`flex items-center justify-center p-1.5 text-[11px] font-medium rounded-lg border transition-colors shrink-0 ${
+                        hasPolished
+                          ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/25 hover:bg-iron-accent/20'
+                          : 'bg-iron-accent/10 text-iron-accent-light border-iron-accent/20 hover:bg-iron-accent/20'
+                      }`}
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                    </button>
+                  );
+                })()}
+                {(() => {
                   const isThisNote = !collabActive || collabNoteId === activeNote.id;
                   const isLocked = collabActive && collabNoteId !== null && collabNoteId !== activeNote.id;
                   return (
@@ -403,6 +455,34 @@ export function NotesPage() {
                 <span className="text-[10px] text-iron-text-muted">
                   {new Date(activeNote.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
                 </span>
+                {/* Draft / Saved pill — auto-save indicator. Flips to "Draft"
+                    on every edit, then back to "Saved" ~600ms after typing
+                    stops. The localStorage write is already synchronous on
+                    every keystroke; this is purely UX feedback so the user
+                    can see their changes are captured. */}
+                {(() => {
+                  const status = noteSaveStatus[activeNote.id] ?? 'saved';
+                  if (status === 'draft') {
+                    return (
+                      <span
+                        className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-iron-warning/10 text-iron-warning border border-iron-warning/20"
+                        title="Saving your changes…"
+                      >
+                        <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                        Draft
+                      </span>
+                    );
+                  }
+                  return (
+                    <span
+                      className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                      title="All changes saved"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      Saved
+                    </span>
+                  );
+                })()}
               </div>
               {/* Tags */}
               <div className="flex items-center gap-1.5 mt-2 flex-wrap">
@@ -425,11 +505,19 @@ export function NotesPage() {
               </div>
             </div>
 
-            {/* Note content */}
+            {/* Note content. When the user has chosen to view the polished
+                version we render it instead of the raw body. Edits go to
+                `content`; the store auto-clears `polishedContent` on body
+                changes, so editing from "polished" view drops the user back
+                onto raw without losing their typing. */}
             <div className="flex-1 overflow-y-auto">
               <textarea
                 ref={contentRef}
-                value={activeNote.content}
+                value={
+                  activeNote.displayMode === 'polished' && activeNote.polishedContent != null
+                    ? activeNote.polishedContent
+                    : activeNote.content
+                }
                 onChange={(e) => updateNote(activeNote.id, { content: e.target.value })}
                 placeholder="Start writing..."
                 className="w-full h-full px-6 py-4 text-sm leading-relaxed bg-transparent text-iron-text placeholder:text-iron-text-muted/40 resize-none focus:outline-none"
@@ -486,6 +574,7 @@ export function NotesPage() {
           onClose={() => setCollabOpen(false)}
         />
       )}
+
     </div>
   );
 }

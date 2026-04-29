@@ -13,7 +13,13 @@ const api = {
 
   // Transcription
   transcribe: (audioBuffer: Buffer) => ipcRenderer.invoke('ironmic:transcribe', audioBuffer),
-  polishText: (rawText: string) => ipcRenderer.invoke('ironmic:polish-text', rawText),
+  polishText: (rawText: string, opts?: { requireModel?: boolean }) =>
+    ipcRenderer.invoke('ironmic:polish-text', rawText, opts),
+  // Detailed variant for the toggle-driven polish UI: returns
+  // { text, providerUsed } so the UI can render a "via Claude/Copilot/local"
+  // badge after a successful polish. Existing callers stay on polishText.
+  polishTextDetailed: (rawText: string, opts?: { requireModel?: boolean }) =>
+    ipcRenderer.invoke('ironmic:polish-text-detailed', rawText, opts),
 
   // Entries
   createEntry: (entry: any) => ipcRenderer.invoke('ironmic:create-entry', entry),

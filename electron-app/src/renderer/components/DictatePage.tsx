@@ -35,14 +35,18 @@ import {
   Quote, Code, Minus, Link as LinkIcon, Highlighter, Undo2, Redo2,
   AlignLeft, AlignCenter, AlignRight, Mic, MicOff, Check,
   Volume2, Square, Pause, Play, ChevronDown,
-  Pencil, Circle, BookPlus, HelpCircle, X, Users, Plus,
+  Pencil, Circle, BookPlus, Users, Plus,
+  Loader2, Sparkles, Save,
 } from 'lucide-react';
 import { useTtsStore } from '../stores/useTtsStore';
 import { useDictationStore } from '../stores/useDictationStore';
 import { useMeetingStore } from '../stores/useMeetingStore';
 import { useToastStore } from '../stores/useToastStore';
+import { useEntryStore } from '../stores/useEntryStore';
+import { RawPolishedToggle } from './RawPolishedToggle';
 import { listNotebooks, createNotebook, getDefaultNotebookId, syncMeetingEntryToSession, type Notebook } from '../services/notebooks';
-import { TITLE_TAG_PREFIX, parseTitleTag, parseNotebookTag, parseMeetingTag, parseStatusTag, type Entry } from '../types';
+import { TITLE_TAG_PREFIX, EMOJI_TAG_PREFIX, parseTitleTag, parseNotebookTag, parseMeetingTag, parseStatusTag, parseEmojiTag, type Entry } from '../types';
+import { NoteEmojiPicker, pickRandomEmoji } from './NoteEmojiPicker';
 import { NotesSidebar } from './NotesSidebar';
 import { NotesCollaborateModal } from './NotesCollaborateModal';
 
@@ -121,11 +125,21 @@ export function DictatePage() {
   /** Actual status of the loaded entry — 'draft' while composing, 'done' after
    *  Done is pressed or when an already-finalized note is opened from sidebar. */
   const [loadedEntryStatus, setLoadedEntryStatus] = useState<'draft' | 'done' | null>(null);
-  const helpRef = useRef<HTMLDivElement>(null);
-  const [showHelp, setShowHelp] = useState(false);
   const [collabOpen, setCollabOpen] = useState(false);
   const [collabActive, setCollabActive] = useState(false);
   const [collabParticipantCount, setCollabParticipantCount] = useState(0);
+  const [noteEmoji, setNoteEmoji] = useState(() => pickRandomEmoji());
+  /** True when we're programmatically replacing editor content (polish,
+   *  toggle to other display mode, sidebar entry switch). The TipTap
+   *  `onUpdate` callback short-circuits its debounced auto-save when this is
+   *  set so we don't immediately write the just-applied content right back —
+   *  which would erase the OTHER side (raw vs polished) and create a feedback
+   *  loop with the reactive sync effect below. */
+  const isApplyingRemoteContentRef = useRef(false);
+  /** Track the last (mode, polishedText, rawTranscript) we applied to the
+   *  editor so the reactive sync effect doesn't re-apply identical content
+   *  every render. */
+  const lastAppliedSyncKeyRef = useRef<string>('');
 
   // ── Dictation state lives in the store (foolproof across navigation) ──
   const status = useDictationStore((s) => s.status);
@@ -142,6 +156,35 @@ export function DictatePage() {
   const setStoreEntryFromDraft = useDictationStore.setState;
   const moveCurrentToNotebook = useDictationStore((s) => s.moveCurrentToNotebook);
   const setEntryStatus = useDictationStore((s) => s.setEntryStatus);
+
+  // ── Polish state from useEntryStore ──
+  // Lives in the store (module scope), so polish keeps running when the user
+  // navigates away. Both Notes (this page) and Timeline read from the same
+  // source of truth, which keeps them in sync.
+  const isPolishing = useEntryStore((s) => entryId ? s.polishingIds.has(entryId) : false);
+  const polishedEntry = useEntryStore((s) =>
+    entryId
+      ? (s.entries.find((e) => e.id === entryId) ?? s.entryCache.get(entryId) ?? null)
+      : null,
+  );
+  const polishProvider = useEntryStore((s) =>
+    entryId ? s.polishProviderByEntryId.get(entryId) : undefined,
+  );
+  // The DB default for display_mode is 'polished' even when polished_text is
+  // null (see entries.rs CREATE without an explicit displayMode). Treat
+  // 'polished with null text' as 'raw' here so the UI never tries to render
+  // a non-existent polished view.
+  const effectiveMode: 'raw' | 'polished' =
+    polishedEntry?.polishedText ? polishedEntry.displayMode : 'raw';
+
+  // Pull the canonical entry into the store cache when this page mounts on
+  // an existing entry (sidebar selection, draft rehydration). Older notes
+  // outside the timeline's first page would otherwise be invisible to
+  // useEntryStore selectors.
+  useEffect(() => {
+    if (!entryId) return;
+    void useEntryStore.getState().getEntryById(entryId);
+  }, [entryId]);
 
   const { state: ttsState, synthesizeAndPlay, stop: ttsStop, toggle: ttsToggle } = useTtsStore();
 
@@ -191,18 +234,6 @@ export function DictatePage() {
     });
   }, [windowNarrow]);
 
-  // Close help popover on outside click.
-  useEffect(() => {
-    if (!showHelp) return;
-    const handler = (e: MouseEvent) => {
-      if (helpRef.current && !helpRef.current.contains(e.target as Node)) {
-        setShowHelp(false);
-      }
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [showHelp]);
-
   const draft = useRef(loadDraft());
 
   const editor = useEditor({
@@ -230,6 +261,16 @@ export function DictatePage() {
       setWordCount(text.trim() ? text.trim().split(/\s+/).length : 0);
     },
     onUpdate: ({ editor }) => {
+      // When we're programmatically swapping editor content (polish complete,
+      // toggle flip, sidebar selection), skip the debounced save — otherwise
+      // we'd persist the just-applied content back over the OTHER side and
+      // race the reactive sync effect below.
+      if (isApplyingRemoteContentRef.current) {
+        const text = editor.getText();
+        setCharCount(text.length);
+        setWordCount(text.trim() ? text.trim().split(/\s+/).length : 0);
+        return;
+      }
       setSaved(false);
       const text = editor.getText();
       setCharCount(text.length);
@@ -277,6 +318,7 @@ export function DictatePage() {
         `${TITLE_TAG_PREFIX}${title}`,
         `__notebook__:${nbId}`,
         `__status__:draft`,
+        `${EMOJI_TAG_PREFIX}${noteEmoji}`,
       ];
       try {
         const entry = await api.createEntry({
@@ -294,7 +336,34 @@ export function DictatePage() {
       }
     } else {
       try {
-        await api.updateEntry(currentId, { rawTranscript: plainText });
+        // Write to whichever side the user is currently viewing. Editing in
+        // 'polished' mode updates polishedText only; editing in 'raw' mode
+        // updates rawTranscript only. The two stay independent so flipping
+        // the toggle round-trips to whatever was last saved on each side.
+        const storeEntry = useEntryStore.getState();
+        const live = storeEntry.entries.find((e) => e.id === currentId)
+          ?? storeEntry.entryCache.get(currentId)
+          ?? null;
+        const writingPolished = !!live?.polishedText && live?.displayMode === 'polished';
+        const updates = writingPolished
+          ? { polishedText: plainText }
+          : { rawTranscript: plainText };
+        const updated = await api.updateEntry(currentId, updates as any);
+        // Mirror the update into the store cache so subscribers see the change.
+        if (updated) {
+          const fixedId = currentId as string;
+          useEntryStore.setState((s) => {
+            const idx = s.entries.findIndex((e) => e.id === fixedId);
+            const nextEntries = idx === -1 ? s.entries : (() => {
+              const out = s.entries.slice();
+              out[idx] = updated;
+              return out;
+            })();
+            const nextCache = new Map(s.entryCache);
+            nextCache.set(fixedId, updated);
+            return { entries: nextEntries, entryCache: nextCache };
+          });
+        }
         try {
           const fresh = await api.getEntry(currentId);
           const sessionId = parseMeetingTag((fresh as any)?.tags ?? null);
@@ -494,6 +563,7 @@ export function DictatePage() {
         `${TITLE_TAG_PREFIX}${finalTitle}`,
         `__notebook__:${state.notebookId}`,
         `__status__:draft`,
+        `${EMOJI_TAG_PREFIX}${noteEmoji}`,
       ];
       try {
         const entry = await window.ironmic.createEntry({
@@ -590,6 +660,7 @@ export function DictatePage() {
     editor.commands.clearContent();
     storeReset();
     setLoadedEntryStatus(null);
+    setNoteEmoji(pickRandomEmoji());
     setWordCount(0);
     setCharCount(0);
     setSaved(true);
@@ -599,6 +670,79 @@ export function DictatePage() {
     try { window.dispatchEvent(new CustomEvent('ironmic:entries-changed')); }
     catch { /* noop */ }
   }, [editor, status, storeStop, storeReset, notebookId, bumpSidebar]);
+
+  /** Build a TipTap-compatible HTML string from a plain-text body, preserving
+   *  paragraph breaks. Plain `setContent(string)` would collapse them. */
+  const textToHtml = useCallback((text: string): string => {
+    if (!text) return '';
+    return text
+      .split(/\n\n+/)
+      .map((p) => `<p>${escapeHtml(p).replace(/\n/g, '<br>')}</p>`)
+      .join('');
+  }, []);
+
+  /** Toggle handler — flicks display mode. If polished text doesn't exist
+   *  yet, kicks off polish via the store (which keeps running through any
+   *  navigation). Otherwise just persists the displayMode flip. */
+  const handleTogglePolish = useCallback((next: 'raw' | 'polished') => {
+    if (!entryId) return;
+    if (next === 'polished' && !polishedEntry?.polishedText) return;
+    void useEntryStore.getState().setEntryDisplayMode(entryId, next);
+  }, [entryId, polishedEntry?.polishedText]);
+
+  const handlePolishClick = useCallback(() => {
+    if (!editor || !entryId) return;
+    if (isPolishing) return;
+    if (status !== 'idle') {
+      toast({ type: 'info', message: 'Stop dictation before polishing.', durationMs: 4000 });
+      return;
+    }
+    const hasExisting = !!polishedEntry?.polishedText;
+    if (hasExisting) {
+      const confirmed = window.confirm(
+        'This will replace the existing polished version with a new one. Continue?',
+      );
+      if (!confirmed) return;
+    }
+    const liveRaw = editor.getText().trim();
+    void useEntryStore.getState().polishEntry(entryId, { rawOverride: liveRaw, force: hasExisting });
+  }, [editor, entryId, isPolishing, polishedEntry?.polishedText, status, toast]);
+
+  // Reactive editor sync: whenever the persisted (mode, polishedText, raw)
+  // changes, swap the editor content to match — but only when the change
+  // comes from outside this editor (e.g., a polish that completed in the
+  // background, or the user toggling on the Timeline page). We guard the
+  // programmatic setContent with isApplyingRemoteContentRef so onUpdate
+  // doesn't immediately persist the shown text back over the other side.
+  useEffect(() => {
+    if (!editor || !entryId) return;
+    if (isPolishing) return; // overlay covers content; don't fight the user.
+    if (!polishedEntry) return;
+    const desired = effectiveMode === 'polished' && polishedEntry.polishedText
+      ? polishedEntry.polishedText
+      : polishedEntry.rawTranscript;
+    const key = `${entryId}|${effectiveMode}|${(desired || '').length}|${(desired || '').slice(0, 32)}`;
+    if (lastAppliedSyncKeyRef.current === key) return;
+    const current = editor.getText();
+    if (current === desired) {
+      lastAppliedSyncKeyRef.current = key;
+      return;
+    }
+    isApplyingRemoteContentRef.current = true;
+    try {
+      editor.commands.setContent(textToHtml(desired || ''), false);
+      lastAppliedSyncKeyRef.current = key;
+    } finally {
+      isApplyingRemoteContentRef.current = false;
+    }
+  }, [editor, entryId, effectiveMode, polishedEntry, isPolishing, textToHtml]);
+
+  // Lock the editor while polish is running so the user can't type into a
+  // view that's about to be replaced.
+  useEffect(() => {
+    if (!editor) return;
+    editor.setEditable(!isPolishing);
+  }, [editor, isPolishing]);
 
   /** Save — persist the current note (status=done) and stay on it. */
   const handleSave = useCallback(async () => {
@@ -663,6 +807,19 @@ export function DictatePage() {
     void handleDone();
   }, [handleDone]);
 
+  const handleEmojiChange = useCallback(async (emoji: string) => {
+    setNoteEmoji(emoji);
+    const currentId = useDictationStore.getState().entryId;
+    if (!currentId) return;
+    try {
+      const freshRaw = await window.ironmic.getEntry(currentId);
+      const parsed: string[] = JSON.parse((freshRaw as any)?.tags || '[]');
+      const filtered = parsed.filter((s: string) => !s.startsWith(EMOJI_TAG_PREFIX));
+      filtered.push(`${EMOJI_TAG_PREFIX}${emoji}`);
+      await window.ironmic.updateEntry(currentId, { tags: JSON.stringify(filtered) } as any);
+    } catch { /* best effort */ }
+  }, []);
+
   // ── Load an entry from the sidebar into the editor ──
   // When the user clicks a different note in the sidebar, we swap the editor
   // content + store state to that entry. Blocked if actively dictating so we
@@ -706,6 +863,7 @@ export function DictatePage() {
     });
     // Reflect actual persisted status so the badge is accurate for finalized notes.
     setLoadedEntryStatus(parseStatusTag(entry.tags));
+    setNoteEmoji(parseEmojiTag(entry.tags) || pickRandomEmoji());
     saveDraft(html, entry.id, nextTitle);
   }, [editor, status, toast]);
 
@@ -767,45 +925,23 @@ export function DictatePage() {
 
       {/* Right: the note editor */}
       <div className="flex-1 flex flex-col min-w-0">
-      {/* Header */}
+      {/* Header — two-row layout with large emoji anchor */}
       <div className="px-5 pt-3 pb-2.5 border-b border-iron-border">
-        <div className="flex items-start justify-between gap-3 max-w-4xl mx-auto">
+        <div className="flex items-center gap-4 max-w-4xl mx-auto">
 
-          {/* Left: icon column + breadcrumb + status */}
-          <div className="flex items-start gap-3 min-w-0 flex-1">
+          {/* Emoji — spans both rows as a visual anchor */}
+          <NoteEmojiPicker
+            emoji={noteEmoji}
+            onChange={handleEmojiChange}
+            buttonClassName="w-12 h-12 rounded-2xl text-2xl"
+          />
 
-            {/* Icon column: mic above help — both centered in same w-8 column */}
-            <div className="flex flex-col items-center gap-0.5 flex-shrink-0 mt-0.5">
-              <div className="w-8 h-8 rounded-xl bg-iron-accent/10 flex items-center justify-center">
-                <Mic className="w-4 h-4 text-iron-accent-light" />
-              </div>
-              <div className="relative w-8 flex justify-center" ref={helpRef}>
-                <button
-                  onClick={() => setShowHelp(v => !v)}
-                  className="flex items-center text-iron-text-muted/40 hover:text-iron-text-muted transition-colors"
-                  title="How this works"
-                >
-                  <HelpCircle className="w-3 h-3" />
-                </button>
-                {showHelp && (
-                  <div className="absolute left-0 top-full mt-2 w-72 bg-iron-surface border border-iron-border rounded-lg shadow-xl p-3 z-30 text-[11px] text-iron-text-muted leading-relaxed">
-                    <div className="flex items-start justify-between mb-1.5">
-                      <span className="font-semibold text-iron-text text-xs">How Notes works</span>
-                      <button onClick={() => setShowHelp(false)} className="text-iron-text-muted hover:text-iron-text ml-2">
-                        <X className="w-3 h-3" />
-                      </button>
-                    </div>
-                    <p>Click <strong className="text-iron-text">Dictate</strong> and start speaking — words appear live as you talk.</p>
-                    <p className="mt-1">Or just type directly into the editor — your note is saved automatically.</p>
-                    <p className="mt-1">Use the notebook picker to file your note anywhere. Click <strong className="text-iron-text">Done</strong> to finalize and start a fresh note.</p>
-                  </div>
-                )}
-              </div>
-            </div>
+          {/* Two-row content */}
+          <div className="flex-1 min-w-0 flex flex-col gap-1.5">
 
-            <div className="min-w-0 flex-1">
-              {/* Breadcrumb: [Notebook ▾] / [Title] */}
-              <div className="flex items-center gap-1 min-w-0">
+            {/* Row 1: Breadcrumb + Status */}
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1 min-w-0 flex-1">
                 {/* Notebook dropdown */}
                 <div className="relative flex items-center flex-shrink-0">
                   <button
@@ -813,7 +949,7 @@ export function DictatePage() {
                     className="flex items-center gap-0.5 text-sm text-iron-text-muted hover:text-iron-text-secondary transition-colors"
                     title="Change notebook"
                   >
-                    <span className="font-medium truncate max-w-[110px]">{currentNotebook?.name ?? 'My Notes'}</span>
+                    <span className="font-medium truncate max-w-[160px]">{currentNotebook?.name ?? 'My Notes'}</span>
                     <ChevronDown className="w-2.5 h-2.5 flex-shrink-0 opacity-60" />
                   </button>
                   {notebookPickerOpen && (
@@ -859,7 +995,6 @@ export function DictatePage() {
                   )}
                 </div>
 
-                {/* Separator */}
                 <span className="text-iron-text-muted/40 text-sm font-light flex-shrink-0">/</span>
 
                 {/* Editable title */}
@@ -873,13 +1008,13 @@ export function DictatePage() {
                       if (e.key === 'Enter') { e.preventDefault(); void commitTitle(); }
                       if (e.key === 'Escape') setIsEditingTitle(false);
                     }}
-                    className="text-base font-semibold bg-transparent border-b border-iron-accent/50 text-iron-text focus:outline-none min-w-0 flex-1 max-w-[220px]"
+                    className="text-sm font-semibold bg-transparent border-b border-iron-accent/50 text-iron-text focus:outline-none min-w-0 flex-1"
                     autoFocus
                   />
                 ) : (
                   <button
                     onClick={startEditTitle}
-                    className="text-base font-semibold text-iron-text truncate hover:text-iron-accent-light text-left group flex items-center gap-1.5 min-w-0"
+                    className="text-sm font-semibold text-iron-text truncate hover:text-iron-accent-light text-left group flex items-center gap-1.5 min-w-0"
                     title="Click to rename"
                   >
                     <span className="truncate">{displayTitle}</span>
@@ -888,13 +1023,13 @@ export function DictatePage() {
                 )}
               </div>
 
-              {/* Status badge row */}
+              {/* Status badge */}
               {entryId && (
-                <div className="flex items-center gap-1.5 mt-1 h-4">
+                <div className="flex items-center flex-shrink-0">
                   {loadedEntryStatus !== 'done' && (
                     <span
                       className="inline-flex items-center gap-1 text-[9px] font-medium uppercase tracking-wider text-amber-300 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded leading-none"
-                      title="Draft — click Done to finalize"
+                      title="Draft — click Save to finalize"
                     >
                       <Circle className="w-1.5 h-1.5 fill-current flex-shrink-0" />
                       Draft
@@ -908,99 +1043,138 @@ export function DictatePage() {
                 </div>
               )}
             </div>
-          </div>
 
-          {/* Right: action buttons */}
-          <div className="flex items-center gap-1.5 flex-shrink-0 pt-0.5">
-            {/* Dictate */}
-            <button
-              onClick={handleDictateToggle}
-              disabled={isStopping}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
-                isRecording
-                  ? 'bg-iron-danger text-white shadow-glow-danger animate-pulse-recording'
-                  : isStopping
-                  ? 'bg-iron-warning text-white shadow-glow'
-                  : 'bg-gradient-accent text-white hover:shadow-glow'
-              }`}
-              title={isRecording ? 'Stop recording' : 'Start live dictation'}
-            >
-              {isRecording ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-              {!windowNarrow && (isRecording ? 'Stop' : isStopping ? 'Stopping…' : 'Dictate')}
-            </button>
+            {/* Row 2: All action controls */}
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {entryId && (
+                <>
+                  {polishedEntry?.polishedText && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={handlePolishClick}
+                        disabled={isPolishing || !editor?.getText().trim()}
+                        className={`p-1.5 rounded-xl transition-all ${
+                          isPolishing
+                            ? 'text-iron-accent-light cursor-wait'
+                            : 'text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10'
+                        } disabled:opacity-30 disabled:cursor-not-allowed`}
+                        title="Re-polish this note"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                      </button>
+                      <RawPolishedToggle
+                        displayMode={isPolishing ? 'polished' : effectiveMode}
+                        isPolishing={isPolishing}
+                        providerBadge={polishProvider}
+                        onToggle={handleTogglePolish}
+                      />
+                    </>
+                  )}
+                  {!polishedEntry?.polishedText && (
+                    <button
+                      type="button"
+                      onClick={handlePolishClick}
+                      disabled={isPolishing || !editor?.getText().trim()}
+                      className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
+                        isPolishing
+                          ? 'text-iron-accent-light cursor-wait'
+                          : 'text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10 border border-iron-border hover:border-iron-accent/30'
+                      } disabled:opacity-30 disabled:cursor-not-allowed`}
+                      title="Polish this note"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      {!windowNarrow && 'Polish'}
+                    </button>
+                  )}
+                </>
+              )}
 
-            {/* Collaborate */}
-            <button
-              onClick={() => setCollabOpen(true)}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
-                collabActive
-                  ? 'bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20'
-                  : 'text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10 border border-iron-border hover:border-iron-accent/30'
-              }`}
-              title={collabActive
-                ? `Live session — ${collabParticipantCount} participant${collabParticipantCount !== 1 ? 's' : ''} connected`
-                : 'Collaborate on this note with teammates'}
-            >
-              {collabActive
-                ? <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse shrink-0" />
-                : <Users className="w-3.5 h-3.5" />}
-              {!windowNarrow && (collabActive
-                ? `Live${collabParticipantCount > 0 ? ` · ${collabParticipantCount}` : ''}`
-                : 'Collaborate')}
-            </button>
-
-            {/* Read Back — icon only */}
-            <button
-              onClick={ttsState === 'playing' || ttsState === 'paused' ? () => ttsToggle() : handleReadBack}
-              disabled={ttsState === 'synthesizing' || (!editor?.getText().trim() && ttsState === 'idle')}
-              className={`p-1.5 rounded-xl text-xs font-medium transition-all ${
-                ttsState === 'playing'
-                  ? 'bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25'
-                  : ttsState === 'paused'
-                  ? 'bg-yellow-500/15 text-yellow-400 hover:bg-yellow-500/25'
-                  : ttsState === 'synthesizing'
-                  ? 'text-iron-text-muted opacity-50 cursor-wait'
-                  : 'text-iron-text-muted hover:text-iron-text-secondary hover:bg-iron-surface-hover'
-              } disabled:opacity-30 disabled:cursor-not-allowed`}
-              title={ttsState === 'playing' ? 'Pause read-back' : ttsState === 'paused' ? 'Resume read-back' : 'Read Back'}
-            >
-              {ttsState === 'playing' ? <Pause className="w-3.5 h-3.5" /> :
-               ttsState === 'paused' ? <Play className="w-3.5 h-3.5" /> :
-               <Volume2 className="w-3.5 h-3.5" />}
-            </button>
-
-            {(ttsState === 'playing' || ttsState === 'paused') && (
               <button
-                onClick={handleReadBack}
-                className="p-1.5 rounded-xl text-iron-text-muted hover:text-red-400 hover:bg-red-500/10 transition-all"
-                title="Stop read-back"
+                onClick={handleDictateToggle}
+                disabled={isStopping}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
+                  isRecording
+                    ? 'bg-iron-danger text-white shadow-glow-danger animate-pulse-recording'
+                    : isStopping
+                    ? 'bg-iron-warning text-white shadow-glow'
+                    : 'bg-gradient-accent text-white hover:shadow-glow'
+                }`}
+                title={isRecording ? 'Stop recording' : 'Start live dictation'}
               >
-                <Square className="w-3 h-3" />
+                {isRecording ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
+                {!windowNarrow && (isRecording ? 'Stop' : isStopping ? 'Stopping…' : 'Dictate')}
               </button>
-            )}
 
-            {/* Save */}
-            <button
-              onClick={handleSave}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
-                doneFlash
-                  ? 'bg-emerald-500/15 text-emerald-400'
-                  : 'text-iron-text-muted hover:text-emerald-400 hover:bg-emerald-500/10'
-              }`}
-              title="Save this note"
-            >
-              <Check className="w-3.5 h-3.5" />
-              {!windowNarrow && (doneFlash ? 'Saved!' : 'Save')}
-            </button>
+              <button
+                onClick={() => setCollabOpen(true)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium transition-all ${
+                  collabActive
+                    ? 'bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20'
+                    : 'text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10 border border-iron-border hover:border-iron-accent/30'
+                }`}
+                title={collabActive
+                  ? `Live session — ${collabParticipantCount} participant${collabParticipantCount !== 1 ? 's' : ''} connected`
+                  : 'Collaborate on this note with teammates'}
+              >
+                {collabActive
+                  ? <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse shrink-0" />
+                  : <Users className="w-3.5 h-3.5" />}
+                {!windowNarrow && (collabActive
+                  ? `Live${collabParticipantCount > 0 ? ` · ${collabParticipantCount}` : ''}`
+                  : 'Collaborate')}
+              </button>
 
-            {/* New note */}
-            <button
-              onClick={handleDone}
-              className="p-1.5 rounded-xl text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10 transition-all"
-              title="Save and start a new note"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
+              <button
+                onClick={ttsState === 'playing' || ttsState === 'paused' ? () => ttsToggle() : handleReadBack}
+                disabled={ttsState === 'synthesizing' || (!editor?.getText().trim() && ttsState === 'idle')}
+                className={`p-1.5 rounded-xl text-xs font-medium transition-all ${
+                  ttsState === 'playing'
+                    ? 'bg-emerald-500/15 text-emerald-400 hover:bg-emerald-500/25'
+                    : ttsState === 'paused'
+                    ? 'bg-yellow-500/15 text-yellow-400 hover:bg-yellow-500/25'
+                    : ttsState === 'synthesizing'
+                    ? 'text-iron-text-muted opacity-50 cursor-wait'
+                    : 'text-iron-text-muted hover:text-iron-text-secondary hover:bg-iron-surface-hover'
+                } disabled:opacity-30 disabled:cursor-not-allowed`}
+                title={ttsState === 'playing' ? 'Pause read-back' : ttsState === 'paused' ? 'Resume read-back' : 'Read Back'}
+              >
+                {ttsState === 'playing' ? <Pause className="w-3.5 h-3.5" /> :
+                 ttsState === 'paused' ? <Play className="w-3.5 h-3.5" /> :
+                 <Volume2 className="w-3.5 h-3.5" />}
+              </button>
+
+              {(ttsState === 'playing' || ttsState === 'paused') && (
+                <button
+                  onClick={handleReadBack}
+                  className="p-1.5 rounded-xl text-iron-text-muted hover:text-red-400 hover:bg-red-500/10 transition-all"
+                  title="Stop read-back"
+                >
+                  <Square className="w-3 h-3" />
+                </button>
+              )}
+
+              <button
+                onClick={handleSave}
+                className={`p-1.5 rounded-xl transition-all ${
+                  doneFlash
+                    ? 'bg-emerald-500/15 text-emerald-400'
+                    : 'text-iron-text-muted hover:text-emerald-400 hover:bg-emerald-500/10'
+                }`}
+                title="Save this note"
+              >
+                <Save className="w-3.5 h-3.5" />
+              </button>
+
+              <button
+                onClick={handleDone}
+                className="p-1.5 rounded-xl text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10 transition-all"
+                title="Save and start a new note"
+              >
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
           </div>
         </div>
       </div>
@@ -1034,8 +1208,20 @@ export function DictatePage() {
       </div>
 
       {/* Editor */}
-      <div className="flex-1 overflow-y-auto">
+      <div className="flex-1 overflow-y-auto relative">
         <EditorContent editor={editor} />
+        {isPolishing && (
+          <div
+            className="absolute inset-0 bg-iron-bg/70 backdrop-blur-[2px] flex items-center justify-center z-10 pointer-events-auto"
+            aria-live="polite"
+            aria-busy="true"
+          >
+            <div className="flex items-center gap-2 px-4 py-2 rounded-xl bg-iron-surface border border-iron-border shadow-lg">
+              <Loader2 className="w-4 h-4 animate-spin text-iron-accent-light" />
+              <span className="text-sm font-medium text-iron-text">Generating polished version…</span>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Status bar */}

@@ -10,7 +10,7 @@ import { IPC_CHANNELS, MODEL_FILES, TRANSCRIPTION_ENGINES } from '../shared/cons
 import { native } from './native-bridge';
 import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine, ensureBundledMoonshineBase, isMoonshineBundleAvailable } from './model-downloader';
 import { aiManager } from './ai/AIManager';
-import { getChatModelPath, resolveActiveChatModel } from './ai/LocalLLMAdapter';
+import { getChatModelPath } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
 import type { AIProvider } from './ai/types';
 import { meetingRecorder } from './meeting-recorder';
@@ -73,6 +73,10 @@ const ALLOWED_SETTING_KEYS = new Set([
   // (see main/index.ts engine-startup block) — so user switches via this
   // setting last only for the current session.
   'transcription_engine',
+  // Polish provider preference. 'true' enables cloud polish via authenticated
+  // Claude/Copilot CLIs; default 'false' keeps polish strictly on-device.
+  // The renderer Settings panel surfaces this with a privacy warning + confirm.
+  'polish_allow_cloud',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -219,50 +223,50 @@ export function registerIpcHandlers(): void {
       throw err;
     }
   });
-  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, async (_e, rawText: string) => {
-    // llama.cpp inference lives in the separate ironmic-llm binary to avoid
-    // ggml symbol collisions with whisper.cpp. The N-API addon's polishText
-    // is a no-op stub.
-    //
-    // Three states the user can be in:
-    //   1. No chat model downloaded         → no LLM at all, return input
-    //                                          unchanged (caller treats this
-    //                                          as "already clean").
-    //   2. Chat model present + binary present → run the subprocess.
-    //   3. Chat model present + binary missing → throw a clear error so the
-    //                                          UI shows what's wrong instead
-    //                                          of silently returning a stub.
-    const resolved = resolveActiveChatModel(native);
-    if (!resolved) {
-      // State 1: user hasn't set up local LLM at all.
-      return native.polishText(rawText);
+  // Polish dispatcher used by both POLISH_TEXT and POLISH_TEXT_DETAILED.
+  // Reads polish_allow_cloud from settings and routes via aiManager. Default
+  // is strictly local — cloud is only considered when the setting is the
+  // explicit string 'true' (auth state alone never enables it).
+  const dispatchPolish = async (
+    rawText: string,
+    requireModel: boolean,
+  ): Promise<{ text: string; providerUsed: AIProvider }> => {
+    let allowCloud = false;
+    try {
+      allowCloud = native.getSetting('polish_allow_cloud') === 'true';
+    } catch { /* setting absent → default false */ }
+    try {
+      return await aiManager.polish(rawText, { allowCloud });
+    } catch (err: any) {
+      // Renderer pattern-matches the "Cleanup model not downloaded" wording.
+      // When the caller doesn't require the model (legacy dictation auto-
+      // cleanup, meeting fallback), gracefully return the input unchanged.
+      if (!requireModel && err?.message?.includes('Cleanup model not downloaded')) {
+        return { text: rawText, providerUsed: 'local' };
+      }
+      throw err;
     }
-    if (!llmSubprocess.isAvailable()) {
-      // State 3: model is downloaded so the user *expects* polish to work,
-      // but the binary isn't built. Surface the real error to the renderer
-      // — the UI will show a toast with this message.
-      throw new Error(
-        'Local LLM binary (ironmic-llm) is missing. Rebuild with: ' +
-          'cargo build --release --bin ironmic-llm --features llm-bin',
-      );
-    }
-    // State 2: run the subprocess with a hard timeout so a hung process
-    // doesn't block indefinitely.
-    const LLM_TIMEOUT_MS = 5 * 60 * 1000;
-    const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error(`LLM call timed out after ${LLM_TIMEOUT_MS / 1000}s`)), LLM_TIMEOUT_MS),
-    );
-    return await Promise.race([
-      llmSubprocess.chatComplete({
-        modelPath: resolved.modelPath,
-        modelType: resolved.modelType,
-        messages: [{ role: 'user', content: rawText }],
-        maxTokens: 2048,
-        temperature: 0.3,
-      }),
-      timeoutPromise,
-    ]);
+  };
+
+  // Backward-compat: existing callers (useRecordingStore, useNotesStore,
+  // SummaryGenerator, MeetingDetector, MeetingTemplateEngine, IntentClassifier)
+  // expect a string return. Don't change that — return only result.text here.
+  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, async (
+    _e,
+    rawText: string,
+    opts?: { requireModel?: boolean },
+  ) => {
+    const result = await dispatchPolish(rawText, !!opts?.requireModel);
+    return result.text;
   });
+
+  // New channel for the toggle-driven polish flow that wants to know which
+  // provider produced the output (for the "via X" badge next to the toggle).
+  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT_DETAILED, async (
+    _e,
+    rawText: string,
+    opts?: { requireModel?: boolean },
+  ) => dispatchPolish(rawText, !!opts?.requireModel));
 
   // ── Processing state tracking (for quit-confirmation) ──
   // Renderer fires this when it starts/stops LLM note generation so the main

@@ -20,6 +20,25 @@ const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 /** Maximum number of conversation history messages to keep for local LLM context. */
 const MAX_HISTORY_MESSAGES = 20;
 
+/** Hard timeout for any single polish call (CLI or local). */
+const POLISH_TIMEOUT_MS = 5 * 60 * 1000;
+
+/** System prompt for the polish pass. Kept verbatim from CLAUDE.md so the
+ *  behavior is consistent across local and CLI providers. */
+const CLEANUP_PROMPT = `You are a text cleanup assistant. You receive raw speech-to-text transcriptions and produce clean, polished text.
+
+Rules:
+- Fix grammar, punctuation, and spelling errors
+- Remove filler words (um, uh, like, you know, so, basically)
+- Remove false starts and repeated phrases
+- Preserve the speaker's original meaning, tone, and intent exactly
+- Maintain the speaker's vocabulary level — do not make it sound more formal or less formal than intended
+- Keep technical terms, proper nouns, and jargon exactly as spoken
+- Format lists, paragraphs, and structure naturally based on content
+- Do NOT add information that wasn't spoken
+- Do NOT summarize or shorten — keep the full content
+- Output ONLY the cleaned text, nothing else — no preamble, no explanation`;
+
 export class AIManager {
   private copilot = new CopilotAdapter();
   private claude = new ClaudeAdapter();
@@ -366,6 +385,132 @@ export class AIManager {
         } else {
           resolve(fullOutput.trim());
         }
+      });
+    });
+  }
+
+  /**
+   * Run a polish (text cleanup) pass with provider preference.
+   *
+   * Provider order:
+   *   - allowCloud && Claude authenticated → Claude
+   *   - allowCloud && Copilot authenticated → Copilot
+   *   - local chat model installed → local
+   *   - otherwise → throw (renderer pattern-matches for "Cleanup model not downloaded")
+   *
+   * Crucially separate from `sendMessage` / `sendCLIMessage`:
+   *   - never touches `this.turnCount`
+   *   - never assigns `this.activeProcess` (chat cancel won't kill polish)
+   *   - never emits `ai:turn-*` events (no chat UI bleed)
+   *   - always one-shot (continueSession=false) — polish has no conversation
+   */
+  async polish(
+    rawText: string,
+    opts: { allowCloud: boolean },
+  ): Promise<{ text: string; providerUsed: AIProvider }> {
+    const claude = opts.allowCloud ? await this.checkAuth('claude') : null;
+    if (claude?.authenticated) {
+      const text = await this.runCliOneShot('claude', rawText);
+      return { text, providerUsed: 'claude' };
+    }
+    const copilot = opts.allowCloud ? await this.checkAuth('copilot') : null;
+    if (copilot?.authenticated) {
+      const text = await this.runCliOneShot('copilot', rawText);
+      return { text, providerUsed: 'copilot' };
+    }
+    const resolvedLocal = resolveActiveChatModel(native);
+    if (resolvedLocal) {
+      if (!llmSubprocess.isAvailable()) {
+        throw new Error(
+          'Local LLM binary (ironmic-llm) is missing. Rebuild with: ' +
+            'cargo build --release --bin ironmic-llm --features llm-bin',
+        );
+      }
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Polish timed out after ${POLISH_TIMEOUT_MS / 1000}s`)),
+          POLISH_TIMEOUT_MS,
+        ),
+      );
+      const text = await Promise.race([
+        llmSubprocess.chatComplete({
+          modelPath: resolvedLocal.modelPath,
+          modelType: resolvedLocal.modelType,
+          messages: [
+            { role: 'system', content: CLEANUP_PROMPT },
+            { role: 'user', content: rawText },
+          ],
+          maxTokens: 2048,
+          temperature: 0.3,
+        }),
+        timeout,
+      ]);
+      return { text, providerUsed: 'local' };
+    }
+    throw new Error(
+      'Cleanup model not downloaded. Import or download one in Settings to enable text polishing.',
+    );
+  }
+
+  /**
+   * Spawn a CLI provider for a single polish turn. Isolated from the chat
+   * pipeline — no shared state, no event emissions, no continueSession.
+   */
+  private async runCliOneShot(
+    provider: 'claude' | 'copilot',
+    rawText: string,
+    model?: string,
+  ): Promise<string> {
+    const adapter = this.getCLIAdapter(provider);
+    const auth = await this.checkAuth(provider);
+    if (!auth.installed) {
+      throw new Error(`${provider} CLI is not installed`);
+    }
+    if (!auth.authenticated) {
+      throw new Error(`${provider} CLI is not authenticated`);
+    }
+    const binary = auth.binaryPath!;
+    // The cleanup prompt is prepended to the raw transcript inline because
+    // the CLI binaries take a single positional/argument prompt — there's no
+    // separate system-message channel like chatComplete has.
+    const prompt = `${CLEANUP_PROMPT}\n\nInput transcript:\n${rawText}`;
+    const args = provider === 'copilot'
+      ? this.copilot.buildArgsForBinary(binary, prompt, false, model)
+      : adapter.buildArgs(prompt, false, model);
+
+    return new Promise<string>((resolve, reject) => {
+      const proc = spawn(binary, args, {
+        env: getScopedSpawnEnv(provider),
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      try { proc.stdin?.end(); } catch { /* ignore */ }
+
+      let fullOutput = '';
+      let stderrBuf = '';
+      const timer = setTimeout(() => {
+        try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+        reject(new Error(`Polish via ${provider} timed out after ${POLISH_TIMEOUT_MS / 1000}s`));
+      }, POLISH_TIMEOUT_MS);
+
+      proc.stdout?.on('data', (chunk: Buffer) => { fullOutput += chunk.toString(); });
+      proc.stderr?.on('data', (chunk: Buffer) => { stderrBuf += chunk.toString(); });
+      proc.on('error', (err) => {
+        clearTimeout(timer);
+        reject(new Error(`Failed to start ${provider}: ${err.message}`));
+      });
+      proc.on('close', (code) => {
+        clearTimeout(timer);
+        if (code !== 0 && !fullOutput.trim()) {
+          const detail = stderrBuf.trim().slice(0, 800) || '(no stderr)';
+          reject(new Error(`${provider} exited with code ${code}: ${detail}`));
+          return;
+        }
+        // Strip ANSI for Copilot which can emit color codes; Claude doesn't.
+        const cleaned = provider === 'copilot'
+          ? this.copilot.parseOutput(fullOutput).content
+          : fullOutput;
+        resolve(cleaned.trim());
       });
     });
   }

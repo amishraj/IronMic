@@ -180,6 +180,7 @@ export const MEETING_TAG_PREFIX = '__meeting__:';
  *  by NotesSidebar to render a yellow dot on drafts so users can tell at a
  *  glance which notes still need attention. */
 export const STATUS_TAG_PREFIX = '__status__:';
+export const EMOJI_TAG_PREFIX = '__emoji__:';
 
 export type NoteStatus = 'draft' | 'done';
 
@@ -197,6 +198,7 @@ export function parseTags(tags: string | null): string[] {
         !s.startsWith(TITLE_TAG_PREFIX) &&
         !s.startsWith(NOTEBOOK_TAG_PREFIX) &&
         !s.startsWith(STATUS_TAG_PREFIX) &&
+        !s.startsWith(EMOJI_TAG_PREFIX) &&
         !s.startsWith('__meeting__:'),
     );
   } catch {
@@ -234,6 +236,21 @@ export function parseTitleTag(tags: string | null): string | null {
     );
     if (!t) return null;
     return (t as string).slice(TITLE_TAG_PREFIX.length);
+  } catch {
+    return null;
+  }
+}
+
+export function parseEmojiTag(tags: string | null): string | null {
+  if (!tags) return null;
+  try {
+    const arr = JSON.parse(tags);
+    if (!Array.isArray(arr)) return null;
+    const t = arr.find(
+      (s: string) => typeof s === 'string' && s.startsWith(EMOJI_TAG_PREFIX),
+    );
+    if (!t) return null;
+    return (t as string).slice(EMOJI_TAG_PREFIX.length);
   } catch {
     return null;
   }

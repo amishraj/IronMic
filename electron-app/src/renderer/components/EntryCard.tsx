@@ -1,4 +1,4 @@
-import { useState, memo } from 'react';
+import { memo } from 'react';
 import { Pin, Archive, Trash2, Clock, Sparkles, MessageSquare } from 'lucide-react';
 import { RawPolishedToggle } from './RawPolishedToggle';
 import { PlaybackControls } from './PlaybackControls';
@@ -7,6 +7,7 @@ import { ShareMenu } from './ShareMenu';
 import { Card } from './ui';
 import { parseTags, parseTitleTag } from '../types';
 import { useTtsStore } from '../stores/useTtsStore';
+import { useEntryStore } from '../stores/useEntryStore';
 import type { Entry } from '../types';
 
 /** Parse sourceApp to check if it's an AI entry and extract the session ID */
@@ -22,20 +23,25 @@ interface EntryCardProps {
   onDelete: (id: string) => void;
   onPin: (id: string, pinned: boolean) => void;
   onArchive: (id: string, archived: boolean) => void;
-  onPolish: (id: string) => void;
+  /** Legacy prop — still honored if the parent passes one, but the toggle now
+   *  routes through useEntryStore directly so all callers stay in sync. */
+  onPolish?: (id: string) => void;
   onTagClick?: (tag: string) => void;
   /** True while this entry's polish pass is running. Drives the spinner
    *  in RawPolishedToggle. */
   isPolishing?: boolean;
 }
 
-function EntryCardInner({ entry, onDelete, onPin, onArchive, onPolish, onTagClick, isPolishing }: EntryCardProps) {
-  const [displayMode, setDisplayMode] = useState<'raw' | 'polished'>(
-    entry.polishedText ? 'polished' : 'raw'
-  );
+function EntryCardInner({ entry, onDelete, onPin, onArchive, onTagClick, isPolishing }: EntryCardProps) {
+  // Effective mode: when polishedText is null (e.g., a freshly-created entry
+  // that inherits the SQL DEFAULT 'polished'), force 'raw' so we never try to
+  // render a non-existent polished view.
+  const effectiveMode: 'raw' | 'polished' =
+    entry.polishedText ? entry.displayMode : 'raw';
+  const polishProvider = useEntryStore((s) => s.polishProviderByEntryId.get(entry.id));
   const { state: ttsState, timestamps, currentTimeMs, activeEntryId } = useTtsStore();
 
-  const text = displayMode === 'polished' && entry.polishedText
+  const text = effectiveMode === 'polished' && entry.polishedText
     ? entry.polishedText
     : entry.rawTranscript;
 
@@ -86,13 +92,16 @@ function EntryCardInner({ entry, onDelete, onPin, onArchive, onPolish, onTagClic
             <span className="text-iron-text-muted">· {entry.sourceApp}</span>
           )}
         </div>
-        <RawPolishedToggle
-          displayMode={displayMode}
-          hasPolished={!!entry.polishedText}
-          onToggle={() => setDisplayMode((m) => (m === 'raw' ? 'polished' : 'raw'))}
-          onPolishNow={() => onPolish(entry.id)}
-          isPolishing={isPolishing}
-        />
+        {entry.polishedText && (
+          <RawPolishedToggle
+            displayMode={isPolishing ? 'polished' : effectiveMode}
+            isPolishing={isPolishing}
+            providerBadge={polishProvider}
+            onToggle={(next) => {
+              void useEntryStore.getState().setEntryDisplayMode(entry.id, next);
+            }}
+          />
+        )}
       </div>
 
       {noteTitle && (
@@ -175,6 +184,8 @@ export const EntryCard = memo(EntryCardInner, (prev, next) =>
   prev.entry.id === next.entry.id &&
   prev.entry.updatedAt === next.entry.updatedAt &&
   prev.entry.displayMode === next.entry.displayMode &&
+  prev.entry.polishedText === next.entry.polishedText &&
+  prev.entry.rawTranscript === next.entry.rawTranscript &&
   prev.entry.isPinned === next.entry.isPinned &&
   prev.isPolishing === next.isPolishing,
 );

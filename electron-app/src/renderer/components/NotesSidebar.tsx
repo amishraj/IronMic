@@ -22,7 +22,7 @@ import {
   PanelLeftOpen, Plus, BookPlus,
 } from 'lucide-react';
 import type { Entry } from '../types';
-import { parseTitleTag, parseNotebookTag, parseStatusTag } from '../types';
+import { parseTitleTag, parseNotebookTag, parseStatusTag, parseEmojiTag } from '../types';
 import {
   listNotebooks, createNotebook, getDefaultNotebookId,
   getMeetingNotesNotebookId, type Notebook,
@@ -373,6 +373,7 @@ function NoteRow({ entry, active, onClick, onDelete }: {
   entry: Entry; active: boolean; onClick: () => void; onDelete: () => void;
 }) {
   const title = parseTitleTag(entry.tags) || 'Untitled';
+  const emoji = parseEmojiTag(entry.tags);
   const status = parseStatusTag(entry.tags);
   const isDraft = status === 'draft';
   const [hovered, setHovered] = useState(false);
@@ -394,7 +395,8 @@ function NoteRow({ entry, active, onClick, onDelete }: {
       <div className="flex items-center justify-between gap-1">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-1">
-            {isDraft && (
+            {emoji && <span className="text-[11px] leading-none flex-shrink-0">{emoji}</span>}
+            {isDraft && !emoji && (
               <span
                 className="w-1.5 h-1.5 rounded-full bg-amber-400 flex-shrink-0"
                 title="Draft — not yet marked Done"

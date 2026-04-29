@@ -697,6 +697,11 @@ function SecuritySettings() {
   const [aiDataConfirm, setAiDataConfirm] = useState(false);
   const [privacyMode, setPrivacyMode] = useState(false);
   const [proxyEnabled, setProxyEnabled] = useState(false);
+  // polish_allow_cloud: off by default. When on, polish prefers an
+  // authenticated Claude/Copilot CLI — which sends transcript text to those
+  // CLIs, breaking IronMic's local-only default. Authentication never
+  // auto-flips this; the user must consciously opt in here.
+  const [allowCloudPolish, setAllowCloudPolish] = useState(false);
   const [proxyUrl, setProxyUrl] = useState('');
   const [proxySaved, setProxySaved] = useState(false);
 
@@ -706,7 +711,7 @@ function SecuritySettings() {
 
   async function loadSecuritySettings() {
     const api = window.ironmic;
-    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl] = await Promise.all([
+    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl, polishCloud] = await Promise.all([
       api.getSetting('security_clipboard_auto_clear'),
       api.getSetting('security_session_timeout'),
       api.getSetting('security_clear_on_exit'),
@@ -714,6 +719,7 @@ function SecuritySettings() {
       api.getSetting('security_privacy_mode'),
       api.getSetting('proxy_enabled'),
       api.getSetting('proxy_url'),
+      api.getSetting('polish_allow_cloud'),
     ]);
     if (clip) setClipboardAutoClear(clip);
     if (timeout) setSessionTimeout(timeout);
@@ -722,6 +728,25 @@ function SecuritySettings() {
     setPrivacyMode(privacy === 'true');
     setProxyEnabled(pEnabled === 'true');
     if (pUrl) setProxyUrl(pUrl);
+    setAllowCloudPolish(polishCloud === 'true');
+  }
+
+  /** Confirm before turning on cloud polish — it's the one setting that
+   *  routes user content off-device, so a misclick shouldn't be silently
+   *  destructive to the privacy posture. Turning OFF is unconditional. */
+  async function handleCloudPolishToggle(next: boolean) {
+    if (next) {
+      const ok = window.confirm(
+        'Allow cloud polishing?\n\n' +
+        'When enabled, IronMic will send your transcript text to the authenticated ' +
+        'Claude or Copilot CLI for higher-quality cleanups. This is the only feature ' +
+        'that sends content off your device.\n\n' +
+        'You can turn this off again at any time.',
+      );
+      if (!ok) return;
+    }
+    setAllowCloudPolish(next);
+    await updateSetting('polish_allow_cloud', String(next));
   }
 
   async function updateSetting(key: string, value: string) {
@@ -741,6 +766,40 @@ function SecuritySettings() {
           <PostureItem icon={Lock} label="Context Isolation" detail="Renderer sandboxed from Node.js. Typed IPC bridge only." status="strong" />
           <PostureItem icon={FileWarning} label="Database Encryption" detail="SQLite database stored unencrypted on disk. Enable OS-level disk encryption (FileVault/BitLocker)." status="warning" />
           <PostureItem icon={ClipboardCheck} label="Clipboard" detail={clipboardAutoClear === 'off' ? 'Text remains in clipboard until overwritten. Enable auto-clear below.' : `Auto-cleared after ${clipboardAutoClear}`} status={clipboardAutoClear === 'off' ? 'warning' : 'strong'} />
+        </div>
+      </Card>
+
+      {/* Cloud polish — the one setting that routes user content off-device. */}
+      <Card
+        variant="default"
+        padding="md"
+        className={allowCloudPolish ? 'border-amber-500/40' : ''}
+      >
+        <div className="space-y-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start gap-2 min-w-0 flex-1">
+              <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-iron-text">Allow cloud polishing (Claude / Copilot)</p>
+                <p className="text-xs text-iron-text-muted mt-0.5">
+                  Off by default. IronMic processes everything locally. Turning this on
+                  sends your transcript text to the authenticated Claude or Copilot CLI
+                  when you polish a note.
+                </p>
+              </div>
+            </div>
+            <Toggle checked={allowCloudPolish} onChange={handleCloudPolishToggle} />
+          </div>
+          {allowCloudPolish && (
+            <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300">
+              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+              <span>
+                Cloud polish is enabled. Polish runs will use Claude or Copilot when authenticated;
+                otherwise they fall back to the local LLM. The polish toggle in Notes shows a "via Claude" /
+                "via Copilot" / "via local" badge so you can confirm where each polish ran.
+              </span>
+            </div>
+          )}
         </div>
       </Card>
 

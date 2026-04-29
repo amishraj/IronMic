@@ -502,6 +502,15 @@ function SpeechRecognitionModelSection({
   const moonshineEngines = TRANSCRIPTION_ENGINES.filter((e) => e.family === 'moonshine');
   const whisperEngines = TRANSCRIPTION_ENGINES.filter((e) => e.family === 'whisper');
   const activeMeta = TRANSCRIPTION_ENGINES.find((e) => e.id === activeEngine);
+  // Only call the engine "Active" if its files are actually on disk. Without
+  // this guard, the chip lies on dev/unpackaged builds where the bundle copy
+  // hasn't run, and on stub builds where getTranscriptionEngine() always
+  // reports moonshine-base. Startup also force-overwrites the persisted
+  // setting to moonshine-base every launch (main/index.ts) — surface that
+  // policy in the tooltip so the user isn't confused when their Whisper
+  // selection resets between runs.
+  const activeReady = !!activeMeta && engineReadiness[activeMeta.id] === true;
+  const activeChipTitle = 'Active for this session — Moonshine Base is restored as the default on next launch.';
 
   return (
     <div className="space-y-2">
@@ -509,11 +518,21 @@ function SpeechRecognitionModelSection({
         <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
           Speech Recognition Model
         </p>
-        {activeMeta && (
-          <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
+        {activeMeta && activeReady ? (
+          <span
+            title={activeChipTitle}
+            className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20"
+          >
             {activeMeta.label} — Active
           </span>
-        )}
+        ) : activeMeta ? (
+          <span
+            title="The selected engine's model files aren't available on disk. Download it below to make it active."
+            className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-iron-warning/10 text-iron-warning border border-iron-warning/20"
+          >
+            {activeMeta.label} — Not ready
+          </span>
+        ) : null}
       </div>
       <p className="text-xs text-iron-text-muted">
         The engine that turns your voice into text. Used for dictation and meeting transcription.
@@ -672,8 +691,14 @@ function EngineRow({
           </p>
         </div>
         <div className="ml-1 flex-shrink-0 flex items-center gap-1.5">
-          {isActive ? (
+          {isActive && isReady ? (
             <Badge variant="success">Active</Badge>
+          ) : isActive && !isReady ? (
+            // The persisted setting points at this engine but the files are
+            // missing — show Download instead of a misleading "Active" badge.
+            <Button size="sm" icon={<Download className="w-3 h-3" />} onClick={onDownload}>
+              Download
+            </Button>
           ) : isDownloading ? (
             <Loader2 className="w-4 h-4 animate-spin text-iron-accent" />
           ) : isReady ? (
