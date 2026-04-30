@@ -199,7 +199,7 @@ export function AudioSetupModal({ onClose, onInstalled }: Props) {
                   <p className="text-[12px] font-medium text-iron-text">
                     {scenario === 'system'
                       ? 'Route Windows output through CABLE Input'
-                      : 'Capture mic + system audio together'}
+                      : 'Capture mic + participants together'}
                   </p>
                 </div>
                 <div className="pl-7 space-y-2">
@@ -219,26 +219,47 @@ export function AudioSetupModal({ onClose, onInstalled }: Props) {
                       </li>
                     </ol>
                   ) : (
-                    <ol className="text-[11px] text-iron-text-muted leading-relaxed list-decimal pl-4 space-y-0.5">
-                      <li>Route system output through CABLE Input (same as the "System audio" flow above).</li>
-                      <li>
-                        In your meeting app (Zoom/Teams/Meet) set the{' '}
-                        <strong className="text-iron-text">speaker</strong> to{' '}
-                        <strong className="text-iron-text">CABLE Input</strong> — this pipes the other
-                        participants into the cable without touching the rest of Windows.
-                      </li>
-                      <li>
-                        In IronMic select <strong className="text-iron-text">CABLE Output</strong>. Your mic
-                        is mixed in automatically because the meeting app is already capturing it
-                        and IronMic records the same transcript stream.
-                      </li>
-                      <li>
-                        Prefer a single-device capture? If your sound card exposes{' '}
-                        <strong className="text-iron-text">Stereo Mix</strong> (open{' '}
-                        <strong>Sound → Recording</strong>, right-click empty space → <strong>Show Disabled Devices</strong>,
-                        enable Stereo Mix), pick it in IronMic — it captures mic + system mix in one stream and skips VB-CABLE entirely.
-                      </li>
-                    </ol>
+                    <div className="space-y-3 text-[11px] text-iron-text-muted leading-relaxed">
+                      <div className="rounded border border-amber-500/20 bg-amber-500/5 px-2.5 py-2 text-[10px]">
+                        <strong className="text-amber-400">VB-CABLE alone is not enough for "me + others".</strong>{' '}
+                        CABLE Output only captures what was routed through CABLE Input — your physical mic
+                        is never included unless you mix it in via an additional tool.
+                      </div>
+
+                      <div>
+                        <p className="font-medium text-iron-text mb-1">Option A — Voicemeeter (recommended, free)</p>
+                        <ol className="list-decimal pl-4 space-y-0.5">
+                          <li>Download and install <strong className="text-iron-text">Voicemeeter</strong> from vb-audio.com/Voicemeeter.</li>
+                          <li>In your meeting app set the <strong className="text-iron-text">speaker</strong> to{' '}
+                            <strong className="text-iron-text">CABLE Input</strong> — this routes participants into the cable.</li>
+                          <li>In Voicemeeter, set <strong className="text-iron-text">Hardware Input 1</strong> to{' '}
+                            <strong className="text-iron-text">CABLE Output</strong> (participants) and{' '}
+                            <strong className="text-iron-text">Hardware Input 2</strong> to your physical mic.
+                            Route both inputs to the same output bus (A1 or B1).
+                          </li>
+                          <li>In IronMic, select{' '}
+                            <strong className="text-iron-text">Voicemeeter Output (VB-Audio Voicemeeter VAIO)</strong> —
+                            this single stream contains both your mic and the participants.
+                          </li>
+                        </ol>
+                      </div>
+
+                      <div>
+                        <p className="font-medium text-iron-text mb-1">Option B — Stereo Mix (no extra software, hardware-dependent)</p>
+                        <ol className="list-decimal pl-4 space-y-0.5">
+                          <li>Open <strong className="text-iron-text">Sound → Recording</strong>.
+                            Right-click empty space → <strong>Show Disabled Devices</strong>.
+                            If <strong className="text-iron-text">Stereo Mix</strong> appears, enable it.
+                          </li>
+                          <li>Select <strong className="text-iron-text">Stereo Mix</strong> in IronMic —
+                            it captures mic + system audio in one stream.
+                          </li>
+                          <li className="text-iron-text-muted/70">
+                            Note: Stereo Mix is unavailable on most modern USB headsets and many laptop sound cards.
+                          </li>
+                        </ol>
+                      </div>
+                    </div>
                   )}
                 </div>
               </div>
