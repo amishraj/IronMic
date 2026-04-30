@@ -10,7 +10,7 @@ import { IPC_CHANNELS, MODEL_FILES, TRANSCRIPTION_ENGINES } from '../shared/cons
 import { native } from './native-bridge';
 import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine, ensureBundledMoonshineBase, isMoonshineBundleAvailable } from './model-downloader';
 import { aiManager } from './ai/AIManager';
-import { resolveActiveChatModel } from './ai/LocalLLMAdapter';
+import { getChatModelPath } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
 import type { AIProvider } from './ai/types';
 import { meetingRecorder } from './meeting-recorder';
@@ -450,10 +450,7 @@ export function registerIpcHandlers(): void {
     const entries: Array<[string, string]> = JSON.parse(entriesJson);
     if (entries.length === 0) return 0;
 
-    const resolvedModel = resolveActiveChatModel(native);
-    if (!resolvedModel) {
-      throw new Error('No local LLM model is available for topic classification');
-    }
+    const modelPath = getChatModelPath('llm');
     const TOPIC_PROMPT = `You are a topic classifier. Given a transcription, output 1 to 3 topic categories that best describe the content.
 
 Choose from broad, reusable categories such as:
@@ -482,8 +479,8 @@ If the text is too short or unclear, output: ["General"]`;
         // Truncate to ~500 words
         const truncated = text.split(/\s+/).slice(0, 500).join(' ');
         const response = await llmSubprocess.chatComplete({
-          modelPath: resolvedModel.modelPath,
-          modelType: resolvedModel.modelType,
+          modelPath,
+          modelType: 'mistral',
           messages: [
             { role: 'user', content: `${TOPIC_PROMPT}\n\nTranscription:\n${truncated}` },
           ],

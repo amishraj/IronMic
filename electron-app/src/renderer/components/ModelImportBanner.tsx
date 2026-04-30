@@ -166,7 +166,7 @@ export function ModelImportSection({ sectionLabel, filter, onImported, highlight
                       {m.isMoonshine && m.parts && m.parts.length > 0 ? (
                         <>
                           <p className="text-[10px] text-iron-text-muted font-medium">
-                            GitHub Releases ({m.parts.length} files — download all, then click Import below):
+                            HuggingFace ({m.parts.length} files — download all, then click Import below):
                           </p>
                           <div className="space-y-0.5 ml-1">
                             {m.parts.map((part) => (
@@ -211,22 +211,18 @@ export function ModelImportSection({ sectionLabel, filter, onImported, highlight
                               </button>
                             ))}
                           </div>
-                          {m.downloadUrl && (
-                            <>
-                              <div className="flex items-center gap-2 pt-1">
-                                <div className="flex-1 h-px bg-iron-border/30" />
-                                <span className="text-[9px] text-iron-text-muted">or</span>
-                                <div className="flex-1 h-px bg-iron-border/30" />
-                              </div>
-                              <button
-                                onClick={() => window.ironmic?.openExternal?.(m.downloadUrl)}
-                                className="flex items-center gap-1.5 text-[10px] text-iron-accent-light hover:underline"
-                              >
-                                <ExternalLink className="w-2.5 h-2.5" />
-                                Single file from HuggingFace (no parts needed)
-                              </button>
-                            </>
-                          )}
+                          <div className="flex items-center gap-2 pt-1">
+                            <div className="flex-1 h-px bg-iron-border/30" />
+                            <span className="text-[9px] text-iron-text-muted">or</span>
+                            <div className="flex-1 h-px bg-iron-border/30" />
+                          </div>
+                          <button
+                            onClick={() => window.ironmic?.openExternal?.(m.downloadUrl)}
+                            className="flex items-center gap-1.5 text-[10px] text-iron-accent-light hover:underline"
+                          >
+                            <ExternalLink className="w-2.5 h-2.5" />
+                            Single file from HuggingFace (no parts needed)
+                          </button>
                         </>
                       ) : (
                         /* Single-file model: one download link */

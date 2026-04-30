@@ -883,7 +883,7 @@ function LlmModelRow({ refreshKey, onImported }: { refreshKey: number; onImporte
   useEffect(() => {
     loadStatus();
     const cleanup = window.ironmic.onModelDownloadProgress((prog: DownloadProgress) => {
-      if (prog.model !== 'llm-chat-phi3') return;
+      if (prog.model !== 'llm') return;
       setProgress(prog);
       if (prog.status === 'complete') { setDownloading(false); setProgress(null); loadStatus(); }
       if (prog.status === 'error') {
@@ -895,18 +895,14 @@ function LlmModelRow({ refreshKey, onImported }: { refreshKey: number; onImporte
     return cleanup;
   }, []);
 
-  const phiSize = status?.files?.['llm-chat-phi3']?.sizeBytes || 0;
-  const mistralSize = status?.files?.llm?.sizeBytes || status?.llm?.sizeBytes || 0;
-  const size = phiSize || mistralSize;
+  const size = status?.files?.llm?.sizeBytes || status?.llm?.sizeBytes || 0;
   const downloaded = size > 0;
-  const readyLabel = phiSize > 0 ? 'Phi-3 Mini — Ready' : 'Mistral 7B — Ready';
-  const displayName = phiSize > 0 ? 'Phi-3 Mini Q4' : mistralSize > 0 ? 'Mistral 7B Instruct Q4' : 'Phi-3 Mini Q4';
 
   const handleDownload = async () => {
     setDownloading(true);
     setError(null);
     try {
-      await window.ironmic.downloadModel('llm-chat-phi3');
+      await window.ironmic.downloadModel('llm');
     } catch (err: any) {
       setError(ipcErrorMessage(err, 'Download failed'));
       setDownloading(false);
@@ -922,16 +918,16 @@ function LlmModelRow({ refreshKey, onImported }: { refreshKey: number; onImporte
       </p>
       {downloaded && (
         <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-green-500/15 text-green-400 border border-green-500/20">
-          {readyLabel}
+          Mistral 7B — Ready
         </span>
       )}
     </div>
     <Card variant="default" padding="md">
       <div className="flex items-start justify-between">
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-medium text-iron-text">{displayName}</p>
+          <p className="text-sm font-medium text-iron-text">Mistral 7B Instruct Q4</p>
           <p className="text-xs text-iron-text-muted mt-0.5">
-            Baseline local cleanup model. Removes filler words and fixes grammar offline (~2.2 GB).
+            Removes filler words, fixes grammar. Optional (~4.4 GB).
           </p>
           {downloaded && <p className="text-[11px] text-iron-text-muted mt-1">{formatBytes(size)}</p>}
           {error && (

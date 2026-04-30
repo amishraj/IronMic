@@ -983,7 +983,7 @@ function SecuritySettings() {
               IronMic blocks all outbound HTTP, HTTPS, and WebSocket requests at the Electron process level. The only exception is model file downloads, which occur <strong className="text-iron-text">only when you explicitly click Download</strong> in the Models settings.
             </p>
             <p className="text-xs text-iron-text-muted mt-1.5 leading-relaxed">
-              Baseline models are bundled with the app. Optional model downloads are fetched from IronMic release assets over HTTPS, with HuggingFace fallback for public installs, and verified with SHA-256 when a checksum is pinned.
+              Model files are fetched from HuggingFace over HTTPS. No checksums are currently verified — this is a known limitation. Future releases will include SHA-256 verification.
             </p>
           </div>
         </div>
