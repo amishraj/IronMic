@@ -350,7 +350,7 @@ export const MODEL_URLS: Record<string, string> = {
   'moonshine-base-tokenizer': `${MOONSHINE_HF_BASE}/tokenizer.json`,
   llm: `${MODELS_BASE_URL}/mistral-7b-instruct-q4_k_m.gguf`,
   'llm-chat-llama3': `${MODELS_BASE_URL}/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf`,
-  'llm-chat-phi3': `${MODELS_BASE_URL}/Phi-3-mini-4k-instruct-Q4_K_M.gguf`,
+  'llm-chat-phi3': `${MODELS_BASE_URL}/Phi-3-mini-4k-instruct-Q2_K.gguf`,
   'tts-model': `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx`,
   // TF.js ML models (v1.1.0) — tar.gz archives containing model.json + weight shards
   'tfjs-vad-silero': `${MODELS_BASE_URL}/tfjs-vad-silero.tar.gz`,
@@ -371,7 +371,7 @@ export const MODEL_FALLBACK_URLS: Record<string, string> = {
   'moonshine-base-tokenizer': `${MOONSHINE_HF_BASE}/tokenizer.json`,
   llm: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf',
   'llm-chat-llama3': 'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
-  'llm-chat-phi3': 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf',
+  'llm-chat-phi3': 'https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q2_K.gguf',
   'tts-model': 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_fp16.onnx',
   // TF.js ML models — fallback is same as primary (GitHub only, no HuggingFace equivalent)
   'tfjs-vad-silero': `${MODELS_BASE_URL}/tfjs-vad-silero.tar.gz`,
@@ -394,7 +394,7 @@ export const MODEL_FILES: Record<string, string> = {
   'moonshine-base-tokenizer': 'moonshine-base/tokenizer.json',
   llm: 'mistral-7b-instruct-q4_k_m.gguf',
   'llm-chat-llama3': 'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf',
-  'llm-chat-phi3': 'Phi-3-mini-4k-instruct-q4.gguf',
+  'llm-chat-phi3': 'Phi-3-mini-4k-instruct-Q2_K.gguf',
   'tts-model': 'kokoro-v1.0-fp16.onnx',
   // TF.js ML models — tar.gz archives extracted to tfjs/<model-name>/
   'tfjs-vad-silero': 'tfjs-vad-silero.tar.gz',
@@ -419,7 +419,7 @@ export const MODEL_CHECKSUMS: Record<string, string> = {
   'moonshine-base-tokenizer': '',
   llm: '3e0039fd0273fcbebb49228943b17831aadd55cbcbf56f0af00499be2040ccf9',
   'llm-chat-llama3': '', // Will be populated when model is uploaded to GitHub Releases
-  'llm-chat-phi3': '', // Will be populated when model is uploaded to GitHub Releases
+  'llm-chat-phi3': '', // Populate after verifying the Q2_K download: sha256sum Phi-3-mini-4k-instruct-Q2_K.gguf
   'tts-model': 'ba4527a874b42b21e35f468c10d326fdff3c7fc8cac1f85e9eb6c0dfc35c334a',
   // TF.js ML models — checksums populated by upload-models workflow
   'tfjs-vad-silero': '',
@@ -440,10 +440,7 @@ export const MODEL_PARTS: Record<string, string[]> = {
     'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part1',
     'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf.part2',
   ],
-  'llm-chat-phi3': [
-    'Phi-3-mini-4k-instruct-q4.gguf.part0',
-    'Phi-3-mini-4k-instruct-q4.gguf.part1',
-  ],
+  // llm-chat-phi3 is Q2_K (~1.41 GB), a single file — no part splitting needed
 };
 
 // ── Chat LLM model registry for AI Assist ──
@@ -468,8 +465,8 @@ export const CHAT_LLM_MODELS: ChatLlmModelMeta[] = [
     label: 'Mistral 7B Instruct',
     sizeLabel: '~4.4 GB',
     modelType: 'mistral',
-    reusesPolishModel: true,
-    description: 'Shared with text cleanup — no extra download needed',
+    reusesPolishModel: false,
+    description: 'Higher-quality option — download separately',
     compatible: true,
   },
   {
@@ -484,10 +481,10 @@ export const CHAT_LLM_MODELS: ChatLlmModelMeta[] = [
   {
     id: 'llm-chat-phi3',
     label: 'Phi-3 Mini 3.8B',
-    sizeLabel: '~2.2 GB',
+    sizeLabel: '~1.4 GB',
     modelType: 'phi3',
-    reusesPolishModel: false,
-    description: 'Smallest and fastest option',
+    reusesPolishModel: true,
+    description: 'Bundled — no download needed. Shared with text cleanup.',
     compatible: true,
   },
 ];

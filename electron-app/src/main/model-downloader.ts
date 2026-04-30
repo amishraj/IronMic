@@ -220,6 +220,51 @@ export type MoonshineBundleStatus =
   | 'incomplete-bundle'  // resources/models/moonshine-base exists but is missing files
   | 'bundle-missing';    // dev mode or unpackaged run — no bundled directory at all
 
+export type BundledLlmStatus =
+  | 'copied'          // model copied from app resources to user-data
+  | 'already-present' // model exists in user-data and is non-empty (≥ 1.2 GB)
+  | 'source-missing'; // no bundled copy (dev mode or unpackaged) — user must download
+
+const BUNDLED_LLM_FILENAME = 'Phi-3-mini-4k-instruct-Q2_K.gguf';
+const BUNDLED_LLM_MIN_BYTES = 1_200_000_000;
+
+/**
+ * Ensure the bundled Phi-3 Mini Q2_K model is copied to the models directory.
+ *
+ * Phi-3 Mini Q2_K ships with the installer (electron-builder.config.js
+ * extraResources). On first launch we copy it from process.resourcesPath/models/
+ * to the writable userData models dir so the LLM subprocess can open it.
+ *
+ * Size-aware: a file present but smaller than 1.2 GB is treated as corrupted
+ * and re-copied. This catches partial writes from interrupted installs.
+ */
+export function ensureBundledLlm(): BundledLlmStatus {
+  const destPath = path.join(resolveModelsDir(), BUNDLED_LLM_FILENAME);
+
+  // Check if a valid copy already exists in user-data.
+  if (fs.existsSync(destPath)) {
+    try {
+      if (fs.statSync(destPath).size >= BUNDLED_LLM_MIN_BYTES) return 'already-present';
+    } catch { /* fall through to re-copy */ }
+    // File exists but too small — remove the corrupted copy before re-copying.
+    try { fs.unlinkSync(destPath); } catch { /* ignore */ }
+  }
+
+  // Dev mode: no resourcesPath, model lives in rust-core/models directly.
+  if (!process.resourcesPath) return 'source-missing';
+
+  const srcPath = path.join(process.resourcesPath, 'models', BUNDLED_LLM_FILENAME);
+  if (!fs.existsSync(srcPath)) return 'source-missing';
+  try {
+    if (fs.statSync(srcPath).size < BUNDLED_LLM_MIN_BYTES) return 'source-missing';
+  } catch { return 'source-missing'; }
+
+  fs.mkdirSync(resolveModelsDir(), { recursive: true });
+  fs.copyFileSync(srcPath, destPath);
+  console.log(`[model-downloader] Copied bundled Phi-3 Mini Q2_K to ${destPath}`);
+  return 'copied';
+}
+
 const MOONSHINE_FILES = ['encoder_model.onnx', 'decoder_model_merged.onnx', 'tokenizer.json'];
 
 function allFilesPresent(dir: string): boolean {
@@ -941,7 +986,8 @@ const IMPORTABLE_FILES: Record<string, { modelId: string; label: string; downloa
   'mistral-7b-instruct-v0.2.Q4_K_M.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
   'mistral-7b-instruct-q4_k_m.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
   'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf': { modelId: 'llm-chat-llama3', label: 'Llama 3.1 8B Instruct', downloadUrl: 'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf' },
-  'Phi-3-mini-4k-instruct-q4.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini', downloadUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf' },
+  'Phi-3-mini-4k-instruct-Q2_K.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini (Q2_K — bundled default)', downloadUrl: 'https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q2_K.gguf' },
+  'Phi-3-mini-4k-instruct-q4.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini (Q4)', downloadUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf' },
   // TTS — single file on GitHub Releases
   'kokoro-v1.0-fp16.onnx': { modelId: 'tts-model', label: 'Kokoro 82M TTS', downloadUrl: `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx` },
   'model_fp16.onnx': { modelId: 'tts-model', label: 'Kokoro 82M TTS', downloadUrl: `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx` },

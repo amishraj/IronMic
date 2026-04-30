@@ -211,7 +211,7 @@ impl Database {
             INSERT OR IGNORE INTO settings (key, value) VALUES ('default_view', 'timeline');
             INSERT OR IGNORE INTO settings (key, value) VALUES ('theme', 'system');
             INSERT OR IGNORE INTO settings (key, value) VALUES ('whisper_model', 'large-v3-turbo');
-            INSERT OR IGNORE INTO settings (key, value) VALUES ('llm_model', 'mistral-7b-instruct-q4');
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('llm_model', 'Phi-3-mini-4k-instruct-Q2_K');
             ",
         )
         .map_err(|e| IronMicError::Storage(format!("Migration v1 failed: {e}")))?;

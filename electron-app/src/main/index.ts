@@ -11,6 +11,7 @@ import {
   ensureBundledVoices,
   ensureBundledTFJSModels,
   ensureBundledMoonshineBase,
+  ensureBundledLlm,
 } from './model-downloader';
 import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
 import { meetingRecorder } from './meeting-recorder';
@@ -188,6 +189,33 @@ app.whenReady().then(async () => {
     }
   } catch (err) {
     console.warn('[startup] Failed to copy bundled Moonshine Base:', err);
+  }
+
+  // Copy bundled Phi-3 Mini Q2_K (default LLM for polish + AI Assist) to user data.
+  try {
+    const llmStatus = ensureBundledLlm();
+    switch (llmStatus) {
+      case 'copied':
+        console.log('[startup] Phi-3 Mini Q2_K: bundled copy restored from app resources');
+        break;
+      case 'already-present':
+        console.log('[startup] Phi-3 Mini Q2_K: already present in user data');
+        break;
+      case 'source-missing':
+        console.warn('[startup] Phi-3 Mini Q2_K: no bundled copy (dev mode or unpackaged) — user must download');
+        break;
+    }
+    // Seed ai_local_model to phi3 on first launch if the user has not yet chosen a model.
+    // This makes resolveActiveChatModel() pick Phi-3 first without changing the fallback array.
+    if (llmStatus !== 'source-missing') {
+      const existing = native.getSetting('ai_local_model');
+      if (!existing) {
+        native.setSetting('ai_local_model', 'llm-chat-phi3');
+        console.log('[startup] ai_local_model seeded to llm-chat-phi3');
+      }
+    }
+  } catch (err) {
+    console.warn('[startup] Failed to copy bundled Phi-3 Mini Q2_K:', err);
   }
 
   // Extract bundled TF.js ML models to user data on first launch

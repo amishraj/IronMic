@@ -45,6 +45,14 @@ module.exports = {
       to: 'models/moonshine-base/',
       filter: ['*.onnx', '*.json'],
     },
+    // Bundle Phi-3 Mini Q2_K as the default local LLM for text cleanup and
+    // AI Assist. ensureBundledLlm() in main copies it to userData on first
+    // run. Keeping this at Q2_K (~1.41 GB) stays under the GitHub Releases
+    // 2 GiB per-asset limit when combined with Moonshine + Electron overhead.
+    {
+      from: '../rust-core/models/Phi-3-mini-4k-instruct-Q2_K.gguf',
+      to: 'models/Phi-3-mini-4k-instruct-Q2_K.gguf',
+    },
     // TF.js ML models — tar.gz archives extracted on first launch
     {
       from: 'resources/ml-models/',

@@ -800,7 +800,11 @@ mod napi_exports {
             },
             llm: JsModelInfo {
                 loaded: llm_size > 0,
-                name: "mistral-7b-instruct-q4".into(),
+                name: llm_model_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("phi3-mini-q2k")
+                    .trim_end_matches(".gguf")
+                    .into(),
                 size_bytes: llm_size,
             },
         }

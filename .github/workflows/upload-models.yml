@@ -43,8 +43,13 @@ jobs:
       - name: Download LLM Chat (Llama 3.1 8B Q4_K_M)
         run: curl -L --fail -o models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
 
-      - name: Download LLM Chat (Phi-3 Mini Q4)
-        run: curl -L --fail -o models/Phi-3-mini-4k-instruct-q4.gguf "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf"
+      - name: Download LLM Chat (Phi-3 Mini Q2_K — bundled default)
+        run: |
+          PARTIAL="models/Phi-3-mini-4k-instruct-Q2_K.gguf.partial"
+          curl -L --fail -o "$PARTIAL" \
+            "https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q2_K.gguf" \
+            || { rm -f "$PARTIAL"; exit 1; }
+          mv "$PARTIAL" models/Phi-3-mini-4k-instruct-Q2_K.gguf
 
       - name: Download TTS model (Kokoro 82M)
         run: curl -L --fail -o models/kokoro-v1.0-fp16.onnx "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/onnx/model_fp16.onnx"

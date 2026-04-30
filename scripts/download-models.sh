@@ -95,7 +95,7 @@ fi
 echo ""
 
 # ── LLM (Mistral-7B for text cleanup, polish, AI notes) ──────────────────
-echo "[3/3] Mistral-7B-Instruct LLM"
+echo "[3/4] Mistral-7B-Instruct LLM"
 if [ -f "$LLM_MODEL" ]; then
     echo "  [OK] LLM model already exists: $(du -h "$LLM_MODEL" | cut -f1)"
 else
@@ -104,6 +104,41 @@ else
     echo "    Example:"
     echo "      curl -L -o '$LLM_MODEL' \\"
     echo "        'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf'"
+fi
+
+echo ""
+
+# ── Phi-3 Mini Q2_K (bundled default LLM, ~1.41 GB) ─────────────────────
+# This is the model bundled with the installer via electron-builder extraResources.
+# Users get local polish/AI out of the box with no post-install downloads.
+# Mistral above remains available as a higher-quality optional upgrade.
+PHI3_FILE="$MODELS_DIR/Phi-3-mini-4k-instruct-Q2_K.gguf"
+PHI3_URL="https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q2_K.gguf"
+PHI3_MIN_BYTES=1200000000
+
+echo "[4/4] Phi-3 Mini Q2_K — bundled default LLM"
+if [ -f "$PHI3_FILE" ]; then
+    phi3_bytes=$(wc -c < "$PHI3_FILE" | tr -d ' ')
+    if [ "$phi3_bytes" -ge $PHI3_MIN_BYTES ]; then
+        echo "  [OK] Phi-3 Q2_K already exists: $(du -h "$PHI3_FILE" | cut -f1)"
+    else
+        echo "  [WARN] Phi-3 file exists but looks truncated ($phi3_bytes bytes) — re-downloading"
+        rm -f "$PHI3_FILE"
+    fi
+fi
+if [ ! -f "$PHI3_FILE" ]; then
+    echo "  [DOWNLOAD] Phi-3-mini-4k-instruct-Q2_K.gguf (~1.41 GB)"
+    echo "    URL: $PHI3_URL"
+    echo "    Dest: $PHI3_FILE"
+    if command -v curl >/dev/null 2>&1; then
+        curl -L --fail -o "${PHI3_FILE}.partial" "$PHI3_URL" \
+            && mv "${PHI3_FILE}.partial" "$PHI3_FILE" \
+            && echo "    [OK] Downloaded $(du -h "$PHI3_FILE" | cut -f1)" \
+            || { rm -f "${PHI3_FILE}.partial"; echo "    [FAIL] Download failed"; exit 1; }
+    else
+        echo "    curl not found — manual download required:"
+        echo "      curl -L -o '$PHI3_FILE' '$PHI3_URL'"
+    fi
 fi
 
 echo ""
