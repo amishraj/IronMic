@@ -7,7 +7,6 @@
  */
 
 export { TFJSRuntime } from './TFJSRuntime';
-export { AudioBridge, audioBridge } from './AudioBridge';
 export { VADService, vadService } from './VADService';
 export type { VADResult, VoiceState } from './VADService';
 export { TurnDetector, turnDetector } from './TurnDetector';

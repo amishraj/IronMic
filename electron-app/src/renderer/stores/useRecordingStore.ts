@@ -2,7 +2,6 @@ import { create } from 'zustand';
 import { useTtsStore } from './useTtsStore';
 import { useAiChatStore } from './useAiChatStore';
 import { useToastStore } from './useToastStore';
-import { vadService } from '../services/tfjs/VADService';
 import type { PipelineState, TranscriptionResult, VoiceState } from '../types';
 
 interface RecordingStore {
@@ -68,23 +67,6 @@ async function handleRecordingAction(
       try { await useTtsStore.getState().stop(); } catch { /* ignore */ }
       set({ state: 'recording', error: null, voiceState: 'unknown', vadActive: false });
 
-      // Start VAD alongside recording (non-blocking — VAD failure is not fatal)
-      try {
-        const vadEnabled = await api.getSetting('vad_enabled');
-        if (vadEnabled !== 'false') {
-          const sensitivity = parseFloat((await api.getSetting('vad_sensitivity')) || '0.5');
-          vadService.setSensitivity(sensitivity);
-          await vadService.start();
-          set({ vadActive: true });
-          // Subscribe to real-time voice state for UI indicator
-          vadService.onVoiceStateChange((voiceState) => {
-            set({ voiceState });
-          });
-        }
-      } catch (vadErr) {
-        console.warn('[recording] VAD failed to start (non-fatal):', vadErr);
-      }
-
       try {
         await api.startRecording();
       } catch (startErr: any) {
@@ -114,20 +96,7 @@ async function handleRecordingAction(
   // ── STOP RECORDING + PROCESS ──
   if (state === 'recording') {
     try {
-      set({ state: 'processing', voiceState: 'unknown' });
-
-      // Stop VAD and check speech detection
-      const vadResult = vadService.isActive() ? vadService.stop() : null;
-      set({ vadActive: false });
-
-      // If VAD detected insufficient speech, skip transcription entirely
-      if (vadResult && !vadResult.hasSufficientSpeech) {
-        console.log(`[recording] VAD: insufficient speech (${vadResult.totalSpeechMs}ms) — skipping transcription`);
-        try { await api.stopRecording(); } catch { /* discard audio */ }
-        set({ state: 'idle', lastResult: null, error: null });
-        window.dispatchEvent(new CustomEvent('ironmic:dictation-empty'));
-        return;
-      }
+      set({ state: 'processing', voiceState: 'unknown', vadActive: false });
 
       let audioBuffer: Buffer;
       try {
@@ -158,8 +127,21 @@ async function handleRecordingAction(
         return;
       }
 
+      // If the native addon returned a stub response, Whisper was not compiled
+      // into this build. Surface a clear error so the user knows why nothing happens.
+      if (rawTranscript.trim().startsWith('[stub')) {
+        set({ state: 'idle', error: 'Whisper engine not available in this build' });
+        showErrorToast(
+          'Transcription engine missing.',
+          'This build does not include Whisper support. Reinstall the latest release from GitHub.',
+        );
+        return;
+      }
+
       // If nothing was heard, skip everything
-      if (!rawTranscript.trim() || rawTranscript.trim().startsWith('[stub')) {
+      if (!rawTranscript.trim()) {
+        // eslint-disable-next-line no-console
+        console.warn('[ironmic:dictation] empty single-shot transcript — Whisper returned no text', { audioBytes: audioBuffer.length });
         set({ state: 'idle', lastResult: null, error: null });
         window.dispatchEvent(new CustomEvent('ironmic:dictation-empty'));
         return;

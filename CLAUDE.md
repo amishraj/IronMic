@@ -135,6 +135,8 @@ The user speaks, IronMic transcribes via Whisper, optionally polishes via a loca
 
 Total bundled model size: ~6 GB. Distributed as part of the installer.
 
+**Moonshine Base (default speech recognition engine)** is bundled in `electron-builder.config.js` `extraResources` and copied from `process.resourcesPath/models/moonshine-base/` to the writable user-data models dir on first launch — no network required for the default dictation flow. See `ensureBundledMoonshineBase()` in `electron-app/src/main/model-downloader.ts`.
+
 ---
 
 ## Data Model (SQLite Schema)
@@ -509,6 +511,8 @@ These are hard architectural constraints, not policies:
 5. **Auditable dependency tree.** Minimal crate dependencies, all reviewed. No proc-macros from unknown sources. `cargo audit` in CI.
 
 6. **Reproducible builds.** CI builds are deterministic and verifiable. Users can build from source.
+
+**One explicit, opt-in exception: cloud polishing.** The `polish_allow_cloud` setting (default `false`, surfaced in Settings → Security & Privacy with a warning callout and a confirmation dialog) lets users route the *polish* pass through an authenticated Claude or Copilot CLI for higher-quality cleanups. When it is on AND a cloud CLI is authenticated, transcript text is sent to that CLI; the toggle in Notes/Timeline shows a "via Claude" / "via Copilot" / "via local" badge so the user always sees where each polish ran. Authentication of a cloud provider does NOT auto-enable this setting — the user must consciously turn it on. With the default off, polish stays strictly on-device. No other feature uses cloud APIs.
 
 ---
 

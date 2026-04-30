@@ -13,7 +13,13 @@ const api = {
 
   // Transcription
   transcribe: (audioBuffer: Buffer) => ipcRenderer.invoke('ironmic:transcribe', audioBuffer),
-  polishText: (rawText: string) => ipcRenderer.invoke('ironmic:polish-text', rawText),
+  polishText: (rawText: string, opts?: { requireModel?: boolean }) =>
+    ipcRenderer.invoke('ironmic:polish-text', rawText, opts),
+  // Detailed variant for the toggle-driven polish UI: returns
+  // { text, providerUsed } so the UI can render a "via Claude/Copilot/local"
+  // badge after a successful polish. Existing callers stay on polishText.
+  polishTextDetailed: (rawText: string, opts?: { requireModel?: boolean }) =>
+    ipcRenderer.invoke('ironmic:polish-text-detailed', rawText, opts),
 
   // Entries
   createEntry: (entry: any) => ipcRenderer.invoke('ironmic:create-entry', entry),
@@ -55,6 +61,12 @@ const api = {
   isGpuAvailable: () => ipcRenderer.invoke('ironmic:is-gpu-available'),
   isGpuEnabled: () => ipcRenderer.invoke('ironmic:is-gpu-enabled'),
   setGpuEnabled: (enabled: boolean) => ipcRenderer.invoke('ironmic:set-gpu-enabled', enabled),
+
+  // Multi-engine transcription (Phase 1) — Moonshine + Whisper selection
+  listTranscriptionEngines: () => ipcRenderer.invoke('ironmic:list-transcription-engines'),
+  getTranscriptionEngine: () => ipcRenderer.invoke('ironmic:get-transcription-engine'),
+  downloadTranscriptionEngine: (engineId: string) => ipcRenderer.invoke('ironmic:download-transcription-engine', engineId),
+  isTranscriptionEngineReady: (engineId: string) => ipcRenderer.invoke('ironmic:is-transcription-engine-ready', engineId),
 
   // TTS
   synthesizeText: (text: string) => ipcRenderer.invoke('ironmic:synthesize-text', text),
@@ -188,6 +200,44 @@ const api = {
   meetingCreateWithTemplate: (templateId: string | null, detectedApp: string | null) => ipcRenderer.invoke('ironmic:meeting-create-with-template', templateId, detectedApp),
   meetingSetStructuredOutput: (id: string, structuredOutput: string) => ipcRenderer.invoke('ironmic:meeting-set-structured-output', id, structuredOutput),
 
+  // ── Meeting Recording (Granola-style chunk loop) ──
+  meetingStartRecording: (sessionId: string, deviceName?: string | null, chunkIntervalS?: number) =>
+    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS),
+  meetingStopRecording: () => ipcRenderer.invoke('ironmic:meeting-stop-recording'),
+
+  // ── Streaming dictation (near-real-time) ──
+  dictationStreamStart: () => ipcRenderer.invoke('ironmic:dictation-stream-start'),
+  dictationStreamStop: () => ipcRenderer.invoke('ironmic:dictation-stream-stop'),
+  onDictationStreamChunk: (callback: (payload: { index: number; text: string; isFinal: boolean }) => void) => {
+    const handler = (_e: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:dictation-stream-chunk', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-chunk', handler);
+  },
+  onDictationStreamState: (callback: (state: { status: string; startedAt: number | null; chunkCount: number }) => void) => {
+    const handler = (_e: any, s: any) => callback(s);
+    ipcRenderer.on('ironmic:dictation-stream-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-state', handler);
+  },
+  /** Notify the main-process LiveSummarizer that the user typed new notes.
+   *  Fire-and-forget — the summarizer will re-read the persisted notes and
+   *  debounce a re-summary. Caller should persist via meetingSetStructuredOutput FIRST. */
+  notifyMeetingUserNotesChanged: (sessionId: string) =>
+    ipcRenderer.send('ironmic:meeting-user-notes-changed', sessionId),
+
+  // ── Meeting Room (LAN multi-user collaboration) ──
+  meetingRoomHostStart: (sessionId: string, hostName: string, templateId?: string | null) =>
+    ipcRenderer.invoke('ironmic:meeting-room-host-start', sessionId, hostName, templateId),
+  meetingRoomHostStop: () => ipcRenderer.invoke('ironmic:meeting-room-host-stop'),
+  meetingRoomHostInfo: () => ipcRenderer.invoke('ironmic:meeting-room-host-info'),
+  meetingRoomJoin: (opts: { hostIp: string; hostPort: number; roomCode: string; displayName: string; deviceName?: string | null }) =>
+    ipcRenderer.invoke('ironmic:meeting-room-join', opts),
+  meetingRoomLeave: () => ipcRenderer.invoke('ironmic:meeting-room-leave'),
+
+  // ── Transcript Segments ──
+  listTranscriptSegments: (sessionId: string) => ipcRenderer.invoke('ironmic:list-transcript-segments', sessionId),
+  updateSegmentSpeaker: (id: string, speakerLabel: string) => ipcRenderer.invoke('ironmic:update-segment-speaker', id, speakerLabel),
+  assembleFullTranscript: (sessionId: string) => ipcRenderer.invoke('ironmic:assemble-full-transcript', sessionId),
+
   // ── Audio Input ──
   listAudioDevices: () => ipcRenderer.invoke('ironmic:list-audio-devices'),
   getCurrentAudioDevice: () => ipcRenderer.invoke('ironmic:get-current-audio-device'),
@@ -212,11 +262,18 @@ const api = {
   // ── TF.js Infrastructure ──
   getModelsDir: () => ipcRenderer.invoke('ironmic:get-models-dir'),
 
+  // ── Model management (delete / redownload / disk usage / open folder) ──
+  openModelsDirectory: () => ipcRenderer.invoke('ironmic:open-models-directory'),
+  getEngineDiskUsage: (engineId: string) => ipcRenderer.invoke('ironmic:get-engine-disk-usage', engineId),
+  deleteEngineFiles: (engineId: string) => ipcRenderer.invoke('ironmic:delete-engine-files', engineId),
+  redownloadEngine: (engineId: string) => ipcRenderer.invoke('ironmic:redownload-engine', engineId),
+
   // Manual model import
   importModel: () => ipcRenderer.invoke('ironmic:import-model'),
   getImportableModels: () => ipcRenderer.invoke('ironmic:get-importable-models'),
   importModelFromPath: (filePath: string, sectionFilter: string) => ipcRenderer.invoke('ironmic:import-model-from-path', filePath, sectionFilter),
   importMultiPartModel: () => ipcRenderer.invoke('ironmic:import-multi-part-model'),
+  importMoonshineEngine: (engineId: string) => ipcRenderer.invoke('ironmic:import-moonshine-engine', engineId),
   openExternal: (url: string) => ipcRenderer.invoke('ironmic:open-external', url),
 
   // Events from main process
@@ -244,9 +301,120 @@ const api = {
     ipcRenderer.on('ironmic:workflow-discovered', handler);
     return () => ipcRenderer.removeListener('ironmic:workflow-discovered', handler);
   },
+
+  // ── Meeting Recording Events (main → renderer) ──
+  onMeetingSegmentReady: (callback: (segment: any) => void) => {
+    const handler = (_event: any, segment: any) => callback(segment);
+    ipcRenderer.on('ironmic:meeting-segment-ready', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-segment-ready', handler);
+  },
+  onMeetingRecordingState: (callback: (state: any) => void) => {
+    const handler = (_event: any, state: any) => callback(state);
+    ipcRenderer.on('ironmic:meeting-recording-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-recording-state', handler);
+  },
+  onMeetingLiveSummary: (callback: (payload: any) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-live-summary', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-live-summary', handler);
+  },
+  /** Tray/menu/notification quick actions → renderer opens the right page and runs the action. */
+  onQuickAction: (callback: (action: 'start-dictation' | 'start-meeting') => void) => {
+    const handler = (_event: any, action: 'start-dictation' | 'start-meeting') => callback(action);
+    ipcRenderer.on('ironmic:quick-action', handler);
+    return () => ipcRenderer.removeListener('ironmic:quick-action', handler);
+  },
+  onMeetingAppDetected: (callback: (event: any, data: any) => void) => {
+    ipcRenderer.on('ironmic:meeting-app-detected', callback);
+    return () => ipcRenderer.removeListener('ironmic:meeting-app-detected', callback);
+  },
+
+  // ── Meeting Room Events (main → renderer) ──
+  onMeetingRoomState: (callback: (info: any) => void) => {
+    const handler = (_event: any, info: any) => callback(info);
+    ipcRenderer.on('ironmic:meeting-room-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-state', handler);
+  },
+  onMeetingRoomParticipantUpdate: (callback: (msg: any) => void) => {
+    const handler = (_event: any, msg: any) => callback(msg);
+    ipcRenderer.on('ironmic:meeting-room-participant-update', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-participant-update', handler);
+  },
+
+  // ── BlackHole (macOS system audio) ──
+  blackholeCheck: (deviceListJson?: string) =>
+    ipcRenderer.invoke('ironmic:blackhole-check', deviceListJson),
+  blackholeInstall: () => ipcRenderer.invoke('ironmic:blackhole-install'),
+  blackholeOpenAudioMidiSetup: () => ipcRenderer.invoke('ironmic:blackhole-open-audio-midi-setup'),
+  onBlackholeInstallProgress: (callback: (p: any) => void) => {
+    const handler = (_event: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:blackhole-install-progress', handler);
+    return () => ipcRenderer.removeListener('ironmic:blackhole-install-progress', handler);
+  },
+
+  // ── Processing state notifications (renderer → main, fire-and-forget) ──
+  // Called when note generation starts/ends so the main process can intercept
+  // window close and warn the user about in-flight work.
+  notifyProcessingState: (isActive: boolean) =>
+    ipcRenderer.send('ironmic:notify-processing-state', isActive),
+
+  // ── Notes Collaboration ──
+  meetingCollabStart: (sessionId: string, hostName: string, notes: string, version?: number) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-start', sessionId, hostName, notes, version),
+  meetingCollabStop: () => ipcRenderer.invoke('ironmic:meeting-collab-stop'),
+  meetingCollabNotifySaved: (notes: string, savedBy: string) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-notify-saved', notes, savedBy),
+  meetingCollabNotifyDraft: (content: string, senderName: string) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-notify-draft', content, senderName),
+  meetingCollabJoin: (opts: { hostIp: string; hostPort: number; sessionCode: string; displayName: string }) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-join', opts),
+  meetingCollabLeave: () => ipcRenderer.invoke('ironmic:meeting-collab-leave'),
+  meetingCollabSaveNotes: (content: string) => ipcRenderer.invoke('ironmic:meeting-collab-save-notes', content),
+  meetingCollabSendDraft: (content: string) => ipcRenderer.invoke('ironmic:meeting-collab-send-draft', content),
+  onMeetingCollabState: (callback: (info: any) => void) => {
+    const handler = (_event: any, info: any) => callback(info);
+    ipcRenderer.on('ironmic:meeting-collab-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-state', handler);
+  },
+  onMeetingCollabNotesUpdated: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-notes-updated', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-notes-updated', handler);
+  },
+  onMeetingCollabDraft: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-draft', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-draft', handler);
+  },
+  onMeetingCollabEnded: (callback: () => void) => {
+    const handler = () => callback();
+    ipcRenderer.on('ironmic:meeting-collab-ended', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-ended', handler);
+  },
+  onMeetingCollabFirewallWarning: (callback: (data: { message: string }) => void) => {
+    const handler = (_event: any, data: { message: string }) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-firewall-warning', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-firewall-warning', handler);
+  },
+
+  // ── Whisper readiness ──
+  onWhisperLoadFailed: (callback: (data: { message: string; permanent: boolean }) => void) => {
+    const handler = (_event: any, data: { message: string; permanent: boolean }) => callback(data);
+    ipcRenderer.on('ironmic:whisper-load-failed', handler);
+    return () => ipcRenderer.removeListener('ironmic:whisper-load-failed', handler);
+  },
 };
 
 contextBridge.exposeInMainWorld('ironmic', api);
+
+// ── Debug audio pipeline logs (gated in main on `debug_audio_logging` setting) ──
+// Emits `[ironmic:debug] <stage>` lines to the renderer DevTools console so the
+// user can see exactly which hop drops a chunk (capture → silence-gate → whisper
+// → sanitize → emit → recv). Self-installing — no API surface needed.
+ipcRenderer.on('ironmic:debug-log', (_event, payload: { stage: string; data: any; t: number }) => {
+  // eslint-disable-next-line no-console
+  console.log(`[ironmic:debug] ${payload.stage}`, payload.data);
+});
 
 // Type declaration for the renderer
 export type IronMicAPI = typeof api;

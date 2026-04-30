@@ -2,6 +2,64 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.5.0] - 2026-04-30
+
+### Added
+
+#### Moonshine Engine — New Default Speech Recognition
+- **Moonshine Base bundled with the installer** — The default speech recognition engine ships with the app (~146 MB). No download required on first launch. The model is copied from `resourcesPath` to the writable user-data models folder automatically.
+- **Multi-engine transcription architecture** — A unified `TranscriptionEngine` trait in Rust supports multiple backends. Switch between Moonshine and Whisper in **Settings > Speech Recognition Model** without restarting the app.
+- **Moonshine ONNX backend** — Runs via ONNX Runtime with SIMD-optimized MLAS kernels and DirectML on Windows. Benchmarks: Moonshine Base 69 ms vs Whisper Tiny 1141 ms on x86 CPU (~16× faster with better WER on short-form speech).
+- **Whisper still available** — Base / Small / Medium / Large-v3-turbo remain downloadable from Settings for multilingual or high-accuracy use cases.
+- **"Restore bundled copy" action** — One-click action in Settings > Models restores the factory Moonshine Base files without re-downloading.
+- **Transcript segments table** — New `transcript_segments` SQLite table stores incremental segment data for streaming and rollback.
+
+#### Notes Page Redesign
+- **Notebooks sidebar** — Organize entries into notebooks. Collapsible sidebar with creation, rename, and delete.
+- **Streaming dictation** — Partial transcript tokens stream into the editor in real-time as you speak via `DictationStreamer`.
+- **Live summarizer** — Real-time meeting summary updates while recording is in progress (`LiveSummarizer`).
+- **Auto-filed AI notes** — Meeting notes are automatically created and filed to the active notebook when a meeting ends.
+- **Responsive layout** — Notes page adapts to narrow windows; sidebar collapses gracefully.
+
+#### Collaboration
+- **Meeting notes collab server/client** — Peer-to-peer shared notes during live meetings. Host a session or join a room; notes sync in real-time across participants on the local network.
+- **Meeting room panel** — In-app UI for starting or joining a collab session from the Meetings page.
+- **Shared notes viewer** — Read-only viewer for participants receiving notes from the host.
+
+#### Windows & VDI Dictation
+- **Multi-round Windows VDI fixes** — Resolved silent-failure chain on corporate VDI environments: RMS gate now sanitizes near-zero audio, the dictation sanitizer no longer drops valid short utterances, and renderer-side handlers propagate results correctly.
+- **Debug-log helper** — `debug-log.ts` utility captures structured audio pipeline events for future bisection without shipping verbose logs to end users.
+- **Build script for Windows** — New `scripts/build-rust.ps1` PowerShell script mirrors the macOS/Linux shell script for Rust compilation on Windows.
+
+#### Performance & Stability
+- **AudioStreamManager** — Centralized audio stream lifecycle. All components share a single `getUserMedia` stream; no duplicate mic captures. Fixes resource leaks on rapid start/stop.
+- **AI response caching** — `AIManager` caches recent completions to avoid redundant LLM calls during repeated polishing.
+- **React ErrorBoundary** — `ErrorBoundary` component wraps major view trees; crashes in one panel no longer take down the whole window.
+- **DB entries query optimization** — Entries storage queries restructured to use covering indexes; timeline load time reduced significantly on large databases.
+- **Dictation streamer back-pressure** — `DictationStreamer` now applies back-pressure when the renderer is busy, preventing dropped partial tokens under load.
+- **Tray menu refresh** — Tray menu rebuilds dynamically when recording state changes, keeping the menu item labels in sync.
+
+#### Developer Experience
+- **`scripts/dev.sh` improvements** — Detects missing Rust build and prints a clear remediation step before starting Electron.
+- **`scripts/download-models.sh` overhaul** — Moonshine Base download, SHA-256 verification, and structured directory layout for all engine types.
+- **`scripts/package.sh` overhaul** — Packaging now bundles Moonshine Base, entitlements plist, and BlackHole placeholder in one pass.
+
+### Changed
+- `electron-builder.config.js` — `extraResources` now includes the bundled Moonshine Base model directory and macOS entitlements plist.
+- Settings > Speech Recognition — Engine selector and model picker consolidated into a single **Speech Recognition Model** card. Previously split across two separate UI sections.
+- macOS installation notes updated — Installer is ad-hoc signed; `xattr -cr` must be run on both the DMG and the installed `.app` bundle.
+- `.gitignore` expanded — Moonshine model files (`.onnx`, `.ort`, `.bin`) excluded from all subdirectories.
+
+### Fixed
+- **Copilot subscription detection** — `CopilotAdapter` now correctly handles the subscription check flow when the CLI is authenticated but the license query returns an unexpected format.
+- **Claude adapter streaming** — Token delivery gaps under high LLM load resolved; stream no longer stalls on the first assistant response.
+- **VAD false-positive on silence** — Web Audio VAD pipeline no longer triggers speech-start on mic open with no input.
+- **Meeting summary broken in packaged app** — `LlmSubprocess` now resolves the binary path relative to `resourcesPath` in production builds.
+- **Notes navigation away while recording** — Navigating away from the Notes page while a recording is active no longer orphans the audio stream.
+- **`ironmic-llm` binary bundling** — Release workflow now correctly includes the compiled LLM subprocess binary.
+
+---
+
 ## [1.3.3] - 2026-04-15
 
 ### Fixed

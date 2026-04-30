@@ -38,9 +38,17 @@ export function InputSettings() {
   const animFrameRef = useRef<number | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
+  // Whisper thread count — default 2 matches the Rust default cap.
+  // VDI / corporate machines should keep this low; desktop CPUs can raise it.
+  // Only meaningful when the active engine is a Whisper variant; Moonshine
+  // ignores it (ONNX Runtime manages its own thread pool).
+  const [whisperThreads, setWhisperThreads] = useState<number>(2);
+
   // Test recording
   const [testRecording, setTestRecording] = useState(false);
   const [testAudioUrl, setTestAudioUrl] = useState<string | null>(null);
+  const [testAudioBytes, setTestAudioBytes] = useState<number>(0);
+  const [testPlaybackError, setTestPlaybackError] = useState<string | null>(null);
   const [testPlaying, setTestPlaying] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
@@ -48,6 +56,13 @@ export function InputSettings() {
 
   useEffect(() => {
     loadDeviceInfo();
+    // Load whisper_threads setting (default 2 if not set)
+    window.ironmic.getSetting('whisper_threads').then((val: string | null) => {
+      if (val !== null) {
+        const n = parseInt(val, 10);
+        if (!isNaN(n) && n >= 1 && n <= 16) setWhisperThreads(n);
+      }
+    }).catch(() => {});
     return () => stopMonitoring();
   }, []);
 
@@ -158,6 +173,8 @@ export function InputSettings() {
         const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
         const url = URL.createObjectURL(blob);
         setTestAudioUrl(url);
+        setTestAudioBytes(blob.size);
+        setTestPlaybackError(null);
         setTestRecording(false);
       };
 
@@ -186,9 +203,20 @@ export function InputSettings() {
     if (!testAudioUrl) return;
     const audio = new Audio(testAudioUrl);
     audioElRef.current = audio;
+    setTestPlaybackError(null);
     setTestPlaying(true);
     audio.onended = () => setTestPlaying(false);
-    audio.play();
+    audio.onerror = () => {
+      setTestPlaying(false);
+      setTestPlaybackError('Playback failed. Check the app console for CSP or codec errors.');
+    };
+    const p = audio.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch((e: any) => {
+        setTestPlaying(false);
+        setTestPlaybackError(`Playback rejected: ${e?.message || e}`);
+      });
+    }
   }, [testAudioUrl]);
 
   const stopPlayback = useCallback(() => {
@@ -428,8 +456,54 @@ export function InputSettings() {
                 Recording... (auto-stops in 5s)
               </p>
             )}
+            {!testRecording && testAudioUrl && (
+              <p className="text-[11px] text-iron-text-muted">
+                Captured {(testAudioBytes / 1024).toFixed(1)} KB.{' '}
+                {testAudioBytes < 1024 && (
+                  <span className="text-amber-400">Clip is suspiciously small — the mic likely captured silence.</span>
+                )}
+              </p>
+            )}
+            {testPlaybackError && (
+              <p className="text-[11px] text-red-400 flex items-center gap-1.5">
+                <AlertTriangle className="w-3 h-3" />
+                {testPlaybackError}
+              </p>
+            )}
           </div>
         </div>
+      </Card>
+
+      {/* Whisper Threads — only meaningful when active engine is a Whisper variant */}
+      <Card variant="default" padding="md">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <p className="text-sm font-medium text-iron-text">Whisper Threads</p>
+              <Badge variant="default">Whisper engines only</Badge>
+            </div>
+            <p className="text-xs text-iron-text-muted mt-0.5 leading-relaxed">
+              Number of CPU threads when using a Whisper engine (1–16). Default 2 is safe for VDI and shared
+              machines. Raise to 4–8 on dedicated desktop CPUs. Has no effect on Moonshine — switch the engine
+              in Settings → Models → Speech Recognition Model.
+            </p>
+          </div>
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={whisperThreads}
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              if (!isNaN(n) && n >= 1 && n <= 16) {
+                setWhisperThreads(n);
+                window.ironmic.setSetting('whisper_threads', String(n)).catch(() => {});
+              }
+            }}
+            className="w-16 px-2 py-1 text-sm bg-iron-surface border border-iron-border rounded text-iron-text text-center focus:outline-none focus:ring-1 focus:ring-iron-accent"
+          />
+        </div>
+        <p className="text-[11px] text-iron-text-muted mt-2">Takes effect after restarting IronMic.</p>
       </Card>
 
       {/* Tips */}

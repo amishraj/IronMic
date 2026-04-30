@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { ErrorBoundary } from './ErrorBoundary';
 import {
   Mic, Settings, List, Sparkles, StickyNote, Search, Home,
   ChevronLeft, ChevronRight, Volume2, PenTool, BarChart3, Users,
@@ -19,9 +20,11 @@ import { GpuPrompt } from './GpuPrompt';
 import { SessionLock } from './SessionLock';
 import { ToastContainer } from './Toast';
 import { useRecordingStore } from '../stores/useRecordingStore';
+import { useDictationStore } from '../stores/useDictationStore';
 import { useSettingsStore } from '../stores/useSettingsStore';
 import { useEntryStore } from '../stores/useEntryStore';
 import { useToastStore } from '../stores/useToastStore';
+import { useMeetingStore } from '../stores/useMeetingStore';
 import iconSmall from '../assets/icon-64.png';
 import micIdle from '../assets/mic-idle.png';
 import micRecording from '../assets/mic-recording.png';
@@ -41,9 +44,11 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'home', label: 'Home', icon: Home, section: 'core' },
   { id: 'main', label: 'Timeline', icon: List, section: 'core' },
   { id: 'ai', label: 'AI Assistant', icon: Sparkles, section: 'core' },
-  { id: 'dictate', label: 'Dictate', icon: PenTool, section: 'tools' },
-  { id: 'listen', label: 'Listen', icon: Volume2, section: 'tools' },
+  // Notes = the canonical dictation-integrated note page (renders DictatePage).
+  // The standalone "Dictate" nav item was removed because it pointed at the
+  // same workflow with a confusingly different label.
   { id: 'notes', label: 'Notes', icon: StickyNote, section: 'tools' },
+  { id: 'listen', label: 'Listen', icon: Volume2, section: 'tools' },
   { id: 'search', label: 'Search', icon: Search, section: 'tools' },
   { id: 'analytics', label: 'Analytics', icon: BarChart3, section: 'tools' },
   { id: 'meetings', label: 'Meetings', icon: Users, section: 'tools' },
@@ -55,8 +60,11 @@ export function Layout() {
   const [sidebarExpanded, setSidebarExpanded] = useState(true);
   const [sessionTimeout, setSessionTimeout] = useState('off');
   const [micVisualState, setMicVisualState] = useState<'idle' | 'recording' | 'processing' | 'success'>('idle');
+  const [whisperFailure, setWhisperFailure] = useState<{ message: string; permanent: boolean } | null>(null);
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const { handleHotkeyPress, state: recordingState } = useRecordingStore();
+  const { state: recordingState } = useRecordingStore();
+  const isGranolaRecording = useMeetingStore(s => s.isGranolaRecording);
+  const processingMeetings = useMeetingStore(s => s.processingMeetings);
   const { loadSettings, aiEnabled } = useSettingsStore();
   const { refresh } = useEntryStore();
   const pageRef = useRef(page);
@@ -71,11 +79,22 @@ export function Layout() {
   }, []);
 
   const handleRecord = useCallback(() => {
-    const source = pageRef.current === 'ai' ? 'ai-chat'
-      : pageRef.current === 'dictate' ? 'dictate'
-      : undefined;
-    handleHotkeyPress(source);
-  }, [handleHotkeyPress]);
+    const currentPage = pageRef.current;
+
+    if (currentPage === 'notes' || currentPage === 'dictate') {
+      // Already on the notes page — toggle dictation via the event bus that
+      // DictatePage listens to. handleDictateToggle handles start/stop itself.
+      window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+      return;
+    }
+
+    // From any other page: navigate to notes with a blank-note flag so
+    // NoteEditor doesn't load the previous entry, and a quick-start flag so
+    // DictatePage (if on 'dictate') auto-starts. Both flags persist in the
+    // store until consumed by the respective component on mount.
+    useDictationStore.setState({ pendingQuickStart: true, newNoteRequested: true });
+    setPage('notes');
+  }, []);
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
 
@@ -108,13 +127,15 @@ export function Layout() {
     const cleanup = window.ironmic.onHotkeyPressed(() => handleRecord());
     return cleanup;
   }, [handleRecord]);
-  // Sync recording pipeline state → visual mic state with success flash
+  // Sync recording pipeline state → visual mic state with success flash.
+  // Granola meeting recording and background note generation also light up
+  // the mic shield so the user can see capture/inference is active.
   useEffect(() => {
     if (successTimerRef.current) clearTimeout(successTimerRef.current);
 
-    if (recordingState === 'recording') {
+    if (recordingState === 'recording' || isGranolaRecording) {
       setMicVisualState('recording');
-    } else if (recordingState === 'processing') {
+    } else if (recordingState === 'processing' || processingMeetings.length > 0) {
       setMicVisualState('processing');
     } else if (recordingState === 'idle') {
       // If we were processing, show success briefly
@@ -126,7 +147,7 @@ export function Layout() {
       }
       refresh();
     }
-  }, [recordingState]);
+  }, [recordingState, isGranolaRecording, processingMeetings.length]);
 
   useEffect(() => {
     if (!aiEnabled && page === 'ai') setPage('home');
@@ -158,14 +179,14 @@ export function Layout() {
       });
     };
     const emptyHandler = () => {
-      const currentPage = pageRef.current;
-      if (!['main', 'dictate'].includes(currentPage)) {
-        useToastStore.getState().show({
-          message: 'No speech detected. Try again — make sure your mic is working.',
-          type: 'info',
-          durationMs: 5000,
-        });
-      }
+      // Always show — silent failures on Windows look identical to "the app froze"
+      // when audio is captured but Whisper returns nothing.  A short toast tells
+      // the user the pipeline ran end-to-end.
+      useToastStore.getState().show({
+        message: 'No speech detected. Try again — speak a bit louder or check your mic.',
+        type: 'info',
+        durationMs: 5000,
+      });
     };
 
     window.addEventListener('ironmic:dictation-complete', handler);
@@ -179,12 +200,53 @@ export function Layout() {
   useEffect(() => {
     const handler = (e: Event) => {
       const target = (e as CustomEvent).detail as string;
-      if (['home', 'main', 'ai', 'dictate', 'listen', 'notes', 'search', 'analytics', 'settings'].includes(target)) {
+      if (['home', 'main', 'ai', 'dictate', 'listen', 'notes', 'search', 'analytics', 'meetings', 'settings'].includes(target)) {
         setPage(target as Page);
       }
     };
     window.addEventListener('ironmic:navigate', handler);
     return () => window.removeEventListener('ironmic:navigate', handler);
+  }, []);
+
+  // ── Whisper readiness banner ──
+  // Surface model-load failures (file missing, feature flag off, build is a
+  // stub) immediately, instead of waiting for the user's first dictation to
+  // bubble a generic "Transcription failed" toast.
+  useEffect(() => {
+    const unsub = window.ironmic?.onWhisperLoadFailed?.((data) => {
+      // Empty message + non-permanent means "clear the banner" (sent after a
+      // successful import reload). Treat that as a dismiss.
+      if (!data.message && !data.permanent) {
+        setWhisperFailure(null);
+        return;
+      }
+      setWhisperFailure(data);
+    });
+    return () => { unsub?.(); };
+  }, []);
+
+  // ── Tray / notification quick actions ──
+  // Tray → Quick Start Dictation / Quick Start Meeting.
+  // We navigate to the right page first, then emit a page-specific event
+  // that the target page listens for (e.g. DictatePage auto-starts recording,
+  // MeetingPage auto-starts a meeting).
+  useEffect(() => {
+    const unsub = window.ironmic?.onQuickAction?.((action) => {
+      if (action === 'start-dictation') {
+        setPage('dictate');
+        // Fire the intent on the next tick so DictatePage has mounted and
+        // registered its listener before we dispatch.
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+        }, 60);
+      } else if (action === 'start-meeting') {
+        setPage('meetings');
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('ironmic:quick-action-meeting'));
+        }, 60);
+      }
+    });
+    return () => { try { unsub?.(); } catch { /* noop */ } };
   }, []);
 
   const handleNavigate = useCallback((p: string) => setPage(p as Page), []);
@@ -252,19 +314,59 @@ export function Layout() {
           </div>
         </div>
 
+        {/* Whisper load failure banner — sticky until resolved */}
+        {whisperFailure && (
+          <div
+            className="px-4 py-2 text-xs flex items-center gap-3 bg-red-500/15 border-b border-red-500/30 text-red-800 dark:text-red-200"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+          >
+            <span className="font-medium shrink-0">Dictation unavailable:</span>
+            <span className="flex-1 truncate" title={whisperFailure.message}>{whisperFailure.message}</span>
+            <button
+              onClick={() => setPage('settings')}
+              className="px-2 py-0.5 text-[10px] font-medium rounded bg-red-500/20 hover:bg-red-500/30 transition-colors shrink-0"
+            >
+              Open Settings
+            </button>
+            {!whisperFailure.permanent && (
+              <button
+                onClick={() => setWhisperFailure(null)}
+                className="text-red-800/70 hover:text-red-800 dark:text-red-200/70 dark:hover:text-red-200 shrink-0"
+                title="Dismiss"
+              >
+                ×
+              </button>
+            )}
+          </div>
+        )}
+
         {page === 'main' && <GpuPrompt />}
 
         {/* Content */}
         <div className="flex-1 overflow-hidden">
           {page === 'home' && <WelcomePage onNavigate={handleNavigate} />}
-          {page === 'main' && <Timeline />}
+          {page === 'main' && (
+            <ErrorBoundary label="Timeline">
+              <Timeline />
+            </ErrorBoundary>
+          )}
           {page === 'ai' && <AIChat />}
-          {page === 'dictate' && <DictatePage />}
+          {/* Notes IS the dictation experience — both routes render DictatePage
+              so tray quick-actions and legacy nav both land users in the
+              canonical entries-backed note surface. */}
+          {(page === 'dictate' || page === 'notes') && (
+            <ErrorBoundary label="Notes">
+              <DictatePage />
+            </ErrorBoundary>
+          )}
           {page === 'listen' && <ListenPage />}
-          {page === 'notes' && <NotesPage />}
           {page === 'search' && <SearchPage />}
           {page === 'analytics' && <AnalyticsPage />}
-          {page === 'meetings' && <MeetingPage />}
+          {page === 'meetings' && (
+            <ErrorBoundary label="Meetings">
+              <MeetingPage />
+            </ErrorBoundary>
+          )}
           {page === 'settings' && <SettingsPanel />}
         </div>
       </div>

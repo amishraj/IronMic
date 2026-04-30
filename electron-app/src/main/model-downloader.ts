@@ -23,6 +23,7 @@ import { execSync } from 'child_process';
 import {
   MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
   MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS, TFJS_MODELS,
+  TRANSCRIPTION_ENGINES,
 } from '../shared/constants';
 
 /**
@@ -76,17 +77,16 @@ function resolveProxyUrl(): string | null {
 
 /**
  * Configure Electron's session proxy for net.request calls.
- * Must be called before downloads when proxy is configured.
+ * Only touches the session when a proxy is explicitly configured by the user
+ * or the environment — calling setProxy({mode:'system'}) unconditionally can
+ * stall for many seconds on Windows boxes that rely on WPAD auto-detection
+ * and have no proxy, which looks to users like the download is broken.
  */
 async function applySessionProxy(): Promise<void> {
   const proxyUrl = resolveProxyUrl();
-  if (proxyUrl) {
-    console.log(`[model-downloader] Configuring proxy: ${proxyUrl}`);
-    await session.defaultSession.setProxy({ proxyRules: proxyUrl });
-  } else {
-    // Use system proxy detection (Electron/Chromium auto-detects PAC, WPAD, etc.)
-    await session.defaultSession.setProxy({ mode: 'system' });
-  }
+  if (!proxyUrl) return;
+  console.log(`[model-downloader] Configuring proxy: ${proxyUrl}`);
+  await session.defaultSession.setProxy({ proxyRules: proxyUrl });
 }
 
 /** Max retries before falling back to HuggingFace */
@@ -117,6 +117,59 @@ export function getModelsStatus() {
     };
   }
   return result;
+}
+
+/**
+ * Check whether all model files required by a transcription engine are present.
+ *
+ * Moonshine engines need three files (encoder + decoder + tokenizer); Whisper
+ * engines need one. Returns false on the first missing file; the UI can use
+ * this to gate the engine selector dropdown ("Download required" badge).
+ */
+export function isTranscriptionEngineReady(engineId: string): boolean {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta) return false;
+  return meta.modelFileKeys.every((key) => isModelDownloaded(key));
+}
+
+/**
+ * Download every file required by a transcription engine, sequentially.
+ *
+ * For Moonshine variants, this fetches encoder + decoder + tokenizer into
+ * `models/<engine-id>/`. Idempotent — already-downloaded files are skipped.
+ * Throws on the first failure.
+ */
+export async function downloadTranscriptionEngine(
+  engineId: string,
+  window: BrowserWindow | null,
+): Promise<void> {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta) {
+    throw new Error(`Unknown transcription engine: ${engineId}`);
+  }
+  let anyDownloaded = false;
+  for (const key of meta.modelFileKeys) {
+    if (isModelDownloaded(key)) {
+      console.log(`[model-downloader] ${key} already present, skipping`);
+      continue;
+    }
+    anyDownloaded = true;
+    console.log(`[model-downloader] Downloading ${key} for engine '${engineId}'`);
+    await downloadModel(key, window);
+  }
+  console.log(`[model-downloader] Engine '${engineId}' fully downloaded`);
+  // If all files were already present (no actual download happened), the
+  // per-file progress events were never sent — so send a synthetic 'complete'
+  // now so the renderer's progress listener fires and refreshes model state.
+  if (!anyDownloaded && window && !window.isDestroyed()) {
+    window.webContents.send('ironmic:model-download-progress', {
+      model: engineId,
+      downloaded: 1,
+      total: 1,
+      status: 'complete',
+      percent: 100,
+    });
+  }
 }
 
 export function isTtsModelReady(): boolean {
@@ -154,6 +207,135 @@ export function ensureBundledVoices(): void {
       console.log(`[model-downloader] Copied ${files.length} bundled voices`);
     }
   }
+}
+
+/**
+ * Status returned by {@link ensureBundledMoonshineBase}. The values are
+ * stable strings so the main process can log a single line and the UI
+ * (renderer) can branch on them later without re-deriving state.
+ */
+export type MoonshineBundleStatus =
+  | 'copied'             // user-data was missing/incomplete; freshly copied from resources
+  | 'already-present'    // all 3 files exist in user-data and are non-empty
+  | 'incomplete-bundle'  // resources/models/moonshine-base exists but is missing files
+  | 'bundle-missing';    // dev mode or unpackaged run — no bundled directory at all
+
+export type BundledLlmStatus =
+  | 'copied'          // model copied from app resources to user-data
+  | 'already-present' // model exists in user-data and is non-empty (≥ 1.2 GB)
+  | 'source-missing'; // no bundled copy (dev mode or unpackaged) — user must download
+
+const BUNDLED_LLM_FILENAME = 'Phi-3-mini-4k-instruct-Q2_K.gguf';
+const BUNDLED_LLM_MIN_BYTES = 1_200_000_000;
+
+/**
+ * Ensure the bundled Phi-3 Mini Q2_K model is copied to the models directory.
+ *
+ * Phi-3 Mini Q2_K ships with the installer (electron-builder.config.js
+ * extraResources). On first launch we copy it from process.resourcesPath/models/
+ * to the writable userData models dir so the LLM subprocess can open it.
+ *
+ * Size-aware: a file present but smaller than 1.2 GB is treated as corrupted
+ * and re-copied. This catches partial writes from interrupted installs.
+ */
+export function ensureBundledLlm(): BundledLlmStatus {
+  const destPath = path.join(resolveModelsDir(), BUNDLED_LLM_FILENAME);
+
+  // Check if a valid copy already exists in user-data.
+  if (fs.existsSync(destPath)) {
+    try {
+      if (fs.statSync(destPath).size >= BUNDLED_LLM_MIN_BYTES) return 'already-present';
+    } catch { /* fall through to re-copy */ }
+    // File exists but too small — remove the corrupted copy before re-copying.
+    try { fs.unlinkSync(destPath); } catch { /* ignore */ }
+  }
+
+  // Dev mode: no resourcesPath, model lives in rust-core/models directly.
+  if (!process.resourcesPath) return 'source-missing';
+
+  const srcPath = path.join(process.resourcesPath, 'models', BUNDLED_LLM_FILENAME);
+  if (!fs.existsSync(srcPath)) return 'source-missing';
+  try {
+    if (fs.statSync(srcPath).size < BUNDLED_LLM_MIN_BYTES) return 'source-missing';
+  } catch { return 'source-missing'; }
+
+  fs.mkdirSync(resolveModelsDir(), { recursive: true });
+  fs.copyFileSync(srcPath, destPath);
+  console.log(`[model-downloader] Copied bundled Phi-3 Mini Q2_K to ${destPath}`);
+  return 'copied';
+}
+
+const MOONSHINE_FILES = ['encoder_model.onnx', 'decoder_model_merged.onnx', 'tokenizer.json'];
+
+function allFilesPresent(dir: string): boolean {
+  for (const f of MOONSHINE_FILES) {
+    const p = path.join(dir, f);
+    if (!fs.existsSync(p)) return false;
+    try {
+      if (fs.statSync(p).size === 0) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Ensure bundled Moonshine Base ONNX files are copied to the models directory.
+ *
+ * Moonshine Base is the default transcription engine and ships with the
+ * installer (see electron-builder.config.js extraResources). On first launch
+ * we copy the three files from process.resourcesPath/models/moonshine-base/
+ * to the writable userData models dir so the Rust loader (which reads from
+ * IRONMIC_MODELS_DIR) can open them.
+ *
+ * Idempotent and re-entrant: returns a {@link MoonshineBundleStatus} so the
+ * caller can log exactly what happened. Verifies *all three* files are present
+ * and non-empty in user data; checking only the decoder sentinel hid partial
+ * directories that then failed at engine load time.
+ */
+export function ensureBundledMoonshineBase(): MoonshineBundleStatus {
+  const destDir = path.join(resolveModelsDir(), 'moonshine-base');
+  if (allFilesPresent(destDir)) return 'already-present';
+
+  // Dev mode: no resourcesPath, files come from rust-core/models directly.
+  if (!process.resourcesPath) return 'bundle-missing';
+
+  const bundledDir = path.join(process.resourcesPath, 'models', 'moonshine-base');
+  if (!fs.existsSync(bundledDir)) return 'bundle-missing';
+  if (!allFilesPresent(bundledDir)) return 'incomplete-bundle';
+
+  fs.mkdirSync(destDir, { recursive: true });
+  let copied = 0;
+  for (const file of MOONSHINE_FILES) {
+    const src = path.join(bundledDir, file);
+    const dest = path.join(destDir, file);
+    // Re-copy if missing OR present-but-empty (covers a previous half-write).
+    let needsCopy = !fs.existsSync(dest);
+    if (!needsCopy) {
+      try { needsCopy = fs.statSync(dest).size === 0; } catch { needsCopy = true; }
+    }
+    if (!needsCopy) continue;
+    fs.copyFileSync(src, dest);
+    copied += 1;
+  }
+  if (copied > 0) {
+    console.log(`[model-downloader] Copied ${copied} bundled Moonshine Base files to ${destDir}`);
+  }
+  return 'copied';
+}
+
+/**
+ * True when the packaged app shipped with all 3 Moonshine Base files in
+ * `process.resourcesPath/models/moonshine-base/`. False in dev mode and on
+ * installers that lost their bundled copy. The renderer uses this to decide
+ * whether "Delete" should read "Restore bundled copy" instead.
+ */
+export function isMoonshineBundleAvailable(): boolean {
+  if (!process.resourcesPath) return false;
+  const bundledDir = path.join(process.resourcesPath, 'models', 'moonshine-base');
+  if (!fs.existsSync(bundledDir)) return false;
+  return allFilesPresent(bundledDir);
 }
 
 /** Validate a URL is HTTPS and points to an allowed domain */
@@ -607,7 +789,12 @@ export async function downloadModel(
     const expectedHash = MODEL_CHECKSUMS[model];
     const fallbackUrl = MODEL_FALLBACK_URLS[model];
 
+    // Ensure both the models root and the *parent dir of destPath* exist.
+    // The latter matters for models like Moonshine that live in a
+    // subdirectory (e.g. `moonshine-base/encoder_model.onnx`) — without
+    // this, createWriteStream throws ENOENT on the missing subdir.
     fs.mkdirSync(resolveModelsDir(), { recursive: true });
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
 
     console.log(`[model-downloader] Starting download: ${model}`);
     console.log(`[model-downloader] Destination: ${destPath}`);
@@ -799,7 +986,8 @@ const IMPORTABLE_FILES: Record<string, { modelId: string; label: string; downloa
   'mistral-7b-instruct-v0.2.Q4_K_M.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
   'mistral-7b-instruct-q4_k_m.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
   'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf': { modelId: 'llm-chat-llama3', label: 'Llama 3.1 8B Instruct', downloadUrl: 'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf' },
-  'Phi-3-mini-4k-instruct-q4.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini', downloadUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf' },
+  'Phi-3-mini-4k-instruct-Q2_K.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini (Q2_K — bundled default)', downloadUrl: 'https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q2_K.gguf' },
+  'Phi-3-mini-4k-instruct-q4.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini (Q4)', downloadUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf' },
   // TTS — single file on GitHub Releases
   'kokoro-v1.0-fp16.onnx': { modelId: 'tts-model', label: 'Kokoro 82M TTS', downloadUrl: `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx` },
   'model_fp16.onnx': { modelId: 'tts-model', label: 'Kokoro 82M TTS', downloadUrl: `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx` },
@@ -814,6 +1002,13 @@ interface ImportableModelInfo {
   downloaded: boolean;
   /** If the model is multi-part on GitHub, these are the individual part URLs */
   parts?: { filename: string; url: string }[];
+  /**
+   * Marks Moonshine engines, which import as a *set* of 3 files (encoder +
+   * decoder + tokenizer) rather than a single file or numeric .partN chunks.
+   * The renderer routes these to importMoonshineEngine() instead of the
+   * generic single/multi-part import.
+   */
+  isMoonshine?: boolean;
 }
 
 /** Get the list of importable models with their download URLs (for UI display) */
@@ -849,6 +1044,29 @@ export function getImportableModels(): ImportableModelInfo[] {
       parts,
     });
   }
+
+  // Moonshine engines aren't in IMPORTABLE_FILES because each engine ships as
+  // 3 separate files (encoder + decoder + tokenizer). Surface them here with
+  // parts[] populated so the UI can render the 3 download links and route to
+  // the dedicated importMoonshineEngine() handler.
+  for (const meta of TRANSCRIPTION_ENGINES) {
+    if (meta.family !== 'moonshine') continue;
+    const downloaded = isTranscriptionEngineReady(meta.id);
+    const parts = meta.modelFileKeys.map((key) => ({
+      filename: MODEL_FILES[key] ?? key,
+      url: MODEL_URLS[key] ?? '',
+    }));
+    result.push({
+      modelId: meta.id,
+      label: meta.label,
+      filename: `${meta.id}/ (3 files)`,
+      downloadUrl: '',
+      downloaded,
+      parts,
+      isMoonshine: true,
+    });
+  }
+
   return result;
 }
 
@@ -1130,4 +1348,104 @@ export async function importModelFromPath(
   }
 
   return await copyModelFile(filePath, modelId, label);
+}
+
+/**
+ * Import a Moonshine engine (3 files: encoder + decoder + tokenizer).
+ *
+ * Moonshine ships as a directory of three artifacts that must be co-located.
+ * The user downloads them from HuggingFace (links shown in the import UI),
+ * then picks all three at once in a multi-select dialog. We classify each
+ * file by name and copy it to the engine's subdirectory (e.g.
+ * `models/moonshine-base/encoder_model.onnx`). The destination filenames are
+ * canonicalized so the Rust loader finds them regardless of how the user
+ * named the source files.
+ *
+ * Returns null if the dialog was cancelled. Throws with a clear message if
+ * the selection is missing one of the three roles or contains the wrong
+ * count.
+ */
+export async function importMoonshineEngine(
+  window: BrowserWindow | null,
+  engineId: string,
+): Promise<{ modelId: string; label: string; fileCount: number } | null> {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta || meta.family !== 'moonshine') {
+    throw new Error(`Not a Moonshine engine: ${engineId}`);
+  }
+
+  const dialogWindow = window || BrowserWindow.getFocusedWindow();
+  const result = await dialog.showOpenDialog(dialogWindow!, {
+    title: `Import ${meta.label}`,
+    message:
+      'Select all 3 files: the encoder .onnx, the decoder .onnx, and tokenizer.json',
+    filters: [
+      { name: 'Moonshine files', extensions: ['onnx', 'json'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+    properties: ['openFile', 'multiSelections'],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  // Classify each picked file by filename. Encoder/decoder distinction relies
+  // on the substring — both end in .onnx, so we can't use extension alone.
+  let encoderSrc: string | null = null;
+  let decoderSrc: string | null = null;
+  let tokenizerSrc: string | null = null;
+
+  for (const p of result.filePaths) {
+    const lower = path.basename(p).toLowerCase();
+    if (lower.endsWith('.json') && lower.includes('tokenizer')) {
+      tokenizerSrc = p;
+    } else if (lower.endsWith('.onnx') && lower.includes('encoder')) {
+      encoderSrc = p;
+    } else if (lower.endsWith('.onnx') && lower.includes('decoder')) {
+      decoderSrc = p;
+    }
+  }
+
+  const missing: string[] = [];
+  if (!encoderSrc) missing.push('encoder_model.onnx');
+  if (!decoderSrc) missing.push('decoder_model_merged.onnx');
+  if (!tokenizerSrc) missing.push('tokenizer.json');
+  if (missing.length > 0) {
+    throw new Error(
+      `Could not identify all 3 Moonshine files in your selection. Missing: ${missing.join(', ')}.\n\n` +
+        `File names must contain "encoder", "decoder", or "tokenizer" so we can route each one correctly. ` +
+        `Download them from the links in the import section above.`,
+    );
+  }
+
+  // Final destination paths (canonical names so the Rust loader finds them).
+  const modelsDir = resolveModelsDir();
+  const engineDir = path.join(modelsDir, engineId);
+  fs.mkdirSync(engineDir, { recursive: true });
+
+  const copies: Array<{ src: string; dest: string }> = [
+    { src: encoderSrc!, dest: path.join(engineDir, 'encoder_model.onnx') },
+    { src: decoderSrc!, dest: path.join(engineDir, 'decoder_model_merged.onnx') },
+    { src: tokenizerSrc!, dest: path.join(engineDir, 'tokenizer.json') },
+  ];
+
+  for (const { src, dest } of copies) {
+    const stats = fs.statSync(src);
+    if (stats.size < 256) {
+      throw new Error(`File ${path.basename(src)} is too small (${stats.size} bytes) — likely truncated.`);
+    }
+    await new Promise<void>((resolve, reject) => {
+      const rs = fs.createReadStream(src);
+      const ws = fs.createWriteStream(dest);
+      rs.pipe(ws);
+      ws.on('finish', resolve);
+      ws.on('error', reject);
+      rs.on('error', reject);
+    });
+    console.log(`[model-import] Moonshine: copied ${path.basename(src)} → ${dest}`);
+  }
+
+  console.log(`[model-import] Successfully imported ${meta.label} (${copies.length} files)`);
+  return { modelId: engineId, label: meta.label, fileCount: copies.length };
 }

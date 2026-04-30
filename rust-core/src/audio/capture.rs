@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, Stream, StreamConfig};
+use cpal::{Device, Sample, SampleFormat, Stream, StreamConfig};
 use tracing::{debug, error, info, warn};
 
 use crate::error::IronMicError;
@@ -145,10 +145,11 @@ impl CaptureEngine {
         info!(device = %device_name, "Using input device");
         self.device_name = Some(device_name);
 
-        let config = Self::preferred_config(&device)?;
+        let (config, format) = Self::preferred_config(&device)?;
         info!(
             sample_rate = config.sample_rate.0,
             channels = config.channels,
+            ?format,
             "Recording config"
         );
 
@@ -158,27 +159,13 @@ impl CaptureEngine {
             buf.set_format(config.sample_rate.0, config.channels);
         }
 
-        let buffer = Arc::clone(&self.buffer);
-        let recording = Arc::clone(&self.recording);
-
-        let err_callback = |err: cpal::StreamError| {
-            error!(%err, "Audio stream error");
-        };
-
-        let stream = device
-            .build_input_stream(
-                &config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if recording.load(Ordering::SeqCst) {
-                        if let Ok(mut buf) = buffer.lock() {
-                            buf.push_samples(data);
-                        }
-                    }
-                },
-                err_callback,
-                None,
-            )
-            .map_err(|e| IronMicError::Audio(e.to_string()))?;
+        let stream = build_input_stream_for_format(
+            &device,
+            &config,
+            format,
+            Arc::clone(&self.buffer),
+            Arc::clone(&self.recording),
+        )?;
 
         stream
             .play()
@@ -189,6 +176,91 @@ impl CaptureEngine {
 
         info!("Recording started");
         Ok(())
+    }
+
+    /// Start recording from a named input device (e.g. "BlackHole 2ch" on macOS).
+    /// Falls back to the default input device if the named device is not found.
+    pub fn start_from_device(&mut self, device_name: &str) -> Result<(), IronMicError> {
+        if self.is_recording() {
+            return Err(IronMicError::AlreadyRecording);
+        }
+
+        use cpal::traits::HostTrait;
+        let host = cpal::default_host();
+
+        // Try to find the named device; fall back to default
+        let device = host
+            .input_devices()
+            .map_err(|e| IronMicError::Audio(e.to_string()))?
+            .find(|d| d.name().ok().as_deref() == Some(device_name))
+            .or_else(|| host.default_input_device())
+            .ok_or_else(|| IronMicError::NoDevice(format!("Device '{device_name}' not found and no default available")))?;
+
+        let found_name = device.name().unwrap_or_else(|_| "unknown".into());
+        info!(requested = %device_name, using = %found_name, "Using input device");
+        self.device_name = Some(found_name);
+
+        let (config, format) = Self::preferred_config(&device)?;
+        info!(
+            sample_rate = config.sample_rate.0,
+            channels = config.channels,
+            ?format,
+            "Recording config"
+        );
+
+        {
+            let mut buf = self.buffer.lock().unwrap();
+            buf.zero();
+            buf.set_format(config.sample_rate.0, config.channels);
+        }
+
+        let stream = build_input_stream_for_format(
+            &device,
+            &config,
+            format,
+            Arc::clone(&self.buffer),
+            Arc::clone(&self.recording),
+        )?;
+
+        stream
+            .play()
+            .map_err(|e| IronMicError::Audio(e.to_string()))?;
+
+        self.recording.store(true, Ordering::SeqCst);
+        self.stream = Some(stream);
+
+        info!("Recording started (from named device)");
+        Ok(())
+    }
+
+    /// Extract the current buffer contents and reset the buffer WITHOUT stopping the stream.
+    /// Used by the meeting chunk loop every 30 seconds so the stream keeps running with zero gap.
+    /// Caller is responsible for zeroing the returned CapturedAudio when done (privacy guarantee).
+    pub fn drain_chunk(&mut self) -> Result<CapturedAudio, IronMicError> {
+        if !self.is_recording() {
+            return Err(IronMicError::NotRecording);
+        }
+
+        let mut buf = self.buffer.lock().unwrap();
+        let sample_rate = buf.sample_rate();
+        let channels = buf.channels();
+        // take() uses mem::take — empties the Vec and transfers ownership to caller
+        let samples = buf.take();
+        // Re-set format metadata so subsequent push_samples() calls get correct metadata
+        buf.set_format(sample_rate, channels);
+
+        info!(
+            samples = samples.len(),
+            sample_rate,
+            channels,
+            "Buffer drained (stream still running)"
+        );
+
+        Ok(CapturedAudio {
+            samples,
+            sample_rate,
+            channels,
+        })
     }
 
     /// Force-reset the recording state. Used for error recovery.
@@ -233,29 +305,109 @@ impl CaptureEngine {
         })
     }
 
-    /// Choose the best input config — prefer f32, fallback to converting.
-    fn preferred_config(device: &Device) -> Result<StreamConfig, IronMicError> {
-        let supported = device
-            .supported_input_configs()
-            .map_err(|e| IronMicError::Audio(e.to_string()))?;
+    /// Choose the best input config for Whisper transcription.
+    ///
+    /// Strategy: prefer F32 at a canonical rate close to 48 kHz, then any
+    /// format at a canonical rate, then fall back to the first available config
+    /// at max rate. Using max rate unconditionally caused problems on Windows
+    /// WASAPI devices that report 192 kHz as their max — rubato handles the
+    /// resampling but the very high ratio degrades quality. 48 kHz → 16 kHz
+    /// (3:1) is the ideal target; 44100 and 96000 also resample cleanly.
+    fn preferred_config(device: &Device) -> Result<(StreamConfig, SampleFormat), IronMicError> {
+        const PREFERRED_RATES: &[u32] = &[48_000, 44_100, 16_000, 24_000, 96_000, 192_000];
 
-        // Prefer f32 configs, then fall back to whatever is available
-        let mut best = None;
-        for cfg in supported {
-            if cfg.sample_format() == SampleFormat::F32 {
-                best = Some(cfg.with_max_sample_rate());
-                break;
-            }
-            if best.is_none() {
-                best = Some(cfg.with_max_sample_rate());
+        let supported: Vec<_> = device
+            .supported_input_configs()
+            .map_err(|e| IronMicError::Audio(e.to_string()))?
+            .collect();
+
+        if supported.is_empty() {
+            return Err(IronMicError::NoDevice("No supported input configs found".into()));
+        }
+
+        // Pass 1: F32 at a preferred rate (best quality, no conversion needed).
+        for &rate in PREFERRED_RATES {
+            let sr = cpal::SampleRate(rate);
+            for cfg in &supported {
+                if cfg.sample_format() == SampleFormat::F32
+                    && cfg.min_sample_rate() <= sr
+                    && cfg.max_sample_rate() >= sr
+                {
+                    return Ok((cfg.with_sample_rate(sr).into(), SampleFormat::F32));
+                }
             }
         }
 
-        let config = best
-            .ok_or_else(|| IronMicError::NoDevice("No supported input config found".into()))?;
+        // Pass 2: any format at a preferred rate (will be converted to f32 in callback).
+        for &rate in PREFERRED_RATES {
+            let sr = cpal::SampleRate(rate);
+            for cfg in &supported {
+                if cfg.min_sample_rate() <= sr && cfg.max_sample_rate() >= sr {
+                    let fmt = cfg.sample_format();
+                    return Ok((cfg.with_sample_rate(sr).into(), fmt));
+                }
+            }
+        }
 
-        Ok(config.into())
+        // Fallback: first available config at its max rate.
+        let cfg = supported.into_iter().next().unwrap();
+        let fmt = cfg.sample_format();
+        Ok((cfg.with_max_sample_rate().into(), fmt))
     }
+}
+
+/// Build a cpal input stream that writes f32 samples into the shared ring
+/// buffer regardless of the device's native sample format. Dispatches on
+/// SampleFormat so I16 / U16 devices (common on Windows WASAPI laptop and USB
+/// mics) are converted to f32 inside the audio callback before being pushed.
+fn build_input_stream_for_format(
+    device: &Device,
+    config: &StreamConfig,
+    format: SampleFormat,
+    buffer: Arc<Mutex<AudioRingBuffer>>,
+    recording: Arc<AtomicBool>,
+) -> Result<Stream, IronMicError> {
+    let err_callback = |err: cpal::StreamError| {
+        error!(%err, "Audio stream error");
+    };
+
+    macro_rules! input_stream {
+        ($t:ty) => {{
+            let buffer = Arc::clone(&buffer);
+            let recording = Arc::clone(&recording);
+            device.build_input_stream(
+                config,
+                move |data: &[$t], _: &cpal::InputCallbackInfo| {
+                    if recording.load(Ordering::SeqCst) {
+                        if let Ok(mut buf) = buffer.lock() {
+                            // Sample::to_sample::<f32>() handles I16/U16/F32/I32 etc.
+                            let converted: Vec<f32> =
+                                data.iter().map(|s| s.to_sample::<f32>()).collect();
+                            buf.push_samples(&converted);
+                        }
+                    }
+                },
+                err_callback,
+                None,
+            )
+        }};
+    }
+
+    let stream_result = match format {
+        SampleFormat::F32 => input_stream!(f32),
+        SampleFormat::I16 => input_stream!(i16),
+        SampleFormat::U16 => input_stream!(u16),
+        SampleFormat::I32 => input_stream!(i32),
+        SampleFormat::I8 => input_stream!(i8),
+        SampleFormat::U8 => input_stream!(u8),
+        other => {
+            return Err(IronMicError::Audio(format!(
+                "Unsupported input sample format: {:?}",
+                other
+            )));
+        }
+    };
+    stream_result.map_err(|e| IronMicError::Audio(e.to_string()))
 }
 
 impl Drop for CaptureEngine {

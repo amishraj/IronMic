@@ -39,7 +39,7 @@ export interface IAIAdapter {
   availableModels(): AIModel[];
 }
 
-/** Extended adapter interface for CLI-based providers (Copilot, Claude). */
+/** Extended adapter interface for CLI-based providers (Claude). */
 export interface ICLIAdapter extends IAIAdapter {
   buildArgs(prompt: string, continueSession: boolean, model?: string): string[];
   parseOutput(data: string): ParsedOutput;

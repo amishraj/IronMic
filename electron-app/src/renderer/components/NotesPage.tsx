@@ -1,18 +1,24 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Plus, Search, StickyNote, FolderOpen, Pin, Trash2, Tag, ChevronRight,
-  BookOpen, MoreHorizontal, X, Hash, Pencil, Check,
+  BookOpen, MoreHorizontal, X, Hash, Pencil, Check, Users, Sparkles, Loader2,
 } from 'lucide-react';
 import { Card } from './ui';
 import { useNotesStore, type Note, type Notebook } from '../stores/useNotesStore';
+import { useToastStore } from '../stores/useToastStore';
+import { NotesCollaborateModal } from './NotesCollaborateModal';
 
 export function NotesPage() {
   const {
     notebooks, activeNoteId, activeNotebookId, searchQuery,
     createNote, updateNote, deleteNote, setActiveNote,
     createNotebook, renameNotebook, deleteNotebook, setActiveNotebook,
-    setSearchQuery, filteredNotes,
+    setSearchQuery, filteredNotes, polishNote,
   } = useNotesStore();
+  // Per-note "Draft" / "Saved" indicator. Subscribe narrowly so the pill
+  // updates without re-rendering the whole page on every keystroke.
+  const noteSaveStatus = useNotesStore((s) => s.noteSaveStatus);
+  const polishingIds = useNotesStore((s) => s.polishingIds);
 
   const notes = filteredNotes();
   const activeNote = useNotesStore((s) => s.getNote(activeNoteId || ''));
@@ -22,6 +28,21 @@ export function NotesPage() {
   const [editingNotebookId, setEditingNotebookId] = useState<string | null>(null);
   const [editingNotebookName, setEditingNotebookName] = useState('');
   const [tagInput, setTagInput] = useState('');
+  const [collabOpen, setCollabOpen] = useState(false);
+  const [collabActive, setCollabActive] = useState(false);
+  const [collabRole, setCollabRole] = useState<'host' | 'client' | null>(null);
+  const [collabParticipantCount, setCollabParticipantCount] = useState(0);
+  const [collabNoteId, setCollabNoteId] = useState<string | null>(null);
+  const collabNoteIdRef = useRef<string | null>(null);
+  const collabRoleRef = useRef<'host' | 'client' | null>(null);
+  const joinedLocalNoteIdRef = useRef<string | null>(null);
+  // Content the last received remote update applied to the editor.  We skip
+  // outbound broadcasts when the editor matches this string — deterministic,
+  // no timer race with React 18 effect timing.
+  const lastRemoteContentRef = useRef<string | null>(null);
+  const draftThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const saveDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showToast = useToastStore((s) => s.show);
 
   const titleRef = useRef<HTMLInputElement>(null);
   const contentRef = useRef<HTMLTextAreaElement>(null);
@@ -32,6 +53,110 @@ export function NotesPage() {
       titleRef.current.focus();
     }
   }, [activeNoteId]);
+
+  // Apply remote saves & drafts into the note that owns the session, even if
+  // the user has switched to a different note locally.  We capture the
+  // applied content in lastRemoteContentRef so the broadcast effect knows to
+  // skip echoing it back — replaces the prior setTimeout-based race.
+  useEffect(() => {
+    const applyRemote = (raw: any) => {
+      const targetNoteId = collabNoteIdRef.current;
+      if (!targetNoteId) return;
+      const content = String(raw ?? '');
+      lastRemoteContentRef.current = content;
+      updateNote(targetNoteId, { content });
+    };
+    const unsubSaved = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
+      applyRemote(data?.notes);
+    });
+    const unsubDraft = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
+      if (data?.content != null) applyRemote(data.content);
+    });
+    return () => { unsubSaved?.(); unsubDraft?.(); };
+  }, [updateNote]);
+
+  // Track live collab session state for the button indicator.  Trust the
+  // server-supplied sessionNoteId when present (defence in depth) and fall
+  // back to parsing it out of sessionId for older payloads.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabState?.((info: any) => {
+      const active = Boolean(info?.active ?? info?.connected);
+      // Server payload has `active`; client payload has `connected`.
+      const role: 'host' | 'client' | null = active
+        ? (info?.active != null ? 'host' : 'client')
+        : null;
+      setCollabActive(active);
+      setCollabRole(role);
+      collabRoleRef.current = role;
+      setCollabParticipantCount(info?.participants?.length ?? 0);
+      const sid = info?.sessionId as string | null;
+      const serverNoteId = (info?.sessionNoteId as string | null) ?? null;
+      const noteId = role === 'client'
+        ? joinedLocalNoteIdRef.current
+        : (serverNoteId ?? (sid?.startsWith('note:') ? sid.slice(5) : null));
+      setCollabNoteId(noteId);
+      collabNoteIdRef.current = noteId;
+      if (!active) lastRemoteContentRef.current = null;
+    });
+    return () => { unsub?.(); };
+  }, []);
+
+  // Surface firewall failures (Mac/Win) to the user as a non-blocking toast.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabFirewallWarning?.((data: { message: string }) => {
+      showToast({ message: data.message, type: 'info', durationMs: 12000 });
+    });
+    return () => { unsub?.(); };
+  }, [showToast]);
+
+  // Broadcast edits for the note that owns the session.  Note-scoped: switching
+  // notes while hosting must not leak the new note into the existing session.
+  // Two paths:
+  //   • draft: 80ms throttle, fire-and-forget, lets the peer feel typing live
+  //   • save:  1.2s debounce, persists & bumps version
+  useEffect(() => {
+    if (!collabActive || !activeNote) return;
+    if (activeNote.id !== collabNoteId) return;
+    // Skip echoes — content already came from the wire.
+    if (lastRemoteContentRef.current === activeNote.content) return;
+
+    const name = (() => {
+      try { return localStorage.getItem('ironmic-collab-display-name') || 'Host'; }
+      catch { return 'Host'; }
+    })();
+    const sendDraft = () => {
+      if (collabRoleRef.current === 'host') {
+        window.ironmic?.meetingCollabNotifyDraft?.(activeNote.content, name)?.catch(() => {});
+      } else if (collabRoleRef.current === 'client') {
+        window.ironmic?.meetingCollabSendDraft?.(activeNote.content)?.catch(() => {});
+      }
+    };
+    const sendSave = () => {
+      if (collabRoleRef.current === 'host') {
+        window.ironmic?.meetingCollabNotifySaved?.(activeNote.content, name)?.catch(() => {});
+      } else if (collabRoleRef.current === 'client') {
+        window.ironmic?.meetingCollabSaveNotes?.(activeNote.content)?.catch(() => {});
+      }
+    };
+
+    if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
+    draftThrottleRef.current = setTimeout(sendDraft, 80);
+
+    if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    saveDebounceRef.current = setTimeout(sendSave, 1200);
+
+    return () => {
+      if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
+      if (saveDebounceRef.current) clearTimeout(saveDebounceRef.current);
+    };
+  }, [activeNote?.id, activeNote?.content, collabActive, collabNoteId]);
+
+  // Auto-stop when the last participant leaves while the modal is closed.
+  useEffect(() => {
+    if (!collabOpen && collabActive && collabParticipantCount === 0) {
+      window.ironmic?.meetingCollabStop?.().catch(() => {});
+    }
+  }, [collabOpen, collabActive, collabParticipantCount]);
 
   const handleCreateNotebook = () => {
     if (!newNotebookName.trim()) return;
@@ -153,13 +278,33 @@ export function NotesPage() {
                 ? notebooks.find((nb) => nb.id === activeNotebookId)?.name || 'Notes'
                 : 'All Notes'}
             </h3>
-            <button
-              onClick={() => createNote()}
-              className="p-1.5 rounded-lg bg-iron-accent/10 text-iron-accent-light hover:bg-iron-accent/20 transition-colors"
-              title="New note"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => setCollabOpen(true)}
+                className={`p-1.5 rounded-lg transition-colors relative ${
+                  collabActive
+                    ? 'text-green-400 bg-green-500/10 hover:bg-green-500/20'
+                    : 'text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10'
+                }`}
+                title={collabActive
+                  ? `Live session — ${collabParticipantCount} participant${collabParticipantCount !== 1 ? 's' : ''} connected`
+                  : 'Collaborate / join a session'}
+              >
+                <Users className="w-3.5 h-3.5" />
+                {collabActive && (
+                  <span className="absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-green-400 border border-iron-surface animate-pulse" />
+                )}
+              </button>
+              {/* Derive lock: session running on a different note */}
+              {/* (lockIcon hidden; the note-list badge handles discoverability) */}
+              <button
+                onClick={() => createNote()}
+                className="p-1.5 rounded-lg bg-iron-accent/10 text-iron-accent-light hover:bg-iron-accent/20 transition-colors"
+                title="New note"
+              >
+                <Plus className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3 h-3 text-iron-text-muted" />
@@ -191,6 +336,8 @@ export function NotesPage() {
               note={note}
               active={activeNoteId === note.id}
               notebook={notebooks.find((nb) => nb.id === note.notebookId)}
+              isCollabLive={collabActive && collabNoteId === note.id}
+              collabParticipantCount={collabParticipantCount}
               onClick={() => setActiveNote(note.id)}
               onDelete={() => deleteNote(note.id)}
               onPin={() => updateNote(note.id, { isPinned: !note.isPinned })}
@@ -205,13 +352,94 @@ export function NotesPage() {
           <>
             {/* Note header */}
             <div className="px-6 pt-5 pb-3 border-b border-iron-border">
-              <input
-                ref={titleRef}
-                value={activeNote.title}
-                onChange={(e) => updateNote(activeNote.id, { title: e.target.value })}
-                placeholder="Note title..."
-                className="w-full text-xl font-bold bg-transparent text-iron-text placeholder:text-iron-text-muted/50 focus:outline-none"
-              />
+              <div className="flex items-start gap-3">
+                <input
+                  ref={titleRef}
+                  value={activeNote.title}
+                  onChange={(e) => updateNote(activeNote.id, { title: e.target.value })}
+                  placeholder="Note title..."
+                  className="flex-1 text-xl font-bold bg-transparent text-iron-text placeholder:text-iron-text-muted/50 focus:outline-none"
+                />
+                {(() => {
+                  // Polish button — sits to the left of Collaborate per the
+                  // intended toolbar order. Three states: idle (run polish),
+                  // polishing (spinner pill, button disabled), and
+                  // already-polished (opens the re-polish/toggle dialog).
+                  const isPolishing = polishingIds.has(activeNote.id);
+                  const hasPolished = !!activeNote.polishedContent;
+                  const handlePolish = () => {
+                    if (isPolishing) return;
+                    if (hasPolished) {
+                      // Toggle displayMode in place — replaces what the
+                      // (now-removed) NotePolishDialog used to do.
+                      updateNote(activeNote.id, {
+                        displayMode: activeNote.displayMode === 'polished' ? 'raw' : 'polished',
+                      });
+                    } else {
+                      polishNote(activeNote.id);
+                    }
+                  };
+                  if (isPolishing) {
+                    return (
+                      <span
+                        className="flex items-center gap-1 text-[10px] text-amber-400 bg-amber-500/10 border border-amber-500/20 px-1.5 py-1 rounded shrink-0"
+                        title="Running local LLM…"
+                      >
+                        <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                        Polishing…
+                      </span>
+                    );
+                  }
+                  return (
+                    <button
+                      onClick={handlePolish}
+                      title={
+                        hasPolished
+                          ? 'View raw or re-polish this note'
+                          : 'Polish this note with the local LLM'
+                      }
+                      className={`flex items-center justify-center p-1.5 text-[11px] font-medium rounded-lg border transition-colors shrink-0 ${
+                        hasPolished
+                          ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/25 hover:bg-iron-accent/20'
+                          : 'bg-iron-accent/10 text-iron-accent-light border-iron-accent/20 hover:bg-iron-accent/20'
+                      }`}
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                    </button>
+                  );
+                })()}
+                {(() => {
+                  const isThisNote = !collabActive || collabNoteId === activeNote.id;
+                  const isLocked = collabActive && collabNoteId !== null && collabNoteId !== activeNote.id;
+                  return (
+                    <button
+                      onClick={() => !isLocked && setCollabOpen(true)}
+                      disabled={isLocked}
+                      title={
+                        isLocked
+                          ? 'A live session is already running on another note — end it first'
+                          : collabActive
+                          ? `Live session — ${collabParticipantCount} connected`
+                          : 'Collaborate on this note'
+                      }
+                      className={`flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium rounded-lg border transition-colors shrink-0 ${
+                        isLocked
+                          ? 'opacity-40 cursor-not-allowed bg-iron-surface border-iron-border text-iron-text-muted'
+                          : collabActive
+                          ? 'bg-green-500/10 text-green-400 border-green-500/20 hover:bg-green-500/20'
+                          : 'bg-iron-accent/10 text-iron-accent-light border-iron-accent/20 hover:bg-iron-accent/20'
+                      }`}
+                    >
+                      {collabActive && isThisNote
+                        ? <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse shrink-0" />
+                        : <Users className="w-3.5 h-3.5" />}
+                      {collabActive && isThisNote
+                        ? `Live${collabParticipantCount > 0 ? ` · ${collabParticipantCount}` : ''}`
+                        : 'Collaborate'}
+                    </button>
+                  );
+                })()}
+              </div>
               {/* Notebook selector */}
               <div className="flex items-center gap-3 mt-2">
                 <select
@@ -227,6 +455,34 @@ export function NotesPage() {
                 <span className="text-[10px] text-iron-text-muted">
                   {new Date(activeNote.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}
                 </span>
+                {/* Draft / Saved pill — auto-save indicator. Flips to "Draft"
+                    on every edit, then back to "Saved" ~600ms after typing
+                    stops. The localStorage write is already synchronous on
+                    every keystroke; this is purely UX feedback so the user
+                    can see their changes are captured. */}
+                {(() => {
+                  const status = noteSaveStatus[activeNote.id] ?? 'saved';
+                  if (status === 'draft') {
+                    return (
+                      <span
+                        className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-iron-warning/10 text-iron-warning border border-iron-warning/20"
+                        title="Saving your changes…"
+                      >
+                        <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                        Draft
+                      </span>
+                    );
+                  }
+                  return (
+                    <span
+                      className="inline-flex items-center gap-1 text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                      title="All changes saved"
+                    >
+                      <Check className="w-2.5 h-2.5" />
+                      Saved
+                    </span>
+                  );
+                })()}
               </div>
               {/* Tags */}
               <div className="flex items-center gap-1.5 mt-2 flex-wrap">
@@ -249,11 +505,19 @@ export function NotesPage() {
               </div>
             </div>
 
-            {/* Note content */}
+            {/* Note content. When the user has chosen to view the polished
+                version we render it instead of the raw body. Edits go to
+                `content`; the store auto-clears `polishedContent` on body
+                changes, so editing from "polished" view drops the user back
+                onto raw without losing their typing. */}
             <div className="flex-1 overflow-y-auto">
               <textarea
                 ref={contentRef}
-                value={activeNote.content}
+                value={
+                  activeNote.displayMode === 'polished' && activeNote.polishedContent != null
+                    ? activeNote.polishedContent
+                    : activeNote.content
+                }
                 onChange={(e) => updateNote(activeNote.id, { content: e.target.value })}
                 placeholder="Start writing..."
                 className="w-full h-full px-6 py-4 text-sm leading-relaxed bg-transparent text-iron-text placeholder:text-iron-text-muted/40 resize-none focus:outline-none"
@@ -269,22 +533,56 @@ export function NotesPage() {
             <p className="text-xs text-iron-text-muted mt-1 max-w-[240px]">
               Select a note to view it, or create a new one to get started.
             </p>
-            <button
-              onClick={() => createNote()}
-              className="mt-4 px-4 py-2 text-xs font-medium bg-gradient-accent text-white rounded-lg hover:shadow-glow transition-all"
-            >
-              <Plus className="w-3.5 h-3.5 inline mr-1.5" />
-              New Note
-            </button>
+            <div className="mt-4 flex items-center gap-2">
+              <button
+                onClick={() => createNote()}
+                className="px-4 py-2 text-xs font-medium bg-gradient-accent text-white rounded-lg hover:shadow-glow transition-all"
+              >
+                <Plus className="w-3.5 h-3.5 inline mr-1.5" />
+                New Note
+              </button>
+              <button
+                onClick={() => setCollabOpen(true)}
+                className="px-4 py-2 text-xs font-medium bg-iron-accent/10 text-iron-accent-light border border-iron-accent/20 rounded-lg hover:bg-iron-accent/20 transition-colors"
+              >
+                <Users className="w-3.5 h-3.5 inline mr-1.5" />
+                Join a session
+              </button>
+            </div>
           </div>
         )}
       </div>
+
+      {collabOpen && (
+        <NotesCollaborateModal
+          noteId={activeNote?.id ?? null}
+          initialNotes={activeNote?.content ?? ''}
+          onNotesUpdated={(notes) => {
+            if (activeNote) updateNote(activeNote.id, { content: notes });
+          }}
+          onJoined={({ notes }) => {
+            // Land the joined content as a new local note so the viewer has
+            // something to edit; subsequent saves flow back over the socket.
+            const id = createNote();
+            joinedLocalNoteIdRef.current = id;
+            collabNoteIdRef.current = id;
+            setCollabNoteId(id);
+            setCollabActive(true);
+            setCollabRole('client');
+            updateNote(id, { title: 'Shared note', content: notes });
+          }}
+          onClose={() => setCollabOpen(false)}
+        />
+      )}
+
     </div>
   );
 }
 
-function NoteListItem({ note, active, notebook, onClick, onDelete, onPin }: {
-  note: Note; active: boolean; notebook?: Notebook; onClick: () => void; onDelete: () => void; onPin: () => void;
+function NoteListItem({ note, active, notebook, isCollabLive, collabParticipantCount = 0, onClick, onDelete, onPin }: {
+  note: Note; active: boolean; notebook?: Notebook; isCollabLive?: boolean;
+  collabParticipantCount?: number;
+  onClick: () => void; onDelete: () => void; onPin: () => void;
 }) {
   const preview = note.content.slice(0, 80).replace(/\n/g, ' ') || 'Empty note';
   const time = new Date(note.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
@@ -294,7 +592,7 @@ function NoteListItem({ note, active, notebook, onClick, onDelete, onPin }: {
       onClick={onClick}
       className={`w-full text-left px-3 py-2.5 border-b border-iron-border transition-colors group ${
         active ? 'bg-iron-accent/10' : 'hover:bg-iron-surface-hover'
-      }`}
+      } ${isCollabLive ? 'border-l-2 border-l-green-500/50' : ''}`}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
@@ -303,6 +601,12 @@ function NoteListItem({ note, active, notebook, onClick, onDelete, onPin }: {
             <p className={`text-xs font-medium truncate ${active ? 'text-iron-text' : 'text-iron-text-secondary'}`}>
               {note.title || 'Untitled'}
             </p>
+            {isCollabLive && (
+              <span className="flex items-center gap-0.5 text-[9px] font-medium text-green-400 bg-green-500/10 border border-green-500/20 px-1.5 py-0.5 rounded-full shrink-0 leading-none">
+                <span className="w-1 h-1 rounded-full bg-green-400 animate-pulse" />
+                {collabParticipantCount > 0 ? `${collabParticipantCount} in` : 'Live'}
+              </span>
+            )}
           </div>
           <p className="text-[11px] text-iron-text-muted truncate mt-0.5">{preview}</p>
           <div className="flex items-center gap-2 mt-1">

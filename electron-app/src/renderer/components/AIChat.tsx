@@ -125,8 +125,27 @@ export function AIChat() {
     setStreaming('');
 
     try {
-      const savedModel = await window.ironmic.getSetting('ai_model');
-      const response = await window.ironmic.aiSendMessage(fullPrompt, provider, savedModel || undefined);
+      // Resolve the model ID for the CURRENT provider. We can't just trust
+      // the persisted `ai_model` setting — it may carry a stale cloud model
+      // id (e.g. `claude-sonnet-4-...`) from a previous session that would
+      // then be sent to the local LLM, which rejects it with "Unknown local
+      // LLM model". Filter by provider convention: local model IDs start
+      // with `llm`; cloud IDs do not. If the stored value doesn't match the
+      // current provider's convention, drop it and let the main process
+      // pick a reasonable default.
+      const [genericModel, localModel] = await Promise.all([
+        window.ironmic.getSetting('ai_model'),
+        window.ironmic.getSetting('ai_local_model'),
+      ]);
+      let modelId: string | undefined;
+      if (provider === 'local') {
+        const candidate = localModel || genericModel;
+        modelId = candidate && candidate.startsWith('llm') ? candidate : undefined;
+      } else {
+        // Cloud providers: accept the generic setting iff it's NOT a local id.
+        modelId = genericModel && !genericModel.startsWith('llm') ? genericModel : undefined;
+      }
+      const response = await window.ironmic.aiSendMessage(fullPrompt, provider, modelId);
 
       const assistantMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),

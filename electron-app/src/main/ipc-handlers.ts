@@ -3,14 +3,27 @@
  * Security: input validation on high-risk channels.
  */
 
-import { ipcMain, BrowserWindow } from 'electron';
-import { IPC_CHANNELS, MODEL_FILES } from '../shared/constants';
+import { ipcMain, BrowserWindow, shell } from 'electron';
+import * as fs from 'fs';
+import * as path from 'path';
+import { IPC_CHANNELS, MODEL_FILES, TRANSCRIPTION_ENGINES } from '../shared/constants';
 import { native } from './native-bridge';
-import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel } from './model-downloader';
+import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine, ensureBundledMoonshineBase, isMoonshineBundleAvailable } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
 import type { AIProvider } from './ai/types';
+import { meetingRecorder } from './meeting-recorder';
+import { liveSummarizer } from './live-summarizer';
+import { dictationStreamer } from './dictation-streamer';
+import { meetingRoomServer } from './meeting-room-server';
+import { meetingRoomClient } from './meeting-room-client';
+import { meetingNotesCollabServer } from './meeting-notes-collab-server';
+import { meetingNotesCollabClient } from './meeting-notes-collab-client';
+import { checkBlackHoleInstalled, installBlackHole, openAudioMidiSetup, broadcastInstallProgress } from './blackhole-setup';
+import { audioStream } from './audio-stream-manager';
+import { debugLog, invalidateDebugLogCache } from './debug-log';
+import { computeRmsPcm16 } from './transcribe-clean';
 
 // ── Input validation helpers ──
 
@@ -28,6 +41,7 @@ const ALLOWED_SETTING_KEYS = new Set([
   'security_clipboard_auto_clear', 'security_session_timeout',
   'security_clear_on_exit', 'security_ai_data_confirm', 'security_privacy_mode',
   'migration_tag_ai_done',
+  'migration_auto_detect_default_v2',
   'analytics_backfill_done',
   // ML Feature settings (v1.1.0)
   'vad_enabled', 'vad_sensitivity', 'vad_web_audio_enabled',
@@ -41,6 +55,28 @@ const ALLOWED_SETTING_KEYS = new Set([
   'proxy_url', 'proxy_enabled',
   // Meeting templates (v1.3.0)
   'meeting_auto_detect_enabled', 'meeting_default_template',
+  // Meeting recording / Granola mode (v1.5.0)
+  'meeting_audio_device', 'meeting_chunk_interval_s', 'meeting_display_name',
+  // Collaboration (v1.6.0)
+  'meeting_collab_display_name',
+  // Notebooks — JSON array of {id,name,createdAt}
+  'notebooks',
+  // Debug toggle for the audio pipeline log channel (renderer DevTools)
+  'debug_audio_logging',
+  // Whisper thread count override — default is min(4, num_cpus).
+  // Reduce on VDI / shared machines if first-transcription hangs.
+  'whisper_threads',
+  // Phase 1 engine swap: which transcription engine is active.
+  // Values: 'moonshine-base' (default, bundled) | 'whisper-base' |
+  // 'whisper-small' | 'whisper-medium' | 'whisper-large-v3-turbo'.
+  // Persisted in SQLite, but every launch overrides this to 'moonshine-base'
+  // (see main/index.ts engine-startup block) — so user switches via this
+  // setting last only for the current session.
+  'transcription_engine',
+  // Polish provider preference. 'true' enables cloud polish via authenticated
+  // Claude/Copilot CLIs; default 'false' keeps polish strictly on-device.
+  // The renderer Settings panel surfaces this with a privacy warning + confirm.
+  'polish_allow_cloud',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -51,15 +87,120 @@ function assertMaxLength(val: string, max: number, name: string): void {
   if (val.length > max) throw new Error(`${name} exceeds maximum length (${max})`);
 }
 
+// ── Model management helpers ──
+// Resolve the user-data models dir the same way model-downloader does. Reading
+// the env var directly avoids exporting a private path resolver.
+function resolveModelsDirForIpc(): string {
+  return process.env.IRONMIC_MODELS_DIR || '';
+}
+
+interface EngineFileEntry {
+  /** Relative path under the models dir (e.g. "moonshine-base/encoder_model.onnx") */
+  relativePath: string;
+  /** Absolute filesystem path, or '' if the models dir is not yet set */
+  absolutePath: string;
+}
+
+function getEngineFiles(engineId: string): EngineFileEntry[] {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta) throw new Error(`Unknown engine: ${engineId}`);
+  const modelsDir = resolveModelsDirForIpc();
+  return meta.modelFileKeys.map((key) => {
+    const rel = MODEL_FILES[key];
+    if (!rel) throw new Error(`Engine ${engineId} references unknown model file key: ${key}`);
+    return {
+      relativePath: rel,
+      absolutePath: modelsDir ? path.join(modelsDir, rel) : '',
+    };
+  });
+}
+
+function assertEngineNotActive(engineId: string, action: string): void {
+  let active: string;
+  try {
+    active = native.getTranscriptionEngine();
+  } catch (err: any) {
+    throw new Error(`Cannot ${action}: failed to read active engine (${err?.message ?? err})`);
+  }
+  if (engineId === active) {
+    throw new Error(
+      `Cannot ${action} the active engine. Switch to another engine in Settings first.`,
+    );
+  }
+}
+
+function deleteEngineFilesImpl(engineId: string): { deleted: number; restoredBundle: boolean } {
+  assertEngineNotActive(engineId, 'delete');
+  const files = getEngineFiles(engineId);
+  let deleted = 0;
+  for (const f of files) {
+    if (!f.absolutePath) continue;
+    try {
+      if (fs.existsSync(f.absolutePath)) {
+        fs.unlinkSync(f.absolutePath);
+        deleted += 1;
+      }
+    } catch (err) {
+      console.warn(`[model-mgmt] Failed to delete ${f.absolutePath}:`, err);
+    }
+  }
+  // For the bundled default engine, immediately restore from app resources
+  // so packaged builds don't leave the user without a working engine.
+  let restoredBundle = false;
+  if (engineId === 'moonshine-base') {
+    try {
+      const status = ensureBundledMoonshineBase();
+      restoredBundle = status === 'copied';
+    } catch (err) {
+      console.warn('[model-mgmt] Failed to restore bundled Moonshine after delete:', err);
+    }
+  }
+  return { deleted, restoredBundle };
+}
+
 export function registerIpcHandlers(): void {
-  // Audio
-  ipcMain.handle(IPC_CHANNELS.START_RECORDING, () => native.startRecording());
-  ipcMain.handle(IPC_CHANNELS.STOP_RECORDING, () => native.stopRecording());
+  // Audio — all callers must go through audioStream for exclusive ownership.
+  ipcMain.handle(IPC_CHANNELS.START_RECORDING, () => {
+    audioStream.acquire('dictation');
+    try {
+      native.startRecording();
+      debugLog('capture.start', { owner: 'dictation', success: true });
+    } catch (err: any) {
+      debugLog('capture.start', { owner: 'dictation', success: false, error: err?.message ?? String(err) });
+      audioStream.release('dictation');
+      throw err;
+    }
+  });
+  ipcMain.handle(IPC_CHANNELS.STOP_RECORDING, () => {
+    try {
+      const buf = native.stopRecording();
+      debugLog('capture.drained', {
+        owner: 'dictation',
+        chunkIndex: 0,
+        byteLength: buf.length,
+        rms: computeRmsPcm16(buf),
+        isFinal: true,
+        path: 'stopRecording',
+      });
+      return buf;
+    } finally {
+      audioStream.release('dictation');
+    }
+  });
   ipcMain.handle(IPC_CHANNELS.IS_RECORDING, () => native.isRecording());
-  ipcMain.handle('ironmic:reset-recording', () => native.addon.resetRecording());
+  // reset-recording: clears both the Rust pipeline state and the ownership
+  // flag so a stuck stream can be recovered without restarting the app.
+  ipcMain.handle('ironmic:reset-recording', () => {
+    audioStream.forceReset();
+    if (typeof native.addon.resetRecording === 'function') {
+      native.addon.resetRecording();
+    } else if (typeof native.addon.resetPipelineState === 'function') {
+      native.addon.resetPipelineState();
+    }
+  });
 
   // Transcription — validate buffer size, convert Uint8Array to Buffer (sandbox sends Uint8Array)
-  ipcMain.handle(IPC_CHANNELS.TRANSCRIBE, (_e, audioBuffer: any) => {
+  ipcMain.handle(IPC_CHANNELS.TRANSCRIBE, async (_e, audioBuffer: any) => {
     if (!Buffer.isBuffer(audioBuffer) && !(audioBuffer instanceof Uint8Array)) {
       throw new Error('audioBuffer must be a Buffer or Uint8Array');
     }
@@ -67,11 +208,75 @@ export function registerIpcHandlers(): void {
       throw new Error(`Audio buffer too large: ${audioBuffer.length} bytes (max ${MAX_AUDIO_BUFFER_SIZE})`);
     }
     const buf = Buffer.isBuffer(audioBuffer) ? audioBuffer : Buffer.from(audioBuffer);
-    return native.transcribe(buf);
+    const start = Date.now();
+    const engineKind = (() => {
+      try { return native.getTranscriptionEngine?.() ?? 'unknown'; }
+      catch { return 'unknown'; }
+    })();
+    debugLog('whisper.in', { engine: engineKind, owner: 'single-shot', byteLength: buf.length, durationSec: buf.length / 2 / 16000 });
+    try {
+      const text = await native.transcribe(buf);
+      debugLog('whisper.raw', { engine: engineKind, owner: 'single-shot', rawText: text, length: text?.length ?? 0, latencyMs: Date.now() - start });
+      return text;
+    } catch (err: any) {
+      debugLog('whisper.error', { engine: engineKind, owner: 'single-shot', message: err?.message ?? String(err), latencyMs: Date.now() - start });
+      throw err;
+    }
   });
-  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, (_e, rawText: string) =>
-    native.polishText(rawText)
-  );
+  // Polish dispatcher used by both POLISH_TEXT and POLISH_TEXT_DETAILED.
+  // Reads polish_allow_cloud from settings and routes via aiManager. Default
+  // is strictly local — cloud is only considered when the setting is the
+  // explicit string 'true' (auth state alone never enables it).
+  const dispatchPolish = async (
+    rawText: string,
+    requireModel: boolean,
+  ): Promise<{ text: string; providerUsed: AIProvider }> => {
+    let allowCloud = false;
+    try {
+      allowCloud = native.getSetting('polish_allow_cloud') === 'true';
+    } catch { /* setting absent → default false */ }
+    try {
+      return await aiManager.polish(rawText, { allowCloud });
+    } catch (err: any) {
+      // Renderer pattern-matches the "Cleanup model not downloaded" wording.
+      // When the caller doesn't require the model (legacy dictation auto-
+      // cleanup, meeting fallback), gracefully return the input unchanged.
+      if (!requireModel && err?.message?.includes('Cleanup model not downloaded')) {
+        return { text: rawText, providerUsed: 'local' };
+      }
+      throw err;
+    }
+  };
+
+  // Backward-compat: existing callers (useRecordingStore, useNotesStore,
+  // SummaryGenerator, MeetingDetector, MeetingTemplateEngine, IntentClassifier)
+  // expect a string return. Don't change that — return only result.text here.
+  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, async (
+    _e,
+    rawText: string,
+    opts?: { requireModel?: boolean },
+  ) => {
+    const result = await dispatchPolish(rawText, !!opts?.requireModel);
+    return result.text;
+  });
+
+  // New channel for the toggle-driven polish flow that wants to know which
+  // provider produced the output (for the "via X" badge next to the toggle).
+  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT_DETAILED, async (
+    _e,
+    rawText: string,
+    opts?: { requireModel?: boolean },
+  ) => dispatchPolish(rawText, !!opts?.requireModel));
+
+  // ── Processing state tracking (for quit-confirmation) ──
+  // Renderer fires this when it starts/stops LLM note generation so the main
+  // process can intercept window close and warn about in-flight work.
+  let activeNotesGeneratingCount = 0;
+  ipcMain.on('ironmic:notify-processing-state', (_e, isActive: boolean) => {
+    activeNotesGeneratingCount = Math.max(0, activeNotesGeneratingCount + (isActive ? 1 : -1));
+  });
+  // Expose the counter so index.ts can read it in the before-close hook.
+  (global as any).__ironmicActiveGeneratingCount = () => activeNotesGeneratingCount;
 
   // Entries
   ipcMain.handle(IPC_CHANNELS.CREATE_ENTRY, (_e, entry) => native.createEntry(entry));
@@ -112,8 +317,50 @@ export function registerIpcHandlers(): void {
     if (!ALLOWED_SETTING_KEYS.has(key)) {
       throw new Error(`Unknown setting key: ${key}`);
     }
-    assertMaxLength(value, MAX_SETTING_VALUE_LENGTH, 'setting value');
-    return native.setSetting(key, value);
+    // `notebooks` stores a JSON array and can exceed the default 1KB cap as
+    // the user adds more notebooks. Give it headroom.
+    const maxLen = key === 'notebooks' ? 64_000 : MAX_SETTING_VALUE_LENGTH;
+    assertMaxLength(value, maxLen, 'setting value');
+    const result = native.setSetting(key, value);
+    // The debug-log helper caches the toggle state to avoid a SQLite hit on
+    // every audio chunk; invalidate when the user flips it in Settings.
+    if (key === 'debug_audio_logging') invalidateDebugLogCache();
+    // When the user picks a different transcription engine, push the change
+    // to Rust immediately so the next dictate/meeting chunk uses the new
+    // engine. The model itself loads lazily on the first transcribe call.
+    if (key === 'transcription_engine') {
+      try {
+        native.setTranscriptionEngine(value);
+        debugLog('engine.swap', { kind: value });
+      } catch (err: any) {
+        debugLog('engine.swap', { kind: value, error: err?.message ?? String(err) });
+        throw err;
+      }
+    }
+    return result;
+  });
+
+  // ── Transcription engine management (Phase 1) ──
+  // Renderer queries the available engines + their download status to render
+  // the dropdown in InputSettings. Returns: Array<{ kind, isActive, isLoaded, isReady }>
+  // where isReady = "all required model files are downloaded".
+  ipcMain.handle('ironmic:list-transcription-engines', () => {
+    const fromRust = native.listAvailableEngines();
+    return fromRust.map((entry) => ({
+      ...entry,
+      isReady: isTranscriptionEngineReady(entry.kind),
+    }));
+  });
+  ipcMain.handle('ironmic:get-transcription-engine', () => native.getTranscriptionEngine());
+  // Download all model files for an engine (e.g. Moonshine = encoder + decoder + tokenizer).
+  ipcMain.handle('ironmic:download-transcription-engine', async (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    const window = BrowserWindow.getFocusedWindow();
+    return downloadTranscriptionEngine(engineId, window);
+  });
+  ipcMain.handle('ironmic:is-transcription-engine-ready', (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    return isTranscriptionEngineReady(engineId);
   });
 
   // Clipboard
@@ -132,7 +379,7 @@ export function registerIpcHandlers(): void {
     files: getModelsStatus(),
   }));
 
-  // Model downloads — validate model name against known list
+  // Model downloads — validate model name against known list.
   ipcMain.handle(IPC_CHANNELS.DOWNLOAD_MODEL, (_e, model: string) => {
     assertString(model, 'model');
     if (model !== 'tts' && !MODEL_FILES[model]) {
@@ -403,27 +650,134 @@ If the text is too short or unclear, output: ["General"]`;
     return process.env.IRONMIC_MODELS_DIR || '';
   });
 
+  // ── Model management (delete / redownload / disk usage / open folder) ──
+
+  // Open the models folder in Finder/Explorer. Create it first since it may
+  // not exist on a fresh install before any download has happened.
+  ipcMain.handle(IPC_CHANNELS.OPEN_MODELS_DIRECTORY, async () => {
+    const dir = resolveModelsDirForIpc();
+    if (!dir) throw new Error('Models directory is not configured');
+    fs.mkdirSync(dir, { recursive: true });
+    const result = await shell.openPath(dir);
+    if (result) throw new Error(result); // shell.openPath returns '' on success
+    return { ok: true, path: dir };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.GET_ENGINE_DISK_USAGE, (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    const files = getEngineFiles(engineId);
+    let totalBytes = 0;
+    const entries = files.map((f) => {
+      let bytes = 0;
+      let exists = false;
+      if (f.absolutePath) {
+        try {
+          const st = fs.statSync(f.absolutePath);
+          if (st.isFile()) {
+            bytes = st.size;
+            exists = true;
+          }
+        } catch { /* missing file → bytes=0, exists=false */ }
+      }
+      totalBytes += bytes;
+      return { relativePath: f.relativePath, bytes, exists };
+    });
+    const result: {
+      totalBytes: number;
+      files: Array<{ relativePath: string; bytes: number; exists: boolean }>;
+      bundledAvailable?: boolean;
+    } = { totalBytes, files: entries };
+    if (engineId === 'moonshine-base') {
+      result.bundledAvailable = isMoonshineBundleAvailable();
+    }
+    return result;
+  });
+
+  ipcMain.handle(IPC_CHANNELS.DELETE_ENGINE_FILES, (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    return deleteEngineFilesImpl(engineId);
+  });
+
+  // Re-download begins by deleting the existing files, so it must also reject
+  // when invoked against the active engine — re-using deleteEngineFilesImpl
+  // gives us that guard for free.
+  ipcMain.handle(IPC_CHANNELS.REDOWNLOAD_ENGINE, async (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    deleteEngineFilesImpl(engineId);
+    const window = BrowserWindow.getFocusedWindow();
+    return downloadTranscriptionEngine(engineId, window);
+  });
+
   // ── Manual Model Import ──
 
-  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL, () => {
+  // After a successful Whisper-model import we reload the engine and clear
+  // any "model missing" banner the renderer may be showing. Without this, the
+  // user has to restart the app for the just-imported model to actually be
+  // picked up — which is exactly the failure mode that makes "I uploaded the
+  // model but dictation still doesn't work" feel unsolvable.
+  const isWhisperModel = (modelId?: string) => !!modelId && (modelId === 'whisper-large-v3-turbo' || modelId.startsWith('whisper-'));
+  const refreshWhisperAfterImport = (result: any) => {
+    if (!result || !isWhisperModel(result.modelId)) return result;
+    void Promise.resolve().then(() => {
+      try {
+        native.loadWhisperModel();
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            // Empty payload acts as "clear the banner" when the renderer sees
+            // permanent === false and message blank.
+            win.webContents.send('ironmic:whisper-load-failed', { message: '', permanent: false });
+          }
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            win.webContents.send('ironmic:whisper-load-failed', { message, permanent: false });
+          }
+        }
+      }
+    });
+    return result;
+  };
+
+  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL, async () => {
     const window = BrowserWindow.getFocusedWindow();
-    return importModelFile(window);
+    return refreshWhisperAfterImport(await importModelFile(window));
   });
   ipcMain.handle('ironmic:get-importable-models', () => {
     return JSON.stringify(getImportableModels());
   });
-  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL_FROM_PATH, (_event, filePath: string, sectionFilter: string) => {
-    return importModelFromPath(filePath, sectionFilter);
+  ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL_FROM_PATH, async (_event, filePath: string, sectionFilter: string) => {
+    return refreshWhisperAfterImport(await importModelFromPath(filePath, sectionFilter));
   });
-  ipcMain.handle(IPC_CHANNELS.IMPORT_MULTI_PART_MODEL, () => {
+  ipcMain.handle(IPC_CHANNELS.IMPORT_MULTI_PART_MODEL, async () => {
     const window = BrowserWindow.getFocusedWindow();
-    return importMultiPartModel(window);
+    return refreshWhisperAfterImport(await importMultiPartModel(window));
+  });
+  // Moonshine engines: same end-to-end flow as Whisper import — open dialog,
+  // copy files, then reload the active engine so the user can `Switch` to it
+  // without restarting the app.
+  ipcMain.handle('ironmic:import-moonshine-engine', async (_e, engineId: string) => {
+    assertString(engineId, 'engineId');
+    const window = BrowserWindow.getFocusedWindow();
+    const result = await importMoonshineEngine(window, engineId);
+    if (result) {
+      // If the user is already on this engine, reload it so the freshly-imported
+      // files take effect immediately. Otherwise leave their current engine alone.
+      try {
+        const active = native.getTranscriptionEngine();
+        if (active === engineId) native.loadWhisperModel();
+      } catch (err) {
+        console.warn('[ipc] Engine reload after Moonshine import failed:', err);
+      }
+    }
+    return result;
   });
   ipcMain.handle(IPC_CHANNELS.OPEN_EXTERNAL, (_event, url: string) => {
     // Only allow opening known model download domains
     try {
       const parsed = new URL(url);
-      const allowed = ['huggingface.co', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com'];
+      const allowed = ['huggingface.co', 'github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'existential.audio', 'vb-audio.com'];
       if (allowed.some(d => parsed.hostname === d || parsed.hostname.endsWith('.' + d))) {
         const { shell } = require('electron');
         shell.openExternal(url);
@@ -440,13 +794,15 @@ If the text is too short or unclear, output: ["General"]`;
     return native.getCurrentAudioDevice();
   });
   ipcMain.handle(IPC_CHANNELS.CHECK_MIC_PERMISSION, async () => {
-    // On macOS, check microphone permission via systemPreferences
+    // systemPreferences.getMediaAccessStatus('microphone') works on both
+    // macOS and Windows (Electron 17+). On Windows it reflects the
+    // Settings > Privacy > Microphone toggle. Hardcoding 'granted' here
+    // hid real denial states on Windows.
     const { systemPreferences } = require('electron');
-    if (process.platform === 'darwin' && systemPreferences.getMediaAccessStatus) {
-      const status = systemPreferences.getMediaAccessStatus('microphone');
-      return status; // 'granted' | 'denied' | 'restricted' | 'not-determined'
+    if ((process.platform === 'darwin' || process.platform === 'win32')
+        && typeof systemPreferences.getMediaAccessStatus === 'function') {
+      return systemPreferences.getMediaAccessStatus('microphone');
     }
-    // On other platforms, assume granted (permission handled at OS level)
     return 'granted';
   });
 
@@ -472,6 +828,167 @@ If the text is too short or unclear, output: ["General"]`;
   });
   ipcMain.handle(IPC_CHANNELS.MEETING_SET_STRUCTURED_OUTPUT, (_event, id: string, structuredOutput: string) => {
     return native.setMeetingStructuredOutput(id, structuredOutput);
+  });
+
+  // ── Meeting Recording (Granola-style chunk loop) ──
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (_event, sessionId: string, deviceName?: string | null, chunkIntervalS?: number) => {
+    assertString(sessionId, 'sessionId');
+    // If the renderer didn't pass an interval, read the user's configured value
+    // from settings; fall back to 15s. Clamp to [10, 60] — shorter hurts Whisper
+    // accuracy, longer hurts the live-summary cadence.
+    let interval = chunkIntervalS;
+    if (typeof interval !== 'number' || !Number.isFinite(interval)) {
+      try {
+        const stored = native.getSetting('meeting_chunk_interval_s');
+        const parsed = stored ? parseInt(stored, 10) : NaN;
+        interval = Number.isFinite(parsed) ? parsed : 15;
+      } catch {
+        interval = 15;
+      }
+    }
+    interval = Math.max(10, Math.min(60, Math.round(interval)));
+    await meetingRecorder.startMeetingRecording(sessionId, deviceName, interval);
+    // Kick off the live-summary stream for this session.
+    try { liveSummarizer.start(sessionId); }
+    catch (err) { console.warn('[ipc] liveSummarizer.start failed:', err); }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_STOP_RECORDING, async () => {
+    // Order matters:
+    //   1. Stop the recorder first — this processes the final chunk and
+    //      emits one last segment via the listener, which the LiveSummarizer
+    //      picks up. Also runs diarization on the transcript.
+    //   2. Flush the summarizer — waits for any in-flight pass to complete
+    //      AND does one final pass covering the last segment + user notes.
+    //   3. Only then actually stop() the summarizer (teardown).
+    const recorderResult = await meetingRecorder.stopMeetingRecording();
+    let liveSummary = '';
+    let liveInsufficient = false;
+    try {
+      const flushed = await liveSummarizer.flush();
+      liveSummary = flushed.summary;
+      liveInsufficient = flushed.insufficient;
+    } catch (err) {
+      console.warn('[ipc] liveSummarizer.flush failed:', err);
+    } finally {
+      try { liveSummarizer.stop(); } catch { /* noop */ }
+    }
+    return { ...recorderResult, liveSummary, liveInsufficient };
+  });
+
+  // Returns the live recording state so the renderer can resync after a
+  // component remount (e.g. navigate away mid-meeting → navigate back).
+  ipcMain.handle('ironmic:get-meeting-recording-state', () =>
+    meetingRecorder.getState(),
+  );
+
+  // ── Streaming dictation (near-real-time, chunked) ──
+  ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_START, async () => {
+    return dictationStreamer.start();
+  });
+  ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_STOP, async () => {
+    return dictationStreamer.stop();
+  });
+
+  // Fire-and-forget: renderer tells the summarizer that user notes changed.
+  // The summarizer debounces and will re-run, picking up the new notes from
+  // the DB (YourNotesPanel persists them via meetingSetStructuredOutput first).
+  ipcMain.on(IPC_CHANNELS.MEETING_USER_NOTES_CHANGED, (_e, sessionId: string) => {
+    if (typeof sessionId !== 'string' || !sessionId) return;
+    try { liveSummarizer.notifyUserNotesChanged(sessionId); }
+    catch (err) { console.warn('[ipc] notifyUserNotesChanged failed:', err); }
+  });
+
+  // ── Meeting Room (LAN multi-user collaboration) ──
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_HOST_START, async (_e, sessionId: string, hostName: string, templateId?: string | null) => {
+    assertString(sessionId, 'sessionId');
+    return meetingRoomServer.start({
+      sessionId,
+      hostName: hostName ?? 'Host',
+      templateId: templateId ?? null,
+    });
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_HOST_STOP, async () => {
+    await meetingRoomServer.stop();
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_HOST_INFO, async () => {
+    return meetingRoomServer.getInfo();
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_JOIN, async (_e, opts: {
+    hostIp: string;
+    hostPort: number;
+    roomCode: string;
+    displayName: string;
+    deviceName?: string | null;
+  }) => {
+    assertString(opts?.hostIp, 'hostIp');
+    assertString(opts?.roomCode, 'roomCode');
+    assertString(opts?.displayName, 'displayName');
+    if (typeof opts.hostPort !== 'number') throw new Error('hostPort must be a number');
+    return meetingRoomClient.connect(opts);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_LEAVE, async () => {
+    await meetingRoomClient.disconnect();
+    return { ok: true };
+  });
+
+  // ── Transcript Segments ──
+  // These handlers fall back to in-memory storage (meetingRecorder) when the
+  // transcript_segments SQLite table is not yet available in the compiled addon.
+
+  ipcMain.handle(IPC_CHANNELS.ADD_TRANSCRIPT_SEGMENT, (_event, sessionId: string, speakerLabel: string | null, startMs: number, endMs: number, text: string, source: string) => {
+    assertString(sessionId, 'sessionId');
+    assertString(text, 'text');
+    if (typeof native.addon.addTranscriptSegment === 'function') {
+      return native.addon.addTranscriptSegment(sessionId, speakerLabel, startMs, endMs, text, source);
+    }
+    return JSON.stringify({ id: `seg-${Date.now()}`, session_id: sessionId, speaker_label: speakerLabel, start_ms: startMs, end_ms: endMs, text, source, participant_id: null, confidence: null, created_at: new Date().toISOString() });
+  });
+
+  ipcMain.handle(IPC_CHANNELS.LIST_TRANSCRIPT_SEGMENTS, (_event, sessionId: string) => {
+    assertString(sessionId, 'sessionId');
+    if (typeof native.addon.listTranscriptSegments === 'function') {
+      return native.addon.listTranscriptSegments(sessionId);
+    }
+    // Fall back to in-memory segments from the meeting recorder
+    return JSON.stringify(meetingRecorder.getSegments().filter(s => s.session_id === sessionId));
+  });
+
+  ipcMain.handle(IPC_CHANNELS.UPDATE_SEGMENT_SPEAKER, (_event, id: string, speakerLabel: string) => {
+    assertString(id, 'id');
+    assertString(speakerLabel, 'speakerLabel');
+    if (typeof native.addon.updateSegmentSpeaker === 'function') {
+      return native.addon.updateSegmentSpeaker(id, speakerLabel);
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.ASSEMBLE_FULL_TRANSCRIPT, (_event, sessionId: string) => {
+    assertString(sessionId, 'sessionId');
+    if (typeof native.addon.assembleFullTranscript === 'function') {
+      return native.addon.assembleFullTranscript(sessionId);
+    }
+    // Fall back to assembling from in-memory segments
+    return meetingRecorder.getSegments()
+      .filter(s => s.session_id === sessionId)
+      .sort((a, b) => a.start_ms - b.start_ms)
+      .map(s => s.text)
+      .join('\n\n');
+  });
+
+  ipcMain.handle(IPC_CHANNELS.START_RECORDING_FROM_DEVICE, (_event, deviceName: string) => {
+    assertString(deviceName, 'deviceName');
+    if (typeof native.addon.startRecordingFromDevice === 'function') {
+      return native.addon.startRecordingFromDevice(deviceName);
+    }
+    // Fall back to default mic
+    return native.addon.startRecording();
   });
 
   // ── Export / Sharing ──
@@ -505,6 +1022,84 @@ If the text is too short or unclear, output: ["General"]`;
     if (result.canceled || !result.filePath) return false;
     await fs.promises.writeFile(result.filePath, content, 'utf-8');
     return true;
+  });
+
+  // ── BlackHole (macOS system audio capture) ──
+
+  ipcMain.handle(IPC_CHANNELS.BLACKHOLE_CHECK, async (_e, deviceListJson?: string) => {
+    return checkBlackHoleInstalled(deviceListJson);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.BLACKHOLE_INSTALL, async () => {
+    // Run installation; stream progress via push events back to renderer.
+    await installBlackHole((progress) => {
+      broadcastInstallProgress(progress);
+    });
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.BLACKHOLE_OPEN_AUDIO_MIDI_SETUP, () => {
+    openAudioMidiSetup();
+    return { ok: true };
+  });
+
+  // ── Notes Collaboration (finished meetings, LAN) ──
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_START, async (
+    _e,
+    sessionId: string,
+    hostName: string,
+    notes: string,
+    version?: number,
+  ) => {
+    assertString(sessionId, 'sessionId');
+    return meetingNotesCollabServer.start({ sessionId, hostName: hostName ?? 'Host', notes, version });
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_STOP, async () => {
+    await meetingNotesCollabServer.stop();
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_NOTIFY_SAVED, (_e, notes: string, savedBy: string) => {
+    assertString(notes, 'notes');
+    meetingNotesCollabServer.notifyNotesSaved(notes, savedBy ?? 'Host');
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_NOTIFY_DRAFT, (_e, content: string, senderName: string) => {
+    assertString(content, 'content');
+    meetingNotesCollabServer.notifyDraft(content, senderName ?? 'Host');
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_JOIN, async (_e, opts: {
+    hostIp: string;
+    hostPort: number;
+    sessionCode: string;
+    displayName: string;
+  }) => {
+    assertString(opts?.hostIp, 'hostIp');
+    assertString(opts?.sessionCode, 'sessionCode');
+    assertString(opts?.displayName, 'displayName');
+    if (typeof opts.hostPort !== 'number') throw new Error('hostPort must be a number');
+    return meetingNotesCollabClient.connect(opts);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_LEAVE, async () => {
+    await meetingNotesCollabClient.disconnect();
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_SAVE_NOTES, (_e, content: string) => {
+    assertString(content, 'content');
+    meetingNotesCollabClient.saveNotes(content);
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_SEND_DRAFT, (_e, content: string) => {
+    meetingNotesCollabClient.sendDraft(content);
+    return { ok: true };
   });
 
   console.log('[ipc-handlers] All IPC handlers registered');

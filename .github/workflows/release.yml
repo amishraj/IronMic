@@ -14,13 +14,13 @@ jobs:
         include:
           - os: macos-latest
             rust-target: aarch64-apple-darwin
-            cargo-features: '--features metal,tts'
+            cargo-features: '--features metal,tts,engine-multi'
           - os: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
-            cargo-features: '--features tts'
+            cargo-features: '--features whisper,tts,engine-multi'
           - os: windows-latest
             rust-target: x86_64-pc-windows-msvc
-            cargo-features: '--features tts'
+            cargo-features: '--features whisper,tts,engine-multi'
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +35,7 @@ jobs:
         shell: bash
         working-directory: rust-core
         run: |
-          cargo build --release ${{ matrix.cargo-features }}
+          cargo build --release --features napi-export ${{ matrix.cargo-features }}
           echo "--- Copying native addon to ironmic-core.node ---"
           if [ "$RUNNER_OS" = "macOS" ]; then
             cp target/release/libironmic_core.dylib ironmic-core.node
@@ -45,7 +45,11 @@ jobs:
             cp target/release/ironmic_core.dll ironmic-core.node
           fi
           ls -lh ironmic-core.node
-          file ironmic-core.node
+
+      - name: Build LLM binary
+        shell: bash
+        working-directory: rust-core
+        run: cargo build --release --bin ironmic-llm --features llm-bin
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -65,22 +69,60 @@ jobs:
             curl -L --fail -o "rust-core/models/voices/${v}.bin" "${VOICE_BASE}/${v}.bin"
           done
 
+      - name: Download bundled Moonshine Base
+        shell: bash
+        run: |
+          mkdir -p rust-core/models/moonshine-base
+          BASE="https://huggingface.co/UsefulSensors/moonshine/resolve/main/onnx/merged/base/float"
+          for f in encoder_model.onnx decoder_model_merged.onnx tokenizer.json; do
+            curl -L --fail -o "rust-core/models/moonshine-base/$f" "$BASE/$f"
+          done
+
+      - name: Download bundled Phi-3 Mini Q2_K
+        shell: bash
+        run: |
+          PARTIAL="rust-core/models/Phi-3-mini-4k-instruct-Q2_K.gguf.partial"
+          DEST="rust-core/models/Phi-3-mini-4k-instruct-Q2_K.gguf"
+          curl -L --fail -o "$PARTIAL" \
+            "https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q2_K.gguf" \
+            || { rm -f "$PARTIAL"; echo "Phi-3 download failed"; exit 1; }
+          mv "$PARTIAL" "$DEST"
+
       - name: Build frontend
         working-directory: electron-app
         run: npm run build
 
-      - name: Verify addon and voices before packaging
+      - name: Verify all artifacts before packaging
         shell: bash
         run: |
           echo "=== Verifying build artifacts ==="
           ls -lh rust-core/ironmic-core.node || { echo "FATAL: ironmic-core.node missing!"; exit 1; }
+          LLM_BIN="rust-core/target/release/ironmic-llm"
+          [ "$RUNNER_OS" = "Windows" ] && LLM_BIN="${LLM_BIN}.exe"
+          ls -lh "$LLM_BIN" || { echo "FATAL: ironmic-llm binary missing!"; exit 1; }
           ls rust-core/models/voices/*.bin | wc -l | xargs -I{} echo "TTS voices: {} files"
           test -f rust-core/models/voices/af_heart.bin || { echo "FATAL: TTS voices missing!"; exit 1; }
-          echo "=== All artifacts present ==="
+          test -s rust-core/models/moonshine-base/encoder_model.onnx || { echo "FATAL: Moonshine encoder missing!"; exit 1; }
+          test -s rust-core/models/moonshine-base/decoder_model_merged.onnx || { echo "FATAL: Moonshine decoder missing!"; exit 1; }
+          test -s rust-core/models/moonshine-base/tokenizer.json || { echo "FATAL: Moonshine tokenizer missing!"; exit 1; }
+          phi3_bytes=$(wc -c < rust-core/models/Phi-3-mini-4k-instruct-Q2_K.gguf | tr -d ' ')
+          [ "$phi3_bytes" -ge 1200000000 ] || { echo "FATAL: Phi-3 truncated ($phi3_bytes bytes)!"; exit 1; }
+          echo "=== All artifacts present (Phi-3: $phi3_bytes bytes) ==="
 
       - name: Package
         working-directory: electron-app
         run: npx electron-builder --config electron-builder.config.js --publish never
+
+      - name: Check installer size fits GitHub 2 GiB limit
+        shell: bash
+        run: |
+          for f in electron-app/release/*.dmg electron-app/release/*.exe \
+                   electron-app/release/*.AppImage electron-app/release/*.deb; do
+            [ -f "$f" ] || continue
+            size=$(wc -c < "$f" | tr -d ' ')
+            echo "  $f: $size bytes"
+            [ "$size" -lt 2147483648 ] || { echo "FATAL: $f exceeds GitHub 2 GiB limit!"; exit 1; }
+          done
 
       # Only upload the actual installers — not blockmaps, debug files, or unpacked dirs
       - name: Upload artifacts

@@ -19,6 +19,7 @@ mod napi_exports {
     use crate::audio::capture::CaptureEngine;
     use crate::audio::processor;
     use crate::transcription::dictionary::Dictionary;
+    use crate::transcription::engine::{self, EngineKind};
     use crate::transcription::whisper::{SharedWhisperEngine, WhisperConfig, WhisperEngine};
 
     /// Global capture engine, protected by a mutex.
@@ -182,41 +183,180 @@ mod napi_exports {
             .map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
-    /// Transcribe a PCM audio buffer (16kHz mono i16 little-endian) to text.
-    #[napi]
-    pub async fn transcribe(audio_buffer: Buffer) -> napi::Result<String> {
-        init_tracing();
-        info!("transcribe called from N-API");
-
-        let whisper = WHISPER_ENGINE.clone();
-
-        // Load model if not already loaded
-        if !whisper.is_loaded() {
-            whisper.load_model().map_err(napi::Error::from)?;
-        }
-
-        // Convert i16 LE bytes back to f32 samples
-        let bytes: &[u8] = &audio_buffer;
+    /// Convert little-endian i16 PCM bytes into f32 samples in [-1, 1].
+    /// Shared by `transcribe()` and `transcribe_short()`. Returns an error if
+    /// the buffer length is odd (not aligned to i16 boundary).
+    fn pcm16_to_f32(bytes: &[u8]) -> napi::Result<Vec<f32>> {
         if bytes.len() % 2 != 0 {
             return Err(napi::Error::from_reason(
                 "Audio buffer must contain 16-bit samples (even byte count)",
             ));
         }
-
         let mut samples: Vec<f32> = Vec::with_capacity(bytes.len() / 2);
         for chunk in bytes.chunks_exact(2) {
             let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
             samples.push(sample as f32 / i16::MAX as f32);
         }
+        Ok(samples)
+    }
 
-        let transcript = whisper
-            .transcribe(&samples)
+    /// Transcribe a PCM audio buffer (16kHz mono i16 little-endian) to text.
+    ///
+    /// Routes through the active transcription engine selected by
+    /// `setTranscriptionEngine()` or by the user's `transcription_engine`
+    /// setting. Defaults to Moonshine Base on a fresh install.
+    #[napi]
+    pub async fn transcribe(audio_buffer: Buffer) -> napi::Result<String> {
+        init_tracing();
+        info!("transcribe called from N-API");
+
+        let bytes: &[u8] = &audio_buffer;
+        let mut samples = pcm16_to_f32(bytes)?;
+
+        let transcript = engine::transcribe_active(&samples, /* short */ false)
             .map_err(napi::Error::from)?;
 
-        // Zero the sample buffer
+        // Zero the sample buffer (privacy guarantee — audio leaves no
+        // residual heap allocation that could be inspected later).
         samples.fill(0.0);
 
         Ok(transcript)
+    }
+
+    /// Transcribe a SHORT (< 5s) PCM audio buffer (16kHz mono i16 little-endian).
+    ///
+    /// `short` is a hint that's only honored by the Whisper engine (forces
+    /// `single_segment=true` for the dictation streamer's 2.5s chunk loop).
+    /// Moonshine ignores it because Moonshine is already short-form-optimized.
+    ///
+    /// **Do not call from meeting recording** (10–60s chunks) when running on
+    /// Whisper — `single_segment` makes long buffers slower. Meeting recorder
+    /// uses `transcribe()` instead.
+    #[napi]
+    pub async fn transcribe_short(audio_buffer: Buffer) -> napi::Result<String> {
+        init_tracing();
+        info!("transcribeShort called from N-API");
+
+        let bytes: &[u8] = &audio_buffer;
+        let mut samples = pcm16_to_f32(bytes)?;
+
+        let transcript = engine::transcribe_active(&samples, /* short */ true)
+            .map_err(napi::Error::from)?;
+
+        samples.fill(0.0);
+
+        Ok(transcript)
+    }
+
+    /// Explicitly load the active transcription engine's model.
+    ///
+    /// Despite the legacy name (kept for Electron compatibility), this loads
+    /// whichever engine is currently active — Moonshine, Whisper, etc. The
+    /// first transcription on Windows can legitimately spend a long time
+    /// mapping a large GGML model before any inference happens. Keeping model
+    /// load as a separate call lets Electron warm the model before starting the
+    /// chunk loop, instead of timing out and dropping the user's first words.
+    ///
+    /// Electron should call `setTranscriptionEngine()` first if the user has
+    /// a non-default engine setting, then call this to warm it up.
+    #[napi]
+    pub fn load_whisper_model() -> napi::Result<()> {
+        init_tracing();
+        info!(
+            engine = engine::active_engine_kind().as_str(),
+            "loadWhisperModel called from N-API (loads active engine)"
+        );
+        engine::load_active_engine().map_err(napi::Error::from)
+    }
+
+    /// Switch the active transcription engine. Drops the old engine's loaded
+    /// model and constructs a fresh one. The new model loads lazily on the
+    /// next `transcribe()` call (or eagerly via `loadWhisperModel()`).
+    ///
+    /// Accepts the kind as a string matching [`EngineKind::as_str`]:
+    /// `"moonshine-base"`, `"whisper-large-v3-turbo"`,
+    /// `"whisper-medium"`, `"whisper-small"`, `"whisper-base"`.
+    #[napi]
+    pub fn set_transcription_engine(kind: String) -> napi::Result<()> {
+        init_tracing();
+        info!(%kind, "setTranscriptionEngine called from N-API");
+        let parsed = EngineKind::from_str(&kind).ok_or_else(|| {
+            napi::Error::from_reason(format!("Unknown transcription engine kind: '{}'", kind))
+        })?;
+        engine::set_active_engine(parsed).map_err(napi::Error::from)
+    }
+
+    /// Return the currently active transcription engine kind as a string.
+    #[napi]
+    pub fn get_transcription_engine() -> String {
+        engine::active_engine_kind().as_str().to_string()
+    }
+
+    /// Return a JSON array of available engine kinds for the Settings UI.
+    /// Each entry is `{"kind": "...", "isLoaded": bool}`. The `isLoaded`
+    /// flag only reflects the *active* engine; other entries report `false`.
+    #[napi]
+    pub fn list_available_engines() -> String {
+        let active = engine::active_engine_kind();
+        let active_loaded = engine::is_active_engine_loaded();
+        let entries: Vec<serde_json::Value> = EngineKind::all()
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "kind": k.as_str(),
+                    "isActive": *k == active,
+                    "isLoaded": *k == active && active_loaded,
+                })
+            })
+            .collect();
+        serde_json::Value::Array(entries).to_string()
+    }
+
+    /// Override the Whisper thread count before the model is loaded.
+    ///
+    /// Call this from Electron *before* `loadWhisperModel()` to apply a
+    /// user-configured `whisper_threads` setting. No-op if the model is
+    /// already loaded (takes effect on next app start in that case).
+    #[napi]
+    pub fn set_whisper_n_threads(n: u32) -> napi::Result<()> {
+        init_tracing();
+        info!(n, "setWhisperNThreads called from N-API");
+        WHISPER_ENGINE.set_n_threads(n);
+        Ok(())
+    }
+
+    /// Return the whisper.cpp system info string (CPU features, backend).
+    ///
+    /// Electron calls this at startup and logs it via `debugLog('whisper.sysinfo')`
+    /// so AVX / AVX-512 issues are visible in the renderer DevTools console without
+    /// requiring terminal access. Example output:
+    ///   "AVX = 1 | AVX2 = 1 | AVX512 = 0 | F16C = 1 | FP16_VA = 0 | ..."
+    #[napi]
+    pub fn get_whisper_system_info() -> String {
+        #[cfg(feature = "whisper")]
+        {
+            whisper_rs::print_system_info().to_string()
+        }
+        #[cfg(not(feature = "whisper"))]
+        {
+            "whisper feature not compiled".to_string()
+        }
+    }
+
+    /// Compile-time feature flags of this addon.  Electron reads this at
+    /// startup so a stub binary (e.g. Whisper omitted from the Cargo features)
+    /// can be detected before the user attempts to dictate.
+    #[napi]
+    pub fn native_features() -> napi::Result<String> {
+        let json = serde_json::json!({
+            "whisper": cfg!(feature = "whisper"),
+            "metal": cfg!(feature = "metal"),
+            "llm": cfg!(feature = "llm"),
+            "tts": cfg!(feature = "tts"),
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        });
+        serde_json::to_string(&json).map_err(|e| napi::Error::from_reason(e.to_string()))
     }
 
     /// Polish raw transcript text using the local LLM subprocess.
@@ -660,7 +800,11 @@ mod napi_exports {
             },
             llm: JsModelInfo {
                 loaded: llm_size > 0,
-                name: "mistral-7b-instruct-q4".into(),
+                name: llm_model_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("phi3-mini-q2k")
+                    .trim_end_matches(".gguf")
+                    .into(),
                 size_bytes: llm_size,
             },
         }
@@ -1300,6 +1444,116 @@ mod napi_exports {
             .map_err(Into::into)
     }
 
+    // ── Meeting Recording: Device-Select & Chunk Drain ──
+
+    /// Start recording from a named input device (e.g. "BlackHole 2ch" for system audio).
+    /// Falls back to the default input device if the named device is not found.
+    /// Uses the same CaptureEngine as regular dictation — no new infrastructure.
+    #[napi]
+    pub fn start_recording_from_device(device_name: String) -> napi::Result<()> {
+        init_tracing();
+        info!(device = %device_name, "startRecordingFromDevice called from N-API");
+        let mut engine = CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+        engine.start_from_device(&device_name).map_err(Into::into)
+    }
+
+    /// Drain the current recording buffer and return it as 16kHz mono i16 PCM bytes,
+    /// WITHOUT stopping the stream. The stream keeps running with zero capture gap.
+    /// Used by the meeting chunk loop every 30 seconds.
+    #[napi]
+    pub fn drain_recording_buffer() -> napi::Result<Buffer> {
+        info!("drainRecordingBuffer called from N-API");
+
+        let mut engine = CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+
+        let mut captured = engine.drain_chunk().map_err(napi::Error::from)?;
+
+        // Process to 16kHz mono PCM for Whisper (same path as stop_recording)
+        let mut processed =
+            processor::prepare_for_whisper(&captured).map_err(napi::Error::from)?;
+
+        // Zero the raw captured audio immediately (privacy guarantee)
+        captured.zero();
+
+        // Convert f32 to i16 PCM bytes (little-endian) for the Node.js side
+        let pcm_i16 = processor::f32_to_i16_pcm(&processed.samples);
+        processed.samples.fill(0.0);
+        processed.samples.clear();
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(pcm_i16.len() * 2);
+        for sample in &pcm_i16 {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        info!(
+            pcm_bytes = bytes.len(),
+            duration_seconds = processed.duration_seconds,
+            "Returning drained PCM chunk to Node.js"
+        );
+
+        Ok(bytes.into())
+    }
+
+    // ── Transcript Segments ──
+
+    /// Add a transcript segment to a meeting session.
+    /// Returns the created segment as JSON.
+    #[napi]
+    pub fn add_transcript_segment(
+        session_id: String,
+        speaker_label: Option<String>,
+        start_ms: i64,
+        end_ms: i64,
+        text: String,
+        source: String,
+    ) -> napi::Result<String> {
+        let segment = DATABASE
+            .add_transcript_segment(
+                &session_id,
+                speaker_label.as_deref(),
+                start_ms,
+                end_ms,
+                &text,
+                &source,
+                None,
+                None,
+            )
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&segment).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// List all transcript segments for a meeting session, ordered by start time.
+    /// Returns a JSON array of TranscriptSegment objects.
+    #[napi]
+    pub fn list_transcript_segments(session_id: String) -> napi::Result<String> {
+        let segments = DATABASE
+            .list_transcript_segments(&session_id)
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&segments).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Update the speaker label for a specific transcript segment.
+    /// Called after post-meeting LLM diarization assigns speaker labels.
+    #[napi]
+    pub fn update_segment_speaker(id: String, speaker_label: String) -> napi::Result<()> {
+        DATABASE
+            .update_segment_speaker(&id, &speaker_label)
+            .map_err(Into::into)
+    }
+
+    /// Assemble the full transcript text for a session by joining all segments.
+    /// Speaker labels are prefixed if present: "[Speaker 1]: text"
+    #[napi]
+    pub fn assemble_full_transcript(session_id: String) -> napi::Result<String> {
+        DATABASE
+            .assemble_full_transcript(&session_id)
+            .map_err(Into::into)
+    }
+
     // ── Export / Sharing ──
 
     #[napi]
@@ -1310,7 +1564,8 @@ mod napi_exports {
 
     #[napi]
     pub fn export_entry_markdown(id: String) -> napi::Result<String> {
-        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        let store = EntryStore::new(DATABASE.clone());
+        let entry = store.get(&id).map_err(Into::<napi::Error>::into)?;
         match entry {
             Some(e) => Ok(crate::export::formatter::entry_to_markdown(&e)),
             None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),
@@ -1319,7 +1574,8 @@ mod napi_exports {
 
     #[napi]
     pub fn export_entry_json(id: String) -> napi::Result<String> {
-        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        let store = EntryStore::new(DATABASE.clone());
+        let entry = store.get(&id).map_err(Into::<napi::Error>::into)?;
         match entry {
             Some(e) => Ok(crate::export::formatter::entry_to_json(&e)),
             None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),
@@ -1328,7 +1584,8 @@ mod napi_exports {
 
     #[napi]
     pub fn export_entry_plain_text(id: String) -> napi::Result<String> {
-        let entry = DATABASE.get_entry(&id).map_err(Into::<napi::Error>::into)?;
+        let store = EntryStore::new(DATABASE.clone());
+        let entry = store.get(&id).map_err(Into::<napi::Error>::into)?;
         match entry {
             Some(e) => Ok(crate::export::formatter::entry_to_plain_text(&e)),
             None => Err(napi::Error::from_reason(format!("Entry not found: {id}"))),

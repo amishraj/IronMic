@@ -1,50 +1,56 @@
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import type { ICLIAdapter, ParsedOutput, AIProvider, AIModel } from './types';
+import { getSpawnEnv, resolveInShell } from '../utils/shell-env';
 
 export class ClaudeAdapter implements ICLIAdapter {
   name: AIProvider = 'claude';
 
   async isInstalled(): Promise<boolean> {
-    const path = await this.getBinaryPath();
-    return path !== null;
+    return (await this.getBinaryPath()) !== null;
   }
 
   async isAuthenticated(): Promise<boolean> {
-    try {
-      // Check env var first
-      if (process.env.ANTHROPIC_API_KEY) return true;
+    if (getSpawnEnv().ANTHROPIC_API_KEY) return true;
 
-      // Try claude auth status
-      const result = execSync('claude auth status 2>&1', {
-        encoding: 'utf-8',
-        timeout: 5000,
-        shell: process.env.SHELL || '/bin/zsh',
-      });
-      return !result.toLowerCase().includes('not logged in') && !result.toLowerCase().includes('no api key');
-    } catch {
-      // If the command fails, check for credential files
+    const bin = await this.getBinaryPath();
+    if (bin) {
       try {
-        const fs = require('fs');
-        const path = require('path');
-        const home = process.env.HOME || '';
-        const credPaths = [
-          path.join(home, '.claude', '.credentials.json'),
-          path.join(home, '.claude', 'credentials.json'),
-          path.join(home, '.claude', 'auth.json'),
-        ];
-        return credPaths.some((p: string) => fs.existsSync(p));
+        const result = execFileSync(bin, ['auth', 'status'], {
+          encoding: 'utf-8',
+          timeout: 5000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: getSpawnEnv(),
+        });
+        const text = result.toLowerCase();
+        return !text.includes('not logged in') && !text.includes('no api key');
       } catch {
-        return false;
+        // fall through to credential-file probe
       }
+    }
+    // Fallback: detect Claude credential files in the user's home dir.
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const home = process.env.HOME || process.env.USERPROFILE || '';
+      const credPaths = [
+        path.join(home, '.claude', '.credentials.json'),
+        path.join(home, '.claude', 'credentials.json'),
+        path.join(home, '.claude', 'auth.json'),
+      ];
+      return credPaths.some((p: string) => fs.existsSync(p));
+    } catch {
+      return false;
     }
   }
 
   async getVersion(): Promise<string | null> {
+    const bin = await this.getBinaryPath();
+    if (!bin) return null;
     try {
-      const result = execSync('claude --version 2>/dev/null', {
+      const result = execFileSync(bin, ['--version'], {
         encoding: 'utf-8',
         timeout: 5000,
-        shell: process.env.SHELL || '/bin/zsh',
+        env: getSpawnEnv(),
       });
       const match = result.match(/(\d+\.\d+\.\d+)/);
       return match ? match[1] : null;
@@ -54,16 +60,31 @@ export class ClaudeAdapter implements ICLIAdapter {
   }
 
   async getBinaryPath(): Promise<string | null> {
-    try {
-      const result = execSync('which claude 2>/dev/null', {
-        encoding: 'utf-8',
-        timeout: 3000,
-        shell: process.env.SHELL || '/bin/zsh',
-      });
-      return result.trim() || null;
-    } catch {
-      return null;
+    const resolved = await resolveInShell('claude');
+    if (resolved) return resolved;
+
+    // Electron on macOS/Linux may launch without the user's full PATH.
+    // Check well-known locations before giving up.
+    const { existsSync } = require('fs') as typeof import('fs');
+    const candidates =
+      process.platform === 'win32'
+        ? [
+            `${process.env.LOCALAPPDATA}\\Programs\\claude\\claude.exe`,
+            `${process.env.APPDATA}\\npm\\claude.cmd`,
+          ]
+        : [
+            '/opt/homebrew/bin/claude',
+            '/usr/local/bin/claude',
+            '/usr/bin/claude',
+            `${process.env.HOME || ''}/.local/bin/claude`,
+            `${process.env.HOME || ''}/bin/claude`,
+            `${process.env.HOME || ''}/.volta/bin/claude`,
+            `${process.env.HOME || ''}/.npm-global/bin/claude`,
+          ];
+    for (const p of candidates) {
+      if (p && existsSync(p)) return p;
     }
+    return null;
   }
 
   buildArgs(prompt: string, continueSession: boolean, model?: string): string[] {
