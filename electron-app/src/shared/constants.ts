@@ -109,7 +109,8 @@ export const IPC_CHANNELS = {
   // Streaming dictation (chunked near-real-time transcription)
   DICTATION_STREAM_START: 'ironmic:dictation-stream-start',
   DICTATION_STREAM_STOP: 'ironmic:dictation-stream-stop',
-  DICTATION_STREAM_CHUNK: 'ironmic:dictation-stream-chunk',    // main → renderer push
+  DICTATION_STREAM_CHUNK: 'ironmic:dictation-stream-chunk',    // main → renderer push (committed)
+  DICTATION_STREAM_DRAFT: 'ironmic:dictation-stream-draft',    // main → renderer push (live hypothesis, not persisted)
   DICTATION_STREAM_STATE: 'ironmic:dictation-stream-state',    // main → renderer push
 
   // Transcription

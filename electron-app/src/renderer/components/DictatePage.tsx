@@ -49,6 +49,7 @@ import { TITLE_TAG_PREFIX, EMOJI_TAG_PREFIX, parseTitleTag, parseNotebookTag, pa
 import { NoteEmojiPicker, pickRandomEmoji } from './NoteEmojiPicker';
 import { NotesSidebar } from './NotesSidebar';
 import { NotesCollaborateModal } from './NotesCollaborateModal';
+import { DraftHypothesisExtension } from './DraftHypothesisExtension';
 
 const STORAGE_KEY = 'ironmic-dictate-draft';
 
@@ -149,6 +150,7 @@ export function DictatePage() {
   const chunkSeq = useDictationStore((s) => s.chunkSeq);
   const lastChunkText = useDictationStore((s) => s.lastChunkText);
   const fullText = useDictationStore((s) => s.fullText);
+  const draftHypothesis = useDictationStore((s) => s.draftHypothesis);
   const storeStart = useDictationStore((s) => s.start);
   const storeStop = useDictationStore((s) => s.stop);
   const storeReset = useDictationStore((s) => s.resetSession);
@@ -245,6 +247,7 @@ export function DictatePage() {
       Highlight.configure({ multicolor: false }),
       Link.configure({ openOnClick: false, HTMLAttributes: { class: '' } }),
       Typography,
+      DraftHypothesisExtension,
     ],
     content: draft.current?.html || '',
     editorProps: { attributes: { class: 'focus:outline-none' } },
@@ -393,6 +396,14 @@ export function DictatePage() {
       editor.commands.insertContent(lastChunkText + ' ');
     }
   }, [editor, chunkSeq, lastChunkText]);
+
+  // ── Drive the live draft-hypothesis decoration from the store ──
+  // Cleared automatically when a chunk commits (store wipes draftHypothesis
+  // on every committed chunk and on resetSession).
+  useEffect(() => {
+    if (!editor) return;
+    editor.commands.setDraftHypothesis(status === 'recording' ? draftHypothesis : '');
+  }, [editor, draftHypothesis, status]);
 
   /** Toggle the streaming dictation (click Dictate or press Enter on toolbar). */
   const handleDictateToggle = useCallback(async () => {
@@ -1208,7 +1219,7 @@ export function DictatePage() {
       </div>
 
       {/* Editor */}
-      <div className="flex-1 overflow-y-auto relative">
+      <div className={`flex-1 overflow-y-auto relative${status === 'recording' && draftHypothesis ? ' has-draft-hypothesis' : ''}`}>
         <EditorContent editor={editor} />
         {isPolishing && (
           <div

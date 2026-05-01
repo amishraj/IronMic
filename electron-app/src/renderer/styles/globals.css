@@ -259,6 +259,12 @@
   content: attr(data-placeholder);
 }
 
+/* Hide the empty-doc placeholder while the live draft hypothesis is showing.
+ * Triggered by a class on the editor wrapper set from React state. */
+.has-draft-hypothesis .ProseMirror p.is-editor-empty:first-child::before {
+  content: none;
+}
+
 /* Headings */
 .ProseMirror h1 { font-size: 1.875rem; font-weight: 700; margin-bottom: 1rem; margin-top: 2rem; color: rgb(var(--iron-text)); line-height: 1.2; }
 .ProseMirror h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem; margin-top: 1.5rem; color: rgb(var(--iron-text)); line-height: 1.25; }

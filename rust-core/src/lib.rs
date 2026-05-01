@@ -248,6 +248,68 @@ mod napi_exports {
         Ok(transcript)
     }
 
+    // ── Moonshine streaming session API ──────────────────────────────────────
+    //
+    // These three exports implement the growing-buffer session pattern that
+    // eliminates chunk boundary word-cuts in the dictation streamer.
+    //
+    // Call pattern from JS DictationStreamer.runStreamingSession():
+    //   1. moonshineSessionReset()          — start fresh
+    //   2. loop: moonshineSessionAppend(buffer) → current hypothesis string
+    //   3. moonshineSessionCommit()          → final utterance text, clears buffer
+    //
+    // Only meaningful when moonshineSessionSupports() returns true (i.e. the
+    // active engine is a Moonshine variant compiled with engine-multi feature).
+    // Whisper and NullEngine return an error from append/commit; the JS layer
+    // checks supports() before entering the session loop.
+    //
+    // IMPORTANT: These are `async fn` — napi-rs runs them on its thread-pool
+    // (not the Node.js event loop) so the synchronous Moonshine ONNX inference
+    // inside doesn't block Electron's main thread. This matches the pattern
+    // used by the existing `transcribe()` and `transcribe_short()` exports.
+
+    /// Returns true if the active engine supports the session API.
+    /// Checked by DictationStreamer before entering runStreamingSession().
+    #[napi]
+    pub fn moonshine_session_supports() -> bool {
+        engine::active_engine_supports_session()
+    }
+
+    /// Append a PCM16 audio chunk to the active session buffer and return the
+    /// current running hypothesis (full utterance transcribed so far).
+    ///
+    /// Accepts the same PCM16 Buffer format as `drainRecordingBuffer()` returns
+    /// — little-endian i16 at 16 kHz mono. Conversion to f32 happens in Rust.
+    ///
+    /// Do NOT wrap this call in a JS timeout — the function is strictly
+    /// serialized on the session mutex and a JS-side timeout would not cancel
+    /// the in-flight inference, leaving the session in a corrupt ordering state.
+    #[napi]
+    pub async fn moonshine_session_append(audio_buffer: Buffer) -> napi::Result<String> {
+        let bytes: &[u8] = &audio_buffer;
+        let mut samples = pcm16_to_f32(bytes)?;
+
+        let hypothesis = engine::session_append_active(&samples)
+            .map_err(napi::Error::from)?;
+
+        samples.fill(0.0);
+        Ok(hypothesis)
+    }
+
+    /// Finalize the current session utterance. Transcribes the full accumulated
+    /// buffer one final time, zeros + clears it, and returns the final text.
+    #[napi]
+    pub async fn moonshine_session_commit() -> napi::Result<String> {
+        engine::session_commit_active().map_err(napi::Error::from)
+    }
+
+    /// Discard the session buffer without emitting text. Zero-cost no-op on
+    /// engines that don't implement sessions (Whisper, NullEngine).
+    #[napi]
+    pub fn moonshine_session_reset() {
+        engine::session_reset_active();
+    }
+
     /// Explicitly load the active transcription engine's model.
     ///
     /// Despite the legacy name (kept for Electron compatibility), this loads

@@ -217,6 +217,38 @@ export function sanitizeTranscribedText(raw: string): string {
 }
 
 /**
+ * Strip the overlap prefix from a new chunk's transcription output.
+ *
+ * When Moonshine chunked mode prepends 800ms of audio overlap from the
+ * previous chunk for context, the transcribed output often begins with the
+ * same words as the end of the previous chunk. This function finds the
+ * longest suffix of prevText that matches a prefix of newText (minimum 3
+ * normalized word tokens) and strips it from newText before emitting.
+ *
+ * Conservative minimum of 3 tokens prevents false positives from common
+ * single- or two-word matches that are legitimate repetitions (e.g. "I I",
+ * "the the").
+ */
+export function stripOverlapPrefix(prevText: string, newText: string): string {
+  if (!prevText || !newText) return newText;
+  const normalize = (s: string) =>
+    s.toLowerCase().replace(/[^a-z0-9\s]/g, '').split(/\s+/).filter(Boolean);
+  const prevWords = normalize(prevText);
+  const newWords = normalize(newText);
+  const rawNewWords = newText.trim().split(/\s+/);
+
+  const maxCheck = Math.min(prevWords.length, newWords.length, 6);
+  for (let matchLen = maxCheck; matchLen >= 3; matchLen--) {
+    const prevTail = prevWords.slice(-matchLen).join(' ');
+    const newHead = newWords.slice(0, matchLen).join(' ');
+    if (prevTail === newHead) {
+      return rawNewWords.slice(matchLen).join(' ');
+    }
+  }
+  return newText;
+}
+
+/**
  * Race a promise against a timeout. Used to guard `native.addon.transcribe()`
  * so a hung Whisper call can't stall the whole chunk loop. The native call
  * may still be running in C++ — we can't cancel it from JS — but at least

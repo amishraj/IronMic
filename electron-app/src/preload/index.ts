@@ -213,6 +213,13 @@ const api = {
     ipcRenderer.on('ironmic:dictation-stream-chunk', handler);
     return () => ipcRenderer.removeListener('ironmic:dictation-stream-chunk', handler);
   },
+  /** Live hypothesis from the Moonshine session path — replaces, does not append.
+   *  Not persisted; cleared when a committed chunk arrives or recording stops. */
+  onDictationStreamDraft: (callback: (payload: { hypothesis: string }) => void) => {
+    const handler = (_e: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:dictation-stream-draft', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-draft', handler);
+  },
   onDictationStreamState: (callback: (state: { status: string; startedAt: number | null; chunkCount: number }) => void) => {
     const handler = (_e: any, s: any) => callback(s);
     ipcRenderer.on('ironmic:dictation-stream-state', handler);
