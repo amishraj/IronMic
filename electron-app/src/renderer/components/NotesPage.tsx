@@ -2,10 +2,12 @@ import { useState, useEffect, useRef } from 'react';
 import {
   Plus, Search, StickyNote, FolderOpen, Pin, Trash2, Tag, ChevronRight,
   BookOpen, MoreHorizontal, X, Hash, Pencil, Check, Users, Sparkles, Loader2,
+  Volume2,
 } from 'lucide-react';
 import { Card } from './ui';
 import { useNotesStore, type Note, type Notebook } from '../stores/useNotesStore';
 import { useToastStore } from '../stores/useToastStore';
+import { useTtsStore } from '../stores/useTtsStore';
 import { NotesCollaborateModal } from './NotesCollaborateModal';
 
 export function NotesPage() {
@@ -22,6 +24,13 @@ export function NotesPage() {
 
   const notes = filteredNotes();
   const activeNote = useNotesStore((s) => s.getNote(activeNoteId || ''));
+  // Which note (if any) is currently the TTS read-back target. Subscribed
+  // narrowly so the list re-renders only on TTS state changes, not on every
+  // currentTimeMs poll tick.
+  const ttsActiveEntryId = useTtsStore((s) => s.activeEntryId);
+  const ttsState = useTtsStore((s) => s.state);
+  const isTtsPlayingForNote = (noteId: string) =>
+    ttsActiveEntryId === noteId && (ttsState === 'playing' || ttsState === 'paused' || ttsState === 'synthesizing');
 
   const [showNewNotebook, setShowNewNotebook] = useState(false);
   const [newNotebookName, setNewNotebookName] = useState('');
@@ -335,6 +344,8 @@ export function NotesPage() {
               key={note.id}
               note={note}
               active={activeNoteId === note.id}
+              isTtsPlaying={isTtsPlayingForNote(note.id)}
+              ttsState={ttsActiveEntryId === note.id ? ttsState : null}
               notebook={notebooks.find((nb) => nb.id === note.notebookId)}
               isCollabLive={collabActive && collabNoteId === note.id}
               collabParticipantCount={collabParticipantCount}
@@ -579,20 +590,31 @@ export function NotesPage() {
   );
 }
 
-function NoteListItem({ note, active, notebook, isCollabLive, collabParticipantCount = 0, onClick, onDelete, onPin }: {
-  note: Note; active: boolean; notebook?: Notebook; isCollabLive?: boolean;
+function NoteListItem({ note, active, isTtsPlaying, ttsState, notebook, isCollabLive, collabParticipantCount = 0, onClick, onDelete, onPin }: {
+  note: Note; active: boolean; isTtsPlaying?: boolean;
+  ttsState?: 'idle' | 'synthesizing' | 'playing' | 'paused' | null;
+  notebook?: Notebook; isCollabLive?: boolean;
   collabParticipantCount?: number;
   onClick: () => void; onDelete: () => void; onPin: () => void;
 }) {
   const preview = note.content.slice(0, 80).replace(/\n/g, ' ') || 'Empty note';
   const time = new Date(note.updatedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 
+  // TTS playback gets a left-edge green stripe + tinted background so the
+  // note that's currently being read is identifiable in the list at a glance,
+  // even when the user is viewing a different note.
+  const ttsClasses = isTtsPlaying
+    ? 'bg-emerald-500/10 border-l-2 border-l-emerald-500/70'
+    : isCollabLive
+    ? 'border-l-2 border-l-green-500/50'
+    : '';
+
   return (
     <button
       onClick={onClick}
       className={`w-full text-left px-3 py-2.5 border-b border-iron-border transition-colors group ${
         active ? 'bg-iron-accent/10' : 'hover:bg-iron-surface-hover'
-      } ${isCollabLive ? 'border-l-2 border-l-green-500/50' : ''}`}
+      } ${ttsClasses}`}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="min-w-0 flex-1">
@@ -601,6 +623,15 @@ function NoteListItem({ note, active, notebook, isCollabLive, collabParticipantC
             <p className={`text-xs font-medium truncate ${active ? 'text-iron-text' : 'text-iron-text-secondary'}`}>
               {note.title || 'Untitled'}
             </p>
+            {isTtsPlaying && (
+              <span
+                className="flex items-center gap-0.5 text-[9px] font-medium text-emerald-300 bg-emerald-500/15 border border-emerald-500/30 px-1.5 py-0.5 rounded-full shrink-0 leading-none"
+                title={ttsState === 'paused' ? 'Read-back paused' : ttsState === 'synthesizing' ? 'Synthesizing speech' : 'Reading aloud'}
+              >
+                <Volume2 className={`w-2 h-2 ${ttsState === 'playing' ? 'animate-pulse' : ''}`} />
+                {ttsState === 'paused' ? 'Paused' : ttsState === 'synthesizing' ? '…' : 'Live'}
+              </span>
+            )}
             {isCollabLive && (
               <span className="flex items-center gap-0.5 text-[9px] font-medium text-green-400 bg-green-500/10 border border-green-500/20 px-1.5 py-0.5 rounded-full shrink-0 leading-none">
                 <span className="w-1 h-1 rounded-full bg-green-400 animate-pulse" />

@@ -14,7 +14,7 @@ mod napi_exports {
 
     use napi::bindgen_prelude::*;
     use napi_derive::napi;
-    use tracing::info;
+    use tracing::{info, warn};
 
     use crate::audio::capture::CaptureEngine;
     use crate::audio::processor;
@@ -36,13 +36,94 @@ mod napi_exports {
         });
 
     /// Initialize the tracing subscriber for structured logging.
+    ///
+    /// ort/onnxruntime/transcribe_rs emit *thousands* of INFO log events
+    /// during ONNX graph optimization (one per pruned NodeArg, one per
+    /// GraphTransformer pass). When the stdout pipe to npm/vite saturates,
+    /// each write returns EAGAIN; tracing-subscriber's fmt writer does not
+    /// retry/drop gracefully and ultimately panics. That panic fires from a
+    /// stack frame that is NOT under our `catch_unwind` shield, so it
+    /// propagates across the C FFI boundary and aborts Electron with SIGABRT.
+    /// Filter those crates to WARN so the flood never starts.
     pub(crate) fn init_tracing() {
         use tracing_subscriber::EnvFilter;
         let _ = tracing_subscriber::fmt()
             .with_env_filter(
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    EnvFilter::new("info,ort=warn,onnxruntime=warn,transcribe_rs=warn")
+                }),
             )
             .try_init();
+        install_panic_hook();
+    }
+
+    /// Install a process-wide panic hook that logs panic location + payload via
+    /// `tracing` and stderr. Without this, a panic inside a sync napi call only
+    /// prints the bare panic message to stderr and the user sees an opaque app
+    /// crash. With it, we get a "[panic] at file:line: message" line we can find
+    /// in `~/Library/Logs/IronMic/` or the Electron stderr.
+    fn install_panic_hook() {
+        use std::sync::Once;
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            let prev = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let location = info
+                    .location()
+                    .map(|l| format!("{}:{}", l.file(), l.line()))
+                    .unwrap_or_else(|| "<unknown>".into());
+                let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic payload>".into()
+                };
+                tracing::error!(target: "ironmic-core::panic", "panic at {location}: {payload}");
+                eprintln!("[ironmic-core::panic] at {location}: {payload}");
+                prev(info);
+            }));
+        });
+    }
+
+    /// Run `f` while catching unwinding panics. Converts a panic into a
+    /// `napi::Error` so the host (Electron) sees a normal JS exception instead
+    /// of aborting the process. This is the only correct shape for sync napi
+    /// functions on stable Rust — without it, `panic!` propagates up the FFI
+    /// boundary and triggers SIGABRT in the host.
+    pub(crate) fn catch_panic<T>(
+        ctx: &'static str,
+        f: impl FnOnce() -> napi::Result<T>,
+    ) -> napi::Result<T> {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(result) => result,
+            Err(payload) => {
+                let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = payload.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "<non-string panic payload>".into()
+                };
+                Err(napi::Error::from_reason(format!(
+                    "{ctx} panicked: {msg}. The native engine recovered; check ~/Library/Logs/IronMic/ for the panic backtrace."
+                )))
+            }
+        }
+    }
+
+    /// Acquire a mutex lock that recovers from poisoning. A poisoned lock is
+    /// not a logic error for our use cases — the playback engine state is
+    /// rebuilt on every `play()`, so we'd rather keep going than abort the
+    /// process when a previous panic poisoned the lock.
+    fn lock_or_recover<'a, T>(m: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+        match m.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                tracing::warn!("Recovered from poisoned mutex");
+                p.into_inner()
+            }
+        }
     }
 
     #[napi]
@@ -957,81 +1038,273 @@ mod napi_exports {
     static PLAYBACK_ENGINE: std::sync::LazyLock<Mutex<PlaybackEngine>> =
         std::sync::LazyLock::new(|| Mutex::new(PlaybackEngine::new()));
 
+    /// Cumulative TTS stream state. Each call to `synthesize_text` resets
+    /// these and the background thread keeps appending to them as chunks
+    /// complete. The renderer polls `tts_get_stream_state` to learn about
+    /// new timestamps + total duration without waiting for synthesis to
+    /// finish.
+    static STREAM_TIMESTAMPS: std::sync::LazyLock<Mutex<Vec<crate::tts::timestamps::WordTimestamp>>> =
+        std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+    static STREAM_DURATION_MS: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    static STREAM_CHUNKS_DONE: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    static STREAM_CHUNKS_TOTAL: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(0);
+    /// Generation counter that lets the background synthesis thread detect
+    /// "I've been superseded" — every new call to `synthesize_text` bumps
+    /// this and the thread bails as soon as the stored value diverges from
+    /// the one it captured at spawn.
+    static SYNTH_GENERATION: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     #[napi]
     pub fn synthesize_text(text: String) -> napi::Result<String> {
         init_tracing();
         info!("synthesizeText called, text_len={}", text.len());
 
-        if !TTS_ENGINE.is_loaded() {
-            TTS_ENGINE.load_model().map_err(napi::Error::from)?;
-        }
+        catch_panic("synthesize_text", || {
+            if !TTS_ENGINE.is_loaded() {
+                TTS_ENGINE.load_model().map_err(napi::Error::from)?;
+            }
 
-        let mut result = TTS_ENGINE.synthesize(&text).map_err(napi::Error::from)?;
+            #[cfg(feature = "tts")]
+            let chunks = crate::tts::kokoro::split_text_for_streaming(&text);
+            #[cfg(not(feature = "tts"))]
+            let chunks: Vec<String> = vec![text.clone()];
 
-        let timestamps = std::mem::take(&mut result.timestamps);
-        let duration_ms = (result.duration_seconds * 1000.0) as u64;
-        let sample_rate = result.sample_rate;
-        let samples = result.take_samples();
+            if chunks.is_empty() {
+                return Err(napi::Error::from_reason(
+                    "Text produced no chunks to synthesize",
+                ));
+            }
+            info!(chunks = chunks.len(), "Streaming synthesis: split into chunks");
 
-        // Start playback
-        let mut playback = PLAYBACK_ENGINE.lock().unwrap();
-        playback
-            .play(samples, sample_rate)
-            .map_err(napi::Error::from)?;
+            // Stop any in-flight playback. Bumping SYNTH_GENERATION first so
+            // any still-running thread from a previous call exits cleanly
+            // when it next checks the counter.
+            let my_gen = SYNTH_GENERATION
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            {
+                let mut playback = lock_or_recover(&PLAYBACK_ENGINE);
+                playback.stop();
+            }
 
-        // Return timestamps as JSON
+            // Reset cumulative stream state.
+            STREAM_TIMESTAMPS.lock().unwrap().clear();
+            STREAM_DURATION_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+            STREAM_CHUNKS_DONE.store(0, std::sync::atomic::Ordering::SeqCst);
+            STREAM_CHUNKS_TOTAL.store(chunks.len() as u32, std::sync::atomic::Ordering::SeqCst);
+
+            // Synthesize chunk 1 synchronously so the napi response carries
+            // real timestamps + duration AND playback has already started by
+            // the time the renderer's polling loop fires its first tick.
+            let mut chunk1_idx = 0usize;
+            let mut chunk1_result = None;
+            for (i, chunk) in chunks.iter().enumerate() {
+                match TTS_ENGINE.synthesize_single_chunk(chunk) {
+                    Ok(r) => { chunk1_result = Some(r); chunk1_idx = i; break; }
+                    Err(e) => {
+                        warn!(idx = i, err = %e, "First-chunk synthesis failed; trying next");
+                        STREAM_CHUNKS_DONE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+            let mut chunk1 = match chunk1_result {
+                Some(r) => r,
+                None => {
+                    // Every chunk failed. Surface the failure cleanly.
+                    return Err(napi::Error::from_reason(
+                        "Failed to synthesize any chunk of the text",
+                    ));
+                }
+            };
+
+            let sample_rate = chunk1.sample_rate;
+            let chunk1_duration_ms = (chunk1.duration_seconds * 1000.0) as u64;
+            let chunk1_timestamps = std::mem::take(&mut chunk1.timestamps);
+            let chunk1_samples = chunk1.take_samples();
+
+            // Seed the cumulative timestamp / duration state with chunk 1.
+            STREAM_TIMESTAMPS.lock().unwrap().extend(chunk1_timestamps.clone());
+            STREAM_DURATION_MS.store(chunk1_duration_ms, std::sync::atomic::Ordering::SeqCst);
+            STREAM_CHUNKS_DONE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            // Start playback in streaming mode so cpal won't auto-stop on EOF
+            // while later chunks are still being appended.
+            {
+                let mut playback = lock_or_recover(&PLAYBACK_ENGINE);
+                playback
+                    .play_streaming(chunk1_samples, sample_rate)
+                    .map_err(napi::Error::from)?;
+            }
+
+            // Spawn background thread for remaining chunks. It owns a clone
+            // of the TTS engine handle and writes into the shared stream
+            // state + playback engine as each chunk lands.
+            let remaining: Vec<String> = chunks.iter().skip(chunk1_idx + 1).cloned().collect();
+            if !remaining.is_empty() {
+                let engine = TTS_ENGINE.clone_handle();
+                std::thread::spawn(move || {
+                    // 200 ms silence between chunks for natural sentence
+                    // pauses (espeak --ipa strips punctuation, so this is
+                    // our only mechanism for prosodic breaks).
+                    let silence: Vec<f32> = vec![0.0f32; (sample_rate as usize) / 5];
+                    let silence_ms: u64 = 200;
+
+                    for chunk in remaining {
+                        // Cancellation: a newer synthesize_text call has
+                        // started, or the user pressed stop. Bail.
+                        if SYNTH_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != my_gen {
+                            return;
+                        }
+                        let pb_state = lock_or_recover(&PLAYBACK_ENGINE).state();
+                        if pb_state == crate::tts::playback::PlaybackState::Idle {
+                            return;
+                        }
+
+                        match engine.synthesize_single_chunk(&chunk) {
+                            Ok(mut part) => {
+                                let part_duration_ms = (part.duration_seconds * 1000.0) as u64;
+                                let part_timestamps = std::mem::take(&mut part.timestamps);
+                                let part_samples = part.take_samples();
+
+                                // Append silence + new audio. The cpal
+                                // callback's mutex serializes with these.
+                                {
+                                    let playback = lock_or_recover(&PLAYBACK_ENGINE);
+                                    let _ = playback.append_samples(silence.clone());
+                                    let _ = playback.append_samples(part_samples);
+                                }
+
+                                // Offset timestamps by current cumulative
+                                // duration BEFORE we add this chunk.
+                                let offset_ms = STREAM_DURATION_MS
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                    + silence_ms;
+                                let mut ts_lock = STREAM_TIMESTAMPS.lock().unwrap();
+                                for ts in part_timestamps {
+                                    ts_lock.push(crate::tts::timestamps::WordTimestamp {
+                                        word: ts.word,
+                                        start_ms: ts.start_ms + offset_ms as u32,
+                                        end_ms: ts.end_ms + offset_ms as u32,
+                                    });
+                                }
+                                drop(ts_lock);
+                                STREAM_DURATION_MS.fetch_add(
+                                    silence_ms + part_duration_ms,
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                            }
+                            Err(e) => {
+                                warn!(err = %e, "Skipping unreadable chunk during streaming");
+                            }
+                        }
+                        STREAM_CHUNKS_DONE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+
+                    // Last chunk done — release the cpal auto-stop gate so
+                    // playback ends naturally when the cursor catches up.
+                    if SYNTH_GENERATION.load(std::sync::atomic::Ordering::SeqCst) == my_gen {
+                        lock_or_recover(&PLAYBACK_ENGINE).mark_streaming_complete();
+                    }
+                });
+            } else {
+                // Single-chunk note — there's no background work, so flip
+                // the auto-stop gate immediately. Playback ends when chunk
+                // 1's audio is exhausted.
+                lock_or_recover(&PLAYBACK_ENGINE).mark_streaming_complete();
+            }
+
+            // Return chunk-1 timestamps + duration so the renderer's UI
+            // (live caption strip, progress bar) has something to render
+            // immediately. The poll loop fetches the cumulative state via
+            // tts_get_stream_state and replaces these as more chunks land.
+            let response = serde_json::json!({
+                "timestamps": chunk1_timestamps,
+                "durationMs": chunk1_duration_ms,
+                "streaming": !chunks.is_empty() && chunks.len() > 1,
+                "chunkCount": chunks.len(),
+            });
+            Ok(response.to_string())
+        })
+    }
+
+    /// Cumulative streaming state for the renderer. Returns the full
+    /// timestamps array known so far plus current duration; the renderer's
+    /// poll loop fetches this each tick to grow the live caption window
+    /// as background chunks land.
+    #[napi]
+    pub fn tts_get_stream_state() -> String {
+        let timestamps = STREAM_TIMESTAMPS.lock().unwrap().clone();
+        let duration_ms = STREAM_DURATION_MS.load(std::sync::atomic::Ordering::SeqCst);
+        let chunks_done = STREAM_CHUNKS_DONE.load(std::sync::atomic::Ordering::SeqCst);
+        let chunks_total = STREAM_CHUNKS_TOTAL.load(std::sync::atomic::Ordering::SeqCst);
         let response = serde_json::json!({
             "timestamps": timestamps,
             "durationMs": duration_ms,
+            "chunksDone": chunks_done,
+            "chunksTotal": chunks_total,
+            "complete": chunks_total > 0 && chunks_done >= chunks_total,
         });
-
-        Ok(response.to_string())
+        response.to_string()
     }
 
     #[napi]
     pub fn tts_play() -> napi::Result<()> {
-        let mut playback = PLAYBACK_ENGINE.lock().unwrap();
-        playback.resume();
-        Ok(())
+        catch_panic("tts_play", || {
+            let mut playback = lock_or_recover(&PLAYBACK_ENGINE);
+            playback.resume();
+            Ok(())
+        })
     }
 
     #[napi]
     pub fn tts_pause() -> napi::Result<()> {
-        let mut playback = PLAYBACK_ENGINE.lock().unwrap();
-        playback.pause();
-        Ok(())
+        catch_panic("tts_pause", || {
+            let mut playback = lock_or_recover(&PLAYBACK_ENGINE);
+            playback.pause();
+            Ok(())
+        })
     }
 
     #[napi]
     pub fn tts_stop() -> napi::Result<()> {
-        let mut playback = PLAYBACK_ENGINE.lock().unwrap();
-        playback.stop();
-        Ok(())
+        catch_panic("tts_stop", || {
+            let mut playback = lock_or_recover(&PLAYBACK_ENGINE);
+            playback.stop();
+            Ok(())
+        })
     }
 
     #[napi]
     pub fn tts_get_position() -> f64 {
-        let playback = PLAYBACK_ENGINE.lock().unwrap();
+        let playback = lock_or_recover(&PLAYBACK_ENGINE);
         playback.position_ms()
     }
 
     #[napi]
     pub fn tts_get_state() -> String {
-        let playback = PLAYBACK_ENGINE.lock().unwrap();
+        let playback = lock_or_recover(&PLAYBACK_ENGINE);
         playback.state().to_string()
     }
 
     #[napi]
     pub fn tts_set_speed(speed: f64) -> napi::Result<()> {
-        let playback = PLAYBACK_ENGINE.lock().unwrap();
-        playback.set_speed(speed as f32);
-        TTS_ENGINE.set_speed(speed as f32);
-        Ok(())
+        catch_panic("tts_set_speed", || {
+            let playback = lock_or_recover(&PLAYBACK_ENGINE);
+            playback.set_speed(speed as f32);
+            TTS_ENGINE.set_speed(speed as f32);
+            Ok(())
+        })
     }
 
     #[napi]
     pub fn tts_set_voice(voice_id: String) -> napi::Result<()> {
-        TTS_ENGINE.set_voice(&voice_id).map_err(Into::into)
+        catch_panic("tts_set_voice", || {
+            TTS_ENGINE.set_voice(&voice_id).map_err(Into::into)
+        })
     }
 
     #[napi]
@@ -1043,7 +1316,62 @@ mod napi_exports {
     #[napi]
     pub fn tts_load_model() -> napi::Result<()> {
         init_tracing();
-        TTS_ENGINE.load_model().map_err(Into::into)
+        catch_panic("tts_load_model", || {
+            TTS_ENGINE.load_model().map_err(Into::into)
+        })
+    }
+
+    /// Validate that an ONNX file at `path` is loadable as a Kokoro TTS model.
+    /// Opens a one-shot ort::Session against the path on a local builder — does
+    /// NOT touch the global TTS_ENGINE. Used by the import path to accept a
+    /// renamed-but-valid Kokoro file before swapping it into the canonical
+    /// model location.
+    #[napi]
+    pub fn tts_validate_model_file(path: String) -> napi::Result<()> {
+        init_tracing();
+        catch_panic("tts_validate_model_file", || {
+        #[cfg(feature = "tts")]
+        {
+            let p = std::path::Path::new(&path);
+            if !p.exists() {
+                return Err(napi::Error::from_reason(format!(
+                    "Validation file not found: {path}"
+                )));
+            }
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2);
+            let session = ort::session::Session::builder()
+                .map_err(|e| napi::Error::from_reason(format!("Session builder error: {e}")))?
+                .with_log_level(ort::logging::LogLevel::Warning)
+                .map_err(|e| napi::Error::from_reason(format!("Log level config error: {e}")))?
+                .with_intra_threads(n_threads)
+                .map_err(|e| napi::Error::from_reason(format!("Thread config error: {e}")))?
+                .commit_from_file(p)
+                .map_err(|e| napi::Error::from_reason(format!(
+                    "Not a loadable ONNX model: {e}"
+                )))?;
+
+            // Kokoro signature: 3 inputs (tokens int64, style float, speed float)
+            // and 1 output (audio float). Reject mismatches before accepting.
+            let n_inputs = session.inputs().len();
+            let n_outputs = session.outputs().len();
+            if n_inputs != 3 || n_outputs < 1 {
+                return Err(napi::Error::from_reason(format!(
+                    "ONNX signature mismatch: expected Kokoro (3 inputs, ≥1 output), got ({n_inputs} inputs, {n_outputs} outputs). This doesn't look like a Kokoro model."
+                )));
+            }
+            drop(session);
+            Ok(())
+        }
+        #[cfg(not(feature = "tts"))]
+        {
+            let _ = path;
+            Err(napi::Error::from_reason(
+                "TTS feature not enabled in this build",
+            ))
+        }
+        })
     }
 
     #[napi]
@@ -1053,8 +1381,13 @@ mod napi_exports {
 
     #[napi]
     pub fn tts_toggle() -> String {
-        let mut playback = PLAYBACK_ENGINE.lock().unwrap();
-        playback.toggle().to_string()
+        match catch_panic("tts_toggle", || {
+            let mut playback = lock_or_recover(&PLAYBACK_ENGINE);
+            Ok(playback.toggle().to_string())
+        }) {
+            Ok(s) => s,
+            Err(_) => "idle".into(),
+        }
     }
 
     // ── ML Features: Notifications ──

@@ -116,9 +116,113 @@ fn build_vocab() -> HashMap<char, i64> {
     vocab
 }
 
+/// Maximum number of unpadded phoneme tokens per synthesis call. Kokoro's
+/// model context is 510 tokens before padding; we sit a few below to leave
+/// headroom for the 2 PAD tokens and any rounding inside ort's graph.
+const MAX_UNPADDED_TOKENS: usize = 500;
+
+/// Approximate source-character budget per chunk. English text phonemizes at
+/// roughly 1 phoneme/char, with letter-dense fragments going as high as 5×.
+/// 250 chars is conservative for ordinary prose and small enough that even
+/// a worst-case acronym-heavy chunk stays well under MAX_UNPADDED_TOKENS.
+const CHUNK_CHAR_TARGET: usize = 250;
+
+/// Public re-export so the napi layer can split before orchestrating
+/// streaming playback. See split_for_synthesis below.
+#[cfg(feature = "tts")]
+pub fn split_text_for_streaming(text: &str) -> Vec<String> {
+    split_for_synthesis(text)
+}
+
+/// Split arbitrary text into chunks for sequential synthesis.
+///
+/// **One chunk per sentence**, deliberately. The 200ms inter-chunk silence
+/// inserted by the playback path is the *only* source of pauses we have —
+/// espeak's --ipa mode strips raw punctuation from the phoneme stream, so
+/// the model never hears periods or commas as prosodic input. Greedy
+/// packing of multiple sentences into a single chunk would erase those
+/// pause boundaries and the synthesized speech would run all of them
+/// together. Trade-off: more inference calls, but with streaming playback
+/// (chunk 1 plays while the rest synthesize) the perceived latency is the
+/// time-to-first-audio, not the total synthesis time.
+///
+/// Strategy:
+///   1. Split on sentence-ending punctuation (`.`, `!`, `?`, `\n`, `;`),
+///      preserving the punctuation so it shows in the live caption.
+///   2. Any single sentence over CHUNK_CHAR_TARGET gets split further on
+///      commas, then on whitespace, in chunks of at most CHUNK_CHAR_TARGET.
+///
+/// Empty/whitespace-only chunks are dropped.
+#[cfg(feature = "tts")]
+fn split_for_synthesis(text: &str) -> Vec<String> {
+    let mut sentences: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    // First pass: split on sentence-ending punctuation, preserving it.
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        current.push(c);
+        let is_terminal = matches!(c, '.' | '!' | '?' | '\n' | ';');
+        if is_terminal {
+            // Greedy: include trailing whitespace in this sentence so the next
+            // one starts clean.
+            while let Some(&next) = chars.peek() {
+                if next.is_whitespace() { current.push(next); chars.next(); } else { break; }
+            }
+            let trimmed = current.trim().to_string();
+            if !trimmed.is_empty() { sentences.push(trimmed); }
+            current.clear();
+        }
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() { sentences.push(trimmed); }
+
+    // Second pass: split any oversized sentence further (commas, then words).
+    // Sentences that already fit pass through untouched — one chunk apiece.
+    let mut chunks: Vec<String> = Vec::new();
+    for s in sentences {
+        if s.len() <= CHUNK_CHAR_TARGET {
+            chunks.push(s);
+            continue;
+        }
+        // Try comma split first — keeps the comma trailing so prosody is
+        // preserved within the model's context.
+        let comma_parts: Vec<&str> = s.split(',').collect();
+        if comma_parts.iter().all(|p| p.len() <= CHUNK_CHAR_TARGET) && comma_parts.len() > 1 {
+            for (i, p) in comma_parts.iter().enumerate() {
+                let mut piece = p.trim().to_string();
+                if piece.is_empty() { continue; }
+                if i + 1 < comma_parts.len() { piece.push(','); }
+                chunks.push(piece);
+            }
+            continue;
+        }
+        // Last resort: word-by-word fill at the char budget.
+        let mut buf = String::new();
+        for word in s.split_whitespace() {
+            if !buf.is_empty() && buf.len() + 1 + word.len() > CHUNK_CHAR_TARGET {
+                chunks.push(buf.trim().to_string());
+                buf = String::new();
+            }
+            if !buf.is_empty() { buf.push(' '); }
+            buf.push_str(word);
+        }
+        if !buf.trim().is_empty() { chunks.push(buf.trim().to_string()); }
+    }
+    chunks
+}
+
 /// Convert text to IPA phonemes using espeak-ng, then map to Kokoro token IDs.
 /// Adds PAD (0) at start and end as required by the model.
 /// Returns (padded_tokens, unpadded_length).
+///
+/// **Rejects** inputs whose phonemized form exceeds [`MAX_UNPADDED_TOKENS`].
+/// The previous behavior was to silently truncate, but truncating mid-cluster
+/// with letter-dense input (acronyms, spelled letters) produces a token
+/// sequence the decoder sometimes resolves to NaN/Inf — which onnxruntime's
+/// Metal backend asserts on, killing the host with SIGTRAP that no Rust panic
+/// handler can catch. Refusing the call up-front lets the renderer surface a
+/// clean error and chunk the text instead of nuking the engine.
 #[cfg(feature = "tts")]
 fn phonemize_and_tokenize(text: &str, vocab: &HashMap<char, i64>) -> Result<(Vec<i64>, usize), IronMicError> {
     let phonemes = phonemize_with_espeak(text)?;
@@ -132,12 +236,23 @@ fn phonemize_and_tokenize(text: &str, vocab: &HashMap<char, i64>) -> Result<(Vec
         // Skip characters not in vocabulary (e.g., newlines from espeak)
     }
 
-    let unpadded_len = tokens.len();
-
-    // Clamp to max context (510 tokens before padding)
-    if tokens.len() > 510 {
-        tokens.truncate(510);
+    if tokens.is_empty() {
+        return Err(IronMicError::Tts("Text produced no tokens".into()));
     }
+
+    // Hard upper bound: refuse rather than risk an FFI trap. The renderer
+    // sanitizer caps source text but phonemizer expansion is unpredictable
+    // (acronyms / numbers / spelled letters expand 4–6× per character), so a
+    // server-side check here is the only safe guarantee.
+    if tokens.len() > MAX_UNPADDED_TOKENS {
+        return Err(IronMicError::Tts(format!(
+            "Text too long for one read-back: produced {} phoneme tokens (limit {}). Try a shorter passage or break the text into paragraphs.",
+            tokens.len(),
+            MAX_UNPADDED_TOKENS,
+        )));
+    }
+
+    let unpadded_len = tokens.len();
 
     // Add PAD at start and end as required by Kokoro
     tokens.insert(0, 0); // PAD start
@@ -258,14 +373,38 @@ impl TtsEngine for KokoroEngine {
         let model_path = self.model_path();
         let default_voice_path = self.voice_path(DEFAULT_VOICE);
 
-        if !model_path.exists() || !default_voice_path.exists() {
-            warn!(model = %model_path.display(), "Kokoro TTS model files not found");
+        let model_missing = !model_path.exists();
+        let voice_missing = !default_voice_path.exists();
+
+        if model_missing || voice_missing {
+            warn!(
+                model = %model_path.display(),
+                voice = %default_voice_path.display(),
+                model_missing,
+                voice_missing,
+                "Kokoro TTS asset(s) not found",
+            );
 
             #[cfg(feature = "tts")]
             {
-                return Err(IronMicError::Tts(
-                    "TTS model not downloaded. Go to Settings to download it.".into(),
-                ));
+                let msg = if model_missing && voice_missing {
+                    format!(
+                        "TTS assets missing. Model not found at {} and default voice not found at {}. Open Settings → Voice Output and click Repair to install both.",
+                        model_path.display(),
+                        default_voice_path.display(),
+                    )
+                } else if model_missing {
+                    format!(
+                        "TTS model not found at {}. Open Settings → Voice Output to download or import the Kokoro model.",
+                        model_path.display(),
+                    )
+                } else {
+                    format!(
+                        "TTS default voice not found at {}. Open Settings → Voice Output and click Repair to install the voice pack.",
+                        default_voice_path.display(),
+                    )
+                };
+                return Err(IronMicError::Tts(msg));
             }
             #[cfg(not(feature = "tts"))]
             {
@@ -283,8 +422,16 @@ impl TtsEngine for KokoroEngine {
                 .map(|n| n.get())
                 .unwrap_or(4);
 
+            // Log severity: Warning. ort emits thousands of INFO log lines
+            // during ONNX graph optimization (one per pruned NodeArg, one per
+            // GraphTransformer pass). When stdout is piped to npm/vite, the
+            // pipe saturates and tracing-subscriber's writer hits EAGAIN; that
+            // path eventually panics across the C FFI boundary and SIGABRTs
+            // Electron. Cutting the source is the only reliable fix.
             let session = ort::session::Session::builder()
                 .map_err(|e| IronMicError::Tts(format!("Session builder error: {e}")))?
+                .with_log_level(ort::logging::LogLevel::Warning)
+                .map_err(|e| IronMicError::Tts(format!("Log level config error: {e}")))?
                 .with_intra_threads(n_threads)
                 .map_err(|e| IronMicError::Tts(format!("Thread config error: {e}")))?
                 .commit_from_file(&model_path)
@@ -331,30 +478,127 @@ impl TtsEngine for KokoroEngine {
 }
 
 impl KokoroEngine {
+    /// Top-level synthesis: chunk the input so each chunk fits the model's
+    /// 510-token context window, run ort once per chunk, and concatenate the
+    /// audio with a brief silence between chunks for prosody. Per-chunk
+    /// failures are logged and skipped — never propagated — so a single
+    /// pathological fragment (acronym, gibberish letter run, oversized
+    /// sentence) doesn't kill an otherwise readable note. The whole call only
+    /// fails if EVERY chunk failed.
     #[cfg(feature = "tts")]
     fn synthesize_with_ort(&self, text: &str) -> Result<SynthesisResult, IronMicError> {
-        use ort::value::Tensor;
-
         let session_mutex = self.session.as_ref().ok_or_else(|| {
             IronMicError::Tts("Model not loaded".into())
         })?;
-        let mut session = session_mutex.lock().unwrap();
+        // Poison-tolerant: a previous panic that poisoned this lock should
+        // not block all future synthesis.
+        let mut session = match session_mutex.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                warn!("Recovered from poisoned TTS session mutex");
+                p.into_inner()
+            }
+        };
 
         info!(text_len = text.len(), voice = %self.config.voice_id, "Starting synthesis");
 
-        // Phonemize and tokenize (returns padded tokens + unpadded length)
-        let (tokens, unpadded_len) = phonemize_and_tokenize(text, &self.vocab)?;
-        if unpadded_len == 0 {
+        let chunks = split_for_synthesis(text);
+        if chunks.is_empty() {
             return Err(IronMicError::Tts("Text produced no tokens".into()));
         }
+        info!(chunk_count = chunks.len(), "Split input into chunks");
 
+        let sample_rate: u32 = 24000;
+        // 200 ms of silence between chunks: long enough to feel like a sentence
+        // pause, short enough that long passages don't drag.
+        let inter_chunk_silence = (sample_rate as usize) / 5;
+
+        let mut all_audio: Vec<f32> = Vec::new();
+        let mut all_timestamps: Vec<crate::tts::timestamps::WordTimestamp> = Vec::new();
+        let mut time_offset_ms: u32 = 0;
+        let mut succeeded = 0usize;
+        let mut last_err: Option<String> = None;
+
+        for (idx, chunk) in chunks.iter().enumerate() {
+            match self.synthesize_chunk(&mut session, chunk) {
+                Ok(mut part) => {
+                    succeeded += 1;
+                    let part_duration_ms = (part.duration_seconds * 1000.0) as u32;
+                    // Move out of `part` rather than clone — SynthesisResult
+                    // implements Drop (zeroes audio for privacy), so the
+                    // fields can't be borrow-moved directly. take_samples()
+                    // and mem::take leave `part` empty for safe drop.
+                    let part_timestamps = std::mem::take(&mut part.timestamps);
+                    let part_samples = part.take_samples();
+                    for ts in part_timestamps {
+                        all_timestamps.push(crate::tts::timestamps::WordTimestamp {
+                            word: ts.word,
+                            start_ms: ts.start_ms + time_offset_ms,
+                            end_ms: ts.end_ms + time_offset_ms,
+                        });
+                    }
+                    all_audio.extend(part_samples);
+                    if idx + 1 < chunks.len() {
+                        all_audio.extend(std::iter::repeat(0.0f32).take(inter_chunk_silence));
+                    }
+                    time_offset_ms = time_offset_ms
+                        .saturating_add(part_duration_ms)
+                        .saturating_add(if idx + 1 < chunks.len() { 200 } else { 0 });
+                }
+                Err(e) => {
+                    let msg = format!("{e}");
+                    warn!(
+                        chunk_index = idx,
+                        chunk_chars = chunk.len(),
+                        err = %msg,
+                        "Skipping unreadable chunk"
+                    );
+                    last_err = Some(msg);
+                }
+            }
+        }
+
+        if succeeded == 0 {
+            return Err(IronMicError::Tts(format!(
+                "Failed to synthesize any chunk of the text. Last error: {}",
+                last_err.unwrap_or_else(|| "unknown".into()),
+            )));
+        }
+
+        let duration_seconds = all_audio.len() as f64 / sample_rate as f64;
+        info!(
+            samples = all_audio.len(),
+            duration_seconds,
+            chunks_succeeded = succeeded,
+            chunks_total = chunks.len(),
+            "Synthesis complete",
+        );
+
+        Ok(SynthesisResult {
+            samples: all_audio,
+            sample_rate,
+            timestamps: all_timestamps,
+            duration_seconds,
+        })
+    }
+
+    /// Single-chunk synthesis. Reuses an already-locked session so the chunked
+    /// loop above doesn't re-acquire the mutex N times. Returns the same
+    /// SynthesisResult shape as the top-level call but only for one chunk.
+    #[cfg(feature = "tts")]
+    fn synthesize_chunk(
+        &self,
+        session: &mut ort::session::Session,
+        text: &str,
+    ) -> Result<SynthesisResult, IronMicError> {
+        use ort::value::Tensor;
+
+        let (tokens, unpadded_len) = phonemize_and_tokenize(text, &self.vocab)?;
         let padded_len = tokens.len();
 
-        // Create input_ids tensor [1, padded_len]
         let input_ids = Tensor::from_array(([1usize, padded_len], tokens))
             .map_err(|e| IronMicError::Tts(format!("Input tensor error: {e}")))?;
 
-        // Load voice embedding — index by unpadded token count
         let style_vec = self.load_voice_embedding(unpadded_len)?;
         let style = Tensor::from_array(([1usize, 256usize], style_vec))
             .map_err(|e| IronMicError::Tts(format!("Style tensor error: {e}")))?;
@@ -362,23 +606,18 @@ impl KokoroEngine {
         let speed_tensor = Tensor::from_array(([1usize], vec![self.config.speed]))
             .map_err(|e| IronMicError::Tts(format!("Speed tensor error: {e}")))?;
 
-        // Run inference
         let outputs = session.run(ort::inputs![input_ids, style, speed_tensor])
             .map_err(|e| IronMicError::Tts(format!("Inference failed: {e}")))?;
 
-        // Extract audio output
         let output_value = &outputs[0];
         let (_shape, audio_slice) = output_value.try_extract_tensor::<f32>()
             .map_err(|e| IronMicError::Tts(format!("Failed to extract output: {e}")))?;
 
         let audio: Vec<f32> = audio_slice.to_vec();
-
         let sample_rate: u32 = 24000;
         let duration_seconds = audio.len() as f64 / sample_rate as f64;
         let duration_ms = (duration_seconds * 1000.0) as u32;
         let timestamps = estimate_timestamps(text, duration_ms);
-
-        info!(samples = audio.len(), duration_seconds, "Synthesis complete");
 
         Ok(SynthesisResult {
             samples: audio,
@@ -396,16 +635,25 @@ impl KokoroEngine {
         let voice_path = self.voice_path(&self.config.voice_id);
 
         if !voice_path.exists() {
-            // Fall back to default voice if selected voice not downloaded
-            let fallback = self.voice_path(DEFAULT_VOICE);
-            if !fallback.exists() {
-                return Err(IronMicError::Tts(format!(
-                    "Voice file not found: {}. Go to Settings to download TTS voices.",
-                    self.config.voice_id
-                )));
+            // Fall back to the default voice only if it actually exists on disk.
+            // Silently substituting a missing fallback would yield a confusing
+            // "Failed to read voice file" downstream.
+            let fallback_path = self.voice_path(DEFAULT_VOICE);
+            if self.config.voice_id != DEFAULT_VOICE && fallback_path.exists() {
+                warn!(
+                    voice = %self.config.voice_id,
+                    selected = %voice_path.display(),
+                    fallback = %fallback_path.display(),
+                    "Selected voice not found, using default voice as fallback",
+                );
+                return load_voice_file(&fallback_path, unpadded_len);
             }
-            warn!(voice = %self.config.voice_id, "Voice file not found, using default");
-            return load_voice_file(&fallback, unpadded_len);
+            return Err(IronMicError::Tts(format!(
+                "TTS voice '{}' not found at {}. Default voice fallback also missing at {}. Open Settings → Voice Output and click Repair to install voices.",
+                self.config.voice_id,
+                voice_path.display(),
+                fallback_path.display(),
+            )));
         }
 
         load_voice_file(&voice_path, unpadded_len)
@@ -495,6 +743,41 @@ impl SharedTtsEngine {
 
     pub fn synthesize(&self, text: &str) -> Result<SynthesisResult, IronMicError> {
         self.inner.lock().unwrap().synthesize(text)
+    }
+
+    /// Synthesize a SINGLE pre-split chunk. Used by the streaming napi
+    /// orchestrator which splits the full text up-front and feeds chunks one
+    /// at a time, starting playback after the first lands. Skips the inner
+    /// chunking that `synthesize` does, so the caller can interleave playback
+    /// with synthesis. Holds the inner mutex across the ort.run call (same
+    /// behavior as the non-streaming path).
+    #[cfg(feature = "tts")]
+    pub fn synthesize_single_chunk(&self, text: &str) -> Result<SynthesisResult, IronMicError> {
+        let mut engine = self.inner.lock().unwrap();
+        // The session lives inside KokoroEngine — we have to take a transient
+        // mut borrow of the session via the engine. synthesize_chunk requires
+        // &mut Session, so we lock the inner session mutex here.
+        let session_mutex = engine
+            .session
+            .as_ref()
+            .ok_or_else(|| IronMicError::Tts("Model not loaded".into()))?;
+        // Same poison-tolerant lock pattern as synthesize_with_ort.
+        let mut session_guard = match session_mutex.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Re-borrow engine immutably for synthesize_chunk's & receiver — we
+        // only need mut on the session, not the engine itself.
+        let result = engine.synthesize_chunk(&mut session_guard, text)?;
+        drop(session_guard);
+        drop(engine);
+        Ok(result)
+    }
+
+    /// Clone the underlying Arc<Mutex<KokoroEngine>> handle so a background
+    /// thread can synthesize chunks while the napi call has already returned.
+    pub fn clone_handle(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
     }
 
     pub fn available_voices(&self) -> Vec<TtsVoice> {

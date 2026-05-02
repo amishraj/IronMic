@@ -79,9 +79,18 @@ const api = {
   ttsSetVoice: (voiceId: string) => ipcRenderer.invoke('ironmic:tts-set-voice', voiceId),
   ttsAvailableVoices: () => ipcRenderer.invoke('ironmic:tts-available-voices'),
   ttsLoadModel: () => ipcRenderer.invoke('ironmic:tts-load-model'),
+  ttsGetStreamState: () => ipcRenderer.invoke('ironmic:tts-get-stream-state'),
   isTtsModelReady: () => ipcRenderer.invoke('ironmic:is-tts-model-ready'),
+  ttsGetReadiness: (voiceId?: string) => ipcRenderer.invoke('ironmic:tts-get-readiness', voiceId),
   ttsIsLoaded: () => ipcRenderer.invoke('ironmic:tts-is-loaded'),
   ttsToggle: () => ipcRenderer.invoke('ironmic:tts-toggle'),
+  /** Per-voice progress events from the Settings → Repair flow.
+   *  payload: { id, downloaded, total, status: 'downloading'|'verifying'|'verified'|'error'|'complete', error? } */
+  onTtsVoicesProgress: (callback: (payload: any) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:tts-voices-progress', handler);
+    return () => ipcRenderer.removeListener('ironmic:tts-voices-progress', handler);
+  },
 
   // Analytics
   analyticsRecomputeToday: () => ipcRenderer.invoke('ironmic:analytics-recompute-today'),

@@ -18,12 +18,14 @@ import https from 'https';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { pipeline } from 'stream/promises';
 import { BrowserWindow, net, session, dialog } from 'electron';
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import {
   MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
-  MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS, TFJS_MODELS,
-  TRANSCRIPTION_ENGINES,
+  MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS, TTS_VOICES, TtsVoiceMeta,
+  KOKORO_DEFAULT_VOICE_ID, KOKORO_ONNX_SHA256, getEspeakInstallHint,
+  TFJS_MODELS, TRANSCRIPTION_ENGINES,
 } from '../shared/constants';
 
 /**
@@ -172,26 +174,131 @@ export async function downloadTranscriptionEngine(
   }
 }
 
-export function isTtsModelReady(): boolean {
-  if (!isModelDownloaded('tts-model')) return false;
+/**
+ * Structured readiness for the Kokoro TTS pipeline. `ready` requires only the
+ * model + default voice + espeak-ng so the engine can synthesize at all; the
+ * other fields let Settings distinguish "ready with fallback" from "all
+ * selected voices installed" and surface precise repair steps.
+ */
+export interface TtsReadiness {
+  ready: boolean;
+  modelPresent: boolean;
+  voicesPresent: boolean;        // af_heart.bin specifically
+  selectedVoicePresent: boolean; // current `tts_voice` setting (af_heart by default)
+  selectedVoiceId: string;
+  missingVoices: string[];       // voice IDs from TTS_VOICES absent on disk
+  espeakAvailable: boolean;
+  espeakHint: string | null;     // platform install hint when not available
+  modelPath: string;
+  voicesDir: string;
+}
+
+let cachedEspeakAvailable: boolean | null = null;
+
+/** Reset the cached espeak probe — call after a successful Repair so a freshly
+ *  installed espeak-ng is picked up without an app restart. */
+export function invalidateEspeakCache(): void {
+  cachedEspeakAvailable = null;
+}
+
+/**
+ * Cross-platform check for espeak-ng on PATH.
+ * Packaged Electron apps don't inherit the user's login-shell PATH, so the
+ * env-hydration step prepends common Homebrew/local-bin locations on macOS
+ * and explicitly probes the default install dir on Windows.
+ */
+function checkEspeakAvailable(): boolean {
+  if (cachedEspeakAvailable !== null) return cachedEspeakAvailable;
+
+  const hydratedPath = (() => {
+    const current = process.env.PATH || '';
+    if (process.platform === 'darwin') {
+      const macExtra = ['/opt/homebrew/bin', '/usr/local/bin'].filter(p => !current.split(':').includes(p));
+      return macExtra.length ? `${macExtra.join(':')}:${current}` : current;
+    }
+    return current;
+  })();
+
+  try {
+    const result = spawnSync('espeak-ng', ['--version'], {
+      env: { ...process.env, PATH: hydratedPath },
+      timeout: 3000,
+    });
+    if (result.status === 0) {
+      cachedEspeakAvailable = true;
+      return true;
+    }
+  } catch { /* spawn failed entirely — fall through */ }
+
+  // Windows fallback: probe the default installer location directly.
+  if (process.platform === 'win32') {
+    const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files';
+    const candidate = path.join(programFiles, 'eSpeak NG', 'espeak-ng.exe');
+    if (fs.existsSync(candidate)) {
+      cachedEspeakAvailable = true;
+      return true;
+    }
+  }
+
+  cachedEspeakAvailable = false;
+  return false;
+}
+
+/**
+ * Get current TTS readiness. Synchronous and side-effect-free aside from the
+ * cached espeak probe — safe to call from any IPC handler or store hook.
+ */
+export function getTtsReadiness(selectedVoiceId?: string): TtsReadiness {
   const voicesDir = path.join(resolveModelsDir(), 'voices');
-  const defaultVoice = path.join(voicesDir, 'af_heart.bin');
-  return fs.existsSync(defaultVoice);
+  const modelPath = getModelPath('tts-model');
+  const modelPresent = fs.existsSync(modelPath);
+  const voicesPresent = fs.existsSync(path.join(voicesDir, `${KOKORO_DEFAULT_VOICE_ID}.bin`));
+
+  const missingVoices = TTS_VOICES
+    .filter(v => !fs.existsSync(path.join(voicesDir, `${v.id}.bin`)))
+    .map(v => v.id);
+
+  const selected = (selectedVoiceId && selectedVoiceId.trim()) || KOKORO_DEFAULT_VOICE_ID;
+  const selectedVoicePresent = fs.existsSync(path.join(voicesDir, `${selected}.bin`));
+
+  const espeakAvailable = checkEspeakAvailable();
+
+  return {
+    ready: modelPresent && voicesPresent && espeakAvailable,
+    modelPresent,
+    voicesPresent,
+    selectedVoicePresent,
+    selectedVoiceId: selected,
+    missingVoices,
+    espeakAvailable,
+    espeakHint: espeakAvailable ? null : getEspeakInstallHint(),
+    modelPath,
+    voicesDir,
+  };
+}
+
+/**
+ * Thin compatibility wrapper for legacy call sites. Prefer getTtsReadiness().
+ * @deprecated Use getTtsReadiness() and inspect the structured fields.
+ */
+export function isTtsModelReady(): boolean {
+  return getTtsReadiness().ready;
 }
 
 /**
  * Ensure bundled TTS voices are copied to the models directory.
  * Voices are bundled in the installer at process.resourcesPath/models/voices/.
- * In production, we copy them to userData/models/voices/ on first launch.
+ * On first launch we copy them into userData/models/voices/.
+ *
+ * Synchronous, bundled-copy ONLY — never makes network requests. The download
+ * fallback lives in repairTtsVoices() which is invoked only by user action.
  */
 export function ensureBundledVoices(): void {
   const destVoicesDir = path.join(resolveModelsDir(), 'voices');
-  const defaultVoice = path.join(destVoicesDir, 'af_heart.bin');
+  const defaultVoice = path.join(destVoicesDir, `${KOKORO_DEFAULT_VOICE_ID}.bin`);
 
-  // Already copied
   if (fs.existsSync(defaultVoice)) return;
 
-  // In production, voices are bundled in resources
   if (process.resourcesPath) {
     const bundledDir = path.join(process.resourcesPath, 'models', 'voices');
     if (fs.existsSync(bundledDir)) {
@@ -207,6 +314,144 @@ export function ensureBundledVoices(): void {
       console.log(`[model-downloader] Copied ${files.length} bundled voices`);
     }
   }
+}
+
+/**
+ * Download or cross-copy any TTS voices missing from the active models dir.
+ *
+ * Order of attempts per voice:
+ *  1. Bundled copy — already handled by ensureBundledVoices() at startup.
+ *  2. Cross-copy from the userData voices dir (covers dev clones where the
+ *     developer has run a packaged build on the same machine).
+ *  3. Atomic download from Hugging Face with SHA-256 + size verification.
+ *
+ * Atomic per voice: each file lands at `voicesDir/<id>.bin.tmp`, gets hashed,
+ * size-checked, and renamed only on full success. Partial/corrupt downloads
+ * never replace a working voice file. Emits per-voice progress events on
+ * `'ironmic:tts-voices-progress'` so Settings can show a per-voice bar.
+ *
+ * Privacy: this is the ONLY TTS asset path that touches the network, and it
+ * is invoked only from downloadTtsModel (Settings → Repair) — never at
+ * startup, never from import handlers.
+ */
+export async function repairTtsVoices(
+  window: BrowserWindow | null,
+): Promise<{ source: 'noop' | 'userData-crosscopy' | 'downloaded' | 'mixed'; downloaded: string[]; crossCopied: string[] }> {
+  const voicesDir = path.join(resolveModelsDir(), 'voices');
+  fs.mkdirSync(voicesDir, { recursive: true });
+
+  const sendProgress = (payload: {
+    id: string;
+    downloaded: number;
+    total: number;
+    status: 'downloading' | 'verifying' | 'verified' | 'error' | 'complete';
+    error?: string;
+  }) => {
+    if (window && !window.isDestroyed()) {
+      window.webContents.send('ironmic:tts-voices-progress', payload);
+    }
+  };
+
+  // Userdata cross-copy source for dev mode (when IRONMIC_MODELS_DIR points at
+  // rust-core/models/ but the user has run a packaged build that copied voices
+  // into ~/Library/Application Support/IronMic/models/voices/).
+  function userDataVoicesDir(): string | null {
+    const fromEnv = process.env.IRONMIC_MODELS_DIR;
+    if (process.platform === 'darwin') {
+      const home = process.env.HOME;
+      if (!home) return null;
+      const candidate = path.join(home, 'Library', 'Application Support', 'IronMic', 'models', 'voices');
+      if (candidate === path.join(fromEnv || '', 'voices')) return null;
+      return fs.existsSync(candidate) ? candidate : null;
+    }
+    if (process.platform === 'win32') {
+      const appData = process.env.APPDATA;
+      if (!appData) return null;
+      const candidate = path.join(appData, 'IronMic', 'models', 'voices');
+      if (candidate === path.join(fromEnv || '', 'voices')) return null;
+      return fs.existsSync(candidate) ? candidate : null;
+    }
+    const home = process.env.HOME;
+    if (!home) return null;
+    const candidate = path.join(home, '.config', 'IronMic', 'models', 'voices');
+    if (candidate === path.join(fromEnv || '', 'voices')) return null;
+    return fs.existsSync(candidate) ? candidate : null;
+  }
+
+  const crossCopySrc = userDataVoicesDir();
+  const downloaded: string[] = [];
+  const crossCopied: string[] = [];
+
+  for (const voice of TTS_VOICES) {
+    const destPath = path.join(voicesDir, `${voice.id}.bin`);
+
+    // Already present + correct size? Skip silently.
+    if (fs.existsSync(destPath)) {
+      try {
+        if (fs.statSync(destPath).size === voice.sizeBytes) continue;
+        fs.unlinkSync(destPath);
+      } catch { /* fall through to re-acquire */ }
+    }
+
+    // 1. Cross-copy from userData if available.
+    if (crossCopySrc) {
+      const src = path.join(crossCopySrc, `${voice.id}.bin`);
+      if (fs.existsSync(src)) {
+        try {
+          const stats = fs.statSync(src);
+          if (stats.size === voice.sizeBytes) {
+            fs.copyFileSync(src, destPath);
+            crossCopied.push(voice.id);
+            sendProgress({ id: voice.id, downloaded: voice.sizeBytes, total: voice.sizeBytes, status: 'complete' });
+            continue;
+          }
+        } catch { /* fall through to download */ }
+      }
+    }
+
+    // 2. Download from Hugging Face — atomic with SHA-256 verify.
+    const tmpPath = `${destPath}.tmp`;
+    try {
+      sendProgress({ id: voice.id, downloaded: 0, total: voice.sizeBytes, status: 'downloading' });
+      await downloadFile(
+        voice.url,
+        tmpPath,
+        (down, total, status) => {
+          if (status === 'downloading') {
+            sendProgress({ id: voice.id, downloaded: down, total: total || voice.sizeBytes, status: 'downloading' });
+          }
+        },
+      );
+
+      sendProgress({ id: voice.id, downloaded: voice.sizeBytes, total: voice.sizeBytes, status: 'verifying' });
+      const tmpStat = fs.statSync(tmpPath);
+      if (tmpStat.size !== voice.sizeBytes) {
+        throw new Error(`Size mismatch: expected ${voice.sizeBytes} bytes, got ${tmpStat.size}`);
+      }
+      const actualHash = await hashFile(tmpPath);
+      if (actualHash !== voice.sha256) {
+        throw new Error(`SHA-256 mismatch: expected ${voice.sha256}, got ${actualHash}`);
+      }
+
+      fs.renameSync(tmpPath, destPath);
+      downloaded.push(voice.id);
+      sendProgress({ id: voice.id, downloaded: voice.sizeBytes, total: voice.sizeBytes, status: 'verified' });
+      sendProgress({ id: voice.id, downloaded: voice.sizeBytes, total: voice.sizeBytes, status: 'complete' });
+    } catch (err: any) {
+      cleanupTemp(tmpPath);
+      const message = err?.message || String(err);
+      console.error(`[model-downloader] Voice ${voice.id} failed: ${message}`);
+      sendProgress({ id: voice.id, downloaded: 0, total: voice.sizeBytes, status: 'error', error: message });
+      throw new Error(`Failed to acquire TTS voice '${voice.id}': ${message}`);
+    }
+  }
+
+  if (downloaded.length === 0 && crossCopied.length === 0) {
+    return { source: 'noop', downloaded, crossCopied };
+  }
+  if (downloaded.length === 0) return { source: 'userData-crosscopy', downloaded, crossCopied };
+  if (crossCopied.length === 0) return { source: 'downloaded', downloaded, crossCopied };
+  return { source: 'mixed', downloaded, crossCopied };
 }
 
 /**
@@ -832,17 +1077,23 @@ export async function downloadModel(
 }
 
 /**
- * Download TTS model (ONNX). Voices are bundled in the installer.
+ * Download / repair the full TTS asset set.
+ *
+ * Steps (idempotent):
+ *  1. Copy any bundled voices that haven't been copied yet (no network).
+ *  2. Repair missing voices via cross-copy from userData or HF download.
+ *  3. Download the Kokoro ONNX if not present.
+ *
+ * Invoked only when the user explicitly clicks "Repair TTS" or
+ * "Download TTS model" in Settings — never at startup.
  */
 export async function downloadTtsModel(window: BrowserWindow | null): Promise<void> {
-  // Ensure bundled voices are in place
   ensureBundledVoices();
+  await repairTtsVoices(window);
 
-  // Download the ONNX model if not present
   if (!isModelDownloaded('tts-model')) {
     await downloadModel('tts-model', window);
   } else {
-    // Already downloaded, signal complete
     if (window && !window.isDestroyed()) {
       window.webContents.send('ironmic:model-download-progress', {
         model: 'tts-model', downloaded: 1, total: 1, status: 'complete', percent: 100,
@@ -1011,6 +1262,58 @@ interface ImportableModelInfo {
   isMoonshine?: boolean;
 }
 
+/**
+ * True when `filename` matches one of the known Kokoro ONNX keys in
+ * IMPORTABLE_FILES. Used by the import paths as the fast-accept gate before
+ * falling back to hash and structural checks.
+ */
+export function isKokoroOnnxFilename(filename: string): boolean {
+  const entry = IMPORTABLE_FILES[filename];
+  return !!entry && entry.modelId === 'tts-model';
+}
+
+/**
+ * Layered validation for an `.onnx` file claimed to be a Kokoro TTS model.
+ *
+ *   1. Fast accept on filename match.
+ *   2. Hash accept on SHA-256 match against the canonical Kokoro hash.
+ *   3. Structural validate via the dedicated napi export — opens a one-shot
+ *      ort::Session in Rust without touching the global TTS_ENGINE.
+ *
+ * Throws with a consistent rejection message on miss across all three layers.
+ * Never mutates the live model directory; callers handle the rename.
+ */
+async function validateKokoroOnnx(sourcePath: string): Promise<{ acceptedBy: 'filename' | 'hash' | 'structural' }> {
+  const sourceFilename = path.basename(sourcePath);
+  if (isKokoroOnnxFilename(sourceFilename)) return { acceptedBy: 'filename' };
+
+  // Hash check — bail fast for tiny stub files.
+  const stats = fs.statSync(sourcePath);
+  if (stats.size >= 1024 * 1024) {
+    const sha = await hashFile(sourcePath);
+    if (sha === KOKORO_ONNX_SHA256) return { acceptedBy: 'hash' };
+  }
+
+  // Structural validate via the Rust addon. Lazy require because the addon
+  // pulls in heavy native deps and this module is imported from many places.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { native } = require('./native-bridge');
+    if (native?.addon?.ttsValidateModelFile) {
+      native.addon.ttsValidateModelFile(sourcePath);
+      return { acceptedBy: 'structural' };
+    }
+  } catch (err: any) {
+    throw new Error(
+      `This doesn't look like a Kokoro TTS model. ${err?.message || err || 'Structural validation failed.'}`
+    );
+  }
+
+  throw new Error(
+    "This doesn't look like a Kokoro TTS model. Expected kokoro-v1.0-fp16.onnx (or a renamed copy with matching contents)."
+  );
+}
+
 /** Get the list of importable models with their download URLs (for UI display) */
 export function getImportableModels(): ImportableModelInfo[] {
   const seen = new Set<string>();
@@ -1096,13 +1399,23 @@ export async function importModelFile(
 
   const sourcePath = result.filePaths[0];
   const sourceFilename = path.basename(sourcePath);
+  const ext = path.extname(sourceFilename).toLowerCase();
 
   // Try to match the filename to a known model
   const match = IMPORTABLE_FILES[sourceFilename];
   if (!match) {
-    // Try fuzzy matching — check if filename contains a known pattern
+    // For .onnx files, route through layered Kokoro validation instead of
+    // accepting any unknown ONNX as a TTS model — that previously let arbitrary
+    // ONNX files clobber the canonical kokoro-v1.0-fp16.onnx path.
+    if (ext === '.onnx') {
+      await validateKokoroOnnx(sourcePath);
+      return await copyModelFile(sourcePath, 'tts-model', 'Kokoro 82M TTS');
+    }
+
+    // Try fuzzy matching for non-ONNX formats — check if filename contains a known pattern
     let fuzzyMatch: { modelId: string; label: string; downloadUrl: string } | null = null;
     for (const [knownFile, info] of Object.entries(IMPORTABLE_FILES)) {
+      if (info.modelId === 'tts-model') continue; // ONNX path handled above
       if (sourceFilename.toLowerCase().includes(knownFile.toLowerCase().replace(/\.[^.]+$/, ''))) {
         fuzzyMatch = info;
         break;
@@ -1117,6 +1430,12 @@ export async function importModelFile(
     return await copyModelFile(sourcePath, fuzzyMatch.modelId, fuzzyMatch.label);
   }
 
+  if (match.modelId === 'tts-model') {
+    // Even named-canonically files get the structural sanity check — protects
+    // against name collisions where a non-Kokoro .onnx happens to share the
+    // canonical filename. validateKokoroOnnx fast-accepts the real one.
+    await validateKokoroOnnx(sourcePath);
+  }
   return await copyModelFile(sourcePath, match.modelId, match.label);
 }
 
@@ -1135,22 +1454,35 @@ async function copyModelFile(
 
   const destPath = path.join(modelsDir, destFilename);
 
+  // Same-source guard: piping a file onto itself truncates the source mid-read.
+  // When the user re-imports the canonical file from inside IRONMIC_MODELS_DIR,
+  // there is nothing to do.
+  if (path.resolve(sourcePath) === path.resolve(destPath)) {
+    console.log(`[model-import] Source equals destination, no copy needed: ${destPath}`);
+    return { modelId, label };
+  }
+
   // Verify the source file exists and has reasonable size
   const stats = fs.statSync(sourcePath);
   if (stats.size < 1024) {
     throw new Error(`File is too small (${stats.size} bytes) — this doesn't look like a valid model file.`);
   }
 
-  // Copy the file (streaming to handle large files)
   console.log(`[model-import] Copying ${label} (${(stats.size / 1048576).toFixed(0)} MB) to ${destPath}`);
-  await new Promise<void>((resolve, reject) => {
-    const readStream = fs.createReadStream(sourcePath);
-    const writeStream = fs.createWriteStream(destPath);
-    readStream.pipe(writeStream);
-    writeStream.on('finish', resolve);
-    writeStream.on('error', reject);
-    readStream.on('error', reject);
-  });
+  await pipeline(
+    fs.createReadStream(sourcePath),
+    fs.createWriteStream(destPath),
+  );
+
+  // Verify the post-copy size matches — catches truncated streams that the
+  // pipeline didn't flag. A short copy here is a confusing runtime failure
+  // later, much better to fail fast at import time.
+  const destStats = fs.statSync(destPath);
+  if (destStats.size !== stats.size) {
+    throw new Error(
+      `Copy verification failed: source ${stats.size} bytes, destination ${destStats.size} bytes at ${destPath}`
+    );
+  }
 
   console.log(`[model-import] Successfully imported: ${label}`);
   return { modelId, label };
@@ -1309,16 +1641,27 @@ export async function importModelFromPath(
   sectionFilter: string,
 ): Promise<{ modelId: string; label: string }> {
   const sourceFilename = path.basename(filePath);
+  const sourceExt = path.extname(sourceFilename).toLowerCase();
 
   // Try to match the filename to a known model
   const match = IMPORTABLE_FILES[sourceFilename];
   if (match) {
+    if (match.modelId === 'tts-model') await validateKokoroOnnx(filePath);
     return await copyModelFile(filePath, match.modelId, match.label);
+  }
+
+  // Any unknown .onnx targets the TTS slot — gate it through layered validation
+  // BEFORE fuzzy-matching so a renamed garbage ONNX can't slide through to the
+  // canonical Kokoro destination.
+  if (sourceExt === '.onnx' || sectionFilter === 'tts') {
+    await validateKokoroOnnx(filePath);
+    return await copyModelFile(filePath, 'tts-model', 'Kokoro 82M TTS');
   }
 
   // Try fuzzy matching
   let fuzzyMatch: { modelId: string; label: string; downloadUrl: string } | null = null;
   for (const [knownFile, info] of Object.entries(IMPORTABLE_FILES)) {
+    if (info.modelId === 'tts-model') continue; // ONNX path handled above
     if (sourceFilename.toLowerCase().includes(knownFile.toLowerCase().replace(/\.[^.]+$/, ''))) {
       fuzzyMatch = info;
       break;

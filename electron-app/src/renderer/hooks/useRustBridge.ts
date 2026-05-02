@@ -71,7 +71,27 @@ declare global {
       ttsSetVoice: (voiceId: string) => Promise<void>;
       ttsAvailableVoices: () => Promise<string>;
       ttsLoadModel: () => Promise<void>;
+      ttsGetStreamState: () => Promise<string>;
       isTtsModelReady: () => Promise<boolean>;
+      ttsGetReadiness: (voiceId?: string) => Promise<{
+        ready: boolean;
+        modelPresent: boolean;
+        voicesPresent: boolean;
+        selectedVoicePresent: boolean;
+        selectedVoiceId: string;
+        missingVoices: string[];
+        espeakAvailable: boolean;
+        espeakHint: string | null;
+        modelPath: string;
+        voicesDir: string;
+      }>;
+      onTtsVoicesProgress: (callback: (payload: {
+        id: string;
+        downloaded: number;
+        total: number;
+        status: 'downloading' | 'verifying' | 'verified' | 'error' | 'complete';
+        error?: string;
+      }) => void) => () => void;
       ttsIsLoaded: () => Promise<boolean>;
       ttsToggle: () => Promise<string>;
       // Analytics

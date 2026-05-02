@@ -484,22 +484,39 @@ function AIAssistSettings() {
 // Speech (TTS)
 // ═══════════════════════════════════════════
 
+interface TtsReadiness {
+  ready: boolean;
+  modelPresent: boolean;
+  voicesPresent: boolean;
+  selectedVoicePresent: boolean;
+  selectedVoiceId: string;
+  missingVoices: string[];
+  espeakAvailable: boolean;
+  espeakHint: string | null;
+  modelPath: string;
+  voicesDir: string;
+}
+
 function SpeechSettings() {
   const [autoReadback, setAutoReadback] = useState(false);
   const [voice, setVoice] = useState('af_heart');
   const [speed, setSpeed] = useState(1.0);
   const [voices, setVoices] = useState<any[]>([]);
   const [previewPlaying, setPreviewPlaying] = useState<string | null>(null);
-  const [modelReady, setModelReady] = useState(false);
+  const [readiness, setReadiness] = useState<TtsReadiness | null>(null);
   const [ttsModelDownloaded, setTtsModelDownloaded] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [voicesProgress, setVoicesProgress] = useState<{ id: string; downloaded: number; total: number; status: string } | null>(null);
+  const [voicesProgressCount, setVoicesProgressCount] = useState<{ done: number; total: number }>({ done: 0, total: 15 });
+
+  const modelReady = readiness?.ready ?? false;
 
   useEffect(() => {
     loadTtsSettings();
-    const cleanup = window.ironmic.onModelDownloadProgress((prog: any) => {
+    const cleanupModel = window.ironmic.onModelDownloadProgress((prog: any) => {
       if (prog.model === 'tts-model' || prog.model === 'tts-voices') {
         if (prog.model === 'tts-model') setDownloadProgress(prog.percent);
         if (prog.status === 'complete' && prog.model === 'tts-model') {
@@ -510,24 +527,41 @@ function SpeechSettings() {
         if (prog.status === 'error') { setDownloading(false); setDownloadError(prog.errorDetail || 'TTS model download failed'); setShowImport(true); }
       }
     });
-    return cleanup;
+    const cleanupVoices = (window.ironmic as any).onTtsVoicesProgress?.((prog: any) => {
+      setVoicesProgress(prog);
+      if (prog.status === 'complete' || prog.status === 'verified') {
+        setVoicesProgressCount(c => ({ ...c, done: Math.min(c.total, c.done + 1) }));
+        // After the last voice resolves, refresh readiness so the UI flips green.
+        if (prog.status === 'complete') void loadTtsSettings();
+      }
+    });
+    return () => {
+      cleanupModel();
+      if (typeof cleanupVoices === 'function') cleanupVoices();
+    };
   }, []);
 
   async function loadTtsSettings() {
     const api = window.ironmic;
-    const [rb, v, s, voicesJson, ready, modelsStatus] = await Promise.all([
+    const [rb, v, s, voicesJson, readinessResult, modelsStatus] = await Promise.all([
       api.getSetting('tts_auto_readback'),
       api.getSetting('tts_voice'),
       api.getSetting('tts_speed'),
       api.ttsAvailableVoices(),
-      api.isTtsModelReady(),
+      (api as any).ttsGetReadiness?.(undefined) as Promise<TtsReadiness | undefined> | undefined,
       api.getModelStatus(),
     ]);
     setAutoReadback(rb !== 'false');
-    setModelReady(ready);
+    if (readinessResult) {
+      setReadiness(readinessResult);
+      setVoicesProgressCount({ done: 15 - readinessResult.missingVoices.length, total: 15 });
+    }
     // Check if just the .onnx model file exists (even without voices)
     const ttsStatus = modelsStatus?.files?.['tts-model'] || modelsStatus?.['tts-model'];
-    setTtsModelDownloaded(ready || (ttsStatus?.downloaded === true) || (ttsStatus?.sizeBytes > 0));
+    setTtsModelDownloaded(
+      (readinessResult?.modelPresent ?? false) ||
+      (ttsStatus?.downloaded === true) || (ttsStatus?.sizeBytes > 0)
+    );
     if (v) setVoice(v);
     if (s) setSpeed(parseFloat(s));
     try { setVoices(JSON.parse(voicesJson)); } catch { /* ignore */ }
@@ -587,31 +621,74 @@ function SpeechSettings() {
         )}
       </SectionHeader>
 
-      <Card variant={ttsModelDownloaded ? 'default' : 'highlighted'} padding="md">
+      <Card variant={modelReady ? 'default' : 'highlighted'} padding="md">
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm font-medium text-iron-text">Kokoro 82M</p>
             <p className="text-xs text-iron-text-muted mt-0.5">
               {modelReady
-                ? 'Local TTS engine ready (~165 MB)'
+                ? readiness && !readiness.selectedVoicePresent
+                  ? `Ready — selected voice missing, falling back to af_heart`
+                  : 'Local TTS engine ready (~165 MB)'
                 : ttsModelDownloaded
-                ? 'Model imported — voices will download on first use'
+                ? 'Model imported — click Repair to install missing assets'
                 : 'Download the voice model (~165 MB)'}
             </p>
           </div>
-          {ttsModelDownloaded ? (
-            <StatusBadge status={modelReady ? 'success' : 'warning'} label={modelReady ? 'Ready' : 'Imported'} />
+          {modelReady ? (
+            <StatusBadge status="success" label="Ready" />
           ) : downloading ? (
             <span className="text-xs text-iron-text-muted">{downloadProgress}%</span>
           ) : (
             <button onClick={handleDownloadModel} className="px-3 py-1.5 bg-gradient-accent text-white text-xs font-medium rounded-lg hover:shadow-glow transition-all">
-              Download
+              {ttsModelDownloaded ? 'Repair TTS' : 'Download'}
             </button>
           )}
         </div>
+
+        {readiness && (
+          <div className="mt-3 space-y-1.5 text-[11px] text-iron-text-muted">
+            <div className="flex items-center justify-between">
+              <span>Model file</span>
+              <span className={readiness.modelPresent ? 'text-green-400' : 'text-amber-400'}>
+                {readiness.modelPresent ? 'Installed' : `Missing — ${readiness.modelPath}`}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>Voice pack</span>
+              <span className={readiness.voicesPresent && readiness.missingVoices.length === 0 ? 'text-green-400' : readiness.voicesPresent ? 'text-amber-400' : 'text-red-400'}>
+                {15 - readiness.missingVoices.length}/15 installed
+                {readiness.missingVoices.length > 0 && readiness.missingVoices.length <= 4 && (
+                  <span className="ml-1">(missing: {readiness.missingVoices.join(', ')})</span>
+                )}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>espeak-ng phonemizer</span>
+              <span className={readiness.espeakAvailable ? 'text-green-400' : 'text-red-400'}>
+                {readiness.espeakAvailable ? 'Available' : (readiness.espeakHint || 'Not installed')}
+              </span>
+            </div>
+          </div>
+        )}
+
         {downloading && (
           <div className="mt-2 w-full h-1 bg-iron-surface-active rounded-full overflow-hidden">
             <div className="h-full bg-gradient-accent rounded-full transition-all duration-300" style={{ width: `${downloadProgress}%` }} />
+          </div>
+        )}
+        {voicesProgress && voicesProgress.status !== 'complete' && (
+          <div className="mt-2 text-[11px] text-iron-text-muted">
+            <div className="flex items-center justify-between">
+              <span>Voice {voicesProgressCount.done + 1}/{voicesProgressCount.total} — {voicesProgress.id}</span>
+              <span className={voicesProgress.status === 'error' ? 'text-red-400' : ''}>{voicesProgress.status}</span>
+            </div>
+            <div className="mt-1 w-full h-1 bg-iron-surface-active rounded-full overflow-hidden">
+              <div
+                className="h-full bg-gradient-accent rounded-full transition-all duration-300"
+                style={{ width: voicesProgress.total > 0 ? `${Math.min(100, (voicesProgress.downloaded / voicesProgress.total) * 100)}%` : '0%' }}
+              />
+            </div>
           </div>
         )}
         {downloadError && (

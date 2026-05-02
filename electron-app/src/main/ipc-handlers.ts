@@ -8,7 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { IPC_CHANNELS, MODEL_FILES, TRANSCRIPTION_ENGINES } from '../shared/constants';
 import { native } from './native-bridge';
-import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine, ensureBundledMoonshineBase, isMoonshineBundleAvailable } from './model-downloader';
+import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, getTtsReadiness, ensureBundledVoices, invalidateEspeakCache, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine, ensureBundledMoonshineBase, isMoonshineBundleAvailable } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath } from './ai/LocalLLMAdapter';
 import { llmSubprocess } from './ai/LlmSubprocess';
@@ -392,6 +392,15 @@ export function registerIpcHandlers(): void {
     return downloadModel(model, window);
   });
   ipcMain.handle('ironmic:is-tts-model-ready', () => isTtsModelReady());
+  // Structured readiness — preferred over the boolean above. Accepts an
+  // optional voice ID so the renderer can report selectedVoicePresent. Each
+  // call clears the espeak-ng probe cache so a freshly-installed phonemizer
+  // (e.g. user just ran `brew install espeak-ng` and clicked Repair) is
+  // picked up without an app restart. The probe itself is sub-millisecond.
+  ipcMain.handle('ironmic:tts-get-readiness', (_e, voiceId?: string) => {
+    invalidateEspeakCache();
+    return getTtsReadiness(voiceId);
+  });
 
   // Whisper model & GPU config
   ipcMain.handle('ironmic:get-available-whisper-models', () => native.addon.getAvailableWhisperModels());
@@ -507,7 +516,28 @@ If the text is too short or unclear, output: ["General"]`;
   );
 
   // ── TTS ──
-  ipcMain.handle('ironmic:synthesize-text', (_e, text: string) => native.addon.synthesizeText(text));
+  // Pre-flight readiness gate: every synth call routes through here, including
+  // the SettingsPanel preview button which bypasses the renderer-side store.
+  // Reaching the Rust engine in a non-ready state produced silent crashes
+  // (panic in cpal / ort / poisoned mutex). Now we throw a structured JS error
+  // that the renderer surfaces as a real toast.
+  ipcMain.handle('ironmic:synthesize-text', (_e, text: string) => {
+    const r = getTtsReadiness();
+    if (!r.ready) {
+      let detail: string;
+      if (!r.espeakAvailable) {
+        detail = `espeak-ng phonemizer not installed. ${r.espeakHint || ''}`.trim();
+      } else if (!r.modelPresent && !r.voicesPresent) {
+        detail = `TTS assets missing. Model: ${r.modelPath}; voices: ${r.voicesDir}. Open Settings → Voice Output and click Repair.`;
+      } else if (!r.modelPresent) {
+        detail = `TTS model missing at ${r.modelPath}. Open Settings → Voice Output to download.`;
+      } else {
+        detail = `TTS voice pack incomplete (${r.missingVoices.length} of 15 missing) at ${r.voicesDir}. Open Settings → Voice Output and click Repair.`;
+      }
+      throw new Error(detail);
+    }
+    return native.addon.synthesizeText(text);
+  });
   ipcMain.handle('ironmic:tts-play', () => native.addon.ttsPlay());
   ipcMain.handle('ironmic:tts-pause', () => native.addon.ttsPause());
   ipcMain.handle('ironmic:tts-stop', () => native.addon.ttsStop());
@@ -518,6 +548,11 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle('ironmic:tts-available-voices', () => native.addon.ttsAvailableVoices());
   ipcMain.handle('ironmic:tts-load-model', () => native.addon.ttsLoadModel());
   ipcMain.handle('ironmic:tts-is-loaded', () => native.addon.ttsIsLoaded());
+  // Cumulative streaming state — timestamps + duration grow as background
+  // chunks land. Renderer polls this each animation frame alongside
+  // ttsGetPosition so the live caption fills in word-by-word as new chunks
+  // are synthesized.
+  ipcMain.handle('ironmic:tts-get-stream-state', () => native.addon.ttsGetStreamState());
   ipcMain.handle('ironmic:tts-toggle', () => native.addon.ttsToggle());
 
   // ── AI Chat ──
@@ -740,19 +775,40 @@ If the text is too short or unclear, output: ["General"]`;
     return result;
   };
 
+  // After a TTS-model import we (1) defensively stop any in-flight playback
+  // before swapping the engine, (2) idempotently copy bundled voices, and
+  // (3) await ttsLoadModel so a load failure becomes the import failure.
+  // Throws on engine load failure — surfaces the precise Rust error (now
+  // path-bearing) through the existing import error path. We do NOT trigger
+  // voice downloads here; if voices are still missing the next readiness
+  // check surfaces the Repair CTA.
+  const isTtsModel = (modelId?: string) => modelId === 'tts-model';
+  const refreshTtsAfterImport = async (result: any) => {
+    if (!result || !isTtsModel(result.modelId)) return result;
+    try {
+      try { native.addon.ttsStop(); } catch { /* ignore — playback may not be active */ }
+      ensureBundledVoices();
+      native.addon.ttsLoadModel();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`TTS engine reload failed after import: ${message}`);
+    }
+    return result;
+  };
+
   ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL, async () => {
     const window = BrowserWindow.getFocusedWindow();
-    return refreshWhisperAfterImport(await importModelFile(window));
+    return refreshWhisperAfterImport(await refreshTtsAfterImport(await importModelFile(window)));
   });
   ipcMain.handle('ironmic:get-importable-models', () => {
     return JSON.stringify(getImportableModels());
   });
   ipcMain.handle(IPC_CHANNELS.IMPORT_MODEL_FROM_PATH, async (_event, filePath: string, sectionFilter: string) => {
-    return refreshWhisperAfterImport(await importModelFromPath(filePath, sectionFilter));
+    return refreshWhisperAfterImport(await refreshTtsAfterImport(await importModelFromPath(filePath, sectionFilter)));
   });
   ipcMain.handle(IPC_CHANNELS.IMPORT_MULTI_PART_MODEL, async () => {
     const window = BrowserWindow.getFocusedWindow();
-    return refreshWhisperAfterImport(await importMultiPartModel(window));
+    return refreshWhisperAfterImport(await refreshTtsAfterImport(await importMultiPartModel(window)));
   });
   // Moonshine engines: same end-to-end flow as Whisper import — open dialog,
   // copy files, then reload the active engine so the user can `Switch` to it

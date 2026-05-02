@@ -552,3 +552,63 @@ export const TTS_VOICE_IDS = [
   'bf_alice', 'bf_emma', 'bf_lily',
   'bm_daniel', 'bm_george', 'bm_lewis',
 ];
+
+/**
+ * Per-voice download metadata for the Kokoro 82M voice pack. Bundled in the
+ * installer (see electron-builder.config.js extraResources) and copied into
+ * userData on first launch by ensureBundledVoices(). When a user lands without
+ * bundled voices (dev clone, partial install) the Repair flow downloads them
+ * from Hugging Face. URLs resolve to onnx-community/Kokoro-82M-v1.0-ONNX/voices.
+ *
+ * Each .bin file is float32 [510, 256] = 522,240 bytes. Hashes pinned against
+ * the bundled installer copy; if upstream rotates them this list must update
+ * in lockstep.
+ */
+export interface TtsVoiceMeta {
+  id: string;
+  url: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
+const KOKORO_VOICE_BASE = 'https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/main/voices';
+const KOKORO_VOICE_SIZE = 522240;
+
+export const TTS_VOICES: TtsVoiceMeta[] = [
+  { id: 'af_bella',   url: `${KOKORO_VOICE_BASE}/af_bella.bin`,   sha256: 'f69d836209b78eb8c66e75e3cda491e26ea838a3674257e9d4e5703cbaf55c8b', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'af_heart',   url: `${KOKORO_VOICE_BASE}/af_heart.bin`,   sha256: 'd583ccff3cdca2f7fae535cb998ac07e9fcb90f09737b9a41fa2734ec44a8f0b', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'af_nicole',  url: `${KOKORO_VOICE_BASE}/af_nicole.bin`,  sha256: 'cd2191ab31b914ed7b318416b0e4440fdf392ddad9106a060819aa600a64f59a', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'af_nova',    url: `${KOKORO_VOICE_BASE}/af_nova.bin`,    sha256: '18778272caa0d0eebaea251c35fd635f038434f9eee5e691d02a174bd328414f', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'af_sarah',   url: `${KOKORO_VOICE_BASE}/af_sarah.bin`,   sha256: '4409fbc125afabacc615d94db5398d847006a737b0247d6892b7a9a0007a2f0a', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'af_sky',     url: `${KOKORO_VOICE_BASE}/af_sky.bin`,     sha256: '4435255c9744f3f31659e0d714ab7689bf65d9e77ec1cce060f083912614f0b9', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'am_adam',    url: `${KOKORO_VOICE_BASE}/am_adam.bin`,    sha256: '162b035ed91cfc48b6046982184c645f72edcdd1b82843347f605d7bf7b15716', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'am_fenrir',  url: `${KOKORO_VOICE_BASE}/am_fenrir.bin`,  sha256: 'c27989f741f7ee34d273a39d8a595cc0837d35f5ced9a29b7cc162614616df43', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'am_michael', url: `${KOKORO_VOICE_BASE}/am_michael.bin`, sha256: '1d1f21dd8da39c30705cd4c75d039d265e9bc4a2a93ed09bc9e1b1225eb95ba1', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'bf_alice',   url: `${KOKORO_VOICE_BASE}/bf_alice.bin`,   sha256: '08afa6ba24da61ea5e8efa139e5aadc938d83f0a6da5a900adaf763ac1da5573', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'bf_emma',    url: `${KOKORO_VOICE_BASE}/bf_emma.bin`,    sha256: '669fe0647f9dd04fcab92f1439a40eeb4c8b4ab1f82e4996fe3d918ce4a63b73', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'bf_lily',    url: `${KOKORO_VOICE_BASE}/bf_lily.bin`,    sha256: '5e0ee32ebe64a467124976b14e69590746f1c4ce41a12b587a50c862edfea335', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'bm_daniel',  url: `${KOKORO_VOICE_BASE}/bm_daniel.bin`,  sha256: '6b3194bbceffb746733cbc22c8f593dd44e401a71d53895a2dca891bc595a1e8', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'bm_george',  url: `${KOKORO_VOICE_BASE}/bm_george.bin`,  sha256: 'c4b235a4c1f2cd3b939fed08b899ce9385638b763f7b73a59616c4fc9bd6c9bc', sizeBytes: KOKORO_VOICE_SIZE },
+  { id: 'bm_lewis',   url: `${KOKORO_VOICE_BASE}/bm_lewis.bin`,   sha256: 'b8f671cef828c30e66fdf0b0756a76bba58f6bb3398cbbf27058642acbcedb97', sizeBytes: KOKORO_VOICE_SIZE },
+];
+
+export const KOKORO_DEFAULT_VOICE_ID = 'af_heart';
+
+/**
+ * Pinned SHA-256 of the canonical kokoro-v1.0-fp16.onnx model. Used by the
+ * import path to fast-accept a renamed-but-identical Kokoro file before
+ * falling back to structural validation. Sourced from MODEL_CHECKSUMS.
+ */
+export const KOKORO_ONNX_SHA256 = 'ba4527a874b42b21e35f468c10d326fdff3c7fc8cac1f85e9eb6c0dfc35c334a';
+
+/** Platform-specific install hint for the espeak-ng phonemizer. */
+export function getEspeakInstallHint(platform: NodeJS.Platform | string = process.platform): string {
+  switch (platform) {
+    case 'darwin':
+      return 'Install with: brew install espeak-ng';
+    case 'win32':
+      return 'Download the eSpeak NG installer from https://github.com/espeak-ng/espeak-ng/releases/latest';
+    default:
+      return 'Install with: sudo apt install espeak-ng (or your distro equivalent)';
+  }
+}
