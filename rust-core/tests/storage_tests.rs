@@ -70,6 +70,7 @@ fn sample_new_entry() -> NewEntry {
         polished_text: Some("I think we should use Rust.".into()),
         duration_seconds: Some(3.2),
         source_app: Some("Terminal".into()),
+        ..Default::default()
     }
 }
 
@@ -123,9 +124,7 @@ fn entry_update_polished_text() {
     let entry = store
         .create(NewEntry {
             raw_transcript: "test".into(),
-            polished_text: None,
-            duration_seconds: None,
-            source_app: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -165,9 +164,8 @@ fn entry_list_all() {
         store
             .create(NewEntry {
                 raw_transcript: format!("Entry number {i}"),
-                polished_text: None,
                 duration_seconds: Some(1.0),
-                source_app: None,
+                ..Default::default()
             })
             .unwrap();
     }
@@ -189,9 +187,7 @@ fn entry_list_pagination() {
         store
             .create(NewEntry {
                 raw_transcript: format!("Entry {i}"),
-                polished_text: None,
-                duration_seconds: None,
-                source_app: None,
+                ..Default::default()
             })
             .unwrap();
     }
@@ -253,25 +249,19 @@ fn fts_search_by_transcript() {
     store
         .create(NewEntry {
             raw_transcript: "Kubernetes cluster deployment strategy".into(),
-            polished_text: None,
-            duration_seconds: None,
-            source_app: None,
+            ..Default::default()
         })
         .unwrap();
     store
         .create(NewEntry {
             raw_transcript: "React component lifecycle hooks".into(),
-            polished_text: None,
-            duration_seconds: None,
-            source_app: None,
+            ..Default::default()
         })
         .unwrap();
     store
         .create(NewEntry {
             raw_transcript: "Database migration patterns".into(),
-            polished_text: None,
-            duration_seconds: None,
-            source_app: None,
+            ..Default::default()
         })
         .unwrap();
 
@@ -345,17 +335,13 @@ fn pinned_entries_sort_first() {
     let e1 = store
         .create(NewEntry {
             raw_transcript: "Unpinned entry".into(),
-            polished_text: None,
-            duration_seconds: None,
-            source_app: None,
+            ..Default::default()
         })
         .unwrap();
     let e2 = store
         .create(NewEntry {
             raw_transcript: "Will be pinned".into(),
-            polished_text: None,
-            duration_seconds: None,
-            source_app: None,
+            ..Default::default()
         })
         .unwrap();
 

@@ -144,6 +144,33 @@ pub trait TranscriptionEngine: Send {
         samples: &[f32],
         short: bool,
     ) -> Result<String, IronMicError>;
+
+    // ── Session API (Moonshine streaming) ────────────────────────────────────
+    // Default implementations return "unsupported" so Whisper and NullEngine
+    // compile without changes. `session_reset` is a safe no-op on all engines.
+
+    /// Whether this engine supports the growing-buffer session API.
+    fn supports_session(&self) -> bool { false }
+
+    /// Append new PCM samples to the in-progress session buffer and return
+    /// the current hypothesis (full utterance so far). Lazy-loads the model.
+    fn session_append(&mut self, _samples: &[f32]) -> Result<String, IronMicError> {
+        Err(IronMicError::Transcription(
+            "session_append not supported by this engine".into(),
+        ))
+    }
+
+    /// Finalize the current session utterance. Returns the final text and
+    /// clears (zeros) the session buffer. Lazy-loads the model.
+    fn session_commit(&mut self) -> Result<String, IronMicError> {
+        Err(IronMicError::Transcription(
+            "session_commit not supported by this engine".into(),
+        ))
+    }
+
+    /// Discard the session buffer without emitting text. Safe to call on any
+    /// engine — no-op on engines that don't implement sessions.
+    fn session_reset(&mut self) {}
 }
 
 // ── Moonshine adapter ─────────────────────────────────────────────────────
@@ -159,6 +186,10 @@ mod moonshine_adapter {
         kind: EngineKind,
         variant: MoonshineVariant,
         model: Option<MoonshineModel>,
+        /// Growing audio buffer for the streaming session API. Accumulates
+        /// 16 kHz mono f32 samples for the current utterance. Zeroed and
+        /// cleared on commit and reset to satisfy IronMic's privacy guarantees.
+        session_buffer: Vec<f32>,
     }
 
     impl MoonshineAdapter {
@@ -173,6 +204,7 @@ mod moonshine_adapter {
                 kind,
                 variant,
                 model: None,
+                session_buffer: Vec::new(),
             }
         }
 
@@ -238,6 +270,39 @@ mod moonshine_adapter {
                     IronMicError::Transcription(format!("Moonshine inference failed: {}", e))
                 })?;
             Ok(result.text)
+        }
+
+        fn supports_session(&self) -> bool { true }
+
+        fn session_append(&mut self, new_samples: &[f32]) -> Result<String, IronMicError> {
+            self.load()?;
+            self.session_buffer.extend_from_slice(new_samples);
+            let model = self.model.as_mut().expect("model loaded above");
+            let result = model
+                .transcribe(&self.session_buffer, &TranscribeOptions::default())
+                .map_err(|e| {
+                    IronMicError::Transcription(format!("Moonshine session_append failed: {}", e))
+                })?;
+            Ok(result.text)
+        }
+
+        fn session_commit(&mut self) -> Result<String, IronMicError> {
+            self.load()?;
+            let model = self.model.as_mut().expect("model loaded above");
+            let result = model
+                .transcribe(&self.session_buffer, &TranscribeOptions::default())
+                .map_err(|e| {
+                    IronMicError::Transcription(format!("Moonshine session_commit failed: {}", e))
+                })?;
+            // Zero before clearing — audio privacy guarantee.
+            self.session_buffer.fill(0.0);
+            self.session_buffer.clear();
+            Ok(result.text)
+        }
+
+        fn session_reset(&mut self) {
+            self.session_buffer.fill(0.0);
+            self.session_buffer.clear();
         }
     }
 }
@@ -407,7 +472,8 @@ static ENGINE: LazyLock<Mutex<Box<dyn TranscriptionEngine>>> =
 /// [`transcribe`] calls will lazy-load the new model.
 ///
 /// Idempotent: setting the same kind twice is a no-op (we keep the existing
-/// loaded model rather than reloading).
+/// loaded model rather than reloading). Any in-progress session buffer is
+/// zeroed and cleared before the old engine is replaced.
 pub fn set_active_engine(kind: EngineKind) -> Result<(), IronMicError> {
     let mut slot = ENGINE.lock().map_err(|e| {
         IronMicError::Transcription(format!("engine mutex poisoned: {}", e))
@@ -426,6 +492,8 @@ pub fn set_active_engine(kind: EngineKind) -> Result<(), IronMicError> {
         to = kind.as_str(),
         "swapping active transcription engine"
     );
+    // Zero any in-progress session buffer on the outgoing engine before drop.
+    slot.session_reset();
     *slot = build_engine(kind);
     Ok(())
 }
@@ -462,6 +530,40 @@ pub fn transcribe_active(samples: &[f32], short: bool) -> Result<String, IronMic
         IronMicError::Transcription(format!("engine mutex poisoned: {}", e))
     })?;
     slot.transcribe(samples, short)
+}
+
+// ── Session API helpers (used by lib.rs N-API exports) ───────────────────────
+
+/// Returns true if the active engine supports the growing-buffer session API.
+pub fn active_engine_supports_session() -> bool {
+    ENGINE.lock().map(|e| e.supports_session()).unwrap_or(false)
+}
+
+/// Append PCM samples to the active engine's session buffer and return the
+/// current hypothesis. Only meaningful when [`active_engine_supports_session`]
+/// returns true.
+pub fn session_append_active(samples: &[f32]) -> Result<String, IronMicError> {
+    let mut slot = ENGINE.lock().map_err(|e| {
+        IronMicError::Transcription(format!("engine mutex poisoned: {}", e))
+    })?;
+    slot.session_append(samples)
+}
+
+/// Finalize the active session utterance. Returns final text, zeros + clears
+/// the session buffer.
+pub fn session_commit_active() -> Result<String, IronMicError> {
+    let mut slot = ENGINE.lock().map_err(|e| {
+        IronMicError::Transcription(format!("engine mutex poisoned: {}", e))
+    })?;
+    slot.session_commit()
+}
+
+/// Discard the session buffer without emitting text. No-op on engines that
+/// don't support sessions.
+pub fn session_reset_active() {
+    if let Ok(mut slot) = ENGINE.lock() {
+        slot.session_reset();
+    }
 }
 
 #[cfg(test)]

@@ -20,15 +20,24 @@ pub struct Entry {
     pub is_pinned: bool,
     pub is_archived: bool,
     pub tags: Option<String>,
+    /// Serialized TipTap JSON for the raw side (rich editor state). Null for
+    /// notes created before migration v6 or entries that never went through
+    /// the editor (e.g. pure Whisper output).
+    pub raw_transcript_json: Option<String>,
+    /// Serialized TipTap JSON for the polished side. Null until the user
+    /// hand-edits in polished mode — polish completion writes plaintext only.
+    pub polished_text_json: Option<String>,
 }
 
 /// Parameters for creating a new entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NewEntry {
     pub raw_transcript: String,
     pub polished_text: Option<String>,
     pub duration_seconds: Option<f64>,
     pub source_app: Option<String>,
+    pub raw_transcript_json: Option<String>,
+    pub polished_text_json: Option<String>,
 }
 
 /// Parameters for listing entries.
@@ -48,6 +57,10 @@ pub struct EntryUpdate {
     pub display_mode: Option<String>,
     pub tags: Option<Option<String>>,
     pub source_app: Option<Option<String>>,
+    /// Absent → leave column untouched (preserves prior rich state on partial
+    /// updates like polish completion). Set to `Some(...)` to write a new value.
+    pub raw_transcript_json: Option<String>,
+    pub polished_text_json: Option<String>,
 }
 
 fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
@@ -63,11 +76,13 @@ fn row_to_entry(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
         is_pinned: row.get::<_, i32>(8)? != 0,
         is_archived: row.get::<_, i32>(9)? != 0,
         tags: row.get(10)?,
+        raw_transcript_json: row.get(11)?,
+        polished_text_json: row.get(12)?,
     })
 }
 
 const SELECT_COLS: &str =
-    "id, created_at, updated_at, raw_transcript, polished_text, display_mode, duration_seconds, source_app, is_pinned, is_archived, tags";
+    "id, created_at, updated_at, raw_transcript, polished_text, display_mode, duration_seconds, source_app, is_pinned, is_archived, tags, raw_transcript_json, polished_text_json";
 
 fn get_entry_with_conn(conn: &Connection, id: &str) -> Result<Option<Entry>, IronMicError> {
     let mut stmt = conn
@@ -96,11 +111,12 @@ impl EntryStore {
 
         let conn = self.db.conn();
         conn.execute(
-            "INSERT INTO entries (id, created_at, updated_at, raw_transcript, polished_text, duration_seconds, source_app)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO entries (id, created_at, updated_at, raw_transcript, polished_text, duration_seconds, source_app, raw_transcript_json, polished_text_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 id, now, now,
                 new.raw_transcript, new.polished_text, new.duration_seconds, new.source_app,
+                new.raw_transcript_json, new.polished_text_json,
             ],
         )
         .map_err(|e| IronMicError::Storage(format!("Failed to create entry: {e}")))?;
@@ -137,11 +153,13 @@ impl EntryStore {
             }};
         }
 
-        if let Some(v) = updates.raw_transcript   { push_col!("raw_transcript", v); }
-        if let Some(v) = updates.polished_text     { push_col!("polished_text",  v); }
-        if let Some(v) = updates.display_mode      { push_col!("display_mode",   v); }
-        if let Some(v) = updates.tags              { push_col!("tags",           v); }
-        if let Some(v) = updates.source_app        { push_col!("source_app",     v); }
+        if let Some(v) = updates.raw_transcript        { push_col!("raw_transcript",      v); }
+        if let Some(v) = updates.polished_text         { push_col!("polished_text",       v); }
+        if let Some(v) = updates.display_mode          { push_col!("display_mode",        v); }
+        if let Some(v) = updates.tags                  { push_col!("tags",                v); }
+        if let Some(v) = updates.source_app            { push_col!("source_app",          v); }
+        if let Some(v) = updates.raw_transcript_json   { push_col!("raw_transcript_json", v); }
+        if let Some(v) = updates.polished_text_json    { push_col!("polished_text_json",  v); }
 
         // id is the final bind parameter
         params.push(Box::new(id.to_string()));
@@ -189,9 +207,16 @@ impl EntryStore {
                 Some(false) => "AND e.is_archived = 0",
                 None => "",
             };
+            // Build the column list with the e. alias so it slots into the
+            // JOIN query. Reusing SELECT_COLS here keeps this site in lock-step
+            // with row_to_entry whenever new columns are added.
+            let aliased_cols: String = SELECT_COLS
+                .split(',')
+                .map(|c| format!("e.{}", c.trim()))
+                .collect::<Vec<_>>()
+                .join(", ");
             let query = format!(
-                "SELECT e.id, e.created_at, e.updated_at, e.raw_transcript, e.polished_text,
-                        e.display_mode, e.duration_seconds, e.source_app, e.is_pinned, e.is_archived, e.tags
+                "SELECT {aliased_cols}
                  FROM entries e
                  JOIN entries_fts ON entries_fts.rowid = e.rowid
                  WHERE entries_fts MATCH ?1 {archived_filter}
@@ -303,6 +328,7 @@ mod tests {
             polished_text: Some("Hello world, this is a test.".into()),
             duration_seconds: Some(2.5),
             source_app: Some("VSCode".into()),
+            ..Default::default()
         }
     }
 
@@ -361,9 +387,8 @@ mod tests {
             store
                 .create(NewEntry {
                     raw_transcript: format!("Entry {i}"),
-                    polished_text: None,
                     duration_seconds: Some(1.0),
-                    source_app: None,
+                    ..Default::default()
                 })
                 .unwrap();
         }
@@ -381,9 +406,7 @@ mod tests {
             store
                 .create(NewEntry {
                     raw_transcript: format!("Entry {i}"),
-                    polished_text: None,
-                    duration_seconds: None,
-                    source_app: None,
+                    ..Default::default()
                 })
                 .unwrap();
         }
@@ -412,8 +435,8 @@ mod tests {
     #[test]
     fn fts_search() {
         let store = test_store();
-        store.create(NewEntry { raw_transcript: "Kubernetes deployment strategy".into(), polished_text: None, duration_seconds: None, source_app: None }).unwrap();
-        store.create(NewEntry { raw_transcript: "React component testing".into(), polished_text: None, duration_seconds: None, source_app: None }).unwrap();
+        store.create(NewEntry { raw_transcript: "Kubernetes deployment strategy".into(), ..Default::default() }).unwrap();
+        store.create(NewEntry { raw_transcript: "React component testing".into(), ..Default::default() }).unwrap();
 
         let results = store.list(ListOptions { limit: 10, offset: 0, search: Some("Kubernetes".into()), ..Default::default() }).unwrap();
         assert_eq!(results.len(), 1);
@@ -447,12 +470,47 @@ mod tests {
     #[test]
     fn pinned_entries_first() {
         let store = test_store();
-        let e1 = store.create(NewEntry { raw_transcript: "First".into(), polished_text: None, duration_seconds: None, source_app: None }).unwrap();
-        let _e2 = store.create(NewEntry { raw_transcript: "Second".into(), polished_text: None, duration_seconds: None, source_app: None }).unwrap();
+        let e1 = store.create(NewEntry { raw_transcript: "First".into(), ..Default::default() }).unwrap();
+        let _e2 = store.create(NewEntry { raw_transcript: "Second".into(), ..Default::default() }).unwrap();
 
         store.pin(&e1.id, true).unwrap();
 
         let entries = store.list(ListOptions { limit: 10, offset: 0, ..Default::default() }).unwrap();
         assert!(entries[0].is_pinned);
+    }
+
+    #[test]
+    fn rich_json_round_trip() {
+        let store = test_store();
+        let json_blob = r#"{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Hello"}]},{"type":"paragraph","content":[{"type":"text","marks":[{"type":"bold"}],"text":"World"}]}]}"#;
+        let entry = store
+            .create(NewEntry {
+                raw_transcript: "Hello\n\nWorld".into(),
+                raw_transcript_json: Some(json_blob.into()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let fetched = store.get(&entry.id).unwrap().unwrap();
+        assert_eq!(fetched.raw_transcript_json.as_deref(), Some(json_blob));
+        assert!(fetched.polished_text_json.is_none());
+
+        // Update polished_text_json without touching raw_transcript_json — the
+        // raw side must survive untouched. This is the polish-write semantic.
+        let polished_blob = r#"{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"Polished."}]}]}"#;
+        store
+            .update(
+                &entry.id,
+                EntryUpdate {
+                    polished_text: Some(Some("Polished.".into())),
+                    polished_text_json: Some(polished_blob.into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let after = store.get(&entry.id).unwrap().unwrap();
+        assert_eq!(after.raw_transcript_json.as_deref(), Some(json_blob));
+        assert_eq!(after.polished_text_json.as_deref(), Some(polished_blob));
     }
 }

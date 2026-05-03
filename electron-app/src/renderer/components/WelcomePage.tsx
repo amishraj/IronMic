@@ -58,12 +58,20 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
 
   async function loadStatus() {
     try {
-      const [status, hk, ttsReady, allEntries] = await Promise.all([
+      const [status, hk, ttsReadinessRaw, allEntries] = await Promise.all([
         window.ironmic.getModelStatus(),
         window.ironmic.getSetting('hotkey_record'),
-        window.ironmic.isTtsModelReady(),
+        // Prefer structured readiness so onboarding can distinguish
+        // "model missing" from "voices missing" / "espeak missing".
+        ((window.ironmic as any).ttsGetReadiness?.(undefined) ??
+          window.ironmic.isTtsModelReady().then((b: boolean) => ({ ready: b, modelPresent: b }))),
         window.ironmic.listEntries({ limit: 1, offset: 0, archived: false }),
       ]);
+      const ttsReadiness = ttsReadinessRaw as { ready: boolean; modelPresent: boolean } | undefined;
+      // A user who has the model file on disk but is missing voices / espeak
+      // shouldn't see "Download" — surfacing the .onnx as "downloaded" is the
+      // right onboarding signal; Settings handles the rest.
+      const ttsDownloaded = ttsReadiness?.modelPresent ?? ttsReadiness?.ready ?? false;
       if (hk) setHotkey(hk.replace('CommandOrControl', 'Cmd'));
       setEntryCount(allEntries?.length ?? 0);
 
@@ -88,7 +96,7 @@ export function WelcomePage({ onNavigate }: WelcomePageProps) {
           required: false,
         },
         tts: {
-          downloaded: ttsReady,
+          downloaded: ttsDownloaded,
           sizeLabel: '~170 MB',
           name: 'Kokoro 82M',
           purpose: 'Text-to-Speech',

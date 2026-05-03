@@ -115,6 +115,12 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     analyticsGetUnclassifiedEntries: () => '[]',
     analyticsSaveEntryTopics: () => {},
     analyticsGetUnclassifiedCount: () => 0,
+    // Moonshine streaming session API stubs (returns sensible no-ops so the
+    // app works against older addon builds — canStream gate prevents use)
+    moonshineSessionSupports: () => false,
+    moonshineSessionAppend: async () => '',
+    moonshineSessionCommit: async () => '',
+    moonshineSessionReset: () => {},
     // Meeting recording stubs (Granola mode)
     startRecordingFromDevice: () => {},
     drainRecordingBuffer: () => Buffer.alloc(0),
@@ -216,6 +222,26 @@ export const native = {
     }
     try { return JSON.parse(this.addon.nativeFeatures()); }
     catch { return { whisper: false, metal: false, llm: false, tts: false, platform: process.platform, arch: process.arch, stub: true }; }
+  },
+
+  // ── Moonshine streaming session API ────────────────────────────────────────
+  // Optional — only present in builds compiled with the engine-multi feature.
+  // DictationStreamer checks moonshineSessionSupports() before using these.
+  moonshineSessionSupports(): boolean {
+    return typeof this.addon.moonshineSessionSupports === 'function'
+      ? this.addon.moonshineSessionSupports()
+      : false;
+  },
+  moonshineSessionAppend(buffer: Buffer): Promise<string> {
+    return this.addon.moonshineSessionAppend(buffer);
+  },
+  moonshineSessionCommit(): Promise<string> {
+    return this.addon.moonshineSessionCommit();
+  },
+  moonshineSessionReset(): void {
+    if (typeof this.addon.moonshineSessionReset === 'function') {
+      this.addon.moonshineSessionReset();
+    }
   },
 
   // Audio devices

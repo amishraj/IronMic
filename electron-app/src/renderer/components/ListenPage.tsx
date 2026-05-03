@@ -1,19 +1,17 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef } from 'react';
 import { Volume2, Play, Pause, Square, Trash2, Info } from 'lucide-react';
 import { useTtsStore } from '../stores/useTtsStore';
+import { useListenStore, ListenEntry } from '../stores/useListenStore';
 import { HighlightedText } from './HighlightedText';
 import { Card } from './ui';
 
-interface ListenEntry {
-  id: string;
-  text: string;
-  createdAt: number;
-}
-
 export function ListenPage() {
   const [input, setInput] = useState('');
-  const [entries, setEntries] = useState<ListenEntry[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const entries = useListenStore((s) => s.entries);
+  const addEntry = useListenStore((s) => s.addEntry);
+  const removeEntry = useListenStore((s) => s.removeEntry);
 
   const {
     state: ttsState, timestamps, currentTimeMs, activeEntryId, durationMs,
@@ -23,12 +21,7 @@ export function ListenPage() {
   const handleSubmit = () => {
     const text = input.trim();
     if (!text) return;
-    const entry: ListenEntry = {
-      id: Date.now().toString(),
-      text,
-      createdAt: Date.now(),
-    };
-    setEntries((prev) => [entry, ...prev]);
+    const entry = addEntry(text);
     setInput('');
     // Auto-play immediately
     synthesizeAndPlay(text, entry.id);
@@ -53,7 +46,7 @@ export function ListenPage() {
 
   const handleRemoveEntry = (id: string) => {
     if (activeEntryId === id) stop();
-    setEntries((prev) => prev.filter((e) => e.id !== id));
+    removeEntry(id);
   };
 
   const progressPercent = durationMs > 0 ? Math.min((currentTimeMs / durationMs) * 100, 100) : 0;

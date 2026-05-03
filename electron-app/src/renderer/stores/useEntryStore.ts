@@ -271,6 +271,11 @@ export const useEntryStore = create<EntryStore>((set, get) => ({
 
       // Single round-trip: write polishedText AND displayMode='polished' so
       // Notes/Timeline see a consistent record after one event broadcast.
+      // IMPORTANT: do NOT include `polishedTextJson` here. Polish output is
+      // plaintext; if the user previously hand-edited the polished side and
+      // we wrote a JSON column, that rich state would be silently destroyed
+      // every time they re-polished. Omitting the field tells the napi layer
+      // to leave the column untouched (Option<String>::None → no SET clause).
       const updated = await window.ironmic.updateEntry(id, {
         polishedText: polishedTrim,
         displayMode: 'polished',

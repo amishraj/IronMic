@@ -44,13 +44,17 @@ interface DictationState {
   chunkSeq: number;
   /** Text of the most recent chunk — the bit to append to the editor. */
   lastChunkText: string;
+  /** Live hypothesis from the Moonshine session API — shown as a muted preview
+   *  below the editor while recording, cleared when an utterance commits. */
+  draftHypothesis: string;
 
   /** Set by Layout when the user clicks the mic shield from another page.
    *  DictatePage reads + clears this on mount to auto-start recording. */
   pendingQuickStart: boolean;
 
-  /** Set by Layout so NoteEditor starts a blank note instead of loading the
-   *  most-recent entry. Consumed (cleared) by NoteEditor on mount. */
+  /** Set by Layout (mic shield / global hotkey / tray Quick Start Dictation)
+   *  so DictatePage starts a blank note instead of rehydrating the stale
+   *  draft. Consumed (cleared) by DictatePage's resetToBlankNote() helper. */
   newNoteRequested: boolean;
 
   setNotebook: (id: string) => void;
@@ -118,6 +122,7 @@ export const useDictationStore = create<DictationState>((set, get) => ({
   chunkCount: 0,
   chunkSeq: 0,
   lastChunkText: '',
+  draftHypothesis: '',
   pendingQuickStart: false,
   newNoteRequested: false,
 
@@ -130,6 +135,7 @@ export const useDictationStore = create<DictationState>((set, get) => ({
     chunkCount: 0,
     chunkSeq: 0,
     lastChunkText: '',
+    draftHypothesis: '',
   }),
 
   start: async ({ computedTitle, defaultPlainText }) => {
@@ -251,6 +257,10 @@ if (typeof window !== 'undefined' && (window as any).ironmic) {
       // We keep entryId/fullText populated so UI can show "just finished".
     }
   });
+  api.onDictationStreamDraft?.((payload: { hypothesis: string }) => {
+    useDictationStore.setState({ draftHypothesis: payload.hypothesis });
+  });
+
   api.onDictationStreamChunk?.((payload: { index: number; text: string; isFinal: boolean }) => {
     if (!payload.text) {
       // eslint-disable-next-line no-console
@@ -266,6 +276,7 @@ if (typeof window !== 'undefined' && (window as any).ironmic) {
       chunkCount: prev.chunkCount + 1,
       chunkSeq: prev.chunkSeq + 1,
       lastChunkText: payload.text,
+      draftHypothesis: '',
     });
     // Persist accumulated plain text to the entry even if the editor isn't
     // mounted. If the user is on the page, DictatePage's debounced save will

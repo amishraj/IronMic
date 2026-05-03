@@ -1,22 +1,23 @@
 /**
- * DictationStreamer — chunked near-real-time dictation.
+ * DictationStreamer — near-real-time dictation with engine-aware transcription.
  *
- * Problem with single-shot dictation: the user had to stop talking and wait
- * for the whole buffer to transcribe before seeing any text. Feels laggy.
+ * Two transcription paths are selected at start() based on the active engine:
  *
- * Solution: same stop-restart chunk pattern the MeetingRecorder uses, but
- * with a much shorter chunk interval (~2.5s). Text appears in the editor
- * every couple of seconds as the user speaks, rather than all at the end.
+ * 1. runStreamingSession() — Moonshine + session API available
+ *    Drains audio every 200ms into a growing Rust session buffer. Moonshine
+ *    re-transcribes the full accumulated utterance on each append and returns
+ *    a live hypothesis. On 1.0s of silence (or 20s cap), the utterance is
+ *    committed as permanent text and the session resets for the next utterance.
+ *    Silence is measured from actual drained audio duration, not tick count.
+ *    No chunk boundaries → no mid-word cuts.
  *
- * Trade-offs:
- *   - Whisper accuracy degrades slightly on very short clips. 2.5s is the
- *     practical floor before quality noticeably drops; words that straddle
- *     a chunk boundary may occasionally get misheard. Good enough for a
- *     notes workflow where the user is actively watching the screen.
- *   - The final chunk on stop captures the tail-end. No data is lost.
+ * 2. runChunkedMode(intervalMs) — Whisper or Moonshine without session API
+ *    Self-scheduling drain loop (not setInterval) to prevent overlapping calls.
+ *    Moonshine: 5000ms chunks + 800ms audio overlap with conservative dedup.
+ *    Whisper:   8000ms chunks + transcribeShort single_segment hint.
  *
- * We co-exist with the existing single-shot flow (useRecordingStore) — this
- * path is only taken when the renderer calls `startDictationStreaming`.
+ * Meetings use a completely separate MeetingRecorderManager — this file is
+ * dictation-only.
  */
 
 import { BrowserWindow } from 'electron';
@@ -27,30 +28,33 @@ import {
   sanitizeTranscribedText,
   transcribeWithTimeout,
   computeRmsPcm16,
+  stripOverlapPrefix,
 } from './transcribe-clean';
 import { audioStream } from './audio-stream-manager';
 import { debugLog } from './debug-log';
 
-/** Same timeout rationale as MeetingRecorder — don't let a hung Whisper call
- *  stall the 2.5s chunk loop. Dictation chunks are smaller so the timeout is
- *  tighter — 12s is well beyond legitimate transcribe time for 2.5s audio. */
 const TRANSCRIBE_TIMEOUT_MS = 8_000;
-// 20s on the first chunk — covers Moonshine ONNX session warm-up (~1–3s on
-// a slow VDI) plus Whisper users on small/base models (the active engine is
-// selectable via Settings → Audio → Transcription Engine). If you hit this
-// repeatedly, you're probably on a Whisper engine on a CPU without BLAS —
-// switch to Moonshine Base, which transcribes a 2.5s clip in ~150ms even on
-// a contended VDI. Pre-Phase-1 the value was 120s for Whisper Large v3 Turbo;
-// the new default engine doesn't need that headroom.
 const FIRST_TRANSCRIBE_TIMEOUT_MS = 20_000;
 
+// Session streaming constants
+const SESSION_DRAIN_INTERVAL_MS = 200;
+const SESSION_CAP_MS = 20_000;
+const SESSION_SILENCE_COMMIT_MS = 1_000;
+
+// Chunked mode constants (engine-aware intervals chosen at start())
+const MOONSHINE_CHUNK_INTERVAL_MS = 5_000;
+const WHISPER_CHUNK_INTERVAL_MS = 8_000;
+// 800ms overlap at 16kHz PCM16 (2 bytes/sample)
+const MOONSHINE_OVERLAP_BYTES = 16_000 * 2 * 0.8;
+
 export interface DictationChunkEvent {
-  /** Monotonically increasing index, starting at 0 for the first chunk. */
   index: number;
-  /** Raw transcribed text for this chunk (may be empty on silence). */
   text: string;
-  /** True when this is the final chunk emitted on stop. */
   isFinal: boolean;
+}
+
+export interface DictationDraftEvent {
+  hypothesis: string;
 }
 
 export interface DictationStreamState {
@@ -59,20 +63,17 @@ export interface DictationStreamState {
   chunkCount: number;
 }
 
-/** Chunk interval — balance between latency and Whisper accuracy. */
-const CHUNK_INTERVAL_MS = 2500;
+/** Resolves after `ms` milliseconds. */
+function sleep(ms: number): Promise<void> {
+  return new Promise(r => setTimeout(r, ms));
+}
 
 class DictationStreamer {
-  private chunkTimer: ReturnType<typeof setInterval> | null = null;
-  private isProcessingChunk = false;
+  private streamLoopPromise: Promise<void> | null = null;
   private chunkIndex = 0;
-  private state: DictationStreamState = {
-    status: 'idle',
-    startedAt: null,
-    chunkCount: 0,
-  };
+  private state: DictationStreamState = { status: 'idle', startedAt: null, chunkCount: 0 };
   private fullText = '';
-  private whisperReady = false;
+  private cleanupDone = false;
 
   isActive(): boolean {
     return this.state.status !== 'idle';
@@ -86,39 +87,55 @@ class DictationStreamer {
     if (this.state.status !== 'idle') {
       throw new Error('Dictation is already active');
     }
-    // Claim exclusive audio stream ownership before starting capture.
+
+    this.cleanupDone = false;
+    this.chunkIndex = 0;
+    this.fullText = '';
+
     audioStream.acquire('streaming');
     try {
-      if (!this.whisperReady && typeof native.addon.loadWhisperModel === 'function') {
+      if (typeof native.addon.loadWhisperModel === 'function') {
         native.addon.loadWhisperModel();
-        this.whisperReady = true;
       }
       native.addon.startRecording();
       debugLog('capture.start', { owner: 'streaming', success: true });
     } catch (err: any) {
       debugLog('capture.start', { owner: 'streaming', success: false, error: err?.message ?? String(err) });
       audioStream.release('streaming');
-      // Handle "already recording" — reset + retry once.
       if (err?.message?.includes('already')) {
         try { native.addon.resetPipelineState?.(); } catch { /* ignore */ }
-        try {
-          native.addon.startRecording();
-          debugLog('capture.start', { owner: 'streaming', success: true, retried: true });
-        } catch (retryErr) {
-          throw retryErr;
-        }
+        try { native.addon.startRecording(); } catch (retryErr) { throw retryErr; }
       } else {
         throw err;
       }
     }
 
-    this.chunkIndex = 0;
-    this.fullText = '';
     this.state = { status: 'recording', startedAt: Date.now(), chunkCount: 0 };
     this.pushState();
 
-    // Kick off the periodic drain loop.
-    this.chunkTimer = setInterval(() => { void this.processChunk(); }, CHUNK_INTERVAL_MS);
+    // Determine which path to use for this session.
+    const engineKind = (() => {
+      try { return native.getTranscriptionEngine?.() ?? 'moonshine-base'; }
+      catch { return 'moonshine-base'; }
+    })();
+    const isMoonshine = engineKind.startsWith('moonshine');
+    const canStream = isMoonshine
+      && typeof native.addon.moonshineSessionAppend === 'function'
+      && typeof native.addon.drainRecordingBuffer === 'function'
+      && (native.addon.moonshineSessionSupports?.() ?? false);
+
+    debugLog('dictation.start', { engineKind, isMoonshine, canStream });
+
+    const intervalMs = isMoonshine ? MOONSHINE_CHUNK_INTERVAL_MS : WHISPER_CHUNK_INTERVAL_MS;
+
+    this.streamLoopPromise = (
+      canStream
+        ? this.runStreamingSession()
+        : this.runChunkedMode(intervalMs, isMoonshine)
+    ).catch((err) => {
+      console.error('[DictationStreamer] loop exited with error:', err);
+      this.finalizeNativeState();
+    });
   }
 
   async stop(): Promise<{ text: string; chunkCount: number }> {
@@ -129,146 +146,271 @@ class DictationStreamer {
     this.state = { ...this.state, status: 'stopping' };
     this.pushState();
 
-    if (this.chunkTimer) {
-      clearInterval(this.chunkTimer);
-      this.chunkTimer = null;
-    }
+    // Wait for the loop to process the final drain and commit, then clean up.
+    await this.streamLoopPromise;
+    this.streamLoopPromise = null;
+    this.finalizeNativeState();
 
-    try {
-      // Wait for any in-flight chunk transcription to settle so we don't
-      // double-run native.stopRecording.
-      let waited = 0;
-      while (this.isProcessingChunk && waited < 5000) {
-        await new Promise(r => setTimeout(r, 50));
-        waited += 50;
-      }
-      try { await this.processChunk(true /* isFinal */); }
-      catch (err) { console.error('[DictationStreamer] Final chunk failed:', err); }
-
-      return { text: this.fullText.trim(), chunkCount: this.chunkIndex };
-    } finally {
-      // Belt-and-braces: ensure the native recorder is stopped even if
-      // processChunk(true) didn't reach the stop branch.
-      try { native.addon.stopRecording(); } catch { /* already stopped */ }
-      audioStream.release('streaming');
-      this.state = { status: 'idle', startedAt: null, chunkCount: 0 };
-      this.pushState();
-    }
+    return { text: this.fullText.trim(), chunkCount: this.chunkIndex };
   }
 
-  /**
-   * Drain the audio buffer by stop→restart, transcribe the drained audio,
-   * append the text to the running transcript, and push an event to the
-   * renderer. On isFinal, we do NOT restart.
-   */
-  private async processChunk(isFinal = false): Promise<void> {
-    if (this.isProcessingChunk && !isFinal) return;
-    if (this.state.status === 'idle') return;
-    this.isProcessingChunk = true;
+  // ── Moonshine streaming session path ──────────────────────────────────────
 
-    try {
+  private async runStreamingSession(): Promise<void> {
+    let silentAudioMs = 0;
+    let sessionHasContent = false;
+    let sessionAudioMs = 0;
+
+    // Reset any leftover state from a previous session.
+    native.addon.moonshineSessionReset?.();
+
+    while (this.state.status === 'recording') {
+      await sleep(SESSION_DRAIN_INTERVAL_MS);
+      if (this.state.status !== 'recording') break;
+
       let audioBuffer: Buffer;
       try {
-        audioBuffer = isFinal || typeof native.addon.drainRecordingBuffer !== 'function'
-          ? native.addon.stopRecording()
-          : native.addon.drainRecordingBuffer();
-        debugLog('capture.drained', {
-          chunkIndex: this.chunkIndex,
-          byteLength: audioBuffer.length,
-          rms: computeRmsPcm16(audioBuffer),
-          isFinal,
-          path: isFinal ? 'stopRecording' : 'drainRecordingBuffer',
-        });
-      } catch (err: any) {
-        console.warn('[DictationStreamer] Failed to drain recording chunk:', err);
-        debugLog('capture.drained', { chunkIndex: this.chunkIndex, isFinal, error: err?.message ?? String(err) });
-        return;
+        audioBuffer = native.addon.drainRecordingBuffer!();
+      } catch (err) {
+        debugLog('session.drain.error', { error: String(err) });
+        continue;
       }
+      if (!audioBuffer || audioBuffer.length < 500) continue;
 
-      if (!isFinal && typeof native.addon.drainRecordingBuffer !== 'function') {
-        // Immediately restart to keep capture gap-free.
-        try { native.addon.startRecording(); }
-        catch (err) {
-          console.error('[DictationStreamer] Failed to restart after chunk drain:', err);
-          this.state = { ...this.state, status: 'idle' };
-          this.pushState();
-          return;
+      const silent = isAudioSilent(audioBuffer);
+      const bufferAudioMs = (audioBuffer.length / 2 / 16_000) * 1_000;
+      debugLog('session.drain', {
+        byteLength: audioBuffer.length,
+        rms: computeRmsPcm16(audioBuffer),
+        silent,
+        sessionAudioMs,
+        silentAudioMs,
+      });
+
+      if (silent) {
+        silentAudioMs += bufferAudioMs;
+        if (sessionHasContent && silentAudioMs >= SESSION_SILENCE_COMMIT_MS) {
+          await this.commitSessionAndClearDraft(false);
+          sessionHasContent = false;
+          sessionAudioMs = 0;
+          silentAudioMs = 0;
         }
+        // Do NOT append silent audio to the session.
+        continue;
       }
 
-      // ── Silence / low-energy gate (RMS-based) ──
-      // Whisper hallucinates aggressively on silent audio. Skip the native
-      // call entirely if the chunk is below the noise floor — both saves
-      // CPU AND prevents "Thank you." / "[BLANK_AUDIO]" garbage from
-      // appearing in the editor.
-      if (isAudioSilent(audioBuffer)) {
-        if (isFinal) this.emitChunk('', true);
-        return;
-      }
+      // Speech detected — reset silence accumulator, track audio duration.
+      silentAudioMs = 0;
+      sessionHasContent = true;
+      sessionAudioMs += (audioBuffer.length / 2 / 16_000) * 1_000;
 
-      // Timeout-guarded transcribe so a hung Whisper call can't freeze the
-      // 2.5s chunk loop. On timeout we drop the chunk and carry on.
-      //
-      // transcribe_short forces single_segment=true, which is correct for
-      // streaming 2.5s chunks but WRONG for the final flush at stop time —
-      // that buffer can be 10–30s of remaining audio, and forcing one giant
-      // segment makes Whisper much slower (and on slow CPUs, hits the
-      // timeout). Final chunks must use plain transcribe(), which lets
-      // whisper.cpp internally chunk the audio.
-      const useShort = !isFinal && typeof native.addon.transcribeShort === 'function';
-      const transcribeFn = useShort ? native.addon.transcribeShort : native.addon.transcribe;
-      const whisperStart = Date.now();
-      // Capture the active engine kind so each per-chunk log makes it
-      // immediately obvious which speech-recognition model produced the
-      // text. Falls back to 'unknown' if the older Rust addon doesn't
-      // export getTranscriptionEngine yet.
-      const engineKind = (() => {
-        try { return native.getTranscriptionEngine?.() ?? 'unknown'; }
-        catch { return 'unknown'; }
-      })();
-      debugLog('whisper.in', { engine: engineKind, chunkIndex: this.chunkIndex, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000, short: useShort, isFinal });
-      let rawText: string | null = null;
+      let hypothesis: string;
       try {
-        rawText = await transcribeWithTimeout(
-          Promise.resolve(transcribeFn(audioBuffer)),
-          this.chunkIndex === 0 ? FIRST_TRANSCRIBE_TIMEOUT_MS : TRANSCRIBE_TIMEOUT_MS,
-          'DictationStreamer.transcribe',
-        );
-        debugLog('whisper.raw', { engine: engineKind, chunkIndex: this.chunkIndex, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart });
-      } catch (err: any) {
-        debugLog('whisper.error', { engine: engineKind, chunkIndex: this.chunkIndex, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
-        throw err;
-      }
-      if (rawText == null) {
-        if (isFinal) this.emitChunk('', true);
-        return;
+        // No timeout wrapper — this call is strictly serialized. A JS timeout
+        // would not cancel the in-flight Rust inference, corrupting session state.
+        hypothesis = await native.addon.moonshineSessionAppend!(audioBuffer);
+        debugLog('session.append', { hypothesis: hypothesis.slice(0, 80), sessionAudioMs });
+      } catch (err) {
+        console.error('[DictationStreamer] session_append failed, aborting session:', err);
+        debugLog('session.append.error', { error: String(err) });
+        this.emitDraft('');
+        native.addon.moonshineSessionReset?.();
+        sessionHasContent = false;
+        sessionAudioMs = 0;
+        break;
       }
 
-      // Shared text hygiene — bracket markers, repetition loops, exact
-      // hallucinations. Same filter as the meeting pipeline.
-      const cleaned = sanitizeTranscribedText(rawText);
+      const cleaned = sanitizeTranscribedText(hypothesis);
+      this.emitDraft(cleaned);
+
+      // 20s session cap — commit proactively to keep latency bounded.
+      if (sessionAudioMs >= SESSION_CAP_MS) {
+        debugLog('session.cap', { sessionAudioMs });
+        await this.commitSessionAndClearDraft(false);
+        sessionHasContent = false;
+        sessionAudioMs = 0;
+        silentAudioMs = 0;
+      }
+    }
+
+    // ── Final drain after loop exits (status = stopping) ──────────────────
+    // Capture any audio accumulated since the last 400ms tick.
+    let appendedFinalAudio = false;
+    try {
+      const finalBuffer = native.addon.drainRecordingBuffer!();
+      if (finalBuffer && finalBuffer.length >= 500 && !isAudioSilent(finalBuffer)) {
+        try {
+          const hyp = await native.addon.moonshineSessionAppend!(finalBuffer);
+          const cleaned = sanitizeTranscribedText(hyp);
+          if (cleaned) this.emitDraft(cleaned);
+          appendedFinalAudio = true;
+          debugLog('session.final-drain', { byteLength: finalBuffer.length, hypothesis: hyp.slice(0, 80) });
+        } catch { /* best effort — commit whatever is in session */ }
+      }
+    } catch { /* ignore drain errors on stop */ }
+
+    // Stop capture AFTER final drain so no audio is lost.
+    try { native.addon.stopRecording(); } catch { /* already stopped */ }
+
+    if (sessionHasContent || appendedFinalAudio) {
+      await this.commitSessionAndClearDraft(true);
+    } else {
+      this.emitDraft('');
+    }
+    native.addon.moonshineSessionReset?.();
+  }
+
+  private async commitSessionAndClearDraft(isFinalStop: boolean): Promise<void> {
+    this.emitDraft('');
+    try {
+      const finalText = await native.addon.moonshineSessionCommit!();
+      const cleaned = sanitizeTranscribedText(finalText);
+      debugLog('session.commit', { cleaned: cleaned.slice(0, 80), isFinalStop });
       if (cleaned) {
         this.fullText = (this.fullText + ' ' + cleaned).replace(/\s+/g, ' ').trim();
+        this.chunkIndex += 1;
+        this.state = { ...this.state, chunkCount: this.chunkIndex };
+        this.emitChunk(cleaned, isFinalStop);
       }
-
-      this.chunkIndex += 1;
-      this.state = { ...this.state, chunkCount: this.chunkIndex };
-      this.emitChunk(cleaned, isFinal);
-    } finally {
-      this.isProcessingChunk = false;
+    } catch (err) {
+      console.error('[DictationStreamer] session_commit failed:', err);
+      debugLog('session.commit.error', { error: String(err) });
+      native.addon.moonshineSessionReset?.();
     }
   }
 
-  private emitChunk(text: string, isFinal: boolean): void {
-    const payload: DictationChunkEvent = {
-      index: this.chunkIndex,
-      text,
+  // ── Chunked mode (Whisper or Moonshine fallback) ───────────────────────────
+
+  private async runChunkedMode(intervalMs: number, isMoonshine: boolean): Promise<void> {
+    let overlapBuffer: Buffer = Buffer.alloc(0);
+    let previousChunkText = '';
+    let isFirstChunk = true;
+
+    while (this.state.status === 'recording') {
+      await sleep(intervalMs);
+      if (this.state.status !== 'recording') break;
+
+      await this.processChunkBatch(false, isMoonshine, isFirstChunk, overlapBuffer, previousChunkText,
+        (newOverlap, newPrevText) => {
+          overlapBuffer = newOverlap;
+          previousChunkText = newPrevText;
+        });
+      isFirstChunk = false;
+    }
+
+    // Final chunk on stop.
+    await this.processChunkBatch(true, isMoonshine, false, overlapBuffer, previousChunkText, () => {});
+  }
+
+  private async processChunkBatch(
+    isFinal: boolean,
+    isMoonshine: boolean,
+    isFirst: boolean,
+    overlapBuffer: Buffer,
+    previousChunkText: string,
+    updateOverlap: (newOverlap: Buffer, newPrevText: string) => void,
+  ): Promise<void> {
+    let audioBuffer: Buffer;
+    try {
+      audioBuffer = isFinal || typeof native.addon.drainRecordingBuffer !== 'function'
+        ? native.addon.stopRecording()
+        : native.addon.drainRecordingBuffer();
+      debugLog('capture.drained', {
+        chunkIndex: this.chunkIndex,
+        byteLength: audioBuffer.length,
+        rms: computeRmsPcm16(audioBuffer),
+        isFinal,
+      });
+    } catch (err: any) {
+      debugLog('capture.drained', { chunkIndex: this.chunkIndex, isFinal, error: err?.message ?? String(err) });
+      return;
+    }
+
+    if (!isFinal && typeof native.addon.drainRecordingBuffer !== 'function') {
+      try { native.addon.startRecording(); } catch { /* ignore */ }
+    }
+
+    if (isAudioSilent(audioBuffer)) {
+      if (isFinal) this.emitChunk('', true);
+      return;
+    }
+
+    // Moonshine chunked: prepend overlap from previous chunk for context.
+    let transcribeBuffer = audioBuffer;
+    if (isMoonshine && overlapBuffer.length > 0) {
+      transcribeBuffer = Buffer.concat([overlapBuffer, audioBuffer]);
+    }
+
+    const engineKind = (() => {
+      try { return native.getTranscriptionEngine?.() ?? 'unknown'; } catch { return 'unknown'; }
+    })();
+    const useShort = !isFinal && !isMoonshine && typeof native.addon.transcribeShort === 'function';
+    const transcribeFn = useShort ? native.addon.transcribeShort : native.addon.transcribe;
+
+    debugLog('whisper.in', {
+      engine: engineKind,
+      chunkIndex: this.chunkIndex,
+      byteLength: transcribeBuffer.length,
+      durationSec: transcribeBuffer.length / 2 / 16_000,
+      short: useShort,
       isFinal,
-    };
+      hasOverlap: isMoonshine && overlapBuffer.length > 0,
+    });
+
+    const timeoutMs = isFirst ? FIRST_TRANSCRIBE_TIMEOUT_MS : TRANSCRIBE_TIMEOUT_MS;
+    const rawText = await transcribeWithTimeout(
+      Promise.resolve(transcribeFn(transcribeBuffer)),
+      timeoutMs,
+      'DictationStreamer.transcribeChunk',
+    );
+    debugLog('whisper.raw', { engine: engineKind, chunkIndex: this.chunkIndex, rawText: rawText ?? '<null/timeout>' });
+
+    if (rawText == null) {
+      if (isFinal) this.emitChunk('', true);
+      return;
+    }
+
+    let cleaned = sanitizeTranscribedText(rawText);
+
+    // Strip overlap region from output if we prepended context.
+    if (isMoonshine && overlapBuffer.length > 0 && previousChunkText && cleaned) {
+      cleaned = stripOverlapPrefix(previousChunkText, cleaned);
+    }
+
+    // Save new overlap tail (Moonshine only) for the next chunk.
+    if (isMoonshine && !isFinal) {
+      const overlapBytes = Math.floor(MOONSHINE_OVERLAP_BYTES);
+      const newOverlap = audioBuffer.length > overlapBytes
+        ? audioBuffer.slice(audioBuffer.length - overlapBytes)
+        : audioBuffer;
+      updateOverlap(newOverlap, cleaned || previousChunkText);
+    }
+
+    if (cleaned) {
+      this.fullText = (this.fullText + ' ' + cleaned).replace(/\s+/g, ' ').trim();
+    }
+    this.chunkIndex += 1;
+    this.state = { ...this.state, chunkCount: this.chunkIndex };
+    this.emitChunk(cleaned, isFinal);
+  }
+
+  // ── Shared emit helpers ───────────────────────────────────────────────────
+
+  private emitChunk(text: string, isFinal: boolean): void {
+    const payload: DictationChunkEvent = { index: this.chunkIndex, text, isFinal };
     debugLog('chunk.emit', payload);
     const w = BrowserWindow.getAllWindows()[0];
     if (w && !w.isDestroyed()) {
       w.webContents.send(IPC_CHANNELS.DICTATION_STREAM_CHUNK, payload);
+    }
+  }
+
+  private emitDraft(hypothesis: string): void {
+    const payload: DictationDraftEvent = { hypothesis };
+    debugLog('draft.emit', { hypothesis: hypothesis.slice(0, 80) });
+    const w = BrowserWindow.getAllWindows()[0];
+    if (w && !w.isDestroyed()) {
+      w.webContents.send(IPC_CHANNELS.DICTATION_STREAM_DRAFT, payload);
     }
   }
 
@@ -278,9 +420,20 @@ class DictationStreamer {
       w.webContents.send(IPC_CHANNELS.DICTATION_STREAM_STATE, this.state);
     }
   }
-}
 
-// (Legacy inline sanitizer removed — replaced by the shared implementation
-// in ./transcribe-clean, which adds RMS gating + repetition-loop detection.)
+  // ── Cleanup ───────────────────────────────────────────────────────────────
+
+  /** Idempotent cleanup — safe to call from both stop() and error handler. */
+  private finalizeNativeState(): void {
+    if (this.cleanupDone) return;
+    this.cleanupDone = true;
+    this.emitDraft('');
+    try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+    try { native.addon.stopRecording(); } catch { /* already stopped */ }
+    audioStream.release('streaming');
+    this.state = { status: 'idle', startedAt: null, chunkCount: 0 };
+    this.pushState();
+  }
+}
 
 export const dictationStreamer = new DictationStreamer();

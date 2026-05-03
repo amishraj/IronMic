@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -133,6 +133,10 @@ impl Database {
 
         if current_version < 5 {
             self.migrate_v5(&conn)?;
+        }
+
+        if current_version < 6 {
+            self.migrate_v6(&conn)?;
         }
 
         // Update version
@@ -497,6 +501,24 @@ impl Database {
         .map_err(|e| IronMicError::Storage(format!("Migration v5 failed: {e}")))?;
 
         info!("Migration v5 applied: transcript_segments table and meeting session extensions");
+        Ok(())
+    }
+
+    /// Migration v6: Add nullable rich-text JSON columns to entries so the editor
+    /// can round-trip TipTap formatting (paragraphs, headings, bold, lists, etc.)
+    /// instead of having every save flatten back to plaintext. The existing
+    /// raw_transcript / polished_text columns continue to hold plaintext (FTS
+    /// source, timeline previews, Whisper output, polish input/output).
+    fn migrate_v6(&self, conn: &Connection) -> Result<(), IronMicError> {
+        conn.execute_batch(
+            "
+            ALTER TABLE entries ADD COLUMN raw_transcript_json TEXT;
+            ALTER TABLE entries ADD COLUMN polished_text_json TEXT;
+            ",
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v6 failed: {e}")))?;
+
+        info!("Migration v6 applied: rich-text JSON columns on entries");
         Ok(())
     }
 

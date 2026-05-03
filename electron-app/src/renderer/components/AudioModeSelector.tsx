@@ -160,34 +160,56 @@ export function AudioModeSelector({ selectedDevice, onDeviceChange }: Props) {
         </div>
 
         {/* Inline warning: selected device is a virtual/loopback one.
-            BlackHole by itself does NOT capture system audio — audio only flows
-            into it if the user has set their system output to a Multi-Output
-            Device that includes BlackHole. Without that step Whisper gets
-            silence and hallucinates ("Thank you. Thank you."). */}
+            On macOS: BlackHole by itself does NOT capture system audio — audio
+            only flows into it if the user routed their system output through it.
+            On Windows: CABLE Output captures participants/system audio only —
+            the physical mic is never included unless mixed externally. */}
         {selectedDevice && VIRTUAL_RE.test(selectedDevice) && (
           <div className="text-[10px] text-amber-400/90 bg-amber-500/5 border border-amber-500/20 rounded-md px-2 py-1.5 flex items-start gap-1.5 leading-snug">
             <AlertCircle className="w-2.5 h-2.5 mt-0.5 shrink-0" />
             <div className="space-y-0.5">
-              <p className="font-medium">
-                Heads up: {selectedDevice} only captures audio that is <em>routed into it</em>.
-              </p>
-              <p className="text-iron-text-muted">
-                If you also want to hear the audio, open{' '}
-                <button
-                  onClick={() => window.ironmic?.blackholeOpenAudioMidiSetup?.()}
-                  className="underline text-amber-400 hover:text-amber-300"
-                >
-                  Audio MIDI Setup
-                </button>
-                {' '}and either (a) create a Multi-Output Device (Speakers + BlackHole) and set it as your Mac's system output, or (b) create an Aggregate Device (Mic + BlackHole) to capture both yourself and others.
-                {' '}
-                <button
-                  onClick={() => setShowSetup(true)}
-                  className="underline hover:text-amber-300"
-                >
-                  Open setup guide →
-                </button>
-              </p>
+              {isWindows ? (
+                <>
+                  <p className="font-medium">
+                    Heads up: {selectedDevice} captures participants/system audio only.
+                  </p>
+                  <p className="text-iron-text-muted">
+                    Your physical mic is <em>not</em> included unless you mix it in externally.
+                    For "me + others," use <strong className="text-amber-400">Voicemeeter</strong> to
+                    route both mic and participants into a single virtual output, or enable{' '}
+                    <strong className="text-amber-400">Stereo Mix</strong> if your sound card supports it.{' '}
+                    <button
+                      onClick={() => setShowSetup(true)}
+                      className="underline hover:text-amber-300"
+                    >
+                      Open setup guide →
+                    </button>
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="font-medium">
+                    Heads up: {selectedDevice} only captures audio that is <em>routed into it</em>.
+                  </p>
+                  <p className="text-iron-text-muted">
+                    If you also want to hear the audio, open{' '}
+                    <button
+                      onClick={() => window.ironmic?.blackholeOpenAudioMidiSetup?.()}
+                      className="underline text-amber-400 hover:text-amber-300"
+                    >
+                      Audio MIDI Setup
+                    </button>
+                    {' '}and either (a) create a Multi-Output Device (Speakers + BlackHole) and set it as your Mac's system output, or (b) create an Aggregate Device (Mic + BlackHole) to capture both yourself and others.
+                    {' '}
+                    <button
+                      onClick={() => setShowSetup(true)}
+                      className="underline hover:text-amber-300"
+                    >
+                      Open setup guide →
+                    </button>
+                  </p>
+                </>
+              )}
             </div>
           </div>
         )}

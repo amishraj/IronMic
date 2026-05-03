@@ -326,10 +326,10 @@ class MeetingNotesCollabServerManager {
 
   private persistNotes(notes: string): void {
     if (!this.sessionId) return;
-    // Generic note collab (from NotesPage) uses sessionIds prefixed with
-    // "note:<id>". Those are client-side notes stored in localStorage — the
-    // renderer handles persistence when it receives the 'saved' broadcast.
-    // Skip the meetings-DB write to avoid creating orphan meeting rows.
+    // Generic note collab uses sessionIds prefixed with "note:<id>". Those
+    // are client-side notes stored in localStorage — the renderer handles
+    // persistence when it receives the 'saved' broadcast. Skip the
+    // meetings-DB write to avoid creating orphan meeting rows.
     if (this.sessionId.startsWith('note:')) return;
     try {
       native.addon.meetingSetStructuredOutput(

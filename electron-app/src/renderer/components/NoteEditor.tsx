@@ -16,10 +16,19 @@ import {
   ChevronDown, Volume2, Pause,
 } from 'lucide-react';
 import { useTtsStore } from '../stores/useTtsStore';
+import { NoteTtsCaption } from './NoteTtsCaption';
 
 export function NoteEditor() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const currentEntryId = useRef<string | null>(null);
+  const [activeNoteId, setActiveNoteIdState] = useState<string | null>(null);
+  // Single setter that keeps the ref (read by async save callbacks) and the
+  // state (read by render — the play button needs to know which note is
+  // currently loaded so it can compare against the TTS store's activeEntryId).
+  const setNoteId = useCallback((id: string | null) => {
+    currentEntryId.current = id;
+    setActiveNoteIdState(id);
+  }, []);
   const [wordCount, setWordCount] = useState(0);
   const [charCount, setCharCount] = useState(0);
   const [saved, setSaved] = useState(true);
@@ -70,10 +79,10 @@ export function NoteEditor() {
           durationSeconds: undefined,
           sourceApp: 'IronMic Editor',
         } as any);
-        currentEntryId.current = entry.id;
+        setNoteId(entry.id);
       }
     } catch (err) { console.error('Failed to save note:', err); }
-  }, []);
+  }, [setNoteId]);
 
   useEffect(() => {
     if (!editor) return;
@@ -83,7 +92,7 @@ export function NoteEditor() {
     const { newNoteRequested } = useDictationStore.getState();
     if (newNoteRequested) {
       useDictationStore.setState({ newNoteRequested: false });
-      currentEntryId.current = null;
+      setNoteId(null);
       editor.commands.setContent('');
       setWordCount(0);
       setCharCount(0);
@@ -94,7 +103,7 @@ export function NoteEditor() {
       try {
         const entries = await window.ironmic.listEntries({ limit: 1, offset: 0, archived: false });
         if (entries.length > 0 && editor) {
-          currentEntryId.current = entries[0].id;
+          setNoteId(entries[0].id);
           editor.commands.setContent(entries[0].rawTranscript || '');
           const t = editor.getText();
           setWordCount(t.trim() ? t.trim().split(/\s+/).length : 0);
@@ -109,7 +118,7 @@ export function NoteEditor() {
   useEffect(() => {
     if (!editor) return;
     const handler = () => {
-      currentEntryId.current = null;
+      setNoteId(null);
       editor.commands.setContent('');
       editor.commands.focus();
       setWordCount(0);
@@ -206,8 +215,13 @@ export function NoteEditor() {
         <Separator />
 
         {/* TTS Playback */}
-        <EditorPlayButton editor={editor} />
+        <EditorPlayButton editor={editor} noteId={activeNoteId} />
       </div>
+
+      {/* Live caption strip — appears while THIS note is being read aloud.
+          Implements word-by-word highlighting since TipTap's rich-text doc
+          can't be highlighted in-place without invasive Decoration plumbing. */}
+      <NoteTtsCaption noteId={activeNoteId} />
 
       {/* Bubble menu — appears on text selection */}
       {editor && (
@@ -333,42 +347,74 @@ function BlockTypeDropdown({ editor }: { editor: any }) {
 
 /* ─── Editor Play Button ─── */
 
-function EditorPlayButton({ editor }: { editor: any }) {
-  const { state, synthesizeAndPlay, pause, play } = useTtsStore();
-  const isPlaying = state === 'playing';
-  const isSynthesizing = state === 'synthesizing';
+/**
+ * Read-aloud button for the currently-loaded note.
+ *
+ * State machine:
+ *  - `THIS` note is the active TTS target AND playing → button shows Pause.
+ *  - `THIS` note is the active TTS target AND paused  → button shows Play (resumes).
+ *  - `THIS` note is the active TTS target AND synthesizing → spinner.
+ *  - Some OTHER note is currently playing, OR nothing is → button shows
+ *    "Read aloud". Clicking it tears down the previous synth (the store's
+ *    synthesizeAndPlay always calls ttsStop first) and starts fresh on this
+ *    note's text. This matches the requested UX: switching notes mid-playback
+ *    does NOT show pause/stop on the new note; clicking play replaces the
+ *    active stream.
+ */
+function EditorPlayButton({ editor, noteId }: { editor: any; noteId: string | null }) {
+  const { state, synthesizeAndPlay, pause, play, activeEntryId } = useTtsStore();
+  const isThisNote = !!noteId && activeEntryId === noteId;
+  const isPlayingThis = isThisNote && state === 'playing';
+  const isPausedThis = isThisNote && state === 'paused';
+  const isSynthThis = isThisNote && state === 'synthesizing';
 
   const handleClick = async () => {
-    if (isPlaying) {
+    if (isPlayingThis) {
       await pause();
-    } else if (state === 'paused') {
+      return;
+    }
+    if (isPausedThis) {
       await play();
-    } else {
-      const text = editor?.getText() || '';
-      if (text.trim()) {
-        await synthesizeAndPlay(text);
-      }
+      return;
+    }
+    // Either nothing is playing, or a DIFFERENT note is playing. Either way:
+    // start fresh synthesis for this note. The store's synthesizeAndPlay
+    // calls ttsStop() internally before kicking off, so any previous stream
+    // is replaced cleanly.
+    const text = editor?.getText() || '';
+    if (text.trim()) {
+      await synthesizeAndPlay(text, noteId || undefined);
     }
   };
+
+  const Icon = isPlayingThis ? Pause : Volume2;
+  const title = isPlayingThis
+    ? 'Pause'
+    : isPausedThis
+    ? 'Resume'
+    : isThisNote
+    ? 'Read aloud'
+    : activeEntryId
+    ? 'Read aloud (replaces current playback)'
+    : 'Read aloud';
 
   return (
     <button
       onClick={handleClick}
-      disabled={isSynthesizing}
-      title={isPlaying ? 'Pause' : 'Read aloud'}
+      disabled={isSynthThis}
+      title={title}
       className={`p-1.5 rounded-md transition-all ${
-        isPlaying
-          ? 'bg-iron-accent/15 text-iron-accent-light'
+        isPlayingThis || isPausedThis
+          ? 'bg-emerald-500/15 text-emerald-400'
           : 'text-iron-text-muted hover:text-iron-text-secondary hover:bg-iron-surface-hover'
       } disabled:opacity-40`}
     >
-      {isSynthesizing ? (
-        <div className="w-3.5 h-3.5 border-2 border-iron-accent border-t-transparent rounded-full animate-spin" />
-      ) : isPlaying ? (
-        <Pause className="w-3.5 h-3.5" />
+      {isSynthThis ? (
+        <div className="w-3.5 h-3.5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
       ) : (
-        <Volume2 className="w-3.5 h-3.5" />
+        <Icon className="w-3.5 h-3.5" />
       )}
     </button>
   );
 }
+

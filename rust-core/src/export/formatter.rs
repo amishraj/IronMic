@@ -159,6 +159,8 @@ mod tests {
             is_pinned: false,
             is_archived: false,
             tags: Some(r#"["work","meeting"]"#.to_string()),
+            raw_transcript_json: None,
+            polished_text_json: None,
         };
         let md = entry_to_markdown(&entry);
         assert!(md.contains("# Dictation"));
@@ -181,6 +183,8 @@ mod tests {
             is_pinned: false,
             is_archived: false,
             tags: None,
+            raw_transcript_json: None,
+            polished_text_json: None,
         };
         assert_eq!(entry_to_plain_text(&entry), "raw text");
     }

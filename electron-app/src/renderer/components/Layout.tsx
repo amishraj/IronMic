@@ -8,7 +8,6 @@ import { RecordingIndicator } from './RecordingIndicator';
 import { Timeline } from './Timeline';
 import { SettingsPanel } from './SettingsPanel';
 import { AIChat } from './AIChat';
-import { NotesPage } from './NotesPage';
 import { SearchPage } from './SearchPage';
 import { WelcomePage } from './WelcomePage';
 import { ListenPage } from './ListenPage';
@@ -31,7 +30,7 @@ import micRecording from '../assets/mic-recording.png';
 import micProcessing from '../assets/mic-processing.png';
 import micSuccess from '../assets/mic-success.png';
 
-type Page = 'home' | 'main' | 'ai' | 'dictate' | 'listen' | 'notes' | 'search' | 'analytics' | 'meetings' | 'settings';
+type Page = 'home' | 'main' | 'ai' | 'dictate' | 'listen' | 'search' | 'analytics' | 'meetings' | 'settings';
 
 interface NavItem {
   id: Page;
@@ -44,10 +43,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'home', label: 'Home', icon: Home, section: 'core' },
   { id: 'main', label: 'Timeline', icon: List, section: 'core' },
   { id: 'ai', label: 'AI Assistant', icon: Sparkles, section: 'core' },
-  // Notes = the canonical dictation-integrated note page (renders DictatePage).
-  // The standalone "Dictate" nav item was removed because it pointed at the
-  // same workflow with a confusingly different label.
-  { id: 'notes', label: 'Notes', icon: StickyNote, section: 'tools' },
+  { id: 'dictate', label: 'Notes', icon: StickyNote, section: 'tools' },
   { id: 'listen', label: 'Listen', icon: Volume2, section: 'tools' },
   { id: 'search', label: 'Search', icon: Search, section: 'tools' },
   { id: 'analytics', label: 'Analytics', icon: BarChart3, section: 'tools' },
@@ -65,6 +61,10 @@ export function Layout() {
   const { state: recordingState } = useRecordingStore();
   const isGranolaRecording = useMeetingStore(s => s.isGranolaRecording);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
+  // Streaming-dictation status drives the mic shield exactly like meeting
+  // recording does — without this, the icon stays idle/grey while the user
+  // is dictating because useRecordingStore is the legacy non-streaming pipe.
+  const dictationStatus = useDictationStore(s => s.status);
   const { loadSettings, aiEnabled } = useSettingsStore();
   const { refresh } = useEntryStore();
   const pageRef = useRef(page);
@@ -80,20 +80,38 @@ export function Layout() {
 
   const handleRecord = useCallback(() => {
     const currentPage = pageRef.current;
+    const status = useDictationStore.getState().status;
 
-    if (currentPage === 'notes' || currentPage === 'dictate') {
-      // Already on the notes page — toggle dictation via the event bus that
-      // DictatePage listens to. handleDictateToggle handles start/stop itself.
-      window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+    // Debounce: ignore presses while the pipeline is winding down.
+    if (status === 'stopping') return;
+
+    if (status === 'recording') {
+      // Stop the active recording. Never set newNoteRequested here — that
+      // would wipe the in-flight note when the user is just trying to stop.
+      if (currentPage === 'dictate') {
+        window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+      } else {
+        setPage('dictate');
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+        }, 60);
+      }
       return;
     }
 
-    // From any other page: navigate to notes with a blank-note flag so
-    // NoteEditor doesn't load the previous entry, and a quick-start flag so
-    // DictatePage (if on 'dictate') auto-starts. Both flags persist in the
-    // store until consumed by the respective component on mount.
+    // status === 'idle' — fresh-note path.
     useDictationStore.setState({ pendingQuickStart: true, newNoteRequested: true });
-    setPage('notes');
+    if (currentPage === 'dictate') {
+      // Already on the page — DictatePage's quick-action handler will see
+      // newNoteRequested === true, reset to a blank note, then toggle
+      // dictation on. Defer to next tick so React commits the state set above.
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+      }, 0);
+    } else {
+      // Navigate; DictatePage's editor-ready effect consumes both flags on mount.
+      setPage('dictate');
+    }
   }, []);
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
@@ -133,9 +151,9 @@ export function Layout() {
   useEffect(() => {
     if (successTimerRef.current) clearTimeout(successTimerRef.current);
 
-    if (recordingState === 'recording' || isGranolaRecording) {
+    if (recordingState === 'recording' || isGranolaRecording || dictationStatus === 'recording') {
       setMicVisualState('recording');
-    } else if (recordingState === 'processing' || processingMeetings.length > 0) {
+    } else if (recordingState === 'processing' || processingMeetings.length > 0 || dictationStatus === 'stopping') {
       setMicVisualState('processing');
     } else if (recordingState === 'idle') {
       // If we were processing, show success briefly
@@ -147,7 +165,7 @@ export function Layout() {
       }
       refresh();
     }
-  }, [recordingState, isGranolaRecording, processingMeetings.length]);
+  }, [recordingState, isGranolaRecording, processingMeetings.length, dictationStatus]);
 
   useEffect(() => {
     if (!aiEnabled && page === 'ai') setPage('home');
@@ -200,7 +218,7 @@ export function Layout() {
   useEffect(() => {
     const handler = (e: Event) => {
       const target = (e as CustomEvent).detail as string;
-      if (['home', 'main', 'ai', 'dictate', 'listen', 'notes', 'search', 'analytics', 'meetings', 'settings'].includes(target)) {
+      if (['home', 'main', 'ai', 'dictate', 'listen', 'search', 'analytics', 'meetings', 'settings'].includes(target)) {
         setPage(target as Page);
       }
     };
@@ -233,12 +251,9 @@ export function Layout() {
   useEffect(() => {
     const unsub = window.ironmic?.onQuickAction?.((action) => {
       if (action === 'start-dictation') {
-        setPage('dictate');
-        // Fire the intent on the next tick so DictatePage has mounted and
-        // registered its listener before we dispatch.
-        setTimeout(() => {
-          window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
-        }, 60);
+        // Same status-gated semantics as the mic shield + global hotkey:
+        // idle → fresh blank note + auto-start, recording → stop, stopping → ignore.
+        handleRecord();
       } else if (action === 'start-meeting') {
         setPage('meetings');
         setTimeout(() => {
@@ -247,7 +262,7 @@ export function Layout() {
       }
     });
     return () => { try { unsub?.(); } catch { /* noop */ } };
-  }, []);
+  }, [handleRecord]);
 
   const handleNavigate = useCallback((p: string) => setPage(p as Page), []);
 
@@ -351,10 +366,7 @@ export function Layout() {
             </ErrorBoundary>
           )}
           {page === 'ai' && <AIChat />}
-          {/* Notes IS the dictation experience — both routes render DictatePage
-              so tray quick-actions and legacy nav both land users in the
-              canonical entries-backed note surface. */}
-          {(page === 'dictate' || page === 'notes') && (
+          {page === 'dictate' && (
             <ErrorBoundary label="Notes">
               <DictatePage />
             </ErrorBoundary>

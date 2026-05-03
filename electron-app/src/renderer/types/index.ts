@@ -12,6 +12,12 @@ export interface Entry {
   isPinned: boolean;
   isArchived: boolean;
   tags: string | null; // JSON array string
+  /** Serialized TipTap JSON for the raw side (rich editor state). Null for
+   *  notes that predate v6 or never went through the editor (pure Whisper output). */
+  rawTranscriptJson: string | null;
+  /** Serialized TipTap JSON for the polished side. Null until the user
+   *  hand-edits in polished mode — polish completion writes plaintext only. */
+  polishedTextJson: string | null;
 }
 
 export interface NewEntry {
@@ -19,6 +25,8 @@ export interface NewEntry {
   polishedText: string | null;
   durationSeconds: number | null;
   sourceApp: string | null;
+  rawTranscriptJson?: string | null;
+  polishedTextJson?: string | null;
 }
 
 export interface EntryUpdate {
@@ -26,6 +34,11 @@ export interface EntryUpdate {
   polishedText?: string | null;
   displayMode?: 'raw' | 'polished';
   tags?: string | null;
+  /** Absent → leave column untouched. Setting one of these on a polish update
+   *  would clobber the user's hand-edited rich state — the polish writer must
+   *  omit these fields. */
+  rawTranscriptJson?: string;
+  polishedTextJson?: string;
 }
 
 export interface ListOptions {
