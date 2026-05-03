@@ -1,19 +1,31 @@
 import { Mic, Loader2, MicOff } from 'lucide-react';
 import { useRecordingStore } from '../stores/useRecordingStore';
 import { useMeetingStore } from '../stores/useMeetingStore';
+import { useDictationStore } from '../stores/useDictationStore';
 
 export function RecordingIndicator() {
   const { state, error } = useRecordingStore();
   const isGranolaRecording = useMeetingStore(s => s.isGranolaRecording);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
+  // Streaming dictation lives in its own store — the legacy useRecordingStore
+  // stays idle for the streaming pipeline, so without this the top-bar pill
+  // shows "Idle" while the user is actively dictating.
+  const dictationStatus = useDictationStore(s => s.status);
 
-  // Meeting pipeline (Granola mode) overrides dictation state when active —
-  // the top bar should reflect whichever capture/inference is actually running.
+  // Whichever capture/inference is actually running wins. Meeting (Granola)
+  // and streaming dictation are independent pipelines; either should drive
+  // the indicator out of idle.
   let effectiveState: 'idle' | 'recording' | 'processing' = state;
   let effectiveLabel: string | null = null;
   if (isGranolaRecording) {
     effectiveState = 'recording';
     effectiveLabel = 'Meeting';
+  } else if (dictationStatus === 'recording') {
+    effectiveState = 'recording';
+    effectiveLabel = 'Dictating';
+  } else if (dictationStatus === 'stopping') {
+    effectiveState = 'processing';
+    effectiveLabel = 'Finalizing';
   } else if (processingMeetings.length > 0 && state === 'idle') {
     effectiveState = 'processing';
     effectiveLabel = 'Generating notes';

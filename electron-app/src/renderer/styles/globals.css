@@ -265,6 +265,18 @@
   content: none;
 }
 
+/* TTS read-back: highlights the currently-spoken word in place. Driven by
+ * TtsHighlightExtension which wraps the active word in an inline decoration.
+ * Color matches the Listen page / Timeline highlight (iron-accent blue) for
+ * visual consistency across the three TTS surfaces. */
+.ProseMirror .tts-active-word {
+  background-color: rgb(var(--iron-accent) / 0.2);
+  color: rgb(var(--iron-accent-light));
+  border-radius: 3px;
+  padding: 0 2px;
+  transition: background-color 80ms linear;
+}
+
 /* Headings */
 .ProseMirror h1 { font-size: 1.875rem; font-weight: 700; margin-bottom: 1rem; margin-top: 2rem; color: rgb(var(--iron-text)); line-height: 1.2; }
 .ProseMirror h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem; margin-top: 1.5rem; color: rgb(var(--iron-text)); line-height: 1.25; }

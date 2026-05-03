@@ -39,6 +39,7 @@ import {
   Loader2, Sparkles, Save,
 } from 'lucide-react';
 import { useTtsStore } from '../stores/useTtsStore';
+import { TtsHighlightExtension } from './TtsHighlightExtension';
 import { useDictationStore } from '../stores/useDictationStore';
 import { useMeetingStore } from '../stores/useMeetingStore';
 import { useToastStore } from '../stores/useToastStore';
@@ -204,6 +205,11 @@ export function DictatePage() {
   }, [entryId]);
 
   const { state: ttsState, synthesizeAndPlay, stop: ttsStop, toggle: ttsToggle } = useTtsStore();
+  // Live read-back position — subscribed individually so the polling tick
+  // (currentTimeMs every ~16ms) doesn't re-render anything else in the page.
+  const ttsTimestamps = useTtsStore((s) => s.timestamps);
+  const ttsCurrentTimeMs = useTtsStore((s) => s.currentTimeMs);
+  const ttsActiveEntryId = useTtsStore((s) => s.activeEntryId);
 
   // Cross-feature guards: we block conflicting mic actions rather than letting
   // them race the native audio device. Dictation and meeting recording both
@@ -251,7 +257,16 @@ export function DictatePage() {
     });
   }, [windowNarrow]);
 
-  const draft = useRef(loadDraft());
+  // Snapshot newNoteRequested at mount so the editor's initial `content` is
+  // empty when Layout requested a fresh note (mic shield / global hotkey /
+  // tray Quick Start Dictation). Without this, the stale draft loads via the
+  // synchronous useRef initializer below before any effect can intervene.
+  const newNoteAtMountRef = useRef(useDictationStore.getState().newNoteRequested);
+  const draft = useRef(
+    newNoteAtMountRef.current
+      ? (clearDraft(), null)
+      : loadDraft()
+  );
 
   const editor = useEditor({
     extensions: [
@@ -263,6 +278,7 @@ export function DictatePage() {
       Link.configure({ openOnClick: false, HTMLAttributes: { class: '' } }),
       Typography,
       DraftHypothesisExtension,
+      TtsHighlightExtension,
     ],
     content: draft.current?.html || '',
     editorProps: { attributes: { class: 'focus:outline-none' } },
@@ -463,6 +479,47 @@ export function DictatePage() {
     editor.commands.setDraftHypothesis(status === 'recording' ? draftHypothesis : '');
   }, [editor, draftHypothesis, status]);
 
+  /** Wipe page state back to a fresh, empty note. Used when the user clicks
+   *  the mic shield / presses the global hotkey / picks tray "Quick Start
+   *  Dictation" and `newNoteRequested` is set on the store. Cancels any
+   *  in-flight save and bumps the save revision so a stale debounce can't
+   *  later overwrite the new blank entry. */
+  const resetToBlankNote = useCallback(() => {
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    saveRevRef.current += 1;
+
+    clearDraft();
+    draft.current = null;
+    storeReset();
+    // storeReset preserves notebookId by design (so navigating in/out of
+    // Notes keeps your active notebook). For a fresh-note request we want
+    // the new note to land in the user's default ("My Notes") notebook,
+    // not whichever notebook the previously-open note belonged to.
+    useDictationStore.setState({ notebookId: getDefaultNotebookId() });
+
+    if (editor) {
+      isApplyingRemoteContentRef.current = true;
+      try {
+        editor.commands.setContent('');
+      } finally {
+        isApplyingRemoteContentRef.current = false;
+      }
+    }
+
+    setLocalTitle('');
+    setIsEditingTitle(false);
+    setLoadedEntryStatus(null);
+    setWordCount(0);
+    setCharCount(0);
+    setSaved(true);
+    setNoteEmoji(pickRandomEmoji());
+
+    useDictationStore.setState({ newNoteRequested: false });
+  }, [editor, storeReset]);
+
   /** Toggle the streaming dictation (click Dictate or press Enter on toolbar). */
   const handleDictateToggle = useCallback(async () => {
     if (!editor) return;
@@ -482,8 +539,13 @@ export function DictatePage() {
       }
       try {
         const n = await computeNextNoteNumber();
-        const computedTitle = storeTitle || `Note #${n}`;
-        if (!storeTitle) setStoreTitle(computedTitle);
+        // Read title fresh from the store rather than the closure-captured
+        // `storeTitle`. The quick-action handler resets the store
+        // synchronously and then calls this via setTimeout(0); the closure
+        // here can still hold the previous note's title.
+        const liveTitle = useDictationStore.getState().title;
+        const computedTitle = liveTitle || `Note #${n}`;
+        if (!liveTitle) setStoreTitle(computedTitle);
         // Pre-seed fullText with whatever the user has already typed so
         // chunks append coherently to existing text.
         const existingPlain = editor.getText().trim();
@@ -522,27 +584,65 @@ export function DictatePage() {
   const handleDictateToggleRef = useRef(handleDictateToggle);
   useEffect(() => { handleDictateToggleRef.current = handleDictateToggle; }, [handleDictateToggle]);
 
-  // On mount: if Layout set pendingQuickStart (user clicked mic shield from
-  // another page), consume the flag and auto-start dictation now that the
-  // editor is ready. Using a ref for the callback so the effect deps stay [].
+  /** Once-only mount consumption of the quick-start handshake. Layout sets
+   *  pendingQuickStart (and optionally newNoteRequested) before navigating
+   *  here. We wait for the TipTap editor to be ready, then — atomically —
+   *  reset to a blank note (if requested) and auto-start dictation. The
+   *  handleDictateToggleRef indirection keeps deps stable so this effect
+   *  runs exactly once when editor first becomes available. */
+  const consumedQuickStartRef = useRef(false);
   useEffect(() => {
-    if (useDictationStore.getState().pendingQuickStart) {
-      useDictationStore.setState({ pendingQuickStart: false });
-      // Small defer to ensure TipTap editor has fully initialized.
-      setTimeout(() => {
-        if (useDictationStore.getState().status === 'idle') {
-          void handleDictateToggleRef.current();
-        }
-      }, 80);
-    }
-  }, []); // mount only
+    if (!editor || consumedQuickStartRef.current) return;
+    if (!useDictationStore.getState().pendingQuickStart) return;
 
-  // Event bus: mic shield click while already on this page toggles dictation.
+    consumedQuickStartRef.current = true;
+
+    if (useDictationStore.getState().newNoteRequested) {
+      resetToBlankNote();
+    }
+
+    useDictationStore.setState({ pendingQuickStart: false });
+
+    // Defer so the cleared editor commits and store reset settles before
+    // handleDictateToggle reads state.
+    setTimeout(() => {
+      if (useDictationStore.getState().status === 'idle') {
+        void handleDictateToggleRef.current();
+      }
+    }, 80);
+  }, [editor, resetToBlankNote]);
+
+  // Event bus: mic shield click while already on this page. When Layout set
+  // newNoteRequested (status was idle), reset to a blank note first — UNLESS
+  // the currently-loaded note is already an untouched default-titled blank
+  // (no body text + title is null or matches "Note #N"). In that case we
+  // dictate straight into it instead of generating yet another empty
+  // Note #N+1. Otherwise (status was recording, or no flag set) just toggle
+  // to stop, leaving the in-flight note intact.
   useEffect(() => {
-    const handler = () => { void handleDictateToggle(); };
+    const handler = () => {
+      if (useDictationStore.getState().newNoteRequested) {
+        const currentTitle = useDictationStore.getState().title;
+        const isDefaultTitle = !currentTitle || /^Note #\d+$/.test(currentTitle);
+        const bodyEmpty = !editor || editor.getText().trim() === '';
+        if (isDefaultTitle && bodyEmpty) {
+          // Reuse the current default-empty note — just clear the flag and
+          // start dictating. No reset, no new entry, no number bump.
+          useDictationStore.setState({ newNoteRequested: false });
+          void handleDictateToggle();
+          return;
+        }
+        resetToBlankNote();
+        // Defer one tick so React commits the cleared editor before
+        // handleDictateToggle reads its content.
+        setTimeout(() => { void handleDictateToggle(); }, 0);
+        return;
+      }
+      void handleDictateToggle();
+    };
     window.addEventListener('ironmic:quick-action-dictate', handler);
     return () => window.removeEventListener('ironmic:quick-action-dictate', handler);
-  }, [handleDictateToggle]);
+  }, [editor, handleDictateToggle, resetToBlankNote]);
 
   // Track live collab session state for the button indicator.
   useEffect(() => {
@@ -605,6 +705,40 @@ export function DictatePage() {
     const text = editor.getText().trim();
     if (text) synthesizeAndPlay(text, entryId ?? undefined);
   }, [editor, ttsState, synthesizeAndPlay, ttsStop, entryId]);
+
+  // Push the currently-spoken word index into the editor's TTS highlight
+  // extension. The extension translates the index into an inline ProseMirror
+  // decoration so the active word is highlighted in place — no separate
+  // caption UI needed. Clears (-1) when this entry isn't the read-back target
+  // or playback isn't running.
+  useEffect(() => {
+    if (!editor) return;
+    const isThisEntry = !!entryId && ttsActiveEntryId === entryId;
+    const isActive = isThisEntry && (ttsState === 'playing' || ttsState === 'paused');
+
+    if (!isActive || ttsTimestamps.length === 0) {
+      editor.commands.setTtsActiveWord(-1);
+      return;
+    }
+
+    let activeIdx = -1;
+    for (let i = 0; i < ttsTimestamps.length; i += 1) {
+      const t = ttsTimestamps[i];
+      if (ttsCurrentTimeMs >= t.start_ms && ttsCurrentTimeMs < t.end_ms) {
+        activeIdx = i;
+        break;
+      }
+      if (ttsCurrentTimeMs < t.start_ms) {
+        activeIdx = i - 1;
+        break;
+      }
+    }
+    if (activeIdx === -1 && ttsCurrentTimeMs >= ttsTimestamps[ttsTimestamps.length - 1].end_ms) {
+      activeIdx = ttsTimestamps.length - 1;
+    }
+
+    editor.commands.setTtsActiveWord(activeIdx);
+  }, [editor, entryId, ttsActiveEntryId, ttsState, ttsTimestamps, ttsCurrentTimeMs]);
 
   const setLink = useCallback(() => {
     if (!editor) return;
@@ -913,6 +1047,31 @@ export function DictatePage() {
     setDoneFlash(true);
     setTimeout(() => setDoneFlash(false), 1200);
   }, [editor, status, storeStop, notebookId, bumpSidebar, saveContent]);
+
+  // ── Cmd/Ctrl+S — manual save (finalize) ──
+  // Routes through handleSave so the entry's __status__ tag flips to 'done',
+  // the Draft pill becomes Saved, the sidebar refetches, and the bottom
+  // status bar reflects the persisted state — same path as the toolbar Save
+  // button. Captured at the window level so it works regardless of focus
+  // (title input, toolbar, etc.).
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const isSave = (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 's';
+      if (!isSave) return;
+      e.preventDefault();
+      if (!editor) return;
+      const text = editor.getText().trim();
+      if (!text) {
+        toast({ type: 'info', message: 'Nothing to save yet.', durationMs: 2000 });
+        return;
+      }
+      void handleSave().then(() => {
+        toast({ type: 'success', message: 'Note saved.', durationMs: 1500 });
+      });
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [editor, handleSave, toast]);
 
   /** New Note — finalize the current note (status=done) and open a fresh one. */
   const handleDone = useCallback(async () => {

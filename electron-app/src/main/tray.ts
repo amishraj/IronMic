@@ -86,7 +86,7 @@ function rebuildMenu(): void {
     { type: 'separator' },
     {
       label: 'Quick Start Dictation',
-      accelerator: 'CommandOrControl+Shift+D',
+      accelerator: 'CommandOrControl+Shift+V',
       click: () => sendQuickAction('start-dictation'),
     },
     {

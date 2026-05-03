@@ -52,8 +52,9 @@ interface DictationState {
    *  DictatePage reads + clears this on mount to auto-start recording. */
   pendingQuickStart: boolean;
 
-  /** Set by Layout so NoteEditor starts a blank note instead of loading the
-   *  most-recent entry. Consumed (cleared) by NoteEditor on mount. */
+  /** Set by Layout (mic shield / global hotkey / tray Quick Start Dictation)
+   *  so DictatePage starts a blank note instead of rehydrating the stale
+   *  draft. Consumed (cleared) by DictatePage's resetToBlankNote() helper. */
   newNoteRequested: boolean;
 
   setNotebook: (id: string) => void;
