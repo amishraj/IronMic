@@ -417,7 +417,18 @@ export function DictatePage() {
       setCharCount(text.length);
       setWordCount(text.trim() ? text.trim().split(/\s+/).length : 0);
     },
-    onUpdate: ({ editor }) => {
+    onUpdate: ({ editor, transaction }) => {
+      // Hot-path guard: ProseMirror fires onUpdate for EVERY dispatched
+      // transaction, including no-op ones that only carry plugin meta (the
+      // live Moonshine draft hypothesis updates many times per second via
+      // DraftHypothesisExtension) or that only move the selection (focus()
+      // calls). Those don't change the doc, so there's no count to refresh,
+      // no edit revision to bump, and no save to debounce. Returning here
+      // is what keeps dictation feeling snappy on slower machines — every
+      // hypothesis tick used to run the full path including a getText()
+      // over the whole doc and several React state updates.
+      if (!transaction.docChanged) return;
+
       // When we're programmatically swapping editor content (polish complete,
       // toggle flip, sidebar selection), skip the debounced save — otherwise
       // we'd persist the just-applied content back over the OTHER side and
