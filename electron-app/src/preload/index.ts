@@ -419,11 +419,17 @@ const api = {
     ipcRenderer.on('ironmic:meeting-collab-ended', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-collab-ended', handler);
   },
-  onMeetingCollabFirewallWarning: (callback: (data: { message: string }) => void) => {
-    const handler = (_event: any, data: { message: string }) => callback(data);
+  onMeetingCollabFirewallWarning: (
+    callback: (data: { message: string; actions?: Array<'open-settings' | 'elevate'> }) => void,
+  ) => {
+    const handler = (_event: any, data: { message: string; actions?: Array<'open-settings' | 'elevate'> }) => callback(data);
     ipcRenderer.on('ironmic:meeting-collab-firewall-warning', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-collab-firewall-warning', handler);
   },
+  meetingCollabOpenFirewallSettings: () =>
+    ipcRenderer.invoke('ironmic:meeting-collab-open-firewall-settings'),
+  meetingCollabRequestFirewallElevation: () =>
+    ipcRenderer.invoke('ironmic:meeting-collab-request-firewall-elevation'),
 
   // ── Whisper readiness ──
   onWhisperLoadFailed: (callback: (data: { message: string; permanent: boolean }) => void) => {

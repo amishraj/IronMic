@@ -264,7 +264,11 @@ declare global {
       onMeetingCollabNotesUpdated: (callback: (data: any) => void) => () => void;
       onMeetingCollabDraft: (callback: (data: any) => void) => () => void;
       onMeetingCollabEnded: (callback: () => void) => () => void;
-      onMeetingCollabFirewallWarning: (callback: (data: { message: string }) => void) => () => void;
+      onMeetingCollabFirewallWarning: (
+        callback: (data: { message: string; actions?: Array<'open-settings' | 'elevate'> }) => void,
+      ) => () => void;
+      meetingCollabOpenFirewallSettings: () => Promise<{ ok: boolean }>;
+      meetingCollabRequestFirewallElevation: () => Promise<{ ok: boolean; message?: string }>;
       onWhisperLoadFailed: (callback: (data: { message: string; permanent: boolean }) => void) => () => void;
       // Processing-state notification (fire-and-forget, renderer → main)
       notifyProcessingState: (isActive: boolean) => void;

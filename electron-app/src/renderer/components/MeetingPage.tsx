@@ -156,6 +156,38 @@ export function MeetingPage() {
     granolaSessionIdRef.current = granolaSessionId;
   }, [granolaSessionId]);
 
+  // When the active session id appears (recording starts, or component remounts
+  // mid-meeting), hydrate the AI Notes panel from any running summary already
+  // persisted to structured_output. The summarizer writes liveAiSummary on
+  // every emit, so this catches cases where the renderer mounts after the
+  // first few summary passes have already run on the main side.
+  useEffect(() => {
+    if (!granolaSessionId || !isGranolaRecording) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const raw = await window.ironmic?.meetingGet?.(granolaSessionId);
+        if (cancelled || !raw) return;
+        const session = JSON.parse(raw);
+        const structuredRaw = session?.structured_output;
+        if (typeof structuredRaw !== 'string') return;
+        const structured = JSON.parse(structuredRaw);
+        const stored = structured?.liveAiSummary;
+        const storedAt = structured?.liveAiSummaryAt;
+        if (typeof stored === 'string' && stored.trim().length > 0) {
+          // Only adopt the persisted summary if we don't already have a fresher
+          // in-memory one (the subscriber may have already populated it).
+          setLiveSummary((prev) => prev && prev.trim().length > 0 ? prev : stored);
+          if (typeof storedAt === 'number') {
+            setLiveSummaryGeneratedAt((prev) => prev ?? storedAt);
+          }
+          setLiveSummaryInsufficient(false);
+        }
+      } catch { /* ignore */ }
+    })();
+    return () => { cancelled = true; };
+  }, [granolaSessionId, isGranolaRecording]);
+
   // ── Tray / notification quick action: auto-start a meeting ──
   // Listens for the event dispatched by Layout when the user clicks the
   // tray's "Quick Start Meeting" or the auto-detect meeting notification.
@@ -1453,10 +1485,13 @@ export function MeetingPage() {
           <input
             type="text"
             value={joinCollabInvite}
-            onChange={(e) => { setJoinCollabInvite(e.target.value); setJoinCollabError(null); }}
+            onChange={(e) => { setJoinCollabInvite(e.target.value.toUpperCase()); setJoinCollabError(null); }}
             onKeyDown={(e) => e.key === 'Enter' && handleJoinSharedNotes()}
-            placeholder="192.168.x.x:PORT|CODE"
+            placeholder="192.168.X.X:PORT|CODE"
             className="flex-1 px-3 py-2 text-xs font-mono bg-iron-surface text-iron-text rounded-lg border border-iron-border focus:outline-none focus:border-iron-accent/40"
+            autoCapitalize="characters"
+            autoCorrect="off"
+            spellCheck={false}
           />
           <button
             onClick={handleJoinSharedNotes}

@@ -73,13 +73,19 @@ class MeetingNotesCollabClientManager {
       // Bracket IPv6 literals (containing ":") for the WebSocket URL.
       const host = opts.hostIp.includes(':') ? `[${opts.hostIp}]` : opts.hostIp;
       const url = `ws://${host}:${opts.hostPort}`;
-      const ws = new WebSocket(url, { handshakeTimeout: 8000 });
+      const ws = new WebSocket(url, { handshakeTimeout: 20_000 });
       this.ws = ws;
 
       const timeout = setTimeout(() => {
         ws.terminate();
-        reject(new Error('Connection timed out (8 s). Check the invite string.'));
-      }, 10_000);
+        reject(new Error(
+          `Connection timed out after 25 s reaching ${opts.hostIp}:${opts.hostPort}. ` +
+          'If the host is on macOS, the Application Firewall is the most likely cause — ' +
+          'open IronMic on the host machine and accept the firewall prompt, ' +
+          'or go to System Settings → Network → Firewall → Options and allow IronMic. ' +
+          'On Windows hosts, allow IronMic through Windows Defender Firewall on Private networks.',
+        ));
+      }, 25_000);
 
       ws.once('open', () => {
         ws.send(JSON.stringify({

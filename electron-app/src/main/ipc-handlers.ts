@@ -1186,6 +1186,15 @@ If the text is too short or unclear, output: ["General"]`;
     return { ok: true };
   });
 
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_OPEN_FIREWALL_SETTINGS, () => {
+    meetingNotesCollabServer.openMacFirewallSettings();
+    return { ok: true };
+  });
+
+  ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_REQUEST_FIREWALL_ELEVATION, async () => {
+    return meetingNotesCollabServer.requestMacFirewallElevation();
+  });
+
   console.log('[ipc-handlers] All IPC handlers registered');
 }
 

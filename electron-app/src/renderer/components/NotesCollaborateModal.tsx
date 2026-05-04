@@ -17,6 +17,7 @@
 import { useState, useEffect, useRef } from 'react';
 import {
   Users, Copy, CheckCheck, Wifi, WifiOff, X, Loader2, Pencil, LogIn, Plus,
+  ShieldAlert, ExternalLink, KeyRound,
 } from 'lucide-react';
 
 interface Props {
@@ -134,6 +135,11 @@ function CreatePanel({
   const [copied, setCopied] = useState(false);
   const [ending, setEnding] = useState(false);
   const [drafting, setDrafting] = useState<{ peerId: string; peerName: string } | null>(null);
+  const [firewallWarning, setFirewallWarning] = useState<{
+    message: string;
+    actions: Array<'open-settings' | 'elevate'>;
+  } | null>(null);
+  const [elevating, setElevating] = useState(false);
   const draftTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Tracks live participant count in a ref so the cleanup function can read
   // the latest value without a stale closure.
@@ -181,12 +187,17 @@ function CreatePanel({
       if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
       draftTimerRef.current = setTimeout(() => setDrafting(null), 3000);
     });
+    const unsubFw = window.ironmic?.onMeetingCollabFirewallWarning?.((data) => {
+      if (cancelled) return;
+      setFirewallWarning({ message: data.message, actions: data.actions ?? [] });
+    });
 
     return () => {
       cancelled = true;
       unsubState?.();
       unsubNotes?.();
       unsubDraft?.();
+      unsubFw?.();
       if (draftTimerRef.current) clearTimeout(draftTimerRef.current);
       // Keep the server alive when participants are still connected — the
       // parent page watches participant count and auto-stops when all leave.
@@ -238,6 +249,55 @@ function CreatePanel({
       {error && (
         <div className="text-[11px] text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2 leading-snug">
           {error}
+        </div>
+      )}
+
+      {firewallWarning && (
+        <div className="text-[11px] text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2.5 leading-snug space-y-2">
+          <div className="flex items-start gap-2">
+            <ShieldAlert className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+            <p>{firewallWarning.message}</p>
+          </div>
+          {firewallWarning.actions.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 pl-5">
+              {firewallWarning.actions.includes('elevate') && (
+                <button
+                  disabled={elevating}
+                  onClick={async () => {
+                    setElevating(true);
+                    try {
+                      const res = await window.ironmic?.meetingCollabRequestFirewallElevation?.();
+                      if (res?.ok) setFirewallWarning(null);
+                      else if (res?.message) {
+                        setFirewallWarning({ message: res.message, actions: ['open-settings', 'elevate'] });
+                      }
+                    } finally {
+                      setElevating(false);
+                    }
+                  }}
+                  className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium bg-amber-500/20 text-amber-200 border border-amber-500/30 rounded hover:bg-amber-500/30 disabled:opacity-50"
+                >
+                  <KeyRound className="w-3 h-3" />
+                  {elevating ? 'Allowing…' : 'Allow with admin password'}
+                </button>
+              )}
+              {firewallWarning.actions.includes('open-settings') && (
+                <button
+                  onClick={() => window.ironmic?.meetingCollabOpenFirewallSettings?.()}
+                  className="flex items-center gap-1 px-2 py-1 text-[10px] font-medium bg-iron-surface-hover text-iron-text border border-iron-border rounded hover:bg-iron-surface"
+                >
+                  <ExternalLink className="w-3 h-3" />
+                  Open Firewall settings
+                </button>
+              )}
+              <button
+                onClick={() => setFirewallWarning(null)}
+                className="px-2 py-1 text-[10px] text-iron-text-muted hover:text-iron-text"
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -406,9 +466,12 @@ function JoinPanel({
         </label>
         <input
           value={invite}
-          onChange={(e) => setInvite(e.target.value)}
+          onChange={(e) => setInvite(e.target.value.toUpperCase())}
           placeholder="192.168.1.5:54321|ABC123DEF456"
           className="w-full font-mono text-xs bg-iron-bg border border-iron-border rounded-lg px-3 py-2 text-iron-text placeholder:text-iron-text-muted focus:outline-none focus:border-iron-accent/50"
+          autoCapitalize="characters"
+          autoCorrect="off"
+          spellCheck={false}
         />
       </div>
 

@@ -56,6 +56,11 @@ class MeetingRoomClientManager {
    *  later rejoin can't surface stale state. */
   private welcomeNotesHtml: string | null = null;
   private welcomeNotesVersion: number | null = null;
+  /** Last AI summary received from the host, kept so we can persist it to
+   *  the participant's local mirror session at meeting end (the participant
+   *  doesn't run their own LiveSummarizer — they only see the host's). */
+  private lastSummary: string = '';
+  private lastSummaryAt: number | null = null;
 
   isConnected(): boolean {
     return this.socket !== null && this.socket.readyState === WebSocket.OPEN;
@@ -241,6 +246,31 @@ class MeetingRoomClientManager {
     }
   }
 
+  /** Best-effort write the latest broadcast AI summary to this participant's
+   *  local mirror session so the post-meeting detail view has a record. */
+  private persistSummaryToLocal(summary: string, generatedAt: number): void {
+    if (!this.localSessionId) return;
+    try {
+      let merged: Record<string, unknown> = {};
+      try {
+        const raw = native.addon.getMeetingSession(this.localSessionId);
+        if (raw && raw !== 'null') {
+          const session = JSON.parse(raw);
+          const structuredRaw = session?.structured_output;
+          if (typeof structuredRaw === 'string') {
+            const parsed = JSON.parse(structuredRaw);
+            if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+          }
+        }
+      } catch { /* fall through with empty merged */ }
+      merged.liveAiSummary = summary;
+      merged.liveAiSummaryAt = generatedAt;
+      native.setMeetingStructuredOutput(this.localSessionId, JSON.stringify(merged));
+    } catch (err) {
+      console.warn('[MeetingRoomClient] persistSummaryToLocal failed:', (err as Error)?.message);
+    }
+  }
+
   /** Forward this machine's locally-typed Your Notes html to the host so it
    *  can be merged into the shared document and rebroadcast to all peers. */
   sendNotesUpdate(html: string): void {
@@ -292,13 +322,22 @@ class MeetingRoomClientManager {
       // participant's localSessionId so the renderer's session-equality check
       // accepts it as belonging to the active meeting, then forward through
       // the same IPC channel the host's summarizer uses.
+      const summary = typeof msg.summary === 'string' ? msg.summary : '';
+      const generatedAt = Number.isFinite(Number(msg.generatedAt)) ? Number(msg.generatedAt) : Date.now();
+      // Track the latest substantive summary so we can save it to the local
+      // mirror session at meeting end (post-meeting view).
+      if (summary.trim().length > 0 && !msg.insufficient) {
+        this.lastSummary = summary;
+        this.lastSummaryAt = generatedAt;
+        this.persistSummaryToLocal(summary, generatedAt);
+      }
       const windows = BrowserWindow.getAllWindows();
       if (windows.length === 0) return;
       const payload = {
         sessionId: this.localSessionId,
-        summary: typeof msg.summary === 'string' ? msg.summary : '',
+        summary,
         segmentCount: Number.isFinite(Number(msg.segmentCount)) ? Number(msg.segmentCount) : 0,
-        generatedAt: Number.isFinite(Number(msg.generatedAt)) ? Number(msg.generatedAt) : Date.now(),
+        generatedAt,
         insufficient: !!msg.insufficient,
       };
       windows[0].webContents.send(IPC_CHANNELS.MEETING_LIVE_SUMMARY, payload);
@@ -348,6 +387,9 @@ class MeetingRoomClientManager {
     // surface stale state via getInfo().
     this.welcomeNotesHtml = null;
     this.welcomeNotesVersion = null;
+    // Clear cached summary state for next session.
+    this.lastSummary = '';
+    this.lastSummaryAt = null;
   }
 
   private pushStateToRenderer(): void {

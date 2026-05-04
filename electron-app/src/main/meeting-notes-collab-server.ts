@@ -32,10 +32,11 @@
  */
 
 import * as os from 'os';
+import * as net from 'net';
 import * as crypto from 'crypto';
 import { exec } from 'child_process';
 import { WebSocketServer, WebSocket, type RawData } from 'ws';
-import { app, BrowserWindow } from 'electron';
+import { app, BrowserWindow, shell } from 'electron';
 import { native } from './native-bridge';
 
 export interface CollabParticipant {
@@ -83,6 +84,8 @@ class MeetingNotesCollabServerManager {
 
   private currentNotes: string = '';
   private version: number = 0;
+  /** True once we've shown the macOS firewall guidance this session, to avoid re-nagging. */
+  private firewallPromptedThisSession: boolean = false;
 
   // ── Public state ──────────────────────────────────────────────────────────
 
@@ -161,6 +164,10 @@ class MeetingNotesCollabServerManager {
     if (this.boundPort) {
       this.addWindowsFirewallRule(this.boundPort);
       this.addMacFirewallRule();
+      // Loopback bind sanity check — proves the socket is listening locally.
+      // It does NOT prove a remote host can pass the OS firewall; the guidance
+      // copy in notifyFirewallIssue() makes that distinction.
+      this.runLoopbackBindCheck(this.boundPort).catch(() => { /* warning emitted inside */ });
     }
     this.pushStateToRenderer();
     return this.getInfo();
@@ -185,6 +192,7 @@ class MeetingNotesCollabServerManager {
     this.boundPort = null;
     this.boundIsIpv6 = false;
     this.version = 0;
+    this.firewallPromptedThisSession = false;
     this.pushStateToRenderer();
   }
 
@@ -408,30 +416,132 @@ class MeetingNotesCollabServerManager {
   /**
    * macOS application firewall is per-app, not per-port. Adding the running
    * IronMic binary as an allowed app + unblocking it covers inbound LAN
-   * connections. Requires the firewall daemon to be enabled; failures are
-   * non-fatal and surfaced to the renderer.
+   * connections. `socketfilterfw --add` requires root; on failure we surface
+   * a renderer modal with two recovery actions (open settings, or run an
+   * elevated AppleScript that adds the rule).
    */
   private addMacFirewallRule(): void {
     if (process.platform !== 'darwin') return;
-    const appPath = app.getPath('exe');
+    const appPath = this.getMacAppPath();
     const fw = '/usr/libexec/ApplicationFirewall/socketfilterfw';
     exec(`"${fw}" --add "${appPath}" && "${fw}" --unblockapp "${appPath}"`, (err) => {
-      if (err) {
-        // socketfilterfw needs root for --add. We try anyway in case the
-        // user pre-approved IronMic; surface a hint if it failed.
+      if (err && !this.firewallPromptedThisSession) {
+        this.firewallPromptedThisSession = true;
         this.notifyFirewallIssue(
-          'macOS Firewall may block participants from reaching this Mac. ' +
-          'Open System Settings \u2192 Network \u2192 Firewall \u2192 Options, ' +
-          'add IronMic and set it to Allow incoming connections.',
+          'macOS Firewall is blocking inbound connections to IronMic. ' +
+          'Participants on other machines (especially Windows) will time out ' +
+          'when trying to join. Allow IronMic now to fix it.',
+          ['open-settings', 'elevate'],
         );
       }
     });
   }
 
-  private notifyFirewallIssue(message: string): void {
+  /**
+   * Resolve the path that macOS Application Firewall should allow. In packaged
+   * builds this is the .app bundle ("/Applications/IronMic.app"), not the
+   * helper executable. In dev we fall back to the Electron binary.
+   */
+  private getMacAppPath(): string {
+    if (!app.isPackaged) return app.getPath('exe');
+    // exe path is like /Applications/IronMic.app/Contents/MacOS/IronMic
+    const exe = app.getPath('exe');
+    const idx = exe.indexOf('.app/');
+    if (idx === -1) return exe;
+    return exe.slice(0, idx + 4); // include ".app"
+  }
+
+  /**
+   * Open the macOS Firewall pane in System Settings. Triggered by the user
+   * clicking the "Open Firewall settings" action on the warning modal.
+   */
+  openMacFirewallSettings(): void {
+    if (process.platform !== 'darwin') return;
+    shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Firewall')
+      .catch((err) => console.warn('[NotesCollabServer] openExternal failed:', err));
+  }
+
+  /**
+   * Run socketfilterfw --add + --unblockapp under `osascript` with admin
+   * privileges. Triggered by the user clicking "Allow with admin password".
+   * Returns ok=true on success; ok=false with a message otherwise.
+   */
+  async requestMacFirewallElevation(): Promise<{ ok: boolean; message?: string }> {
+    if (process.platform !== 'darwin') {
+      return { ok: false, message: 'Only available on macOS' };
+    }
+    const appPath = this.getMacAppPath();
+    const fw = '/usr/libexec/ApplicationFirewall/socketfilterfw';
+    // Escape for the inner shell: backslash-quotes inside a double-quoted bash
+    // arg, then backslash-quote those for the AppleScript string literal.
+    const shellQuote = (s: string) => `"${s.replace(/(["\\$`])/g, '\\$1')}"`;
+    const innerCmd = `${shellQuote(fw)} --add ${shellQuote(appPath)} && ${shellQuote(fw)} --unblockapp ${shellQuote(appPath)}`;
+    // For AppleScript we need to escape backslashes and double-quotes again.
+    const appleScriptInner = innerCmd.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const script = `do shell script "${appleScriptInner}" with administrator privileges`;
+    return new Promise((resolve) => {
+      exec(`osascript -e ${shellQuote(script)}`, (err, _stdout, stderr) => {
+        if (err) {
+          // User cancelled, or osascript reported an error.
+          const msg = (stderr || err.message || '').trim();
+          const cancelled = /User cancelled|-128/i.test(msg);
+          resolve({
+            ok: false,
+            message: cancelled
+              ? 'Firewall change was cancelled.'
+              : `Could not allow IronMic through the firewall: ${msg}`,
+          });
+          return;
+        }
+        // Success \u2014 refresh the loopback check and clear the prompt latch so
+        // a future failure can re-prompt.
+        this.firewallPromptedThisSession = false;
+        resolve({ ok: true });
+      });
+    });
+  }
+
+  /**
+   * Confirms the WSS is actually accepting on the bound port from this same
+   * machine. Useful as a sanity check that bind succeeded \u2014 does NOT prove
+   * remote reachability through the OS firewall.
+   */
+  private async runLoopbackBindCheck(port: number): Promise<void> {
+    // Always loopback over IPv4 — both 0.0.0.0 and dual-stack :: accept 127.0.0.1
+    // connections. ::1 alone is flaky on dual-stack binds across platforms.
+    // Only warn the user if the WSS itself has stopped listening; transient
+    // connect errors during normal session start aren't worth alarming about.
+    if (!this.wss) return;
+    await new Promise<void>((resolve) => {
+      const socket = net.connect({ host: '127.0.0.1', port, family: 4 });
+      let settled = false;
+      const done = (ok: boolean, err?: Error) => {
+        if (settled) return;
+        settled = true;
+        try { socket.destroy(); } catch { /* ignore */ }
+        if (!ok && this.wss) {
+          // Server is still up but loopback failed — log only, don't alarm
+          // the user (most often a benign timing race during startup).
+          console.warn(
+            `[NotesCollabServer] loopback sanity check failed on port ${port}` +
+            (err ? `: ${err.message}` : ''),
+          );
+        }
+        resolve();
+      };
+      socket.once('connect', () => done(true));
+      socket.once('error', (err) => done(false, err));
+      setTimeout(() => done(false, new Error('loopback connect timed out')), 5000);
+    });
+  }
+
+  private notifyFirewallIssue(
+    message: string,
+    actions: Array<'open-settings' | 'elevate'> = [],
+  ): void {
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed()) {
-        win.webContents.send('ironmic:meeting-collab-firewall-warning', { message });
+        win.webContents.send('ironmic:meeting-collab-firewall-warning', { message, actions });
       }
     }
   }
@@ -445,14 +555,17 @@ class MeetingNotesCollabServerManager {
     const ifaces = os.networkInterfaces();
     type Cand = { name: string; address: string; family: 'IPv4' | 'IPv6' };
     const candidates: Cand[] = [];
-    const virtualInterfacePattern = /(loopback|virtual|vmware|virtualbox|vbox|hyper-v|vethernet|wsl|docker|bluetooth|tailscale|zerotier|utun|awdl|bridge|tunnel|vpn)/i;
+    const virtualInterfacePattern = /(loopback|virtual|vmware|virtualbox|vbox|vmnet|vboxnet|hyper-v|vethernet|wsl|docker|bluetooth|tailscale|zerotier|utun|awdl|bridge|tunnel|vpn)/i;
     for (const name of Object.keys(ifaces)) {
-      if (/^(lo|docker|veth|tun|tap|utun|bridge|llw|awdl|anpi)/i.test(name)) continue;
+      if (/^(lo|docker|veth|tun|tap|utun|bridge|llw|awdl|anpi|vmnet|vboxnet)/i.test(name)) continue;
       if (virtualInterfacePattern.test(name)) continue;
       for (const addr of ifaces[name] ?? []) {
         if (addr.internal) continue;
         if (addr.family === 'IPv4') {
           if (addr.address.startsWith('169.254.')) continue;
+          // CGNAT (RFC 6598, 100.64.0.0/10) — used by Tailscale and some
+          // carrier NATs; not reachable from peers on the regular LAN.
+          if (this.isCgnatV4(addr.address)) continue;
           candidates.push({ name, address: addr.address, family: 'IPv4' });
         } else if (addr.family === 'IPv6') {
           // skip link-local and unique-local fc00::/7? keep ULA, drop fe80
@@ -478,6 +591,16 @@ class MeetingNotesCollabServerManager {
     });
     const best = candidates[0];
     return best ? { address: best.address, family: best.family } : null;
+  }
+
+  /** True if the IPv4 address falls in 100.64.0.0/10 (RFC 6598 CGNAT). */
+  private isCgnatV4(address: string): boolean {
+    const parts = address.split('.');
+    if (parts.length !== 4) return false;
+    const a = Number(parts[0]);
+    const b = Number(parts[1]);
+    if (a !== 100) return false;
+    return b >= 64 && b <= 127;
   }
 
   private generateCode(): string {

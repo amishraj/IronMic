@@ -45,30 +45,24 @@ const MIN_TRANSCRIPT_WORDS = 15;
  */
 const INSUFFICIENT_MARKER = '[INSUFFICIENT_CONTENT]';
 
-const LIVE_SUMMARY_PROMPT = `You are a meeting notes assistant producing concise, factual running notes.
+const LIVE_SUMMARY_PROMPT = `You are a meeting notes assistant producing concise, factual running notes for ONE specific meeting.
 
-You receive:
-1. The spoken transcript (what was said in the meeting).
-2. OPTIONALLY: notes the user is typing live during the meeting. These are the user's own words capturing what matters most to them.
-
-USER NOTES ARE MANDATORY INPUT — not optional context:
-- If a USER'S LIVE NOTES section is present, you MUST reflect its content in your bullets. Every distinct point, question, or action item the user wrote down needs a corresponding bullet in your output.
-- Treat user notes as higher-priority than transcript facts when deciding what to emphasize: the user is signaling what they care about.
-- If the user wrote something not spoken in the transcript (e.g., a reminder to themselves, a question for later), include it as a bullet clearly derived from their notes (you may prefix such bullets with "Note:" to distinguish them).
-- If the transcript contradicts the user's notes, include both and note the discrepancy.
-- Do NOT summarize user notes into oblivion — specific names, numbers, and questions the user typed must appear verbatim or nearly so.
+You receive a MEETING CONTEXT block containing what was said in the meeting and any annotations participants typed alongside it. Treat all of this as a single, unified source of truth about what the meeting is about. Do NOT label content as coming from "the transcript" vs "user notes" vs "annotations" — weave it together so the result reads as one coherent picture of the meeting. Never prefix a bullet with "Note:", "User:", "Annotation:", or any similar source tag.
 
 HARD RULES — violating any of these is a failure:
-- NEVER invent facts, topics, participants, decisions, or action items that are not explicitly present in the transcript or the user's typed notes.
-- NEVER use generic filler like "The team discussed project goals", "Key topics were reviewed", "Several points were raised", or any phrasing that could apply to any meeting. Every bullet must reference specific content from the input.
-- If the transcript is near-empty, mostly silence, or has no substantive content AND the user has typed nothing meaningful, output EXACTLY this single line and nothing else:
+- STAY ON SCOPE. Every bullet must reference specific content present in the MEETING CONTEXT. Do not extrapolate, generalize, or pull in outside knowledge. If a topic is mentioned briefly, the bullet about it must be brief.
+- NEVER invent facts, topics, participants, decisions, action items, dates, numbers, or names not explicitly present in the input.
+- NEVER use generic filler like "The team discussed project goals", "Key topics were reviewed", "Several points were raised", or anything that could apply to any meeting.
+- The participants' typed annotations signal what they find important — emphasize those topics — but always keep them in the meeting's scope. A typed annotation reminding someone to do something later is in scope; a typed annotation about an unrelated subject is not.
+- If the PREVIOUS BULLETS section diverges from what the MEETING CONTEXT actually supports, FIX IT in this pass — do not perpetuate drift.
+- If the input is near-empty, mostly silence, or has no substantive content, output EXACTLY this single line and nothing else:
   ${INSUFFICIENT_MARKER}
 - Do NOT add preamble, headers ("Meeting Notes:"), or closing remarks.
 
 OUTPUT FORMAT:
 - 3 to 8 markdown bullet points prefixed with "- ".
-- Each bullet is one concise sentence.
-- Keep existing bullets stable across updates — refine and extend rather than rewriting from scratch.
+- Each bullet is one concise sentence about the meeting itself.
+- Keep existing bullets stable across updates — refine and extend rather than rewriting from scratch, unless a bullet is now inaccurate or off-scope.
 `;
 
 interface LiveSummaryEvent {
@@ -356,22 +350,22 @@ class LiveSummarizerManager {
       return;
     }
 
-    // Build the prompt body.
-    const transcriptSection = fullTranscript.trim()
-      ? `TRANSCRIPT:\n${fullTranscript.trim()}`
-      : 'TRANSCRIPT:\n(no substantive spoken content yet)';
-
-    const userNotesSection = userNotes.trim()
-      ? `\n\nUSER'S LIVE NOTES (authoritative emphasis — integrate these):\n${userNotes.trim()}`
-      : '';
+    // Build a single unified MEETING CONTEXT block. The transcript and the
+    // typed annotations are both first-class meeting content; the LLM weaves
+    // them together rather than calling out where each line came from.
+    const transcriptBody = fullTranscript.trim() || '(no substantive spoken content yet)';
+    const contextBody = userNotes.trim()
+      ? `${transcriptBody}\n\n${userNotes.trim()}`
+      : transcriptBody;
+    const contextSection = `MEETING CONTEXT:\n${contextBody}`;
 
     const previousSection = this.currentSummary && this.hasSubstantiveSummary
-      ? `\n\nPREVIOUS BULLETS (extend and refine; do not rewrite from scratch):\n${this.currentSummary}`
+      ? `\n\nPREVIOUS BULLETS (extend and refine; correct any that drift off-scope):\n${this.currentSummary}`
       : '';
 
     const userContent =
-      `${transcriptSection}${userNotesSection}${previousSection}\n\n` +
-      `Produce the updated bullet-point notes now. Remember: if nothing substantive is present, output ONLY ${INSUFFICIENT_MARKER}.`;
+      `${contextSection}${previousSection}\n\n` +
+      `Produce the updated bullet-point notes now. Stay strictly within what the MEETING CONTEXT supports. If nothing substantive is present, output ONLY ${INSUFFICIENT_MARKER}.`;
 
     const controller = new AbortController();
     this.activeController = controller;
@@ -414,12 +408,39 @@ class LiveSummarizerManager {
         return;
       }
 
+      // Empty/junk-output guard. If the LLM returned nothing or just
+      // punctuation/whitespace, do NOT overwrite a previously good summary —
+      // that's how the panel can suddenly go blank mid-meeting after working
+      // fine. Treat it like a transient error and keep the existing bullets.
+      const hasSubstance = trimmed.replace(/[\s\-•*\.]/g, '').length >= 4;
+      if (!hasSubstance) {
+        if (!this.hasSubstantiveSummary) {
+          // No good summary yet — fall back to the insufficient state so the
+          // UI shows the "waiting for content" copy instead of a blank panel.
+          this.currentSummary = '';
+          this.currentInsufficient = true;
+          this.lastSummarizedCount = snapshotCount;
+          this.lastUserNotesSnapshot = snapshotUserNotes;
+          this.emitSummary();
+        } else {
+          console.warn('[LiveSummarizer] LLM returned empty output; keeping previous summary');
+          this.lastSummarizedCount = snapshotCount;
+          this.lastUserNotesSnapshot = snapshotUserNotes;
+        }
+        return;
+      }
+
       this.currentSummary = trimmed;
       this.currentInsufficient = false;
       this.hasSubstantiveSummary = true;
       this.lastSummarizedCount = snapshotCount;
       this.lastUserNotesSnapshot = snapshotUserNotes;
       this.emitSummary();
+      // Mid-meeting persistence: write the running summary into the host
+      // session's structured_output so a renderer remount (tab switch,
+      // window reopen) re-hydrates the AI Notes panel instead of going
+      // blank until the next LLM pass lands.
+      this.persistRunningSummaryToHostSession(sessionId, trimmed);
     } catch (err: any) {
       if (err?.message?.includes('aborted')) return;
       console.warn('[LiveSummarizer] Summary generation failed:', err?.message || err);
@@ -433,6 +454,34 @@ class LiveSummarizerManager {
         // Catch-up run, no debounce.
         this.activeRunPromise = this.runSummary();
       }
+    }
+  }
+
+  /** Best-effort write of the running summary into the host session's
+   *  structured_output JSON under the `liveAiSummary` key, alongside a
+   *  timestamp. The post-meeting finalize path overwrites these with the
+   *  final flushed summary; this is purely so a remount during recording
+   *  can re-hydrate the panel rather than wait for the next LLM pass. */
+  private persistRunningSummaryToHostSession(sessionId: string, summary: string): void {
+    try {
+      let merged: Record<string, unknown> = {};
+      try {
+        const raw = native.addon.getMeetingSession(sessionId);
+        if (raw && raw !== 'null') {
+          const session = JSON.parse(raw);
+          const structuredRaw = session?.structured_output;
+          if (typeof structuredRaw === 'string') {
+            const parsed = JSON.parse(structuredRaw);
+            if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+          }
+        }
+      } catch { /* fall through with empty merged */ }
+      merged.liveAiSummary = summary;
+      merged.liveAiSummaryAt = Date.now();
+      native.setMeetingStructuredOutput(sessionId, JSON.stringify(merged));
+    } catch (err) {
+      // Persistence is best-effort. The in-memory + IPC path is authoritative.
+      console.warn('[LiveSummarizer] persistRunningSummary failed:', (err as Error)?.message);
     }
   }
 
