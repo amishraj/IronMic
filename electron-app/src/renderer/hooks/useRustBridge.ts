@@ -242,7 +242,8 @@ declare global {
         callback: (payload: { sessionId: string | null; hypothesis: string; startMs: number }) => void,
       ) => () => void;
       onMeetingRecordingState: (callback: (state: any) => void) => () => void;
-      onMeetingLiveSummary: (callback: (payload: { sessionId: string; summary: string; segmentCount: number; generatedAt: number }) => void) => () => void;
+      onMeetingLiveSummary: (callback: (payload: { sessionId: string; summary: string; segmentCount: number; generatedAt: number; insufficient?: boolean }) => void) => () => void;
+      onMeetingUserNotesBroadcast: (callback: (payload: { sessionId: string | null; html: string; version: number; originId: string | null }) => void) => () => void;
       onQuickAction: (callback: (action: 'start-dictation' | 'start-meeting') => void) => () => void;
       onMeetingAppDetected: (callback: (event: any, data: any) => void) => () => void;
       // BlackHole (macOS system audio)

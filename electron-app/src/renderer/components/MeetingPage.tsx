@@ -82,6 +82,14 @@ export function MeetingPage() {
   // any in-flight debounced save before stopMeetingRecording runs its final
   // summary pass. Without this, notes typed in the last <800ms would be lost.
   const yourNotesRef = useRef<YourNotesPanelHandle>(null);
+  // Tracks the active session id for the onMeetingLiveSummary subscriber so it
+  // can drop stale payloads from a previous meeting (e.g. a slow LLM finishing
+  // after the user already stopped + started a new session).
+  const granolaSessionIdRef = useRef<string | null>(null);
+  // Welcome-time shared Your Notes html captured from meetingRoomJoin so the
+  // participant's panel pre-fills before any subsequent notes_update arrives.
+  // Cleared on leave/end.
+  const [welcomeNotesHtml, setWelcomeNotesHtml] = useState<string | undefined>(undefined);
 
   // ── Granola mode: subscribe to live segment push events ──
   useEffect(() => {
@@ -109,11 +117,16 @@ export function MeetingPage() {
         setGranolaSessionId(null);
         setGranolaRecordingStartedAt(null);
         setDraftHypothesis('');
+        setWelcomeNotesHtml(undefined);
       }
     });
     const unsubLive = window.ironmic?.onMeetingLiveSummary?.((payload: any) => {
-      // Only accept updates for the currently active session.
+      // Drop payloads that don't belong to THIS machine's active session.
+      // For the host this is the host session id; for participants it's the
+      // local mirror id (the room client overrides the broadcast payload's
+      // sessionId before forwarding it to the renderer).
       if (!payload?.sessionId) return;
+      if (granolaSessionIdRef.current && payload.sessionId !== granolaSessionIdRef.current) return;
       setLiveSummary(payload.summary || '');
       setLiveSummaryGeneratedAt(payload.generatedAt || Date.now());
       setLiveSummaryInsufficient(!!payload.insufficient);
@@ -136,6 +149,12 @@ export function MeetingPage() {
       setLiveSummaryInsufficient(true);
     }
   }, [isGranolaRecording]);
+
+  // Keep the ref in sync so the onMeetingLiveSummary subscription (registered
+  // once at mount) can filter by the latest active session without re-binding.
+  useEffect(() => {
+    granolaSessionIdRef.current = granolaSessionId;
+  }, [granolaSessionId]);
 
   // ── Tray / notification quick action: auto-start a meeting ──
   // Listens for the event dispatched by Layout when the user clicks the
@@ -423,6 +442,14 @@ export function MeetingPage() {
       if (info?.sessionId) {
         setGranolaSessionId(info.sessionId);
         setGranolaRecordingStartedAt(Date.now());
+      }
+      // Pre-fill Your Notes with whatever the host already typed before we
+      // joined, so the panel shows the shared state immediately rather than
+      // waiting for the next notes_update broadcast.
+      if (info && typeof info.welcomeNotesHtml === 'string') {
+        setWelcomeNotesHtml(info.welcomeNotesHtml);
+      } else {
+        setWelcomeNotesHtml(undefined);
       }
       // Reset form
       setJoinInviteRaw('');
@@ -1038,6 +1065,7 @@ export function MeetingPage() {
                   ref={yourNotesRef}
                   sessionId={granolaSessionId}
                   isActive={isGranolaRecording}
+                  initialHtml={welcomeNotesHtml}
                 />
               </div>
             </div>

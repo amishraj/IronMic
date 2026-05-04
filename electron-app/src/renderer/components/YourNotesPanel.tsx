@@ -73,6 +73,14 @@ export const YourNotesPanel = forwardRef<YourNotesPanelHandle, Props>(function Y
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [saved, setSaved] = useState(true);
   const [wordCount, setWordCount] = useState(0);
+  /** Last applied collaborative version. -1 (not 0) so an initial
+   *  broadcast at version 0 still applies. The host seeds notesVersion=1
+   *  when there's existing content; subsequent updates are 1, 2, 3… */
+  const lastAppliedVersionRef = useRef<number>(-1);
+  /** Set true while we apply an inbound network update so the editor's
+   *  onUpdate handler doesn't re-persist + re-broadcast the same html
+   *  (which would feedback-loop through MEETING_USER_NOTES_CHANGED). */
+  const suppressOnUpdateRef = useRef<boolean>(false);
 
   const editor = useEditor({
     extensions: [
@@ -88,6 +96,10 @@ export const YourNotesPanel = forwardRef<YourNotesPanelHandle, Props>(function Y
       },
     },
     onUpdate: ({ editor }) => {
+      // Inbound network update is applying — let it land without echoing
+      // back through the persist→IPC→transport path.
+      if (suppressOnUpdateRef.current) return;
+
       setSaved(false);
       const text = editor.getText();
       setWordCount(text.trim() ? text.trim().split(/\s+/).length : 0);
@@ -126,6 +138,39 @@ export const YourNotesPanel = forwardRef<YourNotesPanelHandle, Props>(function Y
     if (!editor) return;
     editor.setEditable(isActive);
   }, [isActive, editor]);
+
+  // Inbound collaborative updates: another participant (or this user's host
+  // if they are a participant receiving the host's edits) updated the shared
+  // Your Notes document. Apply the html, suppressing the editor's own
+  // onUpdate to avoid an immediate echo back through the transport.
+  useEffect(() => {
+    if (!editor || !sessionId) return;
+    const off = window.ironmic?.onMeetingUserNotesBroadcast?.((payload) => {
+      if (!payload) return;
+      // sessionId on the renderer is whatever this side considers active —
+      // for the host that's the host session id; for participants the local
+      // mirror id. The main-process handlers stamp the right one before
+      // sending. Drop payloads belonging to a different active session.
+      if (payload.sessionId !== sessionId) return;
+      const version = Number.isFinite(Number(payload.version)) ? Number(payload.version) : 0;
+      if (version <= lastAppliedVersionRef.current) return; // out-of-order
+      if (typeof payload.html !== 'string') return;
+      lastAppliedVersionRef.current = version;
+      suppressOnUpdateRef.current = true;
+      try {
+        editor.commands.setContent(payload.html, false);
+      } finally {
+        // setContent fires onUpdate synchronously inside the same tick;
+        // by the time this microtask runs that handler has already returned.
+        queueMicrotask(() => { suppressOnUpdateRef.current = false; });
+      }
+      // Update the saved/word-count UI so the user knows the panel is current.
+      const text = editor.getText();
+      setWordCount(text.trim() ? text.trim().split(/\s+/).length : 0);
+      setSaved(true);
+    });
+    return () => { try { off?.(); } catch { /* noop */ } };
+  }, [editor, sessionId]);
 
   // Flush any pending save on unmount.
   useEffect(() => {

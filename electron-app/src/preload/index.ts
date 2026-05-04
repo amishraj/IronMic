@@ -341,6 +341,11 @@ const api = {
     ipcRenderer.on('ironmic:meeting-live-summary', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-live-summary', handler);
   },
+  onMeetingUserNotesBroadcast: (callback: (payload: { sessionId: string | null; html: string; version: number; originId: string | null }) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-user-notes-broadcast', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-user-notes-broadcast', handler);
+  },
   /** Tray/menu/notification quick actions → renderer opens the right page and runs the action. */
   onQuickAction: (callback: (action: 'start-dictation' | 'start-meeting') => void) => {
     const handler = (_event: any, action: 'start-dictation' | 'start-meeting') => callback(action);

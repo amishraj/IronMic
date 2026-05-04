@@ -225,6 +225,7 @@ export const IPC_CHANNELS = {
   MEETING_RECORDING_STATE: 'ironmic:meeting-recording-state',  // main → renderer push
   MEETING_LIVE_SUMMARY: 'ironmic:meeting-live-summary',        // main → renderer push (incremental notes)
   MEETING_USER_NOTES_CHANGED: 'ironmic:meeting-user-notes-changed', // renderer → main (fire-and-forget)
+  MEETING_USER_NOTES_BROADCAST: 'ironmic:meeting-user-notes-broadcast', // main → renderer push (collaborative Your Notes update)
   START_RECORDING_FROM_DEVICE: 'ironmic:start-recording-from-device',
   DRAIN_RECORDING_BUFFER: 'ironmic:drain-recording-buffer',
 

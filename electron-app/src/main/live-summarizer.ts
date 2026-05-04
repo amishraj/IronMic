@@ -449,6 +449,16 @@ class LiveSummarizerManager {
     if (windows.length > 0) {
       windows[0].webContents.send(IPC_CHANNELS.MEETING_LIVE_SUMMARY, payload);
     }
+    // Fan out to participants if a meeting room is currently hosted. Lazy
+    // require to break the import cycle (meeting-room-server lazy-loads
+    // this module on participant notes_update).
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { meetingRoomServer } = require('./meeting-room-server') as typeof import('./meeting-room-server');
+      meetingRoomServer.broadcastLiveSummary(payload);
+    } catch (err) {
+      console.warn('[LiveSummarizer] room broadcast failed:', (err as Error)?.message);
+    }
   }
 }
 

@@ -14,13 +14,23 @@
  *
  * Message protocol (JSON over WebSocket):
  *   client → host: { type: "join", roomCode, displayName }
- *   host   → client: { type: "welcome", sessionId, hostName, templateId }
+ *   host   → client: { type: "welcome", sessionId, hostName, templateId,
+ *                      notesHtml, notesVersion }
  *                 OR { type: "rejected", reason }
  *   client → host: { type: "segment", participantId, displayName, startMs, endMs, text }
+ *   client → host: { type: "notes_update", html, originId }
  *   host   → all : { type: "segment_broadcast", segment }
+ *   host   → all : { type: "notes_update", html, version, originId }
+ *   host   → all : { type: "summary_broadcast", sessionId, summary, generatedAt,
+ *                    insufficient, segmentCount }
  *   host   → all : { type: "participant_joined", participantId, displayName }
  *   host   → all : { type: "participant_left", participantId, displayName }
  *   host   → all : { type: "meeting_ended" }
+ *
+ * Authentication: only sockets that have completed a valid `join` (i.e.
+ * `state.participantId !== null`) ever receive broadcasts. Unauthenticated
+ * sockets that connect to the port can be probed by hostile peers — they
+ * MUST NOT receive transcript, summary, or notes content.
  */
 
 import { BrowserWindow } from 'electron';
@@ -48,7 +58,16 @@ export interface RoomInfo {
   roomCode: string | null;
   inviteString: string | null;  // "ip:port|roomCode"
   participants: RoomParticipant[];
+  /** Current shared Your Notes html (host-authoritative). Empty string if none. */
+  notesHtml: string;
+  /** Monotonic version of the shared Your Notes document. 0 = empty seed. */
+  notesVersion: number;
 }
+
+/** Maximum size (bytes/utf16 length) of a single notes_update html payload.
+ *  Prevents a hostile/buggy peer from blowing up the host with unbounded
+ *  content. 1 MB is comfortably above any realistic note. */
+const MAX_NOTES_HTML_LENGTH = 1_000_000;
 
 interface ClientState {
   socket: WebSocket;
@@ -68,6 +87,17 @@ class MeetingRoomServerManager {
   private boundIp: string | null = null;
   private boundPort: number | null = null;
   private unsubSegment: (() => void) | null = null;
+
+  /** Host-authoritative shared Your Notes html. Updated when:
+   *   - room starts: seeded from host session's structured_output.userNotes
+   *   - host edits locally and ipc-handlers calls applyHostNotesUpdate
+   *   - any authenticated participant sends notes_update
+   */
+  private currentNotesHtml: string = '';
+  /** Monotonic version of currentNotesHtml. Incremented on every accepted
+   *  update. Sent in welcome payload and every notes_update broadcast so
+   *  clients can drop genuinely-out-of-order packets. */
+  private notesVersion: number = 0;
 
   /**
    * Detect the most likely LAN IPv4 address. Prefers private ranges (10/8,
@@ -127,7 +157,52 @@ class MeetingRoomServerManager {
         ? `${this.boundIp}:${this.boundPort}|${this.roomCode}`
         : null,
       participants: Array.from(this.participants.values()),
+      notesHtml: this.currentNotesHtml,
+      notesVersion: this.notesVersion,
     };
+  }
+
+  /** Read the host session's existing userNotes html so a host who typed
+   *  before opening the room broadcasts that content on first participant
+   *  join. Best-effort — returns '' on any error. */
+  private readSeedNotes(sessionId: string): string {
+    try {
+      const raw = native.addon.getMeetingSession(sessionId);
+      if (!raw || raw === 'null') return '';
+      const session = JSON.parse(raw);
+      const structuredRaw = session?.structured_output;
+      if (typeof structuredRaw !== 'string') return '';
+      const structured = JSON.parse(structuredRaw);
+      const html = structured?.userNotes;
+      return typeof html === 'string' ? html : '';
+    } catch {
+      return '';
+    }
+  }
+
+  /** Persist the current shared notes to the host session's structured_output. */
+  private persistNotesToHost(html: string): void {
+    if (!this.sessionId) return;
+    try {
+      // Read-modify-write the structured_output JSON so other keys
+      // (sections, plainSummary, etc.) are preserved.
+      let merged: Record<string, unknown> = {};
+      try {
+        const raw = native.addon.getMeetingSession(this.sessionId);
+        if (raw && raw !== 'null') {
+          const session = JSON.parse(raw);
+          const structuredRaw = session?.structured_output;
+          if (typeof structuredRaw === 'string') {
+            const parsed = JSON.parse(structuredRaw);
+            if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+          }
+        }
+      } catch { /* fall through with empty merged */ }
+      merged.userNotes = html;
+      native.setMeetingStructuredOutput(this.sessionId, JSON.stringify(merged));
+    } catch (err) {
+      console.warn('[MeetingRoomServer] persistNotesToHost failed:', (err as Error)?.message);
+    }
   }
 
   /**
@@ -145,6 +220,13 @@ class MeetingRoomServerManager {
     this.hostName = opts.hostName || 'Host';
     this.templateId = opts.templateId ?? null;
     this.roomCode = this.generateRoomCode();
+
+    // Seed notes from the host's session if they typed something before
+    // hosting. Bump version to 1 if non-empty so the welcome payload's
+    // (notesVersion) is unambiguously real (clients init lastApplied=-1).
+    const seed = this.readSeedNotes(opts.sessionId);
+    this.currentNotesHtml = seed;
+    this.notesVersion = seed.length > 0 ? 1 : 0;
 
     const ip = this.detectLanIp();
     if (!ip) {
@@ -203,6 +285,8 @@ class MeetingRoomServerManager {
     this.roomCode = null;
     this.boundIp = null;
     this.boundPort = null;
+    this.currentNotesHtml = '';
+    this.notesVersion = 0;
     this.pushStateToRenderer();
   }
 
@@ -255,6 +339,10 @@ class MeetingRoomServerManager {
           hostName: this.hostName,
           templateId: this.templateId,
           participantId,
+          // Hand the joiner the current shared notes state so they don't see
+          // an empty editor while waiting for the next notes_update event.
+          notesHtml: this.currentNotesHtml,
+          notesVersion: this.notesVersion,
         }));
       } catch (err) {
         console.warn('[MeetingRoomServer] failed to send welcome:', err);
@@ -332,7 +420,99 @@ class MeetingRoomServerManager {
 
       // Rebroadcast to all OTHER participants so everyone sees a unified view
       this.broadcast({ type: 'segment_broadcast', segment: persisted }, state.socket);
+      return;
     }
+
+    if (msg.type === 'notes_update') {
+      // typeof check (not truthiness) so a deliberately-emptied note still
+      // syncs the empty state to other participants.
+      if (typeof msg.html !== 'string') return;
+      if (msg.html.length > MAX_NOTES_HTML_LENGTH) {
+        console.warn('[MeetingRoomServer] notes_update too large, dropping:', msg.html.length);
+        return;
+      }
+
+      // Host is the source of truth: unconditionally accept, increment, persist,
+      // rebroadcast. baseVersion (if present) is informational only — gating on
+      // it would silently drop edits from active typists, the opposite of LWW.
+      this.notesVersion += 1;
+      this.currentNotesHtml = msg.html;
+      const version = this.notesVersion;
+      const originId = state.participantId; // already non-null inside join branch
+
+      this.persistNotesToHost(msg.html);
+
+      // Trigger the host's LiveSummarizer so the LLM picks up the participant's
+      // notes on the next pass. We can't rely on the host renderer to do this:
+      // it suppresses its own loop when applying inbound updates (otherwise we'd
+      // get an echo through MEETING_USER_NOTES_CHANGED).
+      try {
+        // Lazy require to avoid a static cycle live-summarizer ↔ server.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { liveSummarizer } = require('./live-summarizer') as typeof import('./live-summarizer');
+        liveSummarizer.notifyUserNotesChanged(this.sessionId!);
+      } catch (err) {
+        console.warn('[MeetingRoomServer] live-summarizer notify failed:', (err as Error)?.message);
+      }
+
+      // Push to the host's renderer so the host's YourNotesPanel reflects the
+      // remote edit. The host UI uses its echo-suppression flag to avoid
+      // looping the inbound update back through MEETING_USER_NOTES_CHANGED.
+      this.pushNotesToHostRenderer(msg.html, version, originId);
+
+      // Rebroadcast to every OTHER authenticated participant.
+      this.broadcast(
+        { type: 'notes_update', html: msg.html, version, originId },
+        state.socket,
+      );
+      return;
+    }
+  }
+
+  /** Local host typed in YourNotesPanel — persist + rebroadcast to participants.
+   *  Does NOT push back to the host renderer (it already has the html) and does
+   *  NOT trigger LiveSummarizer (the host renderer's MEETING_USER_NOTES_CHANGED
+   *  path already nudged it). */
+  applyHostNotesUpdate(html: string): void {
+    if (!this.wss || !this.sessionId) return;
+    if (typeof html !== 'string') return;
+    if (html.length > MAX_NOTES_HTML_LENGTH) {
+      console.warn('[MeetingRoomServer] applyHostNotesUpdate html too large, dropping:', html.length);
+      return;
+    }
+    this.notesVersion += 1;
+    this.currentNotesHtml = html;
+    this.persistNotesToHost(html);
+    this.broadcast({
+      type: 'notes_update',
+      html,
+      version: this.notesVersion,
+      originId: 'host',
+    });
+  }
+
+  /** Fan a host-produced live summary out to every authenticated participant. */
+  broadcastLiveSummary(payload: {
+    sessionId: string;
+    summary: string;
+    segmentCount: number;
+    generatedAt: number;
+    insufficient: boolean;
+  }): void {
+    if (!this.wss) return;
+    this.broadcast({ type: 'summary_broadcast', ...payload });
+  }
+
+  private pushNotesToHostRenderer(html: string, version: number, originId: string | null): void {
+    if (!this.sessionId) return;
+    const windows = BrowserWindow.getAllWindows();
+    if (windows.length === 0) return;
+    windows[0].webContents.send(IPC_CHANNELS.MEETING_USER_NOTES_BROADCAST, {
+      sessionId: this.sessionId,
+      html,
+      version,
+      originId,
+    });
   }
 
   private handleDisconnect(state: ClientState): void {
@@ -349,12 +529,17 @@ class MeetingRoomServerManager {
     }
   }
 
-  /** Broadcast a JSON message to all connected participants (optionally excluding one). */
+  /** Broadcast a JSON message to all AUTHENTICATED participants (optionally
+   *  excluding one). A socket counts as authenticated only after a valid
+   *  `join` has been processed (i.e. its ClientState has a participantId).
+   *  Unauthenticated sockets that connected to the port but haven't joined
+   *  MUST never receive transcript / summary / notes content. */
   private broadcast(msg: any, exclude?: WebSocket): void {
     if (!this.wss) return;
     const payload = JSON.stringify(msg);
-    for (const client of this.clients.keys()) {
+    for (const [client, state] of this.clients.entries()) {
       if (client === exclude) continue;
+      if (!state.participantId) continue; // auth gate
       if (client.readyState === WebSocket.OPEN) {
         try { client.send(payload); } catch { /* ignore */ }
       }

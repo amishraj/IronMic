@@ -950,10 +950,38 @@ If the text is too short or unclear, output: ["General"]`;
   // Fire-and-forget: renderer tells the summarizer that user notes changed.
   // The summarizer debounces and will re-run, picking up the new notes from
   // the DB (YourNotesPanel persists them via meetingSetStructuredOutput first).
+  // ALSO: when this machine is part of a collaborative meeting room, route
+  // the latest html through the room transport so participants stay in sync.
   ipcMain.on(IPC_CHANNELS.MEETING_USER_NOTES_CHANGED, (_e, sessionId: string) => {
     if (typeof sessionId !== 'string' || !sessionId) return;
     try { liveSummarizer.notifyUserNotesChanged(sessionId); }
     catch (err) { console.warn('[ipc] notifyUserNotesChanged failed:', err); }
+
+    // Read the freshly-persisted html out of the host DB and forward through
+    // whichever transport this machine is on. Read errors / missing rows
+    // short-circuit silently — solo mode and pre-room-start typing are valid.
+    let html = '';
+    try {
+      const raw = native.addon.getMeetingSession(sessionId);
+      if (raw && raw !== 'null') {
+        const session = JSON.parse(raw);
+        const structuredRaw = session?.structured_output;
+        if (typeof structuredRaw === 'string') {
+          const structured = JSON.parse(structuredRaw);
+          if (typeof structured?.userNotes === 'string') html = structured.userNotes;
+        }
+      }
+    } catch { /* solo mode, no notes yet — fine */ }
+
+    try {
+      if (meetingRoomServer.isActive() && meetingRoomServer.getInfo().sessionId === sessionId) {
+        meetingRoomServer.applyHostNotesUpdate(html);
+      } else if (meetingRoomClient.isConnected() && meetingRoomClient.getInfo().sessionId === sessionId) {
+        meetingRoomClient.sendNotesUpdate(html);
+      }
+    } catch (err) {
+      console.warn('[ipc] notes-update transport failed:', (err as Error)?.message);
+    }
   });
 
   // ── Meeting Room (LAN multi-user collaboration) ──
