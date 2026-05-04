@@ -82,6 +82,69 @@ function escapeHtml(s: string): string {
     .replace(/>/g, '&gt;');
 }
 
+/** Parse a wire payload as a TipTap doc JSON value, or null if it isn't one.
+ *  Used by collab receive paths so DictatePage can speak rich JSON to other
+ *  DictatePage peers while still accepting plaintext payloads from the
+ *  meeting collab components (which still send plaintext). */
+function parseTiptapDocJson(serialized: string): any | null {
+  try {
+    const parsed = JSON.parse(serialized);
+    if (parsed && typeof parsed === 'object' && parsed.type === 'doc') return parsed;
+  } catch { /* not JSON */ }
+  return null;
+}
+
+/** Wrap legacy plaintext payloads as escaped HTML — paragraph breaks on
+ *  `\n\n`, `<br>` on single `\n`. We escape `&<>` first so meeting plaintext
+ *  containing `<` (e.g. "5 < 10") doesn't get mis-parsed as HTML. */
+function plainTextWireToTiptapHtml(s: string): string {
+  return s.split(/\n\n+/)
+    .map(p => `<p>${escapeHtml(p).replace(/\n/g, '<br>')}</p>`)
+    .join('');
+}
+
+/** Walk a TipTap doc JSON tree and produce plain text. Used to derive text
+ *  for `createEntry` / DB writes WITHOUT having to load the JSON into the
+ *  live editor first (which would clobber whatever the user has on screen). */
+function tiptapJsonToPlainText(node: any): string {
+  if (!node) return '';
+  if (node.type === 'text' && typeof node.text === 'string') return node.text;
+  let out = '';
+  if (Array.isArray(node.content)) {
+    for (const child of node.content) out += tiptapJsonToPlainText(child);
+  }
+  // Add a trailing newline after block-ish nodes so paragraph breaks survive.
+  if (node.type && /^(paragraph|heading|listItem|blockquote|codeBlock|horizontalRule)$/.test(node.type)) {
+    out += '\n';
+  }
+  return out;
+}
+
+/** Derive a `(plainText, json)` pair from a wire payload without touching the
+ *  live editor. Accepts a TipTap JSON string or a plaintext/HTML string. The
+ *  json field is always a stringified TipTap doc, so the caller can persist
+ *  it directly into `rawTranscriptJson` for round-trip. */
+function deriveTextAndJsonFromWire(serialized: string): { plainText: string; json: string } {
+  const doc = parseTiptapDocJson(serialized);
+  if (doc) {
+    return { plainText: tiptapJsonToPlainText(doc).trim(), json: JSON.stringify(doc) };
+  }
+  // Fallback: treat as plaintext (or sloppy HTML). Strip tags for text and
+  // synthesise a minimal TipTap doc so the JSON column is valid.
+  const stripped = String(serialized)
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+  const synth = {
+    type: 'doc',
+    content: stripped.split(/\n\n+/).map(p => ({
+      type: 'paragraph',
+      content: p ? [{ type: 'text', text: p }] : [],
+    })),
+  };
+  return { plainText: stripped.trim(), json: JSON.stringify(synth) };
+}
+
 function titleFromTags(tagsJson: string | null | undefined): string | null {
   if (!tagsJson) return null;
   try {
@@ -116,7 +179,6 @@ async function computeNextNoteNumber(): Promise<number> {
 export function DictatePage() {
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const draftThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const collabActiveRef = useRef(false);
   const [wordCount, setWordCount] = useState(0);
   const [charCount, setCharCount] = useState(0);
   const [saved, setSaved] = useState(true);
@@ -128,8 +190,23 @@ export function DictatePage() {
    *  Done is pressed or when an already-finalized note is opened from sidebar. */
   const [loadedEntryStatus, setLoadedEntryStatus] = useState<'draft' | 'done' | null>(null);
   const [collabOpen, setCollabOpen] = useState(false);
-  const [collabActive, setCollabActive] = useState(false);
+  // Collab state is split: host-side (we run the server) vs. joined (we are
+  // a participant on someone else's server). The IPC channel
+  // `ironmic:meeting-collab-state` is shared by both managers — they push
+  // different shapes (CollabServerInfo vs. CollabClientInfo), so the receive
+  // handler below branches on shape.
+  const [collabHostActive, setCollabHostActive] = useState(false);
+  const [collabJoined, setCollabJoined] = useState(false);
+  const [collabHostName, setCollabHostName] = useState<string | null>(null);
   const [collabParticipantCount, setCollabParticipantCount] = useState(0);
+  const collabHostActiveRef = useRef(false);
+  const collabJoinedRef = useRef(false);
+  const collabSelfIdRef = useRef<string | null>(null);
+  /** The entry this collab session reads/writes. Stable across sidebar
+   *  navigation. Cleared on Leave / End. F3 routes persistence to this id. */
+  const collabBoundEntryIdRef = useRef<string | null>(null);
+  // Derived: any kind of collab session is active.
+  const collabActive = collabHostActive || collabJoined;
   const [noteEmoji, setNoteEmoji] = useState(() => pickRandomEmoji());
   /** True when we're programmatically replacing editor content (polish,
    *  toggle to other display mode, sidebar entry switch). The TipTap
@@ -328,6 +405,29 @@ export function DictatePage() {
         saveDraft(html, useDictationStore.getState().entryId, useDictationStore.getState().title);
         setSaved(true);
       }, 1000);
+
+      // Live keystroke preview for collab peers — 300 ms throttle. Folded in
+      // here (not a separate effect keyed on charCount) so that remote
+      // applies — which call setCharCount via applyRemoteToEditor — can't
+      // re-trigger a draft send back at the original sender. The
+      // `isApplyingRemoteContentRef` early-return at the top of onUpdate
+      // already gates this branch, so user keystrokes are the only thing
+      // that schedule a draft.
+      if (collabHostActiveRef.current || collabJoinedRef.current) {
+        if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
+        draftThrottleRef.current = setTimeout(() => {
+          const j = JSON.stringify(editor.getJSON());
+          const name = (() => {
+            try { return localStorage.getItem('ironmic-collab-display-name') || (collabHostActiveRef.current ? 'Host' : 'Viewer'); }
+            catch { return collabHostActiveRef.current ? 'Host' : 'Viewer'; }
+          })();
+          if (collabHostActiveRef.current) {
+            window.ironmic?.meetingCollabNotifyDraft?.(j, name)?.catch(() => {});
+          } else if (collabJoinedRef.current) {
+            window.ironmic?.meetingCollabSendDraft?.(j)?.catch(() => {});
+          }
+        }, 300);
+      }
     },
   });
 
@@ -453,6 +553,21 @@ export function DictatePage() {
           }
         } catch { /* best-effort */ }
       } catch (err) { console.error('Failed to save:', err); }
+    }
+
+    // Durable-commit hop for collab. Only broadcast when this save belongs to
+    // the entry the collab session is bound to, so navigating to an unrelated
+    // note doesn't leak its content to peers.
+    if (isCurrent() && currentId && collabBoundEntryIdRef.current === currentId) {
+      if (collabHostActiveRef.current) {
+        const hostName = (() => {
+          try { return localStorage.getItem('ironmic-collab-display-name') || 'Host'; }
+          catch { return 'Host'; }
+        })();
+        window.ironmic?.meetingCollabNotifySaved?.(json, hostName)?.catch(() => {});
+      } else if (collabJoinedRef.current) {
+        window.ironmic?.meetingCollabSaveNotes?.(json)?.catch(() => {});
+      }
     }
   }, [noteEmoji]);
 
@@ -644,57 +759,167 @@ export function DictatePage() {
     return () => window.removeEventListener('ironmic:quick-action-dictate', handler);
   }, [editor, handleDictateToggle, resetToBlankNote]);
 
-  // Track live collab session state for the button indicator.
+  // Track live collab session state. The server pushes CollabServerInfo (has
+  // `.active`) and the client pushes CollabClientInfo (has `.connected` +
+  // `.participantId`). Branch on shape so we can drive both host and joined
+  // indicators from the same channel without one shape masking the other.
   useEffect(() => {
     const unsub = window.ironmic?.onMeetingCollabState?.((info: any) => {
-      const active = info?.active ?? false;
-      setCollabActive(active);
-      collabActiveRef.current = active;
-      setCollabParticipantCount(info?.participants?.length ?? 0);
+      if (typeof info?.active === 'boolean') {
+        // Server push — host-side state.
+        setCollabHostActive(info.active);
+        collabHostActiveRef.current = info.active;
+        setCollabParticipantCount(info?.participants?.length ?? 0);
+        if (info.active && typeof info.sessionId === 'string' && info.sessionId.startsWith('note:')) {
+          // Bind to the noteId we're hosting for. F3's handlers route
+          // persistence through this so navigation in the sidebar can't
+          // misroute remote saves.
+          collabBoundEntryIdRef.current = info.sessionId.slice(5);
+        } else if (!info.active) {
+          collabBoundEntryIdRef.current = null;
+        }
+        return;
+      }
+      if (typeof info?.connected === 'boolean') {
+        // Client push — collaborator-side state.
+        setCollabJoined(info.connected);
+        collabJoinedRef.current = info.connected;
+        setCollabHostName(info?.hostName ?? null);
+        collabSelfIdRef.current = info?.participantId ?? null;
+        // The collaborator-side participant count includes the host + every
+        // viewer, only present when the server's presence broadcast has
+        // landed. Surface it for the indicator label when available.
+        if (Array.isArray(info?.participants)) {
+          setCollabParticipantCount(info.participants.length);
+        }
+        if (!info.connected) {
+          // Disconnected (Leave or host ended). Clear the binding so no
+          // further remote events apply or persist anywhere.
+          collabBoundEntryIdRef.current = null;
+          collabSelfIdRef.current = null;
+          setCollabHostName(null);
+        }
+      }
     });
     return () => { unsub?.(); };
   }, []);
 
-  // Broadcast host keystrokes to participants as live draft events (300 ms throttle).
-  useEffect(() => {
-    if (!collabActive || !editor) return;
-    if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current);
-    draftThrottleRef.current = setTimeout(() => {
-      const content = editor.getText();
-      const name = (() => { try { return localStorage.getItem('ironmic-collab-display-name') || 'Host'; } catch { return 'Host'; } })();
-      window.ironmic?.meetingCollabNotifySaved?.(content, name)?.catch(() => {});
-    }, 300);
-    return () => { if (draftThrottleRef.current) clearTimeout(draftThrottleRef.current); };
-  }, [charCount, collabActive, editor]);
-
-  // Apply incoming draft content when we're a participant (no local server running).
-  useEffect(() => {
-    const unsub = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
-      if (collabActiveRef.current) return; // we're the host, ignore
-      if (editor && data?.content != null) {
-        const html = `<p>${String(data.content).replace(/\n/g, '</p><p>')}</p>`;
-        editor.commands.setContent(html, false);
-      }
-    });
-    return () => { unsub?.(); };
-  }, [editor]);
-
-  // Keep notes in sync while session is running but modal is closed.
-  useEffect(() => {
-    const unsub = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
-      if (editor && data?.notes) {
-        editor.commands.setContent(`<p>${String(data.notes).replace(/\n/g, '</p><p>')}</p>`);
-      }
-    });
-    return () => { unsub?.(); };
-  }, [editor]);
-
   // Auto-stop when the last participant leaves while the modal is closed.
+  // Only meaningful for the host — collaborators can't stop the server.
   useEffect(() => {
-    if (!collabOpen && collabActive && collabParticipantCount === 0) {
+    if (!collabOpen && collabHostActive && collabParticipantCount === 0) {
       window.ironmic?.meetingCollabStop?.().catch(() => {});
     }
-  }, [collabOpen, collabActive, collabParticipantCount]);
+  }, [collabOpen, collabHostActive, collabParticipantCount]);
+
+  /** Apply a wire payload (TipTap JSON or plaintext) to the live editor.
+   *  Returns the resulting plaintext + JSON for the caller to persist. The
+   *  isApplyingRemoteContentRef bracket suppresses onUpdate's autosave so
+   *  the remote content doesn't immediately echo back via saveContent. */
+  const applyRemoteToEditor = useCallback((serialized: string): { plainText: string; json: string } | null => {
+    if (!editor) return null;
+    isApplyingRemoteContentRef.current = true;
+    try {
+      const doc = parseTiptapDocJson(serialized);
+      if (doc) {
+        editor.commands.setContent(doc, false);
+      } else {
+        editor.commands.setContent(plainTextWireToTiptapHtml(String(serialized)), false);
+      }
+    } finally {
+      isApplyingRemoteContentRef.current = false;
+    }
+    // setContent(_, false) suppresses onUpdate, so update counts manually.
+    // This does NOT re-fire the draft-send (folded into onUpdate, gated by
+    // the same isApplyingRemoteContentRef branch).
+    const text = editor.getText();
+    setCharCount(text.length);
+    setWordCount(text.trim() ? text.trim().split(/\s+/).length : 0);
+    return { plainText: text.trim(), json: JSON.stringify(editor.getJSON()) };
+  }, [editor]);
+
+  /** Persist a received `saved` payload to the bound entry's DB row, mirror
+   *  it into the entry-store cache, and refresh the sidebar. Routed by
+   *  collabBoundEntryIdRef.current so navigating to an unrelated note in
+   *  the sidebar mid-session can't misroute remote saves. */
+  const persistRemoteSaved = useCallback(async (targetEntryId: string, applied: { plainText: string; json: string }) => {
+    const api = window.ironmic;
+    try {
+      const storeEntry = useEntryStore.getState();
+      const live = storeEntry.entries.find((e) => e.id === targetEntryId)
+        ?? storeEntry.entryCache.get(targetEntryId)
+        ?? null;
+      const writingPolished = !!live?.polishedText && live?.displayMode === 'polished';
+      const updates = writingPolished
+        ? { polishedText: applied.plainText, polishedTextJson: applied.json }
+        : { rawTranscript: applied.plainText || ' ', rawTranscriptJson: applied.json };
+      const updated = await api.updateEntry(targetEntryId, updates as any);
+      if (updated) {
+        useEntryStore.setState((s) => {
+          const idx = s.entries.findIndex((e) => e.id === targetEntryId);
+          const nextEntries = idx === -1 ? s.entries : (() => {
+            const out = s.entries.slice();
+            out[idx] = updated;
+            return out;
+          })();
+          const nextCache = new Map(s.entryCache);
+          nextCache.set(targetEntryId, updated);
+          return { entries: nextEntries, entryCache: nextCache };
+        });
+      }
+      // Only touch local rev tracking + draft when the bound entry is on
+      // screen — otherwise we'd corrupt the rev for the unrelated entry the
+      // user is currently editing.
+      if (useDictationStore.getState().entryId === targetEntryId) {
+        lastSyncedLocalRevRef.current = localEditsRevRef.current;
+        setSaved(true);
+        saveDraft(editor?.getHTML() ?? '', targetEntryId, useDictationStore.getState().title);
+      }
+      try { window.dispatchEvent(new CustomEvent('ironmic:entries-changed')); } catch { /* noop */ }
+    } catch (err) {
+      console.warn('[DictatePage] failed to persist remote saved content:', err);
+    }
+  }, [editor]);
+
+  // Apply incoming live drafts. Visual-only — no DB persistence (drafts are
+  // ephemeral). Echo-guarded by peerId, not display name (RC6).
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
+      if (!editor || data?.content == null) return;
+      // Echo guard: ignore our own broadcast bouncing back through the server.
+      if (collabHostActiveRef.current && data.peerId === 'host') return;
+      if (data.peerId && data.peerId === collabSelfIdRef.current) return;
+      // Only apply if the bound entry is currently on screen — otherwise the
+      // draft preview would clobber whatever unrelated note the user is
+      // viewing.
+      const currentId = useDictationStore.getState().entryId;
+      if (collabBoundEntryIdRef.current && collabBoundEntryIdRef.current === currentId) {
+        applyRemoteToEditor(String(data.content));
+      }
+    });
+    return () => { unsub?.(); };
+  }, [editor, applyRemoteToEditor]);
+
+  // Apply incoming committed saves. Always persists to the bound entry's DB
+  // row; only updates the editor when the bound entry is on screen.
+  useEffect(() => {
+    const unsub = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
+      if (!editor || !data?.notes) return;
+      if (collabHostActiveRef.current && data.peerId === 'host') return;
+      if (data.peerId && data.peerId === collabSelfIdRef.current) return;
+      const boundId = collabBoundEntryIdRef.current;
+      if (!boundId) return; // session torn down — ignore stale event
+      const currentId = useDictationStore.getState().entryId;
+      let payload: { plainText: string; json: string } | null = null;
+      if (boundId === currentId) {
+        payload = applyRemoteToEditor(String(data.notes));
+      } else {
+        payload = deriveTextAndJsonFromWire(String(data.notes));
+      }
+      if (payload) void persistRemoteSaved(boundId, payload);
+    });
+    return () => { unsub?.(); };
+  }, [editor, applyRemoteToEditor, persistRemoteSaved]);
 
   const handleReadBack = useCallback(() => {
     if (!editor) return;
@@ -1099,33 +1324,20 @@ export function DictatePage() {
     } catch { /* best effort */ }
   }, []);
 
-  // ── Load an entry from the sidebar into the editor ──
-  // When the user clicks a different note in the sidebar, we swap the editor
-  // content + store state to that entry. Blocked if actively dictating so we
-  // don't create a confusing mismatch between where chunks are landing and
-  // what the user is looking at.
-  const handleSelectEntry = useCallback((entry: Entry) => {
+  /** Swap the editor + store onto a specific entry, running all the
+   *  bookkeeping (counts, status, emoji, draft, store mirror, edit-rev
+   *  reset). Used by both the sidebar click path AND the join-collab path
+   *  so they can't drift. The optional `titleOverride` lets the join path
+   *  pin a "Shared with X" title regardless of what's on the entry tags. */
+  const loadEntryIntoEditor = useCallback((entry: Entry, opts?: { mode?: 'raw' | 'polished'; titleOverride?: string }) => {
     if (!editor) return;
-    if (status !== 'idle') {
-      toast({
-        type: 'info',
-        message: 'Finish or stop dictation before switching notes.',
-        durationMs: 4000,
-      });
-      return;
-    }
     // Flush any pending debounce for the currently-open note before we swap.
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
       debounceRef.current = null;
     }
-    const plain = (entry.rawTranscript || '').trim();
-    // Apply via the helper — preserves TipTap JSON formatting if the entry
-    // has it, falls back to plaintext-wrapped HTML for legacy notes.
-    // Determine which side to load from the entry's persisted displayMode
-    // (mirrors effectiveMode logic — polished only if there's polished text).
-    const sideMode: 'raw' | 'polished' =
-      entry.polishedText && entry.displayMode === 'polished' ? 'polished' : 'raw';
+    const sideMode: 'raw' | 'polished' = opts?.mode
+      ?? (entry.polishedText && entry.displayMode === 'polished' ? 'polished' : 'raw');
     isApplyingRemoteContentRef.current = true;
     try {
       applyEntryToEditor(entry, sideMode);
@@ -1141,23 +1353,38 @@ export function DictatePage() {
     localEditsRevRef.current = 0;
     lastSyncedLocalRevRef.current = 0;
 
-    const nextTitle = parseTitleTag(entry.tags) || 'Untitled note';
+    const nextTitle = opts?.titleOverride ?? (parseTitleTag(entry.tags) || 'Untitled note');
     const nextNotebook = parseNotebookTag(entry.tags) || getDefaultNotebookId();
     useDictationStore.setState({
       entryId: entry.id,
       title: nextTitle,
       notebookId: nextNotebook,
-      fullText: plain,
+      fullText: (entry.rawTranscript || '').trim(),
       // Don't touch chunkSeq — appending future chunks is still keyed off it.
       lastChunkText: '',
     });
-    // Reflect actual persisted status so the badge is accurate for finalized notes.
     setLoadedEntryStatus(parseStatusTag(entry.tags));
     setNoteEmoji(parseEmojiTag(entry.tags) || pickRandomEmoji());
-    // Persist the now-rendered editor HTML (which may include rich JSON-derived
-    // structure) into the localStorage draft so a refresh restores it verbatim.
     saveDraft(editor.getHTML(), entry.id, nextTitle);
-  }, [editor, status, toast, applyEntryToEditor]);
+  }, [editor, applyEntryToEditor]);
+
+  // ── Load an entry from the sidebar into the editor ──
+  // When the user clicks a different note in the sidebar, we swap the editor
+  // content + store state to that entry. Blocked if actively dictating so we
+  // don't create a confusing mismatch between where chunks are landing and
+  // what the user is looking at.
+  const handleSelectEntry = useCallback((entry: Entry) => {
+    if (!editor) return;
+    if (status !== 'idle') {
+      toast({
+        type: 'info',
+        message: 'Finish or stop dictation before switching notes.',
+        durationMs: 4000,
+      });
+      return;
+    }
+    loadEntryIntoEditor(entry);
+  }, [editor, status, toast, loadEntryIntoEditor]);
 
   // ── Refresh the sidebar when meaningful things happen ──
   // (a) dictation finished (status went idle with an entry present), or
@@ -1405,16 +1632,24 @@ export function DictatePage() {
                     ? 'bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20'
                     : 'text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-accent/10 border border-iron-border hover:border-iron-accent/30'
                 }`}
-                title={collabActive
-                  ? `Live session — ${collabParticipantCount} participant${collabParticipantCount !== 1 ? 's' : ''} connected`
-                  : 'Collaborate on this note with teammates'}
+                title={
+                  collabHostActive
+                    ? `Hosting — ${collabParticipantCount} participant${collabParticipantCount !== 1 ? 's' : ''} connected`
+                    : collabJoined
+                    ? `Joined ${collabHostName ?? 'host'}'s session — open the modal to leave`
+                    : 'Collaborate on this note with teammates'
+                }
               >
                 {collabActive
                   ? <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse shrink-0" />
                   : <Users className="w-3.5 h-3.5" />}
-                {!windowNarrow && (collabActive
-                  ? `Live${collabParticipantCount > 0 ? ` · ${collabParticipantCount}` : ''}`
-                  : 'Collaborate')}
+                {!windowNarrow && (
+                  collabHostActive
+                    ? `Live${collabParticipantCount > 0 ? ` · ${collabParticipantCount}` : ''}`
+                    : collabJoined
+                    ? `Joined · ${collabHostName ?? 'host'}`
+                    : 'Collaborate'
+                )}
               </button>
 
               <button
@@ -1470,6 +1705,25 @@ export function DictatePage() {
           </div>
         </div>
       </div>
+
+      {/* Joined-session banner — only shows on a participant. Host gets the
+          live count via the Collaborate button. */}
+      {collabJoined && !collabHostActive && (
+        <div className="flex items-center justify-between px-3 py-1.5 border-b border-iron-border bg-green-500/10 text-[11px] text-green-300">
+          <span className="flex items-center gap-1.5">
+            <Users className="w-3 h-3" />
+            <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse" />
+            Editing live with <strong className="font-medium">{collabHostName ?? 'host'}</strong>
+          </span>
+          <button
+            onClick={() => window.ironmic?.meetingCollabLeave?.().catch(() => {})}
+            className="px-2 py-0.5 rounded bg-green-500/20 hover:bg-green-500/30 text-green-200 text-[10px]"
+            title="Disconnect from this shared note (your local copy stays)"
+          >
+            Leave
+          </button>
+        </div>
+      )}
 
       {/* Toolbar */}
       <div className="flex items-center gap-0.5 px-3 py-1.5 border-b border-iron-border bg-iron-surface/40 flex-wrap">
@@ -1535,12 +1789,56 @@ export function DictatePage() {
       {collabOpen && (
         <NotesCollaborateModal
           noteId={entryId}
-          initialNotes={editor?.getText() ?? ''}
-          onNotesUpdated={(notes) => {
-            if (editor) editor.commands.setContent(`<p>${notes.replace(/\n/g, '</p><p>')}</p>`);
-          }}
-          onJoined={({ notes }) => {
-            if (editor) editor.commands.setContent(`<p>${notes.replace(/\n/g, '</p><p>')}</p>`);
+          // Seed the host's session with rich JSON so late joiners get
+          // formatting via the welcome message.
+          initialNotes={editor ? JSON.stringify(editor.getJSON()) : ''}
+          onJoined={async ({ sessionId, hostName, notes }) => {
+            // 1. Derive plaintext + canonical JSON from the seeded notes
+            //    WITHOUT touching the live editor — if createEntry fails,
+            //    the user's currently-open note must stay untouched.
+            const derived = deriveTextAndJsonFromWire(String(notes ?? ''));
+
+            // 2. Create a brand-new entry already populated with the seeded
+            //    content. Never overwrite the collaborator's existing note.
+            const tagsArr = [
+              `${TITLE_TAG_PREFIX}Shared with ${hostName}`,
+              `__notebook__:${notebookId}`,
+              `__status__:draft`,
+              `${EMOJI_TAG_PREFIX}${noteEmoji}`,
+              `__collab_session__:${sessionId}`,
+            ];
+            let created: any;
+            try {
+              created = await window.ironmic.createEntry({
+                rawTranscript: derived.plainText || ' ',
+                rawTranscriptJson: derived.json,
+                tags: JSON.stringify(tagsArr),
+              } as any);
+            } catch (err) {
+              console.warn('[DictatePage] could not create joined-collab entry:', err);
+              toast({
+                type: 'error',
+                message: "Couldn't start a shared note locally. Your current note is unchanged.",
+                durationMs: 4000,
+              });
+              return;
+            }
+            const newId = (created as any).id as string;
+
+            // 3. Bind the session to this entry. F2/F3 route persistence
+            //    here so sidebar navigation can't misroute remote saves.
+            collabBoundEntryIdRef.current = newId;
+
+            // 4. Load the freshly-created entry through the canonical helper
+            //    so all bookkeeping (counts, status, emoji, store, draft) runs.
+            try {
+              const fresh = await window.ironmic.getEntry(newId);
+              if (fresh) loadEntryIntoEditor(fresh, { titleOverride: `Shared with ${hostName}` });
+            } catch (err) {
+              console.warn('[DictatePage] could not reload joined-collab entry:', err);
+            }
+            bumpSidebar();
+            try { window.dispatchEvent(new CustomEvent('ironmic:entries-changed')); } catch { /* noop */ }
           }}
           onClose={() => setCollabOpen(false)}
         />

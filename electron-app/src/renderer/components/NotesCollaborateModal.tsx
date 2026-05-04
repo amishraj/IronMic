@@ -25,8 +25,6 @@ interface Props {
   noteId: string | null;
   /** Initial contents for the Create flow. */
   initialNotes: string;
-  /** Called with the latest notes when a remote save arrives (host side). */
-  onNotesUpdated?: (notes: string, savedBy: string) => void;
   /** Called when a Join succeeds — parent typically opens a viewer. */
   onJoined?: (info: { sessionId: string; hostName: string; notes: string }) => void;
   onClose: () => void;
@@ -39,7 +37,6 @@ interface CollabParticipant { id: string; displayName: string; joinedAt: number 
 export function NotesCollaborateModal({
   noteId,
   initialNotes,
-  onNotesUpdated,
   onJoined,
   onClose,
 }: Props) {
@@ -102,7 +99,6 @@ export function NotesCollaborateModal({
             <CreatePanel
               noteId={noteId}
               initialNotes={initialNotes}
-              onNotesUpdated={onNotesUpdated}
               onClose={onClose}
             />
           )}
@@ -120,12 +116,10 @@ export function NotesCollaborateModal({
 function CreatePanel({
   noteId,
   initialNotes,
-  onNotesUpdated,
   onClose,
 }: {
   noteId: string;
   initialNotes: string;
-  onNotesUpdated?: (notes: string, savedBy: string) => void;
   onClose?: () => void;
 }) {
   const sessionId = `note:${noteId}`;
@@ -177,10 +171,9 @@ function CreatePanel({
         participantsRef.current = info?.participants ?? [];
       }
     });
-    const unsubNotes = window.ironmic?.onMeetingCollabNotesUpdated?.((data: any) => {
-      if (cancelled) return;
-      onNotesUpdated?.(data.notes, data.savedBy);
-    });
+    // Note: incoming saved/draft application is owned by DictatePage's
+    // page-level listeners. Handling them here as well would race with that
+    // path (both would call setContent on the same editor).
     const unsubDraft = window.ironmic?.onMeetingCollabDraft?.((data: any) => {
       if (cancelled) return;
       setDrafting({ peerId: data.peerId, peerName: data.peerName });
@@ -195,7 +188,6 @@ function CreatePanel({
     return () => {
       cancelled = true;
       unsubState?.();
-      unsubNotes?.();
       unsubDraft?.();
       unsubFw?.();
       if (draftTimerRef.current) clearTimeout(draftTimerRef.current);

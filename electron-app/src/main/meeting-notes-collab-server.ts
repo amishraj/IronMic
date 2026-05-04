@@ -214,7 +214,8 @@ class MeetingNotesCollabServerManager {
     if (!this.isActive()) return;
     this.currentNotes = notes;
     this.version++;
-    this.broadcast({ type: 'saved', content: notes, version: this.version, savedBy });
+    // peerId='host' lets receivers echo-guard by stable identity (not display name).
+    this.broadcast({ type: 'saved', content: notes, version: this.version, savedBy, peerId: 'host' });
     this.pushStateToRenderer();
   }
 
@@ -295,11 +296,12 @@ class MeetingNotesCollabServerManager {
         content,
         version: this.version,
         savedBy: state.displayName ?? 'Participant',
+        peerId: state.participantId,
       };
       // Broadcast the committed version to everyone
       this.broadcast(savedMsg);
       // Also notify the host's renderer
-      this.pushNotesSavedToRenderer(content, state.displayName ?? 'Participant');
+      this.pushNotesSavedToRenderer(content, state.displayName ?? 'Participant', state.participantId);
       return;
     }
   }
@@ -365,11 +367,11 @@ class MeetingNotesCollabServerManager {
     }
   }
 
-  private pushNotesSavedToRenderer(notes: string, savedBy: string): void {
+  private pushNotesSavedToRenderer(notes: string, savedBy: string, peerId: string | null = null): void {
     for (const win of BrowserWindow.getAllWindows()) {
       if (!win.isDestroyed()) {
         win.webContents.send('ironmic:meeting-collab-notes-updated', {
-          notes, savedBy, version: this.version, sessionId: this.sessionId,
+          notes, savedBy, version: this.version, sessionId: this.sessionId, peerId,
         });
       }
     }

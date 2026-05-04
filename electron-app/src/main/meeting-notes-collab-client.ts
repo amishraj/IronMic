@@ -193,6 +193,7 @@ class MeetingNotesCollabClientManager {
           notes: msg.content,
           savedBy: msg.savedBy,
           version: this.version,
+          peerId: msg.peerId,
         });
         break;
 
