@@ -264,7 +264,14 @@ export function Layout() {
     return () => { try { unsub?.(); } catch { /* noop */ } };
   }, [handleRecord]);
 
-  const handleNavigate = useCallback((p: string) => setPage(p as Page), []);
+  const handleNavigate = useCallback((p: string) => {
+    // The Notes UI lives inside DictatePage (NotesSidebar). WelcomePage's
+    // "Notes" quick action and note search results emit 'notes' — map it
+    // to the actual page id so navigation lands somewhere instead of
+    // silently no-op'ing on an unmatched view.
+    const target = p === 'notes' ? 'dictate' : p;
+    setPage(target as Page);
+  }, []);
 
   const coreItems = NAV_ITEMS.filter((n) => n.section === 'core' && (n.id !== 'ai' || aiEnabled));
   const toolItems = NAV_ITEMS.filter((n) => n.section === 'tools');
