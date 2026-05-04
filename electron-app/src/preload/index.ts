@@ -324,6 +324,13 @@ const api = {
     ipcRenderer.on('ironmic:meeting-segment-ready', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-segment-ready', handler);
   },
+  onMeetingDraftReady: (
+    callback: (payload: { sessionId: string | null; hypothesis: string; startMs: number }) => void,
+  ) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-draft-ready', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-draft-ready', handler);
+  },
   onMeetingRecordingState: (callback: (state: any) => void) => {
     const handler = (_event: any, state: any) => callback(state);
     ipcRenderer.on('ironmic:meeting-recording-state', handler);

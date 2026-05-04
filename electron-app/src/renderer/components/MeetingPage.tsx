@@ -25,6 +25,8 @@ export function MeetingPage() {
     createTemplate, deleteTemplate, deleteSession, setActiveResult,
     detectedApp, setDetectedApp,
     segments, addSegment, clearSegments,
+    draftHypothesis, setDraftHypothesis,
+    streamingMode, setStreamingMode,
     selectedAudioDevice, setSelectedAudioDevice,
     isGranolaRecording, setIsGranolaRecording,
     isGranolaStopping, setIsGranolaStopping,
@@ -86,9 +88,15 @@ export function MeetingPage() {
     const unsubSegment = window.ironmic?.onMeetingSegmentReady?.((segment: TranscriptSegment) => {
       addSegment(segment);
     });
+    const unsubDraft = window.ironmic?.onMeetingDraftReady?.((payload) => {
+      setDraftHypothesis(payload?.hypothesis ?? '');
+    });
     const unsubState = window.ironmic?.onMeetingRecordingState?.((state: any) => {
       setIsGranolaRecording(state.status === 'recording');
       setIsGranolaStopping(state.status === 'stopping');
+      // Mirror the recorder's streamingMode so the empty-state copy and any
+      // future UI affordances can branch on it. Defaults to false on idle.
+      setStreamingMode(!!state.streamingMode && state.status === 'recording');
       if (state.status === 'recording') {
         // Keep Zustand store in sync with the backend on every push event.
         // This is the recovery path: if the component remounted (tab switch)
@@ -100,6 +108,7 @@ export function MeetingPage() {
         setDurationMs(0);
         setGranolaSessionId(null);
         setGranolaRecordingStartedAt(null);
+        setDraftHypothesis('');
       }
     });
     const unsubLive = window.ironmic?.onMeetingLiveSummary?.((payload: any) => {
@@ -111,6 +120,7 @@ export function MeetingPage() {
     });
     return () => {
       unsubSegment?.();
+      unsubDraft?.();
       unsubState?.();
       unsubLive?.();
     };
@@ -1082,7 +1092,12 @@ export function MeetingPage() {
                   </button>
                 </div>
                 <div className="flex-1 overflow-hidden px-4 py-3">
-                  <MeetingTranscriptPanel segments={segments} isLive={isGranolaRecording} />
+                  <MeetingTranscriptPanel
+                    segments={segments}
+                    isLive={isGranolaRecording}
+                    draftHypothesis={draftHypothesis}
+                    streamingMode={streamingMode}
+                  />
                 </div>
               </>
             )}

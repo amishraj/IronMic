@@ -17,6 +17,13 @@ export interface TranscriptSegment {
 interface Props {
   segments: TranscriptSegment[];
   isLive: boolean;
+  /** Live Moonshine hypothesis — rendered as grey italic text while the user
+   *  is mid-utterance. Empty when no draft is in flight. */
+  draftHypothesis?: string;
+  /** True when the recorder is using the Moonshine streaming session path.
+   *  Drives the empty-state copy: streaming → "words appear as you speak",
+   *  chunked → "segments every ~15 seconds". */
+  streamingMode?: boolean;
 }
 
 // Stable color palette for speaker badges — cycles for > 6 speakers
@@ -47,17 +54,33 @@ function formatMs(ms: number): string {
   return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
 }
 
-export function MeetingTranscriptPanel({ segments, isLive }: Props) {
+function DraftLine({ text }: { text: string }) {
+  return (
+    <div className="flex items-start gap-2 italic" style={{ opacity: 0.45 }}>
+      <span className="text-xs text-gray-400 font-mono mt-0.5 shrink-0 w-12">--:--</span>
+      <span className="text-xs font-medium px-1.5 py-0.5 rounded shrink-0 bg-gray-100 text-gray-500">
+        you
+      </span>
+      <p className="text-sm text-gray-800 leading-relaxed flex-1">{text}</p>
+    </div>
+  );
+}
+
+export function MeetingTranscriptPanel({ segments, isLive, draftHypothesis, streamingMode }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
 
-  // Auto-scroll to bottom when new segments arrive, unless user scrolled up
+  const draft = (draftHypothesis ?? '').trim();
+  const showDraft = isLive && draft.length > 0;
+
+  // Auto-scroll to bottom when new segments OR a draft update arrives,
+  // unless the user has scrolled up to read history.
   useEffect(() => {
     if (!userScrolledUpRef.current && bottomRef.current) {
       bottomRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [segments.length]);
+  }, [segments.length, draft]);
 
   const handleScroll = () => {
     const container = containerRef.current;
@@ -67,7 +90,22 @@ export function MeetingTranscriptPanel({ segments, isLive }: Props) {
     userScrolledUpRef.current = !isAtBottom;
   };
 
+  // Empty state — no committed segments yet. Still render the draft line
+  // here so the user sees grey-typing on the very first utterance, before
+  // the first commit lands.
   if (segments.length === 0) {
+    if (showDraft) {
+      return (
+        <div
+          ref={containerRef}
+          onScroll={handleScroll}
+          className="h-full overflow-y-auto space-y-3 pr-1"
+        >
+          <DraftLine text={draft} />
+          <div ref={bottomRef} />
+        </div>
+      );
+    }
     return (
       <div className="flex flex-col items-center justify-center h-full text-center py-12 px-4">
         <Mic className="w-8 h-8 text-gray-300 mb-3" />
@@ -75,7 +113,11 @@ export function MeetingTranscriptPanel({ segments, isLive }: Props) {
           {isLive ? 'Listening… transcript will appear here.' : 'No transcript segments yet.'}
         </p>
         {isLive && (
-          <p className="text-xs text-gray-300 mt-1">Segments appear every ~15 seconds.</p>
+          <p className="text-xs text-gray-300 mt-1">
+            {streamingMode
+              ? 'Live transcription — words appear as you speak.'
+              : 'Segments appear every ~15 seconds.'}
+          </p>
         )}
       </div>
     );
@@ -111,6 +153,9 @@ export function MeetingTranscriptPanel({ segments, isLive }: Props) {
           </div>
         </div>
       ))}
+
+      {/* Live grey-typing line — appears below the latest committed segment */}
+      {showDraft && <DraftLine text={draft} />}
 
       {/* Live pulse indicator */}
       {isLive && (

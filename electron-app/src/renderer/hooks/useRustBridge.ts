@@ -238,6 +238,9 @@ declare global {
       onNotificationNew: (callback: (notification: any) => void) => () => void;
       onWorkflowDiscovered: (callback: (workflow: any) => void) => () => void;
       onMeetingSegmentReady: (callback: (segment: any) => void) => () => void;
+      onMeetingDraftReady: (
+        callback: (payload: { sessionId: string | null; hypothesis: string; startMs: number }) => void,
+      ) => () => void;
       onMeetingRecordingState: (callback: (state: any) => void) => () => void;
       onMeetingLiveSummary: (callback: (payload: { sessionId: string; summary: string; segmentCount: number; generatedAt: number }) => void) => () => void;
       onQuickAction: (callback: (action: 'start-dictation' | 'start-meeting') => void) => () => void;

@@ -46,6 +46,14 @@ import { debugLog } from './debug-log';
  *  in startMeetingRecording below. */
 const TRANSCRIBE_TIMEOUT_MS = 20_000;
 
+// Streaming-session constants — mirror dictation-streamer.ts but with a
+// slightly more forgiving silence threshold for natural meeting pacing.
+const SESSION_DRAIN_INTERVAL_MS = 200;
+const SESSION_SILENCE_COMMIT_MS = 1500;
+const SESSION_CAP_MS = 25_000; // Moonshine is trained on ≤30s utterances; commit at 25s to stay safe.
+
+const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
 export interface TranscriptSegment {
   id: string;
   session_id: string;
@@ -65,6 +73,13 @@ export interface MeetingRecordingState {
   startedAt: number | null;
   segmentCount: number;
   deviceName: string | null;
+  /**
+   * True when this session is using the Moonshine streaming session API
+   * (live grey-typing draft + silence-driven commits). False when using the
+   * legacy fixed-interval chunked path. Renderer reads this to choose between
+   * "live transcription" copy and the "segments every ~15s" copy.
+   */
+  streamingMode: boolean;
 }
 
 const DIARIZATION_PROMPT = `You are a meeting transcript analyzer. Given the following raw transcript from a single audio stream, identify speaker changes and label each paragraph with [Speaker 1], [Speaker 2], etc. based on conversational context, topic shifts, and speaking style.
@@ -91,12 +106,19 @@ class MeetingRecorderManager {
   // with the existing compiled addon.
   private segments: TranscriptSegment[] = [];
 
+  // Streaming-session state. Only used when streamingMode is true.
+  private streamLoopPromise: Promise<void> | null = null;
+  private totalDrainedAudioMs = 0;
+  private currentSegmentStartMs = 0;
+  private lastSpeechEndMs = 0;
+
   private state: MeetingRecordingState = {
     status: 'idle',
     sessionId: null,
     startedAt: null,
     segmentCount: 0,
     deviceName: null,
+    streamingMode: false,
   };
 
   isActive(): boolean {
@@ -162,6 +184,30 @@ class MeetingRecorderManager {
     this.chunkIntervalMs = effectiveChunkIntervalS * 1000;
     this.segments = [];
 
+    // Reset streaming-session state so a previous meeting's leftover values
+    // can't leak into this one (the manager is a singleton).
+    this.streamLoopPromise = null;
+    this.totalDrainedAudioMs = 0;
+    this.currentSegmentStartMs = 0;
+    this.lastSpeechEndMs = 0;
+
+    // ── Decide path: streaming session vs. fixed-interval chunks ──
+    // Mirrors the full 4-check gate in dictation-streamer.ts: engine must be
+    // a Moonshine variant AND the addon must expose session_append, drain
+    // buffer, and session_supports() must return true. Anything else falls
+    // back to the legacy chunked path (Whisper has no session API).
+    const engineKind = (() => {
+      try { return native.getTranscriptionEngine?.() ?? ''; }
+      catch { return ''; }
+    })();
+    const isMoonshine = engineKind.startsWith('moonshine');
+    const canStream = isMoonshine
+      && typeof native.addon.moonshineSessionAppend === 'function'
+      && typeof native.addon.drainRecordingBuffer === 'function'
+      && (native.addon.moonshineSessionSupports?.() ?? false);
+
+    debugLog('meeting.start', { engine: engineKind, isMoonshine, canStream });
+
     // Claim the audio stream before starting capture.
     audioStream.acquire('meeting');
     try {
@@ -186,14 +232,30 @@ class MeetingRecorderManager {
       startedAt: now,
       segmentCount: 0,
       deviceName: deviceName ?? null,
+      streamingMode: canStream,
     };
 
     this.pushStateToRenderer();
 
-    // Kick off the periodic chunk loop
-    this.chunkTimer = setInterval(() => {
-      void this.processChunk();
-    }, this.chunkIntervalMs);
+    if (canStream) {
+      // Streaming path — the loop owns audio drain, session append, draft
+      // emission, silence/cap commits, and final drain on stop.
+      try { native.addon.moonshineSessionReset?.(); } catch { /* defensive */ }
+      this.streamLoopPromise = this.runStreamingSession().catch(err => {
+        console.error('[MeetingRecorder] streaming loop crashed:', err);
+        debugLog('meeting.stream.error', { error: String(err) });
+        // Clear the grey line so it doesn't get stuck on screen.
+        this.pushDraftToRenderer('');
+        // Zero the Moonshine session buffer so the next session starts clean.
+        try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+        // Resolve, never re-throw — stopMeetingRecording awaits this promise.
+      });
+    } else {
+      // Legacy chunked path — fixed-interval setInterval.
+      this.chunkTimer = setInterval(() => {
+        void this.processChunk();
+      }, this.chunkIntervalMs);
+    }
   }
 
   /**
@@ -205,10 +267,11 @@ class MeetingRecorderManager {
       throw new Error('Meeting recording is not active');
     }
 
+    const wasStreaming = this.state.streamingMode;
     this.state = { ...this.state, status: 'stopping' };
     this.pushStateToRenderer();
 
-    // Stop the chunk timer so no new chunks start
+    // Stop the chunk timer so no new chunks start (legacy path only)
     if (this.chunkTimer) {
       clearInterval(this.chunkTimer);
       this.chunkTimer = null;
@@ -219,16 +282,35 @@ class MeetingRecorderManager {
     // Otherwise the recorder would be stuck in 'stopping' and block future
     // recordings with "already active".
     try {
-      // Wait for any in-flight chunk to complete before processing the final one
-      let waited = 0;
-      while (this.isProcessingChunk && waited < 10_000) {
-        await new Promise(r => setTimeout(r, 100));
-        waited += 100;
-      }
+      if (wasStreaming) {
+        // Streaming path: the loop watches `state.status` and will perform
+        // its own final drain + commit when it sees 'stopping'. Just await
+        // its promise — do NOT call processChunk(true), it would race the
+        // loop and double-call stopRecording mid-Moonshine-commit.
+        if (this.streamLoopPromise) {
+          try {
+            await this.streamLoopPromise;
+          } catch (err) {
+            console.error('[MeetingRecorder] streaming loop final await failed:', err);
+          }
+          this.streamLoopPromise = null;
+        }
+        // Defensive: zero the session buffer in case the loop's own reset
+        // didn't run (e.g. if it threw before the final commit).
+        try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+      } else {
+        // Legacy chunked path.
+        // Wait for any in-flight chunk to complete before processing the final one
+        let waited = 0;
+        while (this.isProcessingChunk && waited < 10_000) {
+          await new Promise(r => setTimeout(r, 100));
+          waited += 100;
+        }
 
-      // Process the final partial chunk (whatever accumulated since last drain)
-      try { await this.processChunk(true /* isFinal */); }
-      catch (err) { console.error('[MeetingRecorder] Final chunk failed:', err); }
+        // Process the final partial chunk (whatever accumulated since last drain)
+        try { await this.processChunk(true /* isFinal */); }
+        catch (err) { console.error('[MeetingRecorder] Final chunk failed:', err); }
+      }
 
       // Assemble the full transcript from in-memory segments
       const fullTranscript = this.segments
@@ -281,7 +363,17 @@ class MeetingRecorderManager {
         startedAt: null,
         segmentCount: 0,
         deviceName: null,
+        streamingMode: false,
       };
+      // Reset streaming-session bookkeeping so a stop-without-start path or
+      // an exception still leaves the manager in a clean state.
+      this.streamLoopPromise = null;
+      this.totalDrainedAudioMs = 0;
+      this.currentSegmentStartMs = 0;
+      this.lastSpeechEndMs = 0;
+      // Make sure the grey line is cleared on stop, in case the streaming
+      // loop's catch handler didn't run.
+      this.pushDraftToRenderer('');
       this.pushStateToRenderer();
     }
   }
@@ -511,6 +603,224 @@ class MeetingRecorderManager {
     if (windows.length > 0) {
       windows[0].webContents.send(IPC_CHANNELS.MEETING_RECORDING_STATE, s);
     }
+  }
+
+  // ── Moonshine streaming session path ──────────────────────────────────────
+  // Mirrors dictation-streamer.ts:runStreamingSession with meeting-specific
+  // tweaks: emits MEETING_DRAFT_READY for the grey-typing UI, builds full
+  // TranscriptSegments on commit, and tracks totalDrainedAudioMs so segment
+  // start/end timestamps stay monotonic across the whole meeting.
+  private async runStreamingSession(): Promise<void> {
+    let silentAudioMs = 0;
+    let sessionHasContent = false;
+    let sessionAudioMs = 0;
+
+    while (this.state.status === 'recording') {
+      await sleep(SESSION_DRAIN_INTERVAL_MS);
+      if (this.state.status !== 'recording') break;
+
+      let audioBuffer: Buffer;
+      try {
+        audioBuffer = native.addon.drainRecordingBuffer!();
+      } catch (err) {
+        debugLog('meeting.session.drain.error', { error: String(err) });
+        continue;
+      }
+      if (!audioBuffer || audioBuffer.length < 500) continue;
+
+      const silent = isAudioSilent(audioBuffer);
+      const bufferAudioMs = (audioBuffer.length / 2 / 16_000) * 1_000;
+      // Always advance the meeting-wide clock so timestamps reflect real
+      // elapsed audio, including silences.
+      this.totalDrainedAudioMs += bufferAudioMs;
+
+      debugLog('meeting.session.drain', {
+        byteLength: audioBuffer.length,
+        rms: computeRmsPcm16(audioBuffer),
+        silent,
+        sessionAudioMs,
+        silentAudioMs,
+        totalDrainedAudioMs: this.totalDrainedAudioMs,
+      });
+
+      if (silent) {
+        silentAudioMs += bufferAudioMs;
+        if (sessionHasContent && silentAudioMs >= SESSION_SILENCE_COMMIT_MS) {
+          // Last actual speech ended at totalDrainedAudioMs - silentAudioMs.
+          // Use that as the segment's end_ms so trailing silence is excluded.
+          this.lastSpeechEndMs = this.totalDrainedAudioMs - silentAudioMs;
+          await this.commitSegmentAndClearDraft(false);
+          sessionHasContent = false;
+          sessionAudioMs = 0;
+          silentAudioMs = 0;
+        }
+        // Do NOT append silent audio to the Moonshine session.
+        continue;
+      }
+
+      // Speech detected.
+      silentAudioMs = 0;
+      if (!sessionHasContent) {
+        // First speech of a new segment — anchor its start time at the
+        // beginning of THIS buffer (before we counted it into total above).
+        this.currentSegmentStartMs = this.totalDrainedAudioMs - bufferAudioMs;
+      }
+      sessionHasContent = true;
+      sessionAudioMs += bufferAudioMs;
+
+      let hypothesis: string;
+      try {
+        // No JS-side timeout — moonshineSessionAppend is strictly serialized
+        // on the Rust session mutex. A timeout here wouldn't cancel in-flight
+        // inference; it would just corrupt session ordering.
+        hypothesis = await native.addon.moonshineSessionAppend!(audioBuffer);
+        debugLog('meeting.session.append', { hypothesis: hypothesis.slice(0, 80), sessionAudioMs });
+      } catch (err) {
+        console.error('[MeetingRecorder] session_append failed, resetting session:', err);
+        debugLog('meeting.session.append.error', { error: String(err) });
+        this.pushDraftToRenderer('');
+        try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+        sessionHasContent = false;
+        sessionAudioMs = 0;
+        silentAudioMs = 0;
+        continue;
+      }
+
+      // We just appended speech — extend the candidate end time to here.
+      this.lastSpeechEndMs = this.totalDrainedAudioMs;
+
+      const cleaned = sanitizeTranscribedText(hypothesis);
+      this.pushDraftToRenderer(cleaned);
+
+      // 25s session cap — Moonshine is trained for ≤30s utterances. Commit
+      // proactively so we don't run past the training window.
+      if (sessionAudioMs >= SESSION_CAP_MS) {
+        debugLog('meeting.session.cap', { sessionAudioMs });
+        await this.commitSegmentAndClearDraft(false);
+        sessionHasContent = false;
+        sessionAudioMs = 0;
+        silentAudioMs = 0;
+      }
+    }
+
+    // ── Final drain after status flipped to 'stopping' ─────────────────────
+    let appendedFinalAudio = false;
+    try {
+      const finalBuffer = native.addon.drainRecordingBuffer!();
+      if (finalBuffer && finalBuffer.length >= 500 && !isAudioSilent(finalBuffer)) {
+        const bufferAudioMs = (finalBuffer.length / 2 / 16_000) * 1_000;
+        this.totalDrainedAudioMs += bufferAudioMs;
+        if (!sessionHasContent) {
+          this.currentSegmentStartMs = this.totalDrainedAudioMs - bufferAudioMs;
+        }
+        try {
+          const hyp = await native.addon.moonshineSessionAppend!(finalBuffer);
+          const cleaned = sanitizeTranscribedText(hyp);
+          if (cleaned) this.pushDraftToRenderer(cleaned);
+          appendedFinalAudio = true;
+          this.lastSpeechEndMs = this.totalDrainedAudioMs;
+          sessionHasContent = true;
+          debugLog('meeting.session.final-drain', {
+            byteLength: finalBuffer.length,
+            hypothesis: hyp.slice(0, 80),
+          });
+        } catch { /* best effort — commit whatever's already in the session */ }
+      }
+    } catch { /* ignore drain errors on stop */ }
+
+    // Stop capture AFTER final drain so no audio is lost.
+    try { native.addon.stopRecording(); } catch { /* already stopped */ }
+
+    if (sessionHasContent || appendedFinalAudio) {
+      await this.commitSegmentAndClearDraft(true);
+    } else {
+      this.pushDraftToRenderer('');
+    }
+    try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+  }
+
+  /**
+   * Commit the current Moonshine session into a TranscriptSegment.
+   * Called from the streaming loop on silence boundary, on cap, and on stop.
+   * Does the same post-transcription work as processChunk() — persistence,
+   * in-memory push, segmentCount bump, renderer push, listener fan-out.
+   */
+  private async commitSegmentAndClearDraft(isFinalStop: boolean): Promise<void> {
+    // Clear the grey line first so the user sees the handoff.
+    this.pushDraftToRenderer('');
+
+    let finalText: string;
+    try {
+      finalText = await native.addon.moonshineSessionCommit!();
+    } catch (err) {
+      console.error('[MeetingRecorder] session_commit failed:', err);
+      debugLog('meeting.session.commit.error', { error: String(err), isFinalStop });
+      try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+      return;
+    }
+
+    const text = sanitizeTranscribedText(finalText);
+    debugLog('meeting.session.commit', { textLength: text.length, isFinalStop });
+    if (!text) return;
+
+    const { sessionId } = this.state;
+    if (!sessionId) return;
+
+    const segmentCount = this.state.segmentCount;
+    const startMs = this.currentSegmentStartMs;
+    const endMs = Math.max(this.lastSpeechEndMs, startMs);
+
+    const segment: TranscriptSegment = {
+      id: `seg-${Date.now()}-${segmentCount}`,
+      session_id: sessionId,
+      speaker_label: null, // assigned post-meeting by LLM diarization
+      start_ms: startMs,
+      end_ms: endMs,
+      text,
+      source: 'meeting',
+      participant_id: null,
+      confidence: null,
+      created_at: new Date().toISOString(),
+    };
+
+    let persisted: TranscriptSegment = segment;
+    if (typeof native.addon.addTranscriptSegment === 'function') {
+      try {
+        const json = native.addon.addTranscriptSegment(
+          sessionId,
+          null,
+          startMs,
+          endMs,
+          segment.text,
+          'meeting',
+        );
+        const parsed = JSON.parse(json);
+        if (parsed && parsed.id) persisted = parsed as TranscriptSegment;
+      } catch (err) {
+        console.warn('[MeetingRecorder] Failed to persist streamed segment (keeping in-memory):', err);
+      }
+    }
+
+    // CRITICAL: push into in-memory list and bump counter so
+    // stopMeetingRecording's fullTranscript assembly sees this segment.
+    // (The renderer already saw it via pushSegmentToRenderer; this is for
+    // the stop-time return value, not for live UI.)
+    this.segments.push(persisted);
+    this.state = { ...this.state, segmentCount: segmentCount + 1 };
+    this.pushStateToRenderer();
+
+    this.pushSegmentToRenderer(persisted);
+  }
+
+  private pushDraftToRenderer(hypothesis: string): void {
+    const { sessionId } = this.state;
+    const windows = BrowserWindow.getAllWindows();
+    if (windows.length === 0) return;
+    windows[0].webContents.send(IPC_CHANNELS.MEETING_DRAFT_READY, {
+      sessionId,
+      hypothesis,
+      startMs: this.currentSegmentStartMs,
+    });
   }
 
   private pushSegmentToRenderer(segment: TranscriptSegment): void {

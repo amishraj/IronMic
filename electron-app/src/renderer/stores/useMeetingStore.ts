@@ -49,6 +49,14 @@ interface MeetingStore {
 
   // Granola-mode recording state
   segments: TranscriptSegment[];
+  /** Live Moonshine session hypothesis — rendered as grey italic text in the
+   *  transcript panel while the user is mid-utterance. Replaced (not appended)
+   *  on each update; cleared on commit, session reset, and recording stop. */
+  draftHypothesis: string;
+  /** True when the active recording is using the Moonshine streaming session
+   *  path (live grey-typing). False for the legacy chunked path (Whisper or
+   *  Moonshine fallback). Driven by the recorder's MeetingRecordingState. */
+  streamingMode: boolean;
   selectedAudioDevice: string | null;
   isGranolaRecording: boolean;
   /** True while backend is finishing the previous recording (draining buffer + diarization).
@@ -74,6 +82,8 @@ interface MeetingStore {
   // Granola-mode actions
   addSegment: (segment: TranscriptSegment) => void;
   clearSegments: () => void;
+  setDraftHypothesis: (text: string) => void;
+  setStreamingMode: (enabled: boolean) => void;
   loadSegmentsForSession: (sessionId: string) => Promise<void>;
   setSelectedAudioDevice: (device: string | null) => void;
   setIsGranolaRecording: (recording: boolean) => void;
@@ -104,6 +114,8 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   activeResult: null,
   detectedApp: null,
   segments: [],
+  draftHypothesis: '',
+  streamingMode: false,
   selectedAudioDevice: null,
   isGranolaRecording: false,
   isGranolaStopping: false,
@@ -206,7 +218,10 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   addSegment: (segment) =>
     set(state => ({ segments: [...state.segments, segment] })),
 
-  clearSegments: () => set({ segments: [] }),
+  clearSegments: () => set({ segments: [], draftHypothesis: '' }),
+
+  setDraftHypothesis: (text) => set({ draftHypothesis: text }),
+  setStreamingMode: (enabled) => set({ streamingMode: enabled }),
 
   loadSegmentsForSession: async (sessionId) => {
     try {
