@@ -1096,7 +1096,7 @@ mod napi_exports {
     // ── TTS Engine ──
 
     use crate::tts::kokoro::{KokoroEngine, SharedTtsEngine};
-    use crate::tts::playback::PlaybackEngine;
+    use crate::tts::playback::{PlaybackEngine, TTS_LEADING_SILENCE_MS};
 
     static TTS_ENGINE: std::sync::LazyLock<SharedTtsEngine> =
         std::sync::LazyLock::new(|| SharedTtsEngine::new(KokoroEngine::with_defaults()));
@@ -1188,9 +1188,26 @@ mod napi_exports {
             };
 
             let sample_rate = chunk1.sample_rate;
-            let chunk1_duration_ms = (chunk1.duration_seconds * 1000.0) as u64;
-            let chunk1_timestamps = std::mem::take(&mut chunk1.timestamps);
+            let raw_chunk1_duration_ms = (chunk1.duration_seconds * 1000.0) as u64;
+            let raw_chunk1_timestamps = std::mem::take(&mut chunk1.timestamps);
             let chunk1_samples = chunk1.take_samples();
+
+            // play_internal will prepend TTS_LEADING_SILENCE_MS of silence to
+            // chunk-1 audio (Windows only; const is 0 elsewhere). Shift the
+            // word timestamps + reported duration by the same amount so the
+            // renderer's highlight cursor stays aligned with the audio. We
+            // build *adjusted* values here and use ONLY those below — never
+            // the raw originals — so the two sides cannot drift.
+            let chunk1_timestamps: Vec<crate::tts::timestamps::WordTimestamp> =
+                raw_chunk1_timestamps
+                    .into_iter()
+                    .map(|ts| crate::tts::timestamps::WordTimestamp {
+                        word: ts.word,
+                        start_ms: ts.start_ms + TTS_LEADING_SILENCE_MS as u32,
+                        end_ms: ts.end_ms + TTS_LEADING_SILENCE_MS as u32,
+                    })
+                    .collect();
+            let chunk1_duration_ms = raw_chunk1_duration_ms + TTS_LEADING_SILENCE_MS;
 
             // Seed the cumulative timestamp / duration state with chunk 1.
             STREAM_TIMESTAMPS.lock().unwrap().extend(chunk1_timestamps.clone());
