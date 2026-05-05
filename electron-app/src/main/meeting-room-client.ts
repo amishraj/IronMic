@@ -61,6 +61,22 @@ class MeetingRoomClientManager {
    *  doesn't run their own LiveSummarizer — they only see the host's). */
   private lastSummary: string = '';
   private lastSummaryAt: number | null = null;
+  /** Welcome-payload transcript snapshot. Staged here because localSessionId
+   *  doesn't exist yet at welcome time; drained inside startLocalRecorder
+   *  AFTER startMeetingRecording (which wipes recorder.segments). */
+  private welcomeSegments: TranscriptSegment[] = [];
+  /** Welcome-payload summary, drained alongside welcomeSegments. */
+  private welcomeSummaryPayload: {
+    summary: string;
+    segmentCount: number;
+    generatedAt: number;
+    insufficient: boolean;
+  } | null = null;
+  /** Inbound segment ids we've already processed (welcome drain or live
+   *  broadcast). Dedup key is the host-assigned id, which is stable across
+   *  both delivery paths. Guards against the micro-race where a live
+   *  segment_broadcast arrives between welcome construction and the drain. */
+  private ingestedSegmentIds: Set<string> = new Set();
 
   isConnected(): boolean {
     return this.socket !== null && this.socket.readyState === WebSocket.OPEN;
@@ -137,6 +153,31 @@ class MeetingRoomClientManager {
           } else {
             this.welcomeNotesHtml = null;
             this.welcomeNotesVersion = null;
+          }
+          // Stage the historical transcript + latest summary. Drained later
+          // inside startLocalRecorder once localSessionId exists AND after
+          // startMeetingRecording has wiped recorder.segments — otherwise
+          // the wipe would erase the historical segments we just ingested.
+          if (Array.isArray(msg.segments)) {
+            this.welcomeSegments = msg.segments as TranscriptSegment[];
+          } else {
+            this.welcomeSegments = [];
+          }
+          if (typeof msg.summary === 'string') {
+            const generatedAt = Number.isFinite(Number(msg.summaryGeneratedAt))
+              ? Number(msg.summaryGeneratedAt)
+              : Date.now();
+            const segmentCount = Number.isFinite(Number(msg.summarySegmentCount))
+              ? Number(msg.summarySegmentCount)
+              : 0;
+            this.welcomeSummaryPayload = {
+              summary: msg.summary,
+              segmentCount,
+              generatedAt,
+              insufficient: !!msg.summaryInsufficient,
+            };
+          } else {
+            this.welcomeSummaryPayload = null;
           }
           // Swap onMessage to the steady-state handler
           sock.off('message', onMessage);
@@ -220,6 +261,84 @@ class MeetingRoomClientManager {
     this.unsubSegment = meetingRecorder.onSegment((seg) => this.forwardSegment(seg));
 
     await meetingRecorder.startMeetingRecording(this.localSessionId, deviceName);
+
+    // Drain the welcome snapshot AFTER startMeetingRecording: the recorder
+    // wipes its in-memory segments[] on start, so ingesting historical
+    // segments before the wipe would lose them. Order: history first, then
+    // any live segment_broadcast packets that race in via handleMessage; the
+    // ingestedSegmentIds set converges both orderings to the same result.
+    if (this.welcomeSegments.length > 0) {
+      for (const seg of this.welcomeSegments) {
+        this.applyInboundSegment(seg);
+      }
+      this.welcomeSegments = [];
+    }
+    if (this.welcomeSummaryPayload) {
+      this.applySummaryPayload(this.welcomeSummaryPayload);
+      this.welcomeSummaryPayload = null;
+    }
+  }
+
+  /** Process a segment received from the host (welcome snapshot or live
+   *  segment_broadcast). Dedups on the inbound host id, normalizes the
+   *  source so renderer "Me" detection still works, persists to the local
+   *  mirror DB, and pushes into the local recorder so the renderer sees it
+   *  via MEETING_SEGMENT_READY. */
+  private applyInboundSegment(seg: TranscriptSegment): void {
+    if (!seg || typeof seg.id !== 'string' || seg.id.length === 0) return;
+    if (this.ingestedSegmentIds.has(seg.id)) return;
+    this.ingestedSegmentIds.add(seg.id);
+
+    // Renderer's isOwnSegment() (MeetingTranscriptPanel) treats anything
+    // that isn't 'broadcast' or 'participant:*' as the local mic ("Me").
+    // Host-originated segments arrive with source='meeting' — normalize them
+    // to 'broadcast' so they don't get mislabeled on the participant's UI.
+    // Other-participant segments arrive with 'participant:<name>'; preserve.
+    const inboundSource = typeof seg.source === 'string' && seg.source.startsWith('participant:')
+      ? seg.source
+      : 'broadcast';
+
+    let localSeg: TranscriptSegment | null = null;
+    if (this.localSessionId && typeof native.addon.addTranscriptSegment === 'function') {
+      try {
+        const json = native.addon.addTranscriptSegment(
+          this.localSessionId,
+          seg.speaker_label ?? 'Participant',
+          Number(seg.start_ms ?? 0),
+          Number(seg.end_ms ?? seg.start_ms ?? 0),
+          seg.text ?? '',
+          inboundSource,
+        );
+        localSeg = JSON.parse(json) as TranscriptSegment;
+      } catch (err) {
+        console.warn('[MeetingRoomClient] persist inbound segment failed:', (err as Error)?.message);
+      }
+    }
+
+    const ingestable: TranscriptSegment = localSeg
+      ? { ...localSeg, source: inboundSource }
+      : { ...seg, session_id: this.localSessionId ?? seg.session_id, source: inboundSource };
+    meetingRecorder.ingestRemoteSegment(ingestable);
+  }
+
+  /** Apply a host-broadcast (or welcome-staged) summary payload: persist if
+   *  substantive and dispatch MEETING_LIVE_SUMMARY IPC with the local mirror
+   *  session id so the renderer's session-equality check accepts it. */
+  private applySummaryPayload(p: { summary: string; segmentCount: number; generatedAt: number; insufficient: boolean }): void {
+    if (p.summary.trim().length > 0 && !p.insufficient) {
+      this.lastSummary = p.summary;
+      this.lastSummaryAt = p.generatedAt;
+      this.persistSummaryToLocal(p.summary, p.generatedAt);
+    }
+    const windows = BrowserWindow.getAllWindows();
+    if (windows.length === 0) return;
+    windows[0].webContents.send(IPC_CHANNELS.MEETING_LIVE_SUMMARY, {
+      sessionId: this.localSessionId,
+      summary: p.summary,
+      segmentCount: p.segmentCount,
+      generatedAt: p.generatedAt,
+      insufficient: p.insufficient,
+    });
   }
 
   /** Persist the latest shared notes html to the participant's local mirror
@@ -314,37 +433,26 @@ class MeetingRoomClientManager {
     try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'segment_broadcast' && msg.segment) {
-      // Display incoming remote segment in this participant's transcript view
-      const seg = msg.segment as TranscriptSegment;
-      // Mark as broadcast so forwardSegment doesn't loop it back
-      const tagged: TranscriptSegment = { ...seg, source: 'broadcast' };
-      meetingRecorder.ingestRemoteSegment(tagged);
+      // Shared path with the welcome drain: dedup by inbound id, normalize
+      // source for renderer labeling, persist to local mirror DB, push to
+      // recorder. If a packet races welcome (delivered before the drain
+      // runs), the dedup set ensures the same segment isn't applied twice.
+      this.applyInboundSegment(msg.segment as TranscriptSegment);
       return;
     }
     if (msg.type === 'summary_broadcast') {
-      // Host produced a live AI Notes summary — rewrite the sessionId to this
-      // participant's localSessionId so the renderer's session-equality check
-      // accepts it as belonging to the active meeting, then forward through
-      // the same IPC channel the host's summarizer uses.
+      // Host produced a live AI Notes summary. Reuse the same path the
+      // welcome drain uses so behavior stays consistent across delivery
+      // channels.
       const summary = typeof msg.summary === 'string' ? msg.summary : '';
       const generatedAt = Number.isFinite(Number(msg.generatedAt)) ? Number(msg.generatedAt) : Date.now();
-      // Track the latest substantive summary so we can save it to the local
-      // mirror session at meeting end (post-meeting view).
-      if (summary.trim().length > 0 && !msg.insufficient) {
-        this.lastSummary = summary;
-        this.lastSummaryAt = generatedAt;
-        this.persistSummaryToLocal(summary, generatedAt);
-      }
-      const windows = BrowserWindow.getAllWindows();
-      if (windows.length === 0) return;
-      const payload = {
-        sessionId: this.localSessionId,
+      const segmentCount = Number.isFinite(Number(msg.segmentCount)) ? Number(msg.segmentCount) : 0;
+      this.applySummaryPayload({
         summary,
-        segmentCount: Number.isFinite(Number(msg.segmentCount)) ? Number(msg.segmentCount) : 0,
+        segmentCount,
         generatedAt,
         insufficient: !!msg.insufficient,
-      };
-      windows[0].webContents.send(IPC_CHANNELS.MEETING_LIVE_SUMMARY, payload);
+      });
       return;
     }
     if (msg.type === 'notes_update') {
@@ -394,6 +502,10 @@ class MeetingRoomClientManager {
     // Clear cached summary state for next session.
     this.lastSummary = '';
     this.lastSummaryAt = null;
+    // Clear welcome staging + dedup set so a future rejoin starts clean.
+    this.welcomeSegments = [];
+    this.welcomeSummaryPayload = null;
+    this.ingestedSegmentIds.clear();
   }
 
   private pushStateToRenderer(): void {

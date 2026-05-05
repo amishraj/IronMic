@@ -15,7 +15,9 @@
  * Message protocol (JSON over WebSocket):
  *   client → host: { type: "join", roomCode, displayName }
  *   host   → client: { type: "welcome", sessionId, hostName, templateId,
- *                      notesHtml, notesVersion }
+ *                      notesHtml, notesVersion,
+ *                      segments, summary, summaryGeneratedAt,
+ *                      summaryInsufficient, summarySegmentCount }
  *                 OR { type: "rejected", reason }
  *   client → host: { type: "segment", participantId, displayName, startMs, endMs, text }
  *   client → host: { type: "notes_update", html, originId }
@@ -98,6 +100,18 @@ class MeetingRoomServerManager {
    *  update. Sent in welcome payload and every notes_update broadcast so
    *  clients can drop genuinely-out-of-order packets. */
   private notesVersion: number = 0;
+
+  /** Latest live-summary payload broadcast by the LiveSummarizer for this
+   *  hosted session, cached so a late-joiner's welcome carries the AI Notes
+   *  the host already sees. Cleared on start()/stop() and only written when
+   *  payload.sessionId matches the active hosted session. */
+  private cachedSummaryPayload: {
+    sessionId: string;
+    summary: string;
+    segmentCount: number;
+    generatedAt: number;
+    insufficient: boolean;
+  } | null = null;
 
   /**
    * Detect the most likely LAN IPv4 address. Prefers private ranges (10/8,
@@ -227,6 +241,7 @@ class MeetingRoomServerManager {
     const seed = this.readSeedNotes(opts.sessionId);
     this.currentNotesHtml = seed;
     this.notesVersion = seed.length > 0 ? 1 : 0;
+    this.cachedSummaryPayload = null;
 
     const ip = this.detectLanIp();
     if (!ip) {
@@ -287,6 +302,7 @@ class MeetingRoomServerManager {
     this.boundPort = null;
     this.currentNotesHtml = '';
     this.notesVersion = 0;
+    this.cachedSummaryPayload = null;
     this.pushStateToRenderer();
   }
 
@@ -332,6 +348,14 @@ class MeetingRoomServerManager {
       };
       this.participants.set(participantId, participant);
 
+      // Snapshot the host's unified transcript (host-local + remote-ingested)
+      // so the late-joiner sees every segment that landed before they joined.
+      // Filter by active sessionId defensively — the recorder resets segments
+      // on each startMeetingRecording but the filter is cheap insurance.
+      const transcriptSnapshot = this.sessionId
+        ? meetingRecorder.getSegments().filter((s) => s.session_id === this.sessionId)
+        : [];
+
       try {
         state.socket.send(JSON.stringify({
           type: 'welcome',
@@ -343,6 +367,14 @@ class MeetingRoomServerManager {
           // an empty editor while waiting for the next notes_update event.
           notesHtml: this.currentNotesHtml,
           notesVersion: this.notesVersion,
+          // Full meeting state up to this moment so the late joiner doesn't
+          // start with an empty transcript / AI Notes panel. Forward-compatible
+          // additions: older clients ignore unknown fields.
+          segments: transcriptSnapshot,
+          summary: this.cachedSummaryPayload?.summary ?? '',
+          summaryGeneratedAt: this.cachedSummaryPayload?.generatedAt ?? null,
+          summaryInsufficient: this.cachedSummaryPayload?.insufficient ?? true,
+          summarySegmentCount: this.cachedSummaryPayload?.segmentCount ?? 0,
         }));
       } catch (err) {
         console.warn('[MeetingRoomServer] failed to send welcome:', err);
@@ -491,7 +523,10 @@ class MeetingRoomServerManager {
     });
   }
 
-  /** Fan a host-produced live summary out to every authenticated participant. */
+  /** Fan a host-produced live summary out to every authenticated participant.
+   *  Also caches the latest payload so a late-joiner's welcome carries it.
+   *  Drops payloads from a non-active session (e.g. a slow async run from a
+   *  prior meeting) so cache + broadcast can't be poisoned with stale state. */
   broadcastLiveSummary(payload: {
     sessionId: string;
     summary: string;
@@ -499,6 +534,8 @@ class MeetingRoomServerManager {
     generatedAt: number;
     insufficient: boolean;
   }): void {
+    if (!this.sessionId || payload.sessionId !== this.sessionId) return;
+    this.cachedSummaryPayload = { ...payload };
     if (!this.wss) return;
     this.broadcast({ type: 'summary_broadcast', ...payload });
   }
