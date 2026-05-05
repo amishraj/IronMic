@@ -160,6 +160,23 @@ export interface Workflow {
   isDismissed: boolean;
 }
 
+/**
+ * One participant in a meeting (host or joiner). The Rust struct serializes
+ * with `#[serde(rename_all = "camelCase")]` so the JSON shape on the wire
+ * matches this type directly — no conversion needed in the IPC layer.
+ *
+ * Roster is **historical**: entries are NOT removed when a participant
+ * disconnects. Instead, `leftAt` is stamped so transcripts and downstream
+ * consumers can see who attended which portion of the meeting.
+ */
+export interface MeetingParticipant {
+  id: string;
+  displayName: string;
+  isHost: boolean;
+  joinedAt: number;
+  leftAt?: number;
+}
+
 export interface MeetingSession {
   id: string;
   startedAt: string;
@@ -169,6 +186,9 @@ export interface MeetingSession {
   actionItems: string | null;
   totalDurationSeconds: number | null;
   entryIds: string | null;
+  /** Historical roster of host + every joiner (with leftAt timestamps).
+   *  Empty array when the meeting predates the v7 schema migration. */
+  participants?: MeetingParticipant[];
 }
 
 export interface MLModelWeights {

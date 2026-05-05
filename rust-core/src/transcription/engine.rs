@@ -145,6 +145,27 @@ pub trait TranscriptionEngine: Send {
         short: bool,
     ) -> Result<String, IronMicError>;
 
+    /// Transcribe with per-call context terms layered onto the stored
+    /// dictionary (e.g. meeting participant names). Default impl ignores
+    /// `context_terms` and falls through to `transcribe()` — Whisper overrides
+    /// this; Moonshine doesn't have a vocabulary API and gets fuzzy
+    /// post-correction in the renderer instead.
+    fn transcribe_with_context(
+        &mut self,
+        samples: &[f32],
+        short: bool,
+        _context_terms: &[String],
+    ) -> Result<String, IronMicError> {
+        self.transcribe(samples, short)
+    }
+
+    /// Replace the engine's stored dictionary with the given word list.
+    /// Default impl is a no-op (Moonshine).
+    fn replace_dictionary(&mut self, _words: Vec<String>) {}
+
+    /// Apply an incremental change to the stored dictionary. Default no-op.
+    fn apply_dictionary_change(&mut self, _word: &str, _removed: bool) {}
+
     // ── Session API (Moonshine streaming) ────────────────────────────────────
     // Default implementations return "unsupported" so Whisper and NullEngine
     // compile without changes. `session_reset` is a safe no-op on all engines.
@@ -383,6 +404,29 @@ mod whisper_adapter {
                 self.engine.transcribe(samples)
             }
         }
+
+        fn transcribe_with_context(
+            &mut self,
+            samples: &[f32],
+            short: bool,
+            context_terms: &[String],
+        ) -> Result<String, IronMicError> {
+            self.load()?;
+            self.engine.transcribe_with_context(samples, short, context_terms)
+        }
+
+        fn replace_dictionary(&mut self, words: Vec<String>) {
+            self.engine.dictionary_mut().replace_words(words);
+        }
+
+        fn apply_dictionary_change(&mut self, word: &str, removed: bool) {
+            let dict = self.engine.dictionary_mut();
+            if removed {
+                dict.remove_word(word);
+            } else {
+                dict.add_word(word);
+            }
+        }
     }
 }
 
@@ -530,6 +574,37 @@ pub fn transcribe_active(samples: &[f32], short: bool) -> Result<String, IronMic
         IronMicError::Transcription(format!("engine mutex poisoned: {}", e))
     })?;
     slot.transcribe(samples, short)
+}
+
+/// Run inference with per-call context terms (e.g. meeting participant names).
+/// Whisper layers them onto the stored dictionary in the initial prompt;
+/// Moonshine ignores them.
+pub fn transcribe_active_with_context(
+    samples: &[f32],
+    short: bool,
+    context_terms: &[String],
+) -> Result<String, IronMicError> {
+    let mut slot = ENGINE.lock().map_err(|e| {
+        IronMicError::Transcription(format!("engine mutex poisoned: {}", e))
+    })?;
+    slot.transcribe_with_context(samples, short, context_terms)
+}
+
+/// Replace the active engine's stored dictionary in one lock acquisition.
+/// Called by N-API `refreshTranscriptionDictionary` after reading the
+/// persisted word list from SQLite. Whisper applies; Moonshine no-ops.
+pub fn replace_active_dictionary(words: Vec<String>) {
+    if let Ok(mut slot) = ENGINE.lock() {
+        slot.replace_dictionary(words);
+    }
+}
+
+/// Push a single add/remove into the active engine's dictionary. Called by
+/// N-API `add_word`/`remove_word` after the SQLite mutation succeeds.
+pub fn apply_active_dictionary_change(word: &str, removed: bool) {
+    if let Ok(mut slot) = ENGINE.lock() {
+        slot.apply_dictionary_change(word, removed);
+    }
 }
 
 // ── Session API helpers (used by lib.rs N-API exports) ───────────────────────

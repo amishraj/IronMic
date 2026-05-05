@@ -3,6 +3,8 @@ import { useTtsStore } from './useTtsStore';
 import { useAiChatStore } from './useAiChatStore';
 import { useToastStore } from './useToastStore';
 import type { PipelineState, TranscriptionResult, VoiceState } from '../types';
+import { correctTranscript } from '../../shared/transcript-correction';
+import { getCachedDictionary } from './dictionaryCache';
 
 interface RecordingStore {
   state: PipelineState;
@@ -113,6 +115,18 @@ async function handleRecordingAction(
       let rawTranscript: string;
       try {
         rawTranscript = await api.transcribe(audioBuffer);
+        // Fuzzy post-correction against the user's custom dictionary.
+        // Catches Moonshine misses (no vocabulary API in transcribe-rs)
+        // and back-stops Whisper (initial_prompt biases sampling but
+        // isn't 100%). Empty dictionary returns the input unchanged.
+        try {
+          const dict = await getCachedDictionary();
+          if (dict.length > 0 && rawTranscript) {
+            rawTranscript = correctTranscript(rawTranscript, dict);
+          }
+        } catch (corrErr) {
+          console.warn('[recording] dictionary correction failed:', corrErr);
+        }
       } catch (transcribeErr: any) {
         set({ state: 'idle', error: transcribeErr.message });
         showErrorToast(

@@ -426,7 +426,17 @@ mod napi_exports {
         let parsed = EngineKind::from_str(&kind).ok_or_else(|| {
             napi::Error::from_reason(format!("Unknown transcription engine kind: '{}'", kind))
         })?;
-        engine::set_active_engine(parsed).map_err(napi::Error::from)
+        engine::set_active_engine(parsed).map_err(napi::Error::from)?;
+
+        // Critical: every engine swap creates a fresh adapter with an empty
+        // Dictionary. Re-push the persisted word list so the user's custom
+        // vocabulary survives the switch (Moonshine→Whisper, etc.).
+        let store = DictionaryStore::new(DATABASE.clone());
+        let words = store.list_words().unwrap_or_default();
+        let count = words.len();
+        engine::replace_active_dictionary(words);
+        info!(word_count = count, "Refreshed dictionary on engine switch");
+        Ok(())
     }
 
     /// Return the currently active transcription engine kind as a string.
@@ -724,19 +734,75 @@ mod napi_exports {
     #[napi]
     pub fn add_word(word: String) -> napi::Result<()> {
         let store = DictionaryStore::new(DATABASE.clone());
-        store.add_word(&word).map_err(Into::into)
+        store.add_word(&word)?;
+        // Best-effort: push to active engine. If the engine mutex is poisoned
+        // we still succeed the SQLite write.
+        engine::apply_active_dictionary_change(&word, /* removed */ false);
+        Ok(())
     }
 
     #[napi]
     pub fn remove_word(word: String) -> napi::Result<()> {
         let store = DictionaryStore::new(DATABASE.clone());
-        store.remove_word(&word).map_err(Into::into)
+        store.remove_word(&word)?;
+        engine::apply_active_dictionary_change(&word, /* removed */ true);
+        Ok(())
     }
 
     #[napi]
     pub fn list_dictionary() -> napi::Result<Vec<String>> {
         let store = DictionaryStore::new(DATABASE.clone());
         store.list_words().map_err(Into::into)
+    }
+
+    /// Read the persisted dictionary from SQLite and push it into the
+    /// currently-active transcription engine. Idempotent and cheap. Called by
+    /// Electron at app boot (after the engine setting is restored), at
+    /// meeting start (drift safety net), and internally on engine switch.
+    #[napi]
+    pub fn refresh_transcription_dictionary() -> napi::Result<u32> {
+        let store = DictionaryStore::new(DATABASE.clone());
+        let words = store.list_words().unwrap_or_default();
+        let count = words.len() as u32;
+        engine::replace_active_dictionary(words);
+        info!(word_count = count, "refreshTranscriptionDictionary applied");
+        Ok(count)
+    }
+
+    /// Transcribe with per-call context terms (e.g. meeting participant
+    /// names) layered on top of the stored dictionary. `terms_json` is a
+    /// JSON array of strings; an empty array or invalid JSON falls back to
+    /// the equivalent of `transcribe()`.
+    ///
+    /// Whisper merges these into the `initial_prompt`. Moonshine ignores
+    /// them (no vocabulary API in transcribe-rs); the renderer applies
+    /// fuzzy post-correction instead.
+    #[napi]
+    pub async fn transcribe_with_context(
+        audio_buffer: Buffer,
+        terms_json: String,
+    ) -> napi::Result<String> {
+        init_tracing();
+        let context_terms: Vec<String> =
+            serde_json::from_str(&terms_json).unwrap_or_default();
+        info!(
+            terms = context_terms.len(),
+            "transcribeWithContext called from N-API"
+        );
+
+        let bytes: &[u8] = &audio_buffer;
+        let mut samples = pcm16_to_f32(bytes)?;
+
+        let transcript = engine::transcribe_active_with_context(
+            &samples,
+            /* short */ false,
+            &context_terms,
+        )
+        .map_err(napi::Error::from)?;
+
+        samples.fill(0.0);
+
+        Ok(transcript)
     }
 
     // ── Settings N-API exports ──
@@ -1851,6 +1917,82 @@ mod napi_exports {
             .map_err(Into::into)
     }
 
+    /// Replace the entire participant roster on a meeting. JSON is a camelCase
+    /// array of `{ id, displayName, isHost, joinedAt, leftAt? }`. Validation
+    /// happens server-side (max 32 entries, 64-char display name cap).
+    #[napi]
+    pub fn set_meeting_participants(id: String, participants_json: String) -> napi::Result<()> {
+        DATABASE
+            .set_meeting_participants(&id, &participants_json)
+            .map_err(Into::into)
+    }
+
+    /// Append (or update by id) a single participant. Read-merge-write inside
+    /// Rust to avoid races between concurrent join broadcasts.
+    #[napi]
+    pub fn add_meeting_participant(id: String, participant_json: String) -> napi::Result<()> {
+        DATABASE
+            .add_meeting_participant(&id, &participant_json)
+            .map_err(Into::into)
+    }
+
+    /// Stamp `leftAt` on a participant without removing them from the roster.
+    /// Idempotent — silently no-ops if the participant id isn't found.
+    #[napi]
+    pub fn mark_meeting_participant_left(
+        id: String,
+        participant_id: String,
+        left_at: i64,
+    ) -> napi::Result<()> {
+        DATABASE
+            .mark_meeting_participant_left(&id, &participant_id, left_at)
+            .map_err(Into::into)
+    }
+
+    /// Read the JSON roster string for a meeting (camelCase). Returns "[]" if
+    /// the meeting doesn't exist.
+    #[napi]
+    pub fn get_meeting_participants(id: String) -> napi::Result<String> {
+        DATABASE.get_meeting_participants(&id).map_err(Into::into)
+    }
+
+    /// Look up the most recent local meeting session linked to a remote (host)
+    /// session id, INCLUDING already-ended rows. Used by the participant
+    /// rejoin flow to recognize a prior visit. Returns JSON
+    /// `{ id, ended_at }` or the literal string `"null"` if none exists.
+    #[napi]
+    pub fn find_latest_local_session_for_remote(remote_id: String) -> napi::Result<String> {
+        let row = DATABASE
+            .find_latest_local_session_for_remote(&remote_id)
+            .map_err(Into::<napi::Error>::into)?;
+        match row {
+            Some((id, ended_at)) => serde_json::to_string(&serde_json::json!({
+                "id": id,
+                "ended_at": ended_at,
+            }))
+            .map_err(|e| napi::Error::from_reason(e.to_string())),
+            None => Ok("null".to_string()),
+        }
+    }
+
+    /// Returns the largest `Meeting #N` sequence number assigned so far.
+    /// Replaces the renderer's full-table `meetingList(9999, 0)` JSON scan
+    /// with an indexed lookup. Returns 0 if no meetings have a sequence
+    /// number yet.
+    #[napi]
+    pub fn get_max_meeting_sequence() -> napi::Result<i64> {
+        DATABASE.get_max_meeting_sequence().map_err(Into::into)
+    }
+
+    /// Reopen a previously-ended meeting session so a rejoining participant
+    /// can resume into it. Clears the SQL-level sealed-state columns
+    /// (`ended_at`, `summary`, `total_duration_seconds`, `entry_ids`); the JS
+    /// caller is responsible for the matching `structured_output` JSON merge.
+    #[napi]
+    pub fn reopen_meeting_session(id: String) -> napi::Result<()> {
+        DATABASE.reopen_meeting_session(&id).map_err(Into::into)
+    }
+
     // ── Meeting Recording: Device-Select & Chunk Drain ──
 
     /// Start recording from a named input device (e.g. "BlackHole 2ch" for system audio).
@@ -1928,6 +2070,34 @@ mod napi_exports {
                 &source,
                 None,
                 None,
+            )
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&segment).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// Idempotent variant: dedups on (session_id, remote_segment_id). Used by
+    /// participant ingest of host-broadcast / welcome-snapshot segments so a
+    /// rejoin can replay the snapshot freely. Returns the canonical row
+    /// (existing if previously inserted, freshly minted otherwise).
+    #[napi]
+    pub fn add_transcript_segment_with_remote_id(
+        session_id: String,
+        speaker_label: Option<String>,
+        start_ms: i64,
+        end_ms: i64,
+        text: String,
+        source: String,
+        remote_segment_id: String,
+    ) -> napi::Result<String> {
+        let segment = DATABASE
+            .add_transcript_segment_with_remote_id(
+                &session_id,
+                speaker_label.as_deref(),
+                start_ms,
+                end_ms,
+                &text,
+                &source,
+                &remote_segment_id,
             )
             .map_err(Into::<napi::Error>::into)?;
         serde_json::to_string(&segment).map_err(|e| napi::Error::from_reason(e.to_string()))

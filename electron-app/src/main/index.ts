@@ -304,6 +304,19 @@ app.whenReady().then(async () => {
           // the legacy name kept for backwards compatibility).
           native.loadWhisperModel();
           console.log('[engine] Active engine model pre-loaded successfully');
+
+          // Push the persisted custom dictionary into the just-loaded engine.
+          // The Rust addon already syncs on every addWord/removeWord, but the
+          // engine is freshly constructed at boot — this seeds it from SQLite
+          // so the user's vocabulary biases the very first dictation. Cheap
+          // (single SELECT + HashSet rebuild). Skip silently on older addon
+          // binaries that lack the export.
+          try {
+            const wordCount = native.refreshTranscriptionDictionary();
+            console.log(`[dictionary] Loaded ${wordCount} custom words into active engine`);
+          } catch (dictErr) {
+            console.warn('[dictionary] refreshTranscriptionDictionary at boot failed:', dictErr);
+          }
           // Log CPU feature flags to DevTools so AVX/AVX512 issues are
           // visible without checking the terminal. E.g.:
           //   [ironmic:debug] whisper.sysinfo {system_info: "AVX = 1 | AVX512 = 0 | ..."}

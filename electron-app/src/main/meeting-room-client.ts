@@ -61,6 +61,10 @@ class MeetingRoomClientManager {
    *  doesn't run their own LiveSummarizer — they only see the host's). */
   private lastSummary: string = '';
   private lastSummaryAt: number | null = null;
+  /** Last host-set title received via welcome or `title_update`. Used as
+   *  fallback when `meeting_ended` doesn't carry `finalTitle` (older host
+   *  builds). */
+  private lastTitle: string | null = null;
   /** Welcome-payload transcript snapshot. Staged here because localSessionId
    *  doesn't exist yet at welcome time; drained inside startLocalRecorder
    *  AFTER startMeetingRecording (which wipes recorder.segments). */
@@ -72,11 +76,12 @@ class MeetingRoomClientManager {
     generatedAt: number;
     insufficient: boolean;
   } | null = null;
-  /** Inbound segment ids we've already processed (welcome drain or live
-   *  broadcast). Dedup key is the host-assigned id, which is stable across
-   *  both delivery paths. Guards against the micro-race where a live
-   *  segment_broadcast arrives between welcome construction and the drain. */
-  private ingestedSegmentIds: Set<string> = new Set();
+  /** 30s safety-net timer started when MEETING_ROOM_HOST_ENDED is dispatched
+   *  to the renderer. If MEETING_ROOM_PARTICIPANT_FINALIZED doesn't arrive
+   *  back (renderer crash, navigation killed the listener, etc.) we clear
+   *  client state automatically so getInfo() doesn't keep reporting a dead
+   *  session forever. */
+  private finalizeWatchdog: NodeJS.Timeout | null = null;
 
   isConnected(): boolean {
     return this.socket !== null && this.socket.readyState === WebSocket.OPEN;
@@ -142,6 +147,10 @@ class MeetingRoomClientManager {
           this.hostName = msg.hostName ?? null;
           this.remoteSessionId = msg.sessionId ?? null;
           this.participantId = msg.participantId ?? crypto.randomUUID();
+          // Capture host-set title so the renderer can show it in the live
+          // header. Participant input is read-only; this is the single
+          // source of truth on the participant side.
+          this.lastTitle = typeof msg.title === 'string' ? msg.title : null;
           // Capture the shared Your Notes seed so the renderer can pre-fill
           // YourNotesPanel via the connect() return value. The DB-side persist
           // happens later, after localSessionId exists (in startLocalRecorder).
@@ -203,13 +212,16 @@ class MeetingRoomClientManager {
       sock.on('message', onMessage);
       sock.once('error', (err: Error) => {
         this.lastError = err?.message ?? 'Connection error';
-        this.cleanupSocket();
+        // Pre-welcome failure — nothing meaningful to preserve. Full wipe.
+        this.cleanupSocketOnly();
+        this.clearMeetingStateAfterFinalized();
         reject(err);
       });
       sock.once('close', () => {
-        // If close happens before welcome, treat as failure
+        // If close happens before welcome, treat as failure.
         if (!this.remoteSessionId) {
-          this.cleanupSocket();
+          this.cleanupSocketOnly();
+          this.clearMeetingStateAfterFinalized();
           reject(new Error(this.lastError ?? 'Connection closed before welcome'));
         }
       });
@@ -218,7 +230,10 @@ class MeetingRoomClientManager {
     return this.getInfo();
   }
 
-  /** Disconnect and stop the local recorder. */
+  /** Full disconnect: stops the local recorder AND clears all state. Used by
+   *  unexpected error paths and as a fallback. Renderer-driven exits should
+   *  use `disconnectTransport()` instead so the renderer can finalize against
+   *  preserved session ids before main wipes them. */
   async disconnect(): Promise<void> {
     if (this.unsubSegment) { this.unsubSegment(); this.unsubSegment = null; }
     try {
@@ -228,33 +243,95 @@ class MeetingRoomClientManager {
     } catch (err) {
       console.warn('[MeetingRoomClient] Failed to stop local recorder:', err);
     }
-    this.localSessionId = null;
     if (this.socket) {
       try { this.socket.close(1000, 'leaving'); } catch { /* ignore */ }
     }
-    this.cleanupSocket();
+    this.cleanupSocketOnly();
+    this.clearMeetingStateAfterFinalized();
+    this.pushStateToRenderer();
+  }
+
+  /** Transport-only disconnect: closes the socket and unsubscribes from the
+   *  local recorder, but leaves `localSessionId / remoteSessionId / lastSummary
+   *  / lastTitle` in place so the renderer's `finalizeAndExitMeeting` can
+   *  attribute the finalize correctly. The renderer MUST call
+   *  `participantFinalized()` once it's done — the watchdog handles the case
+   *  where it doesn't (renderer crash/nav). */
+  async disconnectTransport(): Promise<void> {
+    if (this.unsubSegment) { this.unsubSegment(); this.unsubSegment = null; }
+    if (this.socket) {
+      try { this.socket.close(1000, 'leaving'); } catch { /* ignore */ }
+    }
+    this.cleanupSocketOnly();
+    // Don't push state here — `localSessionId` etc. are still set so the
+    // renderer can read them via getInfo() during finalize.
+  }
+
+  /** Called by the renderer (via MEETING_ROOM_PARTICIPANT_FINALIZED) once
+   *  finalizeAndExitMeeting has completed. Wipes the durable client state
+   *  that disconnectTransport intentionally preserved. */
+  participantFinalized(): void {
+    if (this.finalizeWatchdog) {
+      clearTimeout(this.finalizeWatchdog);
+      this.finalizeWatchdog = null;
+    }
+    this.clearMeetingStateAfterFinalized();
     this.pushStateToRenderer();
   }
 
   private async startLocalRecorder(deviceName: string | null): Promise<void> {
-    // Create a local meeting session so segments have somewhere to live in
-    // the participant's own DB. The session id is independent from the
-    // host's authoritative session id.
-    let createdId: string | null = null;
-    try {
-      const json = native.addon.createMeetingSession();
-      const session = JSON.parse(json);
-      createdId = session.id ?? null;
-    } catch (err) {
-      console.warn('[MeetingRoomClient] Could not create local meeting session, using ephemeral id:', err);
+    // Rejoin path: if the participant has already had a local mirror session
+    // for this host (matched by `linkedRemoteSessionId`), reuse that row so
+    // their History shows ONE card per meeting instead of one-per-attempt.
+    // The lookup includes ENDED rows — if the participant cleanly left a
+    // prior visit (which finalizes the row), we'll reopen it.
+    let localId: string | null = null;
+    let reusedEnded = false;
+    if (this.remoteSessionId) {
+      const found = native.findLatestLocalSessionForRemote(this.remoteSessionId);
+      if (found && typeof found.id === 'string') {
+        localId = found.id;
+        reusedEnded = !!found.ended_at;
+      }
     }
-    this.localSessionId = createdId ?? `local-${crypto.randomUUID()}`;
+
+    if (!localId) {
+      try {
+        const json = native.addon.createMeetingSession();
+        const session = JSON.parse(json);
+        localId = session.id ?? null;
+      } catch (err) {
+        console.warn('[MeetingRoomClient] Could not create local meeting session, using ephemeral id:', err);
+      }
+      if (!localId) localId = `local-${crypto.randomUUID()}`;
+      // Stamp the linkage so a future rejoin finds this row.
+      if (this.remoteSessionId) {
+        this.mergeStructuredOutput(localId, { linkedRemoteSessionId: this.remoteSessionId });
+      }
+    } else if (reusedEnded) {
+      // Reopen path: clear sealed-state columns, then merge structured_output
+      // to drop stale finalize-time keys while preserving durable ones (title,
+      // sequence, linkedRemoteSessionId, userNotes).
+      try { native.reopenMeetingSession(localId); }
+      catch (err) { console.warn('[MeetingRoomClient] reopenMeetingSession failed:', err); }
+      this.mergeStructuredOutput(localId, {
+        processingState: 'recording',
+        plainSummary: null,
+        sections: null,
+        notebookEntryId: null,
+      });
+    }
+
+    this.localSessionId = localId;
 
     // localSessionId now exists — best-effort persist the welcome-payload
-    // notes to the participant's local DB so post-meeting view reflects the
-    // host's content.
+    // notes + title to the participant's local DB so post-meeting view
+    // reflects the host's content.
     if (this.welcomeNotesHtml && this.localSessionId) {
       this.persistNotesToLocal(this.welcomeNotesHtml);
+    }
+    if (this.lastTitle && this.localSessionId) {
+      this.mergeStructuredOutput(this.localSessionId, { title: this.lastTitle });
     }
 
     // Forward each locally-produced segment up to the host
@@ -265,8 +342,10 @@ class MeetingRoomClientManager {
     // Drain the welcome snapshot AFTER startMeetingRecording: the recorder
     // wipes its in-memory segments[] on start, so ingesting historical
     // segments before the wipe would lose them. Order: history first, then
-    // any live segment_broadcast packets that race in via handleMessage; the
-    // ingestedSegmentIds set converges both orderings to the same result.
+    // any live segment_broadcast packets that race in via handleMessage. The
+    // (session_id, remote_segment_id) DB unique index dedups across both
+    // orderings AND across rejoins (welcome may replay segments we already
+    // have from a prior visit).
     if (this.welcomeSegments.length > 0) {
       for (const seg of this.welcomeSegments) {
         this.applyInboundSegment(seg);
@@ -279,15 +358,48 @@ class MeetingRoomClientManager {
     }
   }
 
+  /** Read-modify-write helper for structured_output JSON. Pass null values to
+   *  delete keys; non-null values overwrite or insert. Other keys are
+   *  preserved unchanged (durable checkpoint state across reopen). */
+  private mergeStructuredOutput(sessionId: string, patch: Record<string, unknown>): void {
+    try {
+      let merged: Record<string, unknown> = {};
+      try {
+        const raw = native.addon.getMeetingSession(sessionId);
+        if (raw && raw !== 'null') {
+          const session = JSON.parse(raw);
+          const structuredRaw = session?.structured_output;
+          if (typeof structuredRaw === 'string') {
+            const parsed = JSON.parse(structuredRaw);
+            if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+          }
+        }
+      } catch { /* fall through with empty merged */ }
+      for (const [k, v] of Object.entries(patch)) {
+        if (v === null) delete merged[k];
+        else merged[k] = v;
+      }
+      native.setMeetingStructuredOutput(sessionId, JSON.stringify(merged));
+    } catch (err) {
+      console.warn('[MeetingRoomClient] mergeStructuredOutput failed:', (err as Error)?.message);
+    }
+  }
+
   /** Process a segment received from the host (welcome snapshot or live
-   *  segment_broadcast). Dedups on the inbound host id, normalizes the
-   *  source so renderer "Me" detection still works, persists to the local
-   *  mirror DB, and pushes into the local recorder so the renderer sees it
-   *  via MEETING_SEGMENT_READY. */
-  private applyInboundSegment(seg: TranscriptSegment): void {
+   *  segment_broadcast). The DB unique index on (session_id, remote_segment_id)
+   *  is the source of truth for dedup — re-applying the same segment is a
+   *  no-op, which is essential for the rejoin welcome-replay case. Normalizes
+   *  the source so the renderer's "Me" detection still works.
+   *
+   *  Origin identity precedence: `seg.originSegmentId` (host-stamped) takes
+   *  priority over `seg.id` because participant-forwarded segments are stored
+   *  on the host with a host-minted `id` but carry the participant's local
+   *  id as `remote_segment_id`/`originSegmentId`. Without this, the
+   *  participant's own pre-leave speech would replay with a host id that
+   *  doesn't match their original local row → duplicate. */
+  private applyInboundSegment(seg: TranscriptSegment & { originSegmentId?: string | null }): void {
     if (!seg || typeof seg.id !== 'string' || seg.id.length === 0) return;
-    if (this.ingestedSegmentIds.has(seg.id)) return;
-    this.ingestedSegmentIds.add(seg.id);
+    const remoteId = (seg.originSegmentId && seg.originSegmentId.length > 0) ? seg.originSegmentId : seg.id;
 
     // Renderer's isOwnSegment() (MeetingTranscriptPanel) treats anything
     // that isn't 'broadcast' or 'participant:*' as the local mic ("Me").
@@ -299,15 +411,16 @@ class MeetingRoomClientManager {
       : 'broadcast';
 
     let localSeg: TranscriptSegment | null = null;
-    if (this.localSessionId && typeof native.addon.addTranscriptSegment === 'function') {
+    if (this.localSessionId) {
       try {
-        const json = native.addon.addTranscriptSegment(
+        const json = native.addTranscriptSegmentWithRemoteId(
           this.localSessionId,
           seg.speaker_label ?? 'Participant',
           Number(seg.start_ms ?? 0),
           Number(seg.end_ms ?? seg.start_ms ?? 0),
           seg.text ?? '',
           inboundSource,
+          remoteId,
         );
         localSeg = JSON.parse(json) as TranscriptSegment;
       } catch (err) {
@@ -422,6 +535,11 @@ class MeetingRoomClientManager {
         startMs: seg.start_ms,
         endMs: seg.end_ms,
         text: seg.text,
+        // Round-trip our local segment id so it ends up as the host's row's
+        // `remote_segment_id`, which then comes back to us as `originSegmentId`
+        // on rebroadcast / next welcome — letting the dedup index recognize
+        // the participant's own speech across leave/rejoin.
+        originSegmentId: seg.id,
       }));
     } catch (err) {
       console.warn('[MeetingRoomClient] Failed to forward segment:', err);
@@ -471,8 +589,77 @@ class MeetingRoomClientManager {
       });
       return;
     }
+    if (msg.type === 'title_update') {
+      const t = typeof msg.title === 'string' ? msg.title : null;
+      this.lastTitle = t;
+      // Persist host-set title onto the participant's local mirror so the
+      // post-meeting card uses the host's name even before any final
+      // broadcast arrives.
+      if (this.localSessionId) {
+        this.mergeStructuredOutput(this.localSessionId, { title: t });
+      }
+      const windows = BrowserWindow.getAllWindows();
+      if (windows.length > 0) {
+        windows[0].webContents.send(IPC_CHANNELS.MEETING_ROOM_TITLE_UPDATE, {
+          sessionId: this.localSessionId,
+          title: t,
+        });
+      }
+      return;
+    }
     if (msg.type === 'meeting_ended') {
-      void this.disconnect();
+      // Capture durable last-state from the packet (with in-memory fallbacks
+      // for older host builds that don't include the fields). Snapshot
+      // BEFORE we clear anything — clearMeetingStateAfterFinalized() runs
+      // when the renderer fires participantFinalized().
+      const finalSummary = typeof msg.finalSummary === 'string' && msg.finalSummary.length > 0
+        ? msg.finalSummary
+        : (this.lastSummary || null);
+      const finalSummaryAt = Number.isFinite(Number(msg.finalSummaryAt))
+        ? Number(msg.finalSummaryAt)
+        : this.lastSummaryAt;
+      const finalTitle = typeof msg.finalTitle === 'string' && msg.finalTitle.length > 0
+        ? msg.finalTitle
+        : this.lastTitle;
+      const localSessionId = this.localSessionId;
+
+      // Persist final title now (don't wait for renderer) so the participant's
+      // saved card has the host's name even if finalize is delayed/crashes.
+      if (localSessionId && finalTitle) {
+        this.mergeStructuredOutput(localSessionId, { title: finalTitle });
+      }
+
+      // Notify the renderer so it can run finalizeAndExitMeeting against the
+      // local mirror session. Renderer is responsible for stopping the
+      // recorder (transport-only disconnect leaves localSessionId intact).
+      const windows = BrowserWindow.getAllWindows();
+      if (windows.length > 0) {
+        windows[0].webContents.send(IPC_CHANNELS.MEETING_ROOM_HOST_ENDED, {
+          localSessionId,
+          finalSummary,
+          finalSummaryAt,
+          finalTitle,
+          finalSegmentCount: Number.isFinite(Number(msg.finalSegmentCount))
+            ? Number(msg.finalSegmentCount)
+            : null,
+        });
+      }
+
+      // Safety net: if the renderer never fires participantFinalized()
+      // (crash, navigation away, listener teardown), we still need to clear
+      // client state eventually so getInfo()/room state push doesn't keep
+      // reporting a dead session.
+      if (this.finalizeWatchdog) clearTimeout(this.finalizeWatchdog);
+      this.finalizeWatchdog = setTimeout(() => {
+        this.finalizeWatchdog = null;
+        if (this.localSessionId === localSessionId) {
+          console.warn('[MeetingRoomClient] participantFinalized timeout — auto-clearing client state');
+          this.clearMeetingStateAfterFinalized();
+          this.pushStateToRenderer();
+        }
+      }, 30_000);
+
+      void this.disconnectTransport();
       return;
     }
     if (msg.type === 'participant_joined' || msg.type === 'participant_left') {
@@ -484,28 +671,40 @@ class MeetingRoomClientManager {
     }
   }
 
+  /** Unexpected socket close (network glitch / server crashed without
+   *  meeting_ended). Treat as a full disconnect — clear everything. */
   private handleDisconnect(): void {
     if (this.unsubSegment) { this.unsubSegment(); this.unsubSegment = null; }
-    this.cleanupSocket();
+    this.cleanupSocketOnly();
+    this.clearMeetingStateAfterFinalized();
     this.pushStateToRenderer();
   }
 
-  private cleanupSocket(): void {
+  /** Socket-level state only. Safe to call without losing finalize-relevant
+   *  data (localSessionId, remoteSessionId, lastSummary, lastTitle). */
+  private cleanupSocketOnly(): void {
     this.socket = null;
-    this.hostName = null;
-    this.participantId = null;
-    this.remoteSessionId = null;
-    // Clear welcome notes so a failed reconnect or a later room join can't
-    // surface stale state via getInfo().
-    this.welcomeNotesHtml = null;
-    this.welcomeNotesVersion = null;
-    // Clear cached summary state for next session.
-    this.lastSummary = '';
-    this.lastSummaryAt = null;
-    // Clear welcome staging + dedup set so a future rejoin starts clean.
+    // Clear welcome staging — those buffers exist purely to bridge welcome
+    // → startLocalRecorder, and a partially-drained set must not leak into
+    // a future connect.
     this.welcomeSegments = [];
     this.welcomeSummaryPayload = null;
-    this.ingestedSegmentIds.clear();
+  }
+
+  /** Clears the durable client-side meeting state that disconnectTransport
+   *  intentionally preserved. Called once the renderer has finalized the
+   *  mirror session (via MEETING_ROOM_PARTICIPANT_FINALIZED) or by the
+   *  watchdog after a renderer-crash timeout. */
+  private clearMeetingStateAfterFinalized(): void {
+    this.localSessionId = null;
+    this.remoteSessionId = null;
+    this.hostName = null;
+    this.participantId = null;
+    this.welcomeNotesHtml = null;
+    this.welcomeNotesVersion = null;
+    this.lastSummary = '';
+    this.lastSummaryAt = null;
+    this.lastTitle = null;
   }
 
   private pushStateToRenderer(): void {

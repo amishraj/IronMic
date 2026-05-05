@@ -76,6 +76,16 @@ export function MeetingPage() {
   // Cleared on leave/end.
   const [welcomeNotesHtml, setWelcomeNotesHtml] = useState<string | undefined>(undefined);
 
+  // Live meeting title — editable by host, read-only on participant. Defaults
+  // to the local "Meeting #N" placeholder until the host (or solo user)
+  // provides one. Synced live via the room server's title_update broadcast.
+  const [granolaTitle, setGranolaTitle] = useState<string>('');
+  const [granolaSequence, setGranolaSequence] = useState<number | null>(null);
+  // Debounce handle for committing title edits via IPC. 600ms to balance
+  // responsiveness vs. WebSocket spam. Refers nothing across renders that
+  // would cause a stale-closure issue.
+  const titleCommitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   // Developer features escape hatch (Settings → Security & Privacy → Developer).
   // When false (default), Solo mode is hidden and an active Solo selection is
   // silently snapped to Host on mount. Source of truth is the SQLite setting.
@@ -181,10 +191,33 @@ export function MeetingPage() {
           }
           setLiveSummaryInsufficient(false);
         }
+        // Hydrate title + sequence from persisted structured_output. Useful
+        // on remount mid-meeting (tab switch) and on rejoin (reopened row
+        // already carries the prior title/sequence by design).
+        const storedTitle = structured?.title;
+        if (typeof storedTitle === 'string') {
+          setGranolaTitle((prev) => prev || storedTitle);
+        }
+        const storedSeq = structured?.sequence;
+        if (typeof storedSeq === 'number') {
+          setGranolaSequence((prev) => prev ?? storedSeq);
+        }
       } catch { /* ignore */ }
     })();
     return () => { cancelled = true; };
   }, [granolaSessionId, isGranolaRecording]);
+
+  // Reset title state on idle so the next meeting starts clean.
+  useEffect(() => {
+    if (!isGranolaRecording) {
+      setGranolaTitle('');
+      setGranolaSequence(null);
+      if (titleCommitTimerRef.current) {
+        clearTimeout(titleCommitTimerRef.current);
+        titleCommitTimerRef.current = null;
+      }
+    }
+  }, [isGranolaRecording]);
 
   // ── Tray / notification quick action: auto-start a meeting ──
   // Listens for the event dispatched by Layout when the user clicks the
@@ -206,9 +239,63 @@ export function MeetingPage() {
   useEffect(() => {
     const unsubState = window.ironmic?.onMeetingRoomState?.((info: any) => {
       applyRoomState(info);
+      // Hydrate title from room state pushes — this picks up the host's
+      // initial title at room-start, plus any title_update broadcasts
+      // (participants on other machines see this too via the title_update
+      // event below; the room-state push is the authoritative current state).
+      if (typeof info?.title === 'string') {
+        setGranolaTitle(info.title);
+      }
     });
     const unsubParticipant = window.ironmic?.onMeetingRoomParticipantUpdate?.((msg: any) => {
       applyParticipantUpdate(msg);
+    });
+    // Live title sync (participant): host's debounced commits land here.
+    const unsubTitle = window.ironmic?.onMeetingRoomTitleUpdate?.((payload) => {
+      // Match against either the participant's local mirror id or the host's
+      // session id so the right update wins regardless of which side we're
+      // on. The host is also a recipient of its own broadcasts in the
+      // current implementation? No — the server broadcasts to authenticated
+      // clients only, so the host's own renderer doesn't get echoed back.
+      // For the host, room-state push above handles the update.
+      setGranolaTitle(payload?.title ?? '');
+    });
+    // Host-ended → renderer-driven finalize. The participant's local mirror
+    // session is the one we finalize; the payload carries the host's
+    // authoritative final summary/title to overwrite stale local state.
+    const unsubHostEnded = window.ironmic?.onMeetingRoomHostEnded?.((payload) => {
+      const localId = payload?.localSessionId;
+      // Snapshot the live durationMs / template / roomMode at the moment the
+      // event fires — the state-update flush below clears them.
+      const durationSec = Math.round(durationMs / 1000);
+      const templateSnapshot = selectedTemplate;
+      const roomModeSnapshot = roomMode;
+
+      if (!localId) return;
+      // Only act if this matches the meeting we're currently in. A stray
+      // event from a stale connection should be a no-op.
+      if (granolaSessionIdRef.current && granolaSessionIdRef.current !== localId) return;
+
+      // Mirror the user-driven stop: mark processing, flip UI, clear state.
+      markMeetingProcessing(localId);
+      setIsGranolaStopping(true);
+      try { void loadSessions(); } catch { /* ignore */ }
+      setGranolaSessionId(null);
+      setGranolaRecordingStartedAt(null);
+      setGranolaStructuredOutput(null);
+      setGranolaPlainSummary(null);
+      setGranolaNotesGenerating(false);
+      clearSegments();
+
+      void finalizeAndExitMeeting({
+        sessionId: localId,
+        durationSec,
+        template: templateSnapshot,
+        roomModeSnapshot,
+        skipRoomTeardown: true,
+        hostSummaryOverride: payload?.finalSummary ?? null,
+        hostTitleOverride: payload?.finalTitle ?? null,
+      });
     });
     // Load persisted display name
     window.ironmic?.getSetting?.('meeting_display_name').then((v) => {
@@ -217,7 +304,10 @@ export function MeetingPage() {
     return () => {
       unsubState?.();
       unsubParticipant?.();
+      unsubTitle?.();
+      unsubHostEnded?.();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Reset invite-details visibility on each recording start ──
@@ -342,26 +432,28 @@ export function MeetingPage() {
       setDetectedApp(null);
 
       // Assign a stable sequential number ("Meeting #N") as the default
-      // title. Count existing sessions at create time so the number sticks
-      // even if older meetings are deleted later. Persisted into
-      // structured_output.sequence, read by MeetingSessionCard as the
-      // fallback title when the user hasn't renamed the meeting.
+      // title. Use indexed Rust aggregate over `structured_output.sequence`
+      // — replaces the old `meetingList(9999, 0)` JSON scan that became
+      // O(N) on slower laptops with many past meetings.
       try {
-        const listRaw = await window.ironmic.meetingList(9999, 0);
-        const allSessions = JSON.parse(listRaw) || [];
-        // Use max(existing sequences) + 1 — guarantees uniqueness even after
-        // deletions (counting alone would reuse numbers of deleted meetings).
-        const maxSeq = allSessions.reduce((max: number, s: any) => {
-          if (s.id === session.id) return max; // skip the just-created session
+        let maxSeq = 0;
+        try { maxSeq = await window.ironmic.meetingGetMaxSequence(); }
+        catch { /* fall through to legacy fallback */ }
+        let sequence: number;
+        if (maxSeq > 0) {
+          sequence = maxSeq + 1;
+        } else {
+          // First-run fallback: no prior sequence numbers exist. Pull a
+          // total-count once (rare path) so pre-existing legacy meetings
+          // get retroactive numbers without making this O(N) on every start.
           try {
-            const parsed = s.structured_output ? JSON.parse(s.structured_output) : null;
-            const seq = parsed?.sequence;
-            return typeof seq === 'number' && seq > max ? seq : max;
-          } catch { return max; }
-        }, 0);
-        // If no prior sequence numbers exist yet, start from the total count
-        // (so pre-existing meetings retroactively "feel" numbered).
-        const sequence = maxSeq > 0 ? maxSeq + 1 : allSessions.length;
+            const listRaw = await window.ironmic.meetingList(9999, 0);
+            const allSessions = JSON.parse(listRaw) || [];
+            sequence = allSessions.length;
+          } catch { sequence = 1; }
+        }
+        setGranolaSequence(sequence);
+        setGranolaTitle('');
         await window.ironmic.meetingSetStructuredOutput(
           session.id,
           JSON.stringify({ sequence, processingState: 'recording' }),
@@ -370,10 +462,14 @@ export function MeetingPage() {
         console.warn('[MeetingPage] Failed to assign meeting sequence number:', err);
       }
 
-      // Start the chunk recording loop via main process
+      // Start the chunk recording loop via main process. Pass the host's
+      // display name so the recorder can seed both contextTerms (Whisper
+      // bias + fuzzy correction) and the persisted participant roster.
       await window.ironmic.meetingStartRecording(
         session.id,
         selectedAudioDevice ?? null,
+        undefined,
+        roomDisplayName || null,
       );
 
       // If hosting, also spin up the LAN room server
@@ -469,40 +565,191 @@ export function MeetingPage() {
   // Returns the user to the idle meetings page immediately, then generates
   // notes asynchronously. The session card shows a "Processing notes…" badge
   // until generation finishes.
+  /**
+   * Shared finalize path used by:
+   *   (a) the user clicking "End Meeting" / "Leave Room" — `skipRoomTeardown=false`
+   *   (b) the host ending the meeting from another machine — participant
+   *       receives `MEETING_ROOM_HOST_ENDED`, which calls this with
+   *       `skipRoomTeardown=true` (transport already gone) plus the host's
+   *       final summary/title to overwrite stale local state.
+   *
+   * Stop ordering matters: meetingStopRecording MUST complete before the
+   * room teardown so the recorder's final segment is broadcast to every
+   * participant before sockets close. Pre-fix, host stop tore down the room
+   * first and participants lost the last sentence.
+   */
+  const finalizeAndExitMeeting = useCallback(async (opts: {
+    sessionId: string;
+    durationSec: number;
+    template: MeetingTemplate | null;
+    roomModeSnapshot: 'solo' | 'host' | 'participant';
+    skipRoomTeardown: boolean;
+    hostSummaryOverride?: string | null;
+    hostTitleOverride?: string | null;
+  }) => {
+    const { sessionId, durationSec, template, roomModeSnapshot, skipRoomTeardown,
+            hostSummaryOverride, hostTitleOverride } = opts;
+    try {
+      // 1. Stop recording FIRST. This drains the final chunk + flushes the
+      //    LiveSummarizer; the resulting segment is emitted to the room
+      //    server's onSegment subscription synchronously, BEFORE we tear
+      //    down. If we tore down the room first, the final segment would
+      //    never reach participants.
+      const result = await window.ironmic.meetingStopRecording();
+      const { fullTranscript, liveSummary, liveInsufficient } = result as {
+        fullTranscript: string;
+        liveSummary?: string;
+        liveInsufficient?: boolean;
+      };
+
+      // 2. Host-only: explicitly broadcast the freshly-flushed final summary
+      //    so participants see it BEFORE the meeting_ended packet arrives.
+      //    meeting_ended also carries it as a durable fallback.
+      if (roomModeSnapshot === 'host' && !skipRoomTeardown && liveSummary && liveSummary.trim().length > 0) {
+        try { await window.ironmic.meetingRoomBroadcastFinalSummary(sessionId, liveSummary); }
+        catch (err) { console.warn('[MeetingPage] Failed to broadcast final summary:', err); }
+      }
+
+      // 3. Tear down the room transport now that the wire has the final
+      //    state. Host stop broadcasts `meeting_ended` (with finalSummary,
+      //    finalTitle, finalSegmentCount) and closes sockets. Participant
+      //    leave-transport closes the socket but preserves localSessionId
+      //    on main so the renderer-owned finalize works.
+      if (!skipRoomTeardown) {
+        if (roomModeSnapshot === 'host') {
+          try { await window.ironmic.meetingRoomHostStop(); } catch (err) {
+            console.warn('[MeetingPage] Failed to stop room server:', err);
+          }
+        } else if (roomModeSnapshot === 'participant') {
+          try { await window.ironmic.meetingRoomLeaveTransport(); } catch (err) {
+            console.warn('[MeetingPage] Failed to leave room transport:', err);
+          }
+        }
+      }
+      resetRoomState();
+
+      // 4. Persist meetingEnd. Host overrides win — when finalize is driven
+      //    by MEETING_ROOM_HOST_ENDED, the participant's local
+      //    meetingStopRecording().liveSummary may be stale or empty (their
+      //    summarizer never ran), so prefer the host's summary if it's set.
+      const summaryForEnd = hostSummaryOverride && hostSummaryOverride.trim().length > 0
+        ? hostSummaryOverride
+        : '';
+      try {
+        await window.ironmic.meetingEnd(sessionId, 1, summaryForEnd, '', durationSec, '');
+      } catch (err) {
+        console.error('[MeetingPage] meetingEnd failed:', err);
+      }
+
+      // 5. Lay down host overrides BEFORE the auto-file Notes upsert in the
+      //    finally block reads structured_output. Title in particular: the
+      //    auto-file path uses so.title to name the Notes entry, so it must
+      //    land first, not after.
+      if (hostTitleOverride || hostSummaryOverride) {
+        try {
+          const rawForOverride = await window.ironmic.meetingGet(sessionId);
+          let merged: any = {};
+          if (rawForOverride) {
+            try { merged = JSON.parse(JSON.parse(rawForOverride)?.structured_output || '{}'); }
+            catch { merged = {}; }
+          }
+          if (hostTitleOverride && hostTitleOverride.length > 0) merged.title = hostTitleOverride;
+          if (hostSummaryOverride && hostSummaryOverride.trim().length > 0) {
+            merged.plainSummary = hostSummaryOverride;
+            merged.sections = [{ key: 'summary', title: 'Summary', content: hostSummaryOverride }];
+            merged.processingState = 'done';
+          }
+          await window.ironmic.meetingSetStructuredOutput(sessionId, JSON.stringify(merged));
+        } catch (err) {
+          console.warn('[MeetingPage] Failed to write host overrides:', err);
+        }
+      }
+
+      await loadSessions();
+
+      // Decide on the finalize-summary path. If we already wrote host
+      // overrides, the structured_output is good — skip the local LLM.
+      const haveHostFinalState = !!(hostSummaryOverride && hostSummaryOverride.trim().length > 0);
+
+      if (!haveHostFinalState) {
+        if (!fullTranscript || fullTranscript.trim().length === 0) {
+          await finalizeInsufficient(sessionId, 'empty');
+        } else if (liveInsufficient && (!liveSummary || !liveSummary.trim())) {
+          await finalizeInsufficient(sessionId, 'insufficient');
+        } else if (liveSummary && liveSummary.trim().length > 0) {
+          await finalizeWithLiveSummary(sessionId, liveSummary, template);
+        } else {
+          await generateStructuredNotes(sessionId, fullTranscript, durationSec, template);
+        }
+        await loadSessions();
+      }
+    } catch (err) {
+      console.error('[MeetingPage] finalize pipeline failed:', err);
+    } finally {
+      // ── Guaranteed Notes-sidebar auto-file ──────────────────────────────
+      // Runs after EVERY processing path. Re-reads from DB so the latest
+      // persisted state (including host overrides above) is what gets filed.
+      try {
+        const rawFinal = await window.ironmic.meetingGet(sessionId);
+        if (rawFinal) {
+          const latestSession = JSON.parse(rawFinal);
+          let so: any = {};
+          try { so = JSON.parse(latestSession.structured_output || '{}'); } catch {}
+
+          const title = so.title || `Meeting ${new Date().toLocaleString()}`;
+          const plainText = (so.plainSummary || latestSession.summary || '').trim();
+
+          if (plainText && so.processingState !== 'generating') {
+            const entryId = await upsertMeetingNoteEntry({
+              existingEntryId: so.notebookEntryId ?? null,
+              sessionId,
+              title,
+              plainText,
+            });
+            if (entryId !== so.notebookEntryId) {
+              await window.ironmic.meetingSetStructuredOutput(
+                sessionId,
+                JSON.stringify({ ...so, notebookEntryId: entryId }),
+              );
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[MeetingPage] Auto-file to Notes sidebar failed:', err);
+      }
+
+      unmarkMeetingProcessing(sessionId);
+      setIsGranolaStopping(false);
+      setIsGranolaRecording(false);
+
+      // Tell main it can wipe its preserved client state now that finalize
+      // is done. Only relevant in the host-ended path; the user-driven path
+      // either teardown-stopped the host server (no client state to clear)
+      // or invoked leave-transport (matching invoke needed).
+      if (skipRoomTeardown) {
+        try { await window.ironmic.meetingRoomParticipantFinalized(); }
+        catch (err) { console.warn('[MeetingPage] participantFinalized failed:', err); }
+      }
+      void loadSessions();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleGranolaStop = useCallback(async () => {
     if (!granolaSessionId) return;
     const sessionId = granolaSessionId;
-    // Capture duration before awaits — the state listener resets it when status=idle
     const durationSec = Math.round(durationMs / 1000);
     const templateSnapshot = selectedTemplate;
+    const roomModeSnapshot = roomMode;
 
-    // CRITICAL: flush the Your Notes editor NOW (before we unmount the
-    // panel via setGranolaSessionId(null)) so the very latest typed content
-    // is persisted to the DB. The main-process LiveSummarizer's final pass
-    // will then read those fresh notes and weave them into the AI summary.
-    // Without this, notes typed in the last <800ms are lost.
     try { await yourNotesRef.current?.flush(); }
     catch (err) { console.warn('[MeetingPage] YourNotes flush failed:', err); }
 
-    // 1. Mark this meeting as processing IMMEDIATELY so when the UI flips back
-    //    to the meetings list, the card already shows the "Processing…" badge
-    //    instead of a blank gap. Also seed an optimistic structured_output so
-    //    the card is rendered even before loadSessions() completes.
     markMeetingProcessing(sessionId);
-    // Also flag the recorder as stopping right away (synchronously) so the
-    // "Start Meeting" button disables immediately — we don't want to wait
-    // for the backend 'stopping' state push, which can race with a fast click.
     setIsGranolaStopping(true);
-    try {
-      // Optimistic: ensure an entry exists in the sessions list right now.
-      // The session was already created in startGranolaRecording, so just
-      // refresh from DB. Don't await — let it happen in parallel.
-      void loadSessions();
-    } catch { /* ignore */ }
+    try { void loadSessions(); } catch { /* ignore */ }
 
-    // 2. Flip the UI back to the meetings page immediately so the user
-    //    isn't staring at a blank/stuck view while we drain the buffer +
-    //    run the LLM in the background.
+    // Flip UI back to meetings list immediately
     setGranolaSessionId(null);
     setGranolaRecordingStartedAt(null);
     setGranolaStructuredOutput(null);
@@ -510,126 +757,15 @@ export function MeetingPage() {
     setGranolaNotesGenerating(false);
     clearSegments();
 
-    // Capture room mode before we reset state
-    const roomModeSnapshot = roomMode;
-
-    // 3. Background: do the actual stop + transcription + LLM. The user
-    //    can keep interacting with the meetings list while this runs.
-    void (async () => {
-      try {
-        // Tear down the LAN room first so participants get `meeting_ended`
-        // before we start draining the audio buffer.
-        if (roomModeSnapshot === 'host') {
-          try { await window.ironmic.meetingRoomHostStop(); } catch (err) {
-            console.warn('[MeetingPage] Failed to stop room server:', err);
-          }
-        } else if (roomModeSnapshot === 'participant') {
-          try { await window.ironmic.meetingRoomLeave(); } catch (err) {
-            console.warn('[MeetingPage] Failed to leave room:', err);
-          }
-        }
-        resetRoomState();
-
-        const result = await window.ironmic.meetingStopRecording();
-        const { fullTranscript, liveSummary, liveInsufficient } = result as {
-          fullTranscript: string;
-          liveSummary?: string;
-          liveInsufficient?: boolean;
-        };
-
-        // Persist duration so the card shows the right "ended at" + length.
-        try {
-          await window.ironmic.meetingEnd(sessionId, 1, '', '', durationSec, '');
-        } catch (err) {
-          console.error('[MeetingPage] meetingEnd failed:', err);
-        }
-        await loadSessions();
-
-        if (!fullTranscript || fullTranscript.trim().length === 0) {
-          await finalizeInsufficient(sessionId, 'empty');
-          await loadSessions();
-          return;
-        }
-
-        // If the live summarizer explicitly flagged the session as too thin
-        // (e.g., a few scattered words over a long recording) — honor that.
-        // We'd rather show "insufficient content" than hallucinate bullets.
-        if (liveInsufficient && (!liveSummary || !liveSummary.trim())) {
-          await finalizeInsufficient(sessionId, 'insufficient');
-          await loadSessions();
-          return;
-        }
-
-        // Use the live AI summary as the final record — it was built
-        // incrementally during the meeting, so we don't re-process the full
-        // transcript. This is the whole point of real-time summarization.
-        if (liveSummary && liveSummary.trim().length > 0) {
-          await finalizeWithLiveSummary(sessionId, liveSummary, templateSnapshot);
-        } else {
-          // Fallback: live summary was unavailable (no LLM / it failed to run).
-          // Run the legacy post-meeting pipeline so the user still gets notes.
-          await generateStructuredNotes(sessionId, fullTranscript, durationSec, templateSnapshot);
-        }
-
-      } catch (err) {
-        console.error('[MeetingPage] Background stop pipeline failed:', err);
-      } finally {
-        // ── Guaranteed Notes-sidebar auto-file ──────────────────────────────
-        // Runs after EVERY processing path — live-summary, full LLM, empty,
-        // insufficient, or pipeline error. Individual finalize functions also
-        // call upsertMeetingNoteEntry for notebookEntryId bookkeeping, but
-        // those are buried in try/catch and silently fail on any error.
-        // This single call in the finally block is the authoritative guarantee
-        // that the note always lands in the Notes sidebar without the user
-        // having to manually edit and save on the Meetings page.
-        // We re-read from DB so we file whatever content was actually persisted,
-        // not a stale in-memory snapshot from a partially-completed pipeline.
-        try {
-          const rawFinal = await window.ironmic.meetingGet(sessionId);
-          if (rawFinal) {
-            const latestSession = JSON.parse(rawFinal);
-            let so: any = {};
-            try { so = JSON.parse(latestSession.structured_output || '{}'); } catch {}
-
-            const title = so.title || `Meeting ${new Date().toLocaleString()}`;
-            const plainText = (so.plainSummary || latestSession.summary || '').trim();
-
-            // Only file meetings that produced actual content. Empty/insufficient
-            // sessions have no summary worth showing in the Notes sidebar.
-            if (plainText && so.processingState !== 'generating') {
-              const entryId = await upsertMeetingNoteEntry({
-                existingEntryId: so.notebookEntryId ?? null,
-                sessionId,
-                title,
-                plainText,
-              });
-              // Persist notebookEntryId back so future upserts (regen, edit-save)
-              // find this exact entry and update in place rather than duplicating.
-              if (entryId !== so.notebookEntryId) {
-                await window.ironmic.meetingSetStructuredOutput(
-                  sessionId,
-                  JSON.stringify({ ...so, notebookEntryId: entryId }),
-                );
-              }
-            }
-          }
-        } catch (err) {
-          console.warn('[MeetingPage] Auto-file to Notes sidebar failed:', err);
-        }
-
-        unmarkMeetingProcessing(sessionId);
-        // Always clear the recording/stopping flags here — the onMeetingRecordingState
-        // listener (which normally clears them) is tied to MeetingPage's lifecycle.
-        // If the user navigated away during processing, that listener was already
-        // cleaned up and the 'idle' push from the backend was silently dropped,
-        // leaving isGranolaStopping=true in the store forever. Clearing here is
-        // unconditionally safe because the pipeline is complete at this point.
-        setIsGranolaStopping(false);
-        setIsGranolaRecording(false);
-        void loadSessions();
-      }
-    })();
-  }, [granolaSessionId, durationMs, selectedTemplate]);
+    // Background pipeline. The user can keep interacting with the list.
+    void finalizeAndExitMeeting({
+      sessionId,
+      durationSec,
+      template: templateSnapshot,
+      roomModeSnapshot,
+      skipRoomTeardown: false,
+    });
+  }, [granolaSessionId, durationMs, selectedTemplate, roomMode, finalizeAndExitMeeting]);
 
   /**
    * Mark a session as having insufficient content to summarize.
@@ -948,16 +1084,59 @@ export function MeetingPage() {
       <div className="flex flex-col h-full">
         {/* Header bar */}
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-iron-border bg-iron-surface shrink-0">
-          <div className="flex items-center gap-3">
-            <div className={`w-2.5 h-2.5 rounded-full ${isGranolaRecording ? 'bg-red-400 animate-pulse' : 'bg-amber-400 animate-pulse'}`} />
-            <span className="text-sm font-medium text-iron-text">
+          <div className="flex items-center gap-3 min-w-0 flex-1">
+            <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${isGranolaRecording ? 'bg-red-400 animate-pulse' : 'bg-amber-400 animate-pulse'}`} />
+            <span className="text-sm font-medium text-iron-text shrink-0">
               {isGranolaRecording ? 'Recording…' : 'Processing notes…'}
             </span>
             {isGranolaRecording && (
-              <span className="text-xs text-iron-text-muted font-mono">{formatDuration(durationMs)}</span>
+              <span className="text-xs text-iron-text-muted font-mono shrink-0">{formatDuration(durationMs)}</span>
+            )}
+            {/* Live meeting title — host & solo can edit, participant is
+                read-only (input disabled and styled flat). Saves debounced
+                via meetingSetTitle, which (host) broadcasts to participants
+                AND (host or solo) persists to structured_output.title so the
+                saved card uses this name without any post-meeting edit. */}
+            {isGranolaRecording && granolaSessionId && (
+              <input
+                type="text"
+                value={granolaTitle}
+                disabled={roomMode === 'participant'}
+                placeholder={granolaSequence != null ? `Meeting #${granolaSequence}` : 'Meeting'}
+                aria-label={roomMode === 'participant' ? 'Meeting title (set by host)' : 'Meeting title'}
+                title={roomMode === 'participant' ? 'Set by host' : 'Edit meeting title'}
+                onChange={(e) => {
+                  const next = e.target.value;
+                  setGranolaTitle(next);
+                  if (roomMode === 'participant') return; // disabled in UI; defense-in-depth
+                  if (titleCommitTimerRef.current) clearTimeout(titleCommitTimerRef.current);
+                  const sessionId = granolaSessionId;
+                  if (!sessionId) return;
+                  titleCommitTimerRef.current = setTimeout(() => {
+                    titleCommitTimerRef.current = null;
+                    void window.ironmic.meetingSetTitle(sessionId, next.trim().length > 0 ? next : null)
+                      .catch((err: unknown) => console.warn('[MeetingPage] meetingSetTitle failed:', err));
+                  }, 600);
+                }}
+                onBlur={() => {
+                  // Flush any pending debounced save on blur so a quick
+                  // type-then-click doesn't lose the last edit.
+                  if (titleCommitTimerRef.current && roomMode !== 'participant' && granolaSessionId) {
+                    clearTimeout(titleCommitTimerRef.current);
+                    titleCommitTimerRef.current = null;
+                    void window.ironmic.meetingSetTitle(granolaSessionId, granolaTitle.trim().length > 0 ? granolaTitle : null)
+                      .catch((err: unknown) => console.warn('[MeetingPage] meetingSetTitle failed:', err));
+                  }
+                }}
+                className={`flex-1 min-w-0 max-w-md px-2 py-1 text-sm rounded-md border transition-colors ${
+                  roomMode === 'participant'
+                    ? 'bg-transparent border-transparent text-iron-text-muted cursor-default'
+                    : 'bg-iron-surface-hover border-iron-border text-iron-text focus:outline-none focus:ring-2 focus:ring-iron-accent/30 focus:border-iron-accent/40'
+                }`}
+              />
             )}
             {selectedTemplate && (
-              <Badge variant="default" className="text-[10px]">
+              <Badge variant="default" className="text-[10px] shrink-0">
                 <LayoutTemplate className="w-2.5 h-2.5 mr-1" />
                 {selectedTemplate.name}
               </Badge>

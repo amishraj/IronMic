@@ -39,6 +39,16 @@ const api = {
   addWord: (word: string) => ipcRenderer.invoke('ironmic:add-word', word),
   removeWord: (word: string) => ipcRenderer.invoke('ironmic:remove-word', word),
   listDictionary: () => ipcRenderer.invoke('ironmic:list-dictionary'),
+  refreshTranscriptionDictionary: () =>
+    ipcRenderer.invoke('ironmic:refresh-transcription-dictionary'),
+  /** Subscribe to dictionary-mutation events so the renderer can refresh
+   *  any cached term lists used for transcript post-correction. Returns a
+   *  cleanup function. */
+  onDictionaryChanged: (callback: () => void) => {
+    const handler = () => callback();
+    ipcRenderer.on('ironmic:dictionary-changed', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictionary-changed', handler);
+  },
 
   // Settings
   getSetting: (key: string) => ipcRenderer.invoke('ironmic:get-setting', key),
@@ -208,10 +218,16 @@ const api = {
   meetingDelete: (id: string) => ipcRenderer.invoke('ironmic:meeting-delete', id),
   meetingCreateWithTemplate: (templateId: string | null, detectedApp: string | null) => ipcRenderer.invoke('ironmic:meeting-create-with-template', templateId, detectedApp),
   meetingSetStructuredOutput: (id: string, structuredOutput: string) => ipcRenderer.invoke('ironmic:meeting-set-structured-output', id, structuredOutput),
+  meetingGetParticipants: (id: string) => ipcRenderer.invoke('ironmic:meeting-get-participants', id),
 
   // ── Meeting Recording (Granola-style chunk loop) ──
-  meetingStartRecording: (sessionId: string, deviceName?: string | null, chunkIntervalS?: number) =>
-    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS),
+  meetingStartRecording: (
+    sessionId: string,
+    deviceName?: string | null,
+    chunkIntervalS?: number,
+    hostDisplayName?: string | null,
+  ) =>
+    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS, hostDisplayName),
   meetingStopRecording: () => ipcRenderer.invoke('ironmic:meeting-stop-recording'),
   /** Toggle self-mute during an active meeting. Backend is the source of
    *  truth — the renderer should mirror state via onMeetingRecordingState
@@ -253,6 +269,14 @@ const api = {
   meetingRoomJoin: (opts: { hostIp: string; hostPort: number; roomCode: string; displayName: string; deviceName?: string | null }) =>
     ipcRenderer.invoke('ironmic:meeting-room-join', opts),
   meetingRoomLeave: () => ipcRenderer.invoke('ironmic:meeting-room-leave'),
+  meetingRoomLeaveTransport: () => ipcRenderer.invoke('ironmic:meeting-room-leave-transport'),
+  meetingRoomBroadcastFinalSummary: (sessionId: string, summary: string) =>
+    ipcRenderer.invoke('ironmic:meeting-room-broadcast-final-summary', sessionId, summary),
+  meetingRoomParticipantFinalized: () =>
+    ipcRenderer.invoke('ironmic:meeting-room-participant-finalized'),
+  meetingSetTitle: (sessionId: string, title: string | null) =>
+    ipcRenderer.invoke('ironmic:meeting-set-title', sessionId, title),
+  meetingGetMaxSequence: () => ipcRenderer.invoke('ironmic:meeting-get-max-sequence'),
 
   // ── Transcript Segments ──
   listTranscriptSegments: (sessionId: string) => ipcRenderer.invoke('ironmic:list-transcript-segments', sessionId),
@@ -372,6 +396,16 @@ const api = {
     const handler = (_event: any, msg: any) => callback(msg);
     ipcRenderer.on('ironmic:meeting-room-participant-update', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-room-participant-update', handler);
+  },
+  onMeetingRoomHostEnded: (callback: (payload: { localSessionId: string | null; finalSummary: string | null; finalSummaryAt: number | null; finalTitle: string | null; finalSegmentCount: number | null }) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-room-host-ended', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-host-ended', handler);
+  },
+  onMeetingRoomTitleUpdate: (callback: (payload: { sessionId: string | null; title: string | null }) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-room-title-update', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-title-update', handler);
   },
 
   // ── BlackHole (macOS system audio) ──

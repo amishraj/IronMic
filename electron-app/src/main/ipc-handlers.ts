@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { IPC_CHANNELS, MODEL_FILES, TRANSCRIPTION_ENGINES } from '../shared/constants';
 import { native } from './native-bridge';
+import { notifyDictionaryChanged } from './dictionary-cache';
 import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, getTtsReadiness, ensureBundledVoices, invalidateEspeakCache, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine, ensureBundledMoonshineBase, isMoonshineBundleAvailable } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath } from './ai/LocalLLMAdapter';
@@ -304,10 +305,33 @@ export function registerIpcHandlers(): void {
   );
   ipcMain.handle('ironmic:run-auto-cleanup', () => native.addon.runAutoCleanup());
 
-  // Dictionary
-  ipcMain.handle(IPC_CHANNELS.ADD_WORD, (_e, word: string) => native.addWord(word));
-  ipcMain.handle(IPC_CHANNELS.REMOVE_WORD, (_e, word: string) => native.removeWord(word));
+  // Dictionary. After a mutation, broadcast `dictionary-changed` so any
+  // renderer/main caches re-fetch their term list (used by transcript
+  // post-correction). The Rust addon already pushes the change into the
+  // active engine; this is the JS-side cache invalidation.
+  function broadcastDictionaryChanged(): void {
+    for (const win of BrowserWindow.getAllWindows()) {
+      try {
+        win.webContents.send(IPC_CHANNELS.DICTIONARY_CHANGED);
+      } catch {
+        /* renderer may be closing — ignore */
+      }
+    }
+  }
+  ipcMain.handle(IPC_CHANNELS.ADD_WORD, (_e, word: string) => {
+    native.addWord(word);
+    notifyDictionaryChanged();
+    broadcastDictionaryChanged();
+  });
+  ipcMain.handle(IPC_CHANNELS.REMOVE_WORD, (_e, word: string) => {
+    native.removeWord(word);
+    notifyDictionaryChanged();
+    broadcastDictionaryChanged();
+  });
   ipcMain.handle(IPC_CHANNELS.LIST_DICTIONARY, () => native.listDictionary());
+  ipcMain.handle(IPC_CHANNELS.REFRESH_TRANSCRIPTION_DICTIONARY, () =>
+    native.refreshTranscriptionDictionary(),
+  );
 
   // Settings — validate key allowlist and value length
   ipcMain.handle(IPC_CHANNELS.GET_SETTING, (_e, key: string) => {
@@ -681,6 +705,9 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle(IPC_CHANNELS.MEETING_GET, (_e, id: string) => native.addon.getMeetingSession(id));
   ipcMain.handle(IPC_CHANNELS.MEETING_LIST, (_e, limit: number, offset: number) => native.addon.listMeetingSessions(limit, offset));
   ipcMain.handle(IPC_CHANNELS.MEETING_DELETE, (_e, id: string) => native.addon.deleteMeetingSession(id));
+  ipcMain.handle(IPC_CHANNELS.MEETING_GET_PARTICIPANTS, (_e, id: string) =>
+    native.getMeetingParticipants(id),
+  );
 
   // ── TF.js Infrastructure ──
 
@@ -891,7 +918,7 @@ If the text is too short or unclear, output: ["General"]`;
 
   // ── Meeting Recording (Granola-style chunk loop) ──
 
-  ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (_event, sessionId: string, deviceName?: string | null, chunkIntervalS?: number) => {
+  ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (_event, sessionId: string, deviceName?: string | null, chunkIntervalS?: number, hostDisplayName?: string | null) => {
     assertString(sessionId, 'sessionId');
     // If the renderer didn't pass an interval, read the user's configured value
     // from settings; fall back to 15s. Clamp to [10, 60] — shorter hurts Whisper
@@ -907,7 +934,7 @@ If the text is too short or unclear, output: ["General"]`;
       }
     }
     interval = Math.max(10, Math.min(60, Math.round(interval)));
-    await meetingRecorder.startMeetingRecording(sessionId, deviceName, interval);
+    await meetingRecorder.startMeetingRecording(sessionId, deviceName, interval, hostDisplayName ?? null);
     // Kick off the live-summary stream for this session.
     try { liveSummarizer.start(sessionId); }
     catch (err) { console.warn('[ipc] liveSummarizer.start failed:', err); }
@@ -1033,6 +1060,93 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_LEAVE, async () => {
     await meetingRoomClient.disconnect();
     return { ok: true };
+  });
+
+  // Transport-only leave: closes WebSocket but PRESERVES the participant's
+  // localSessionId / lastSummary / lastTitle so the renderer's
+  // finalizeAndExitMeeting can use them. Renderer MUST follow up with
+  // MEETING_ROOM_PARTICIPANT_FINALIZED once finalize is done. Renderer-driven
+  // finalize replaces the legacy MEETING_ROOM_LEAVE flow that double-stopped
+  // the recorder.
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_LEAVE_TRANSPORT, async () => {
+    await meetingRoomClient.disconnectTransport();
+    return { ok: true };
+  });
+
+  // Renderer signals "I'm done finalizing the local mirror session — you can
+  // wipe the durable client state now". 30-second watchdog in MeetingRoomClient
+  // handles the case where this never arrives (renderer crash).
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_PARTICIPANT_FINALIZED, async () => {
+    meetingRoomClient.participantFinalized();
+    return { ok: true };
+  });
+
+  // Host-only: explicit final-summary broadcast just before stop(). The
+  // host renderer awaits meetingStopRecording() (which flushes the live
+  // summarizer), then fires this so participants see the final summary
+  // BEFORE the meeting_ended packet arrives. meeting_ended also carries
+  // it as a durable fallback.
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_BROADCAST_FINAL_SUMMARY, async (_e, sessionId: string, summary: string) => {
+    assertString(sessionId, 'sessionId');
+    if (typeof summary !== 'string' || summary.trim().length === 0) return { ok: false };
+    meetingRoomServer.broadcastFinalSummary(sessionId, summary);
+    return { ok: true };
+  });
+
+  // Set the live meeting title (host-only authority).
+  // Accept paths:
+  //   (a) solo mode  — server NOT active, client NOT connected
+  //   (b) host mode  — server.isActive() && server.sessionId === sessionId
+  // Reject path:
+  //   (c) participant — client.isConnected()  → 403 (UI is also disabled, but
+  //                                              this is the security boundary)
+  ipcMain.handle(IPC_CHANNELS.MEETING_SET_TITLE, async (_e, sessionId: string, title: string | null) => {
+    assertString(sessionId, 'sessionId');
+    const safeTitle = typeof title === 'string' ? title : null;
+
+    const serverActive = meetingRoomServer.isActive();
+    const serverInfo = serverActive ? meetingRoomServer.getInfo() : null;
+    const isHost = serverActive && serverInfo?.sessionId === sessionId;
+    const isParticipant = meetingRoomClient.isConnected();
+    const isSolo = !serverActive && !isParticipant;
+
+    if (!isHost && !isSolo) {
+      throw new Error('Only the host (or solo user) may set the meeting title');
+    }
+
+    if (isHost) {
+      // Host path: server owns persistence + broadcast.
+      meetingRoomServer.setTitle(safeTitle);
+    } else {
+      // Solo path: write directly to structured_output, no broadcast.
+      try {
+        let merged: Record<string, unknown> = {};
+        const raw = native.addon.getMeetingSession(sessionId);
+        if (raw && raw !== 'null') {
+          const session = JSON.parse(raw);
+          const structuredRaw = session?.structured_output;
+          if (typeof structuredRaw === 'string') {
+            const parsed = JSON.parse(structuredRaw);
+            if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+          }
+        }
+        if (safeTitle === null || safeTitle.length === 0) {
+          delete merged.title;
+        } else {
+          merged.title = safeTitle.slice(0, 256);
+        }
+        native.setMeetingStructuredOutput(sessionId, JSON.stringify(merged));
+      } catch (err) {
+        console.warn('[ipc] MEETING_SET_TITLE solo persist failed:', err);
+      }
+    }
+    return { ok: true };
+  });
+
+  // Indexed sequence lookup — replaces the renderer's full-table JSON scan
+  // on every meeting-create.
+  ipcMain.handle(IPC_CHANNELS.MEETING_GET_MAX_SEQUENCE, async () => {
+    return native.getMaxMeetingSequence();
   });
 
   // ── Transcript Segments ──
