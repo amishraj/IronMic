@@ -330,9 +330,18 @@ export function setForgeWindowMode(mode: 'compact' | 'expanded' | 'permission'):
         ? BAR_HEIGHT_EXPANDED
         : BAR_HEIGHT_COMPACT;
   try {
-    const [w, h] = fw.getSize();
-    if (h === targetHeight) return;
-    fw.setSize(w, targetHeight, /* animate */ true);
+    const bounds = fw.getBounds();
+    if (bounds.height === targetHeight) return;
+    // Use setBounds rather than setSize: on Windows, setSize() is silently
+    // ignored for windows created with resizable:false (the OS style bits
+    // don't include WS_SIZEBOX so SetWindowPos rejects the resize). setBounds
+    // goes through a different path that works regardless of resizable state.
+    // animate is macOS-only; on Windows/Linux the parameter is ignored so we
+    // pass it explicitly only on darwin to keep intent clear.
+    fw.setBounds(
+      { x: bounds.x, y: bounds.y, width: bounds.width, height: targetHeight },
+      process.platform === 'darwin',
+    );
   } catch {
     // ignore — window may be torn down mid-call
   }
