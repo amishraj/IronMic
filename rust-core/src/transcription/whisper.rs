@@ -335,21 +335,7 @@ impl WhisperEngine {
 
     /// Transcribe PCM audio samples to text.
     pub fn transcribe(&self, samples: &[f32]) -> Result<String, IronMicError> {
-        if samples.is_empty() {
-            return Err(IronMicError::Processing(
-                "No audio samples to transcribe".into(),
-            ));
-        }
-
-        #[cfg(feature = "whisper")]
-        {
-            self.transcribe_with_whisper(samples, /* short_chunk */ false)
-        }
-
-        #[cfg(not(feature = "whisper"))]
-        {
-            self.transcribe_stub(samples)
-        }
+        self.transcribe_with_context(samples, /* short_chunk */ false, &[])
     }
 
     /// Transcribe a short (< 5s) PCM audio chunk to text. Forces single-segment
@@ -358,6 +344,19 @@ impl WhisperEngine {
     /// boundaries inside ~40k samples. Used by the dictation streamer's
     /// 2.5s chunk loop. **Do not call from meeting recording (10–60s chunks).**
     pub fn transcribe_short(&self, samples: &[f32]) -> Result<String, IronMicError> {
+        self.transcribe_with_context(samples, /* short_chunk */ true, &[])
+    }
+
+    /// Transcribe PCM samples with per-call context terms (e.g. meeting
+    /// participant names) layered on top of the stored dictionary in the
+    /// `initial_prompt`. Does not mutate the stored `Dictionary` — the merged
+    /// prompt lives only on this call's `FullParams`.
+    pub fn transcribe_with_context(
+        &self,
+        samples: &[f32],
+        short_chunk: bool,
+        extra_terms: &[String],
+    ) -> Result<String, IronMicError> {
         if samples.is_empty() {
             return Err(IronMicError::Processing(
                 "No audio samples to transcribe".into(),
@@ -366,17 +365,18 @@ impl WhisperEngine {
 
         #[cfg(feature = "whisper")]
         {
-            self.transcribe_with_whisper(samples, /* short_chunk */ true)
+            self.transcribe_with_whisper(samples, short_chunk, extra_terms)
         }
 
         #[cfg(not(feature = "whisper"))]
         {
+            let _ = (short_chunk, extra_terms);
             self.transcribe_stub(samples)
         }
     }
 
     #[cfg(feature = "whisper")]
-    fn transcribe_with_whisper(&self, samples: &[f32], short_chunk: bool) -> Result<String, IronMicError> {
+    fn transcribe_with_whisper(&self, samples: &[f32], short_chunk: bool, extra_terms: &[String]) -> Result<String, IronMicError> {
         use whisper_rs::FullParams;
         use whisper_rs::SamplingStrategy;
 
@@ -426,10 +426,12 @@ impl WhisperEngine {
         }
         params.set_translate(self.config.translate);
 
-        if let Some(prompt) = self.dictionary.build_whisper_prompt() {
-            params.set_initial_prompt(&prompt);
+        let prompt_owned = self.dictionary.build_whisper_prompt_with_extras(extra_terms);
+        if let Some(prompt) = prompt_owned.as_deref() {
+            params.set_initial_prompt(prompt);
             info!(
                 word_count = self.dictionary.len(),
+                extras = extra_terms.len(),
                 "Applied dictionary prompt for word boosting"
             );
         }

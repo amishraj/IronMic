@@ -23,6 +23,12 @@ pub struct TranscriptSegment {
     pub participant_id: Option<String>,
     pub confidence: Option<f64>,
     pub created_at: String,
+    /// Cross-machine identity for rejoin dedup. NULL for legacy/solo segments;
+    /// for participant ingest of host-broadcast segments, this is the
+    /// originator's segment id (host's `id` for host-spoken, participant's own
+    /// local id for participant-spoken — round-tripped via `originSegmentId`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_segment_id: Option<String>,
 }
 
 fn read_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptSegment> {
@@ -37,11 +43,12 @@ fn read_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptSegment> 
         participant_id: row.get(7)?,
         confidence: row.get(8)?,
         created_at: row.get(9)?,
+        remote_segment_id: row.get(10)?,
     })
 }
 
 const SELECT_COLS: &str =
-    "id, session_id, speaker_label, start_ms, end_ms, text, source, participant_id, confidence, created_at";
+    "id, session_id, speaker_label, start_ms, end_ms, text, source, participant_id, confidence, created_at, remote_segment_id";
 
 impl Database {
     /// Add a new transcript segment for a meeting session.
@@ -82,7 +89,71 @@ impl Database {
             participant_id: participant_id.map(String::from),
             confidence,
             created_at: now,
+            remote_segment_id: None,
         })
+    }
+
+    /// Add a transcript segment carrying a cross-machine identity (the
+    /// originator's segment id) so participant rejoin can dedup welcome-snapshot
+    /// replays. Idempotent on `(session_id, remote_segment_id)`: a second call
+    /// with the same pair returns the existing row instead of inserting a dupe.
+    pub fn add_transcript_segment_with_remote_id(
+        &self,
+        session_id: &str,
+        speaker_label: Option<&str>,
+        start_ms: i64,
+        end_ms: i64,
+        text: &str,
+        source: &str,
+        remote_segment_id: &str,
+    ) -> Result<TranscriptSegment, IronMicError> {
+        let conn = self.conn();
+        // Preflight: if a row already exists with this (session_id, remote_segment_id),
+        // return it — this is the rejoin idempotency contract.
+        let existing: Option<TranscriptSegment> = conn
+            .query_row(
+                &format!(
+                    "SELECT {SELECT_COLS} FROM transcript_segments
+                     WHERE session_id = ?1 AND remote_segment_id = ?2"
+                ),
+                rusqlite::params![session_id, remote_segment_id],
+                read_segment,
+            )
+            .optional()
+            .map_err(|e| IronMicError::Storage(format!("Failed dedup lookup: {e}")))?;
+        if let Some(row) = existing {
+            return Ok(row);
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
+        // INSERT OR IGNORE rather than ON CONFLICT — partial unique indexes
+        // and SQLite's UPSERT clause have known interaction quirks. The
+        // preflight + INSERT OR IGNORE pattern is portable.
+        conn.execute(
+            "INSERT OR IGNORE INTO transcript_segments
+             (id, session_id, speaker_label, start_ms, end_ms, text, source,
+              participant_id, confidence, created_at, remote_segment_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9)",
+            rusqlite::params![
+                id, session_id, speaker_label, start_ms, end_ms, text, source,
+                now, remote_segment_id
+            ],
+        )
+        .map_err(|e| IronMicError::Storage(format!("Failed to add transcript segment: {e}")))?;
+
+        // Re-SELECT to return the canonical row (handles the unlikely race
+        // where another writer beat us to it between preflight and insert).
+        conn.query_row(
+            &format!(
+                "SELECT {SELECT_COLS} FROM transcript_segments
+                 WHERE session_id = ?1 AND remote_segment_id = ?2"
+            ),
+            rusqlite::params![session_id, remote_segment_id],
+            read_segment,
+        )
+        .map_err(|e| IronMicError::Storage(format!("Failed to read back segment: {e}")))
     }
 
     /// List all transcript segments for a session, ordered by start time.

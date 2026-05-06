@@ -172,8 +172,9 @@ declare global {
       meetingCreateWithTemplate: (templateId: string | null, detectedApp: string | null) => Promise<string>;
       meetingSetStructuredOutput: (id: string, structuredOutput: string) => Promise<void>;
       // Meeting Recording (Granola-style chunk loop)
-      meetingStartRecording: (sessionId: string, deviceName?: string | null, chunkIntervalS?: number) => Promise<void>;
+      meetingStartRecording: (sessionId: string, deviceName?: string | null, chunkIntervalS?: number, hostDisplayName?: string | null) => Promise<void>;
       meetingStopRecording: () => Promise<any>;
+      meetingSetMicMuted: (sessionId: string, muted: boolean) => Promise<void>;
       notifyMeetingUserNotesChanged: (sessionId: string) => void;
       // Streaming dictation (near-real-time chunked transcription)
       dictationStreamStart: () => Promise<void>;
@@ -186,8 +187,15 @@ declare global {
       meetingRoomHostInfo: () => Promise<any>;
       meetingRoomJoin: (opts: { hostIp: string; hostPort: number; roomCode: string; displayName: string; deviceName?: string | null }) => Promise<any>;
       meetingRoomLeave: () => Promise<any>;
+      meetingRoomLeaveTransport: () => Promise<any>;
+      meetingRoomBroadcastFinalSummary: (sessionId: string, summary: string) => Promise<any>;
+      meetingRoomParticipantFinalized: () => Promise<any>;
+      meetingSetTitle: (sessionId: string, title: string | null) => Promise<any>;
+      meetingGetMaxSequence: () => Promise<number>;
       onMeetingRoomState: (cb: (info: any) => void) => () => void;
       onMeetingRoomParticipantUpdate: (cb: (msg: any) => void) => () => void;
+      onMeetingRoomHostEnded: (cb: (payload: { localSessionId: string | null; finalSummary: string | null; finalSummaryAt: number | null; finalTitle: string | null; finalSegmentCount: number | null }) => void) => () => void;
+      onMeetingRoomTitleUpdate: (cb: (payload: { sessionId: string | null; title: string | null }) => void) => () => void;
       // Transcript Segments
       listTranscriptSegments: (sessionId: string) => Promise<string>;
       updateSegmentSpeaker: (id: string, speakerLabel: string) => Promise<void>;

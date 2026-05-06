@@ -7,6 +7,20 @@ use tracing::{debug, error, info};
 
 use crate::error::IronMicError;
 
+/// Silence prepended to the very first chunk of a TTS session to absorb the
+/// WASAPI shared-mode cold-start gap on Windows, where a freshly opened cpal
+/// stream's first ~50–300 ms of audio is dropped or attenuated while the audio
+/// engine settles. Off-Windows this is 0 — CoreAudio / ALSA do not have the
+/// same cold-start, and adding a leading pause there would be a regression.
+///
+/// Used by `play_internal` to pad chunk-1 audio AND by the napi `synthesize_text`
+/// caller to offset chunk-1 word timestamps + reported duration by the same
+/// amount so the highlight cursor stays aligned with the spoken word.
+#[cfg(windows)]
+pub const TTS_LEADING_SILENCE_MS: u64 = 250;
+#[cfg(not(windows))]
+pub const TTS_LEADING_SILENCE_MS: u64 = 0;
+
 /// Playback state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -198,7 +212,23 @@ impl PlaybackEngine {
         // Stop any current playback
         self.stop();
 
-        let mut buffer = SecureAudioBuffer::new(samples, sample_rate);
+        // Prepend leading silence to absorb the audio device's cold-start gap.
+        // Off Windows TTS_LEADING_SILENCE_MS is 0 and the input vec moves
+        // through untouched (no allocation, no behavior change).
+        let pad = if !samples.is_empty() && sample_rate > 0 {
+            (sample_rate as u64 * TTS_LEADING_SILENCE_MS / 1000) as usize
+        } else {
+            0
+        };
+        let buffer_samples = if pad > 0 {
+            let mut padded = Vec::with_capacity(pad + samples.len());
+            padded.resize(pad, 0.0);
+            padded.extend(samples);
+            padded
+        } else {
+            samples
+        };
+        let mut buffer = SecureAudioBuffer::new(buffer_samples, sample_rate);
         // Reserve generous capacity so subsequent append_samples calls in
         // streaming mode don't reallocate the Vec (which would be safe under
         // the mutex but is wasted work).

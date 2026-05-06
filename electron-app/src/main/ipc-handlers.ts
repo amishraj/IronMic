@@ -3,11 +3,12 @@
  * Security: input validation on high-risk channels.
  */
 
-import { ipcMain, BrowserWindow, shell } from 'electron';
+import { ipcMain, BrowserWindow, shell, systemPreferences, nativeTheme } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import { IPC_CHANNELS, MODEL_FILES, TRANSCRIPTION_ENGINES } from '../shared/constants';
 import { native } from './native-bridge';
+import { notifyDictionaryChanged } from './dictionary-cache';
 import { downloadModel, downloadTtsModel, getModelsStatus, isTtsModelReady, getTtsReadiness, ensureBundledVoices, invalidateEspeakCache, importModelFile, getImportableModels, importModelFromPath, importMultiPartModel, downloadTranscriptionEngine, isTranscriptionEngineReady, importMoonshineEngine, ensureBundledMoonshineBase, isMoonshineBundleAvailable } from './model-downloader';
 import { aiManager } from './ai/AIManager';
 import { getChatModelPath } from './ai/LocalLLMAdapter';
@@ -24,6 +25,18 @@ import { checkBlackHoleInstalled, installBlackHole, openAudioMidiSetup, broadcas
 import { audioStream } from './audio-stream-manager';
 import { debugLog, invalidateDebugLogCache } from './debug-log';
 import { computeRmsPcm16 } from './transcribe-clean';
+import { execFile } from 'child_process';
+import {
+  enterForgeMode,
+  exitForgeMode,
+  openAccessibilityPrefs,
+  isForgeMode,
+  setForgeWindowMode,
+} from './forge-window';
+import {
+  clearForgeOwner,
+  setForgeOwnerProcessing,
+} from './dictation-owner';
 
 // ── Input validation helpers ──
 
@@ -77,6 +90,36 @@ const ALLOWED_SETTING_KEYS = new Set([
   // Claude/Copilot CLIs; default 'false' keeps polish strictly on-device.
   // The renderer Settings panel surfaces this with a privacy warning + confirm.
   'polish_allow_cloud',
+  // Developer features escape hatch. 'true' surfaces legacy/experimental
+  // controls (e.g. Solo meeting mode). Default 'false'.
+  'dev_features_enabled',
+  // ── Forge mode (v1.7.0) ──
+  // forge_persist_history     — 'true'/'false'. Save Forge dictations to
+  //                             entries table. Default 'false' for privacy
+  //                             (Forge dictations may include passwords,
+  //                             private chat, sensitive replies).
+  // forge_polish_enabled      — 'true'/'false'. Run LLM polish before paste.
+  //                             Default 'false' for latency.
+  // forge_polish_allow_cloud  — 'true'/'false'. Cloud polish in Forge requires
+  //                             the AND of (polish_allow_cloud,
+  //                             forge_polish_allow_cloud). Global is upper
+  //                             bound; Forge can be stricter, never looser.
+  // forge_paste_method        — 'paste' (default) | 'type'. 'type' is the
+  //                             char-by-char fallback for paste-blocking apps.
+  // forge_clipboard_restore   — 'true' (default) / 'false'. Restore prior
+  //                             text on the clipboard ~500ms after paste.
+  // forge_bar_position        — last-known bar position, JSON {x,y} or
+  //                             'top-right' (default).
+  'forge_persist_history',
+  'forge_polish_enabled',
+  'forge_polish_allow_cloud',
+  'forge_paste_method',
+  'forge_clipboard_restore',
+  'forge_bar_position',
+  // Auto-paste toggle exposed in the Forge bar's gear icon.
+  // 'true' (default): final transcript is auto-pasted at the OS cursor.
+  // 'false': transcript is copied to clipboard only — user pastes manually.
+  'forge_auto_paste_enabled',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -301,10 +344,33 @@ export function registerIpcHandlers(): void {
   );
   ipcMain.handle('ironmic:run-auto-cleanup', () => native.addon.runAutoCleanup());
 
-  // Dictionary
-  ipcMain.handle(IPC_CHANNELS.ADD_WORD, (_e, word: string) => native.addWord(word));
-  ipcMain.handle(IPC_CHANNELS.REMOVE_WORD, (_e, word: string) => native.removeWord(word));
+  // Dictionary. After a mutation, broadcast `dictionary-changed` so any
+  // renderer/main caches re-fetch their term list (used by transcript
+  // post-correction). The Rust addon already pushes the change into the
+  // active engine; this is the JS-side cache invalidation.
+  function broadcastDictionaryChanged(): void {
+    for (const win of BrowserWindow.getAllWindows()) {
+      try {
+        win.webContents.send(IPC_CHANNELS.DICTIONARY_CHANGED);
+      } catch {
+        /* renderer may be closing — ignore */
+      }
+    }
+  }
+  ipcMain.handle(IPC_CHANNELS.ADD_WORD, (_e, word: string) => {
+    native.addWord(word);
+    notifyDictionaryChanged();
+    broadcastDictionaryChanged();
+  });
+  ipcMain.handle(IPC_CHANNELS.REMOVE_WORD, (_e, word: string) => {
+    native.removeWord(word);
+    notifyDictionaryChanged();
+    broadcastDictionaryChanged();
+  });
   ipcMain.handle(IPC_CHANNELS.LIST_DICTIONARY, () => native.listDictionary());
+  ipcMain.handle(IPC_CHANNELS.REFRESH_TRANSCRIPTION_DICTIONARY, () =>
+    native.refreshTranscriptionDictionary(),
+  );
 
   // Settings — validate key allowlist and value length
   ipcMain.handle(IPC_CHANNELS.GET_SETTING, (_e, key: string) => {
@@ -678,6 +744,9 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle(IPC_CHANNELS.MEETING_GET, (_e, id: string) => native.addon.getMeetingSession(id));
   ipcMain.handle(IPC_CHANNELS.MEETING_LIST, (_e, limit: number, offset: number) => native.addon.listMeetingSessions(limit, offset));
   ipcMain.handle(IPC_CHANNELS.MEETING_DELETE, (_e, id: string) => native.addon.deleteMeetingSession(id));
+  ipcMain.handle(IPC_CHANNELS.MEETING_GET_PARTICIPANTS, (_e, id: string) =>
+    native.getMeetingParticipants(id),
+  );
 
   // ── TF.js Infrastructure ──
 
@@ -888,7 +957,7 @@ If the text is too short or unclear, output: ["General"]`;
 
   // ── Meeting Recording (Granola-style chunk loop) ──
 
-  ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (_event, sessionId: string, deviceName?: string | null, chunkIntervalS?: number) => {
+  ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (_event, sessionId: string, deviceName?: string | null, chunkIntervalS?: number, hostDisplayName?: string | null) => {
     assertString(sessionId, 'sessionId');
     // If the renderer didn't pass an interval, read the user's configured value
     // from settings; fall back to 15s. Clamp to [10, 60] — shorter hurts Whisper
@@ -904,7 +973,7 @@ If the text is too short or unclear, output: ["General"]`;
       }
     }
     interval = Math.max(10, Math.min(60, Math.round(interval)));
-    await meetingRecorder.startMeetingRecording(sessionId, deviceName, interval);
+    await meetingRecorder.startMeetingRecording(sessionId, deviceName, interval, hostDisplayName ?? null);
     // Kick off the live-summary stream for this session.
     try { liveSummarizer.start(sessionId); }
     catch (err) { console.warn('[ipc] liveSummarizer.start failed:', err); }
@@ -939,12 +1008,49 @@ If the text is too short or unclear, output: ["General"]`;
     meetingRecorder.getState(),
   );
 
+  // Self-mute toggle for the active meeting. The renderer passes the
+  // sessionId it thinks is active so we can reject stale events from a
+  // previous meeting. Recorder validates against its internal state.sessionId.
+  ipcMain.handle(IPC_CHANNELS.MEETING_SET_MIC_MUTED, (_event, sessionId: string, muted: boolean) => {
+    assertString(sessionId, 'sessionId');
+    if (typeof muted !== 'boolean') throw new Error('muted must be a boolean');
+    meetingRecorder.setMicMuted(sessionId, muted);
+  });
+
   // ── Streaming dictation (near-real-time, chunked) ──
+  // Wrapped in try/catch so the renderer always gets a structured error
+  // instead of the opaque "Error invoking remote method" wrapper. Forge
+  // mode in particular needs the underlying cause visible in the bar.
   ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_START, async () => {
-    return dictationStreamer.start();
+    try {
+      return await dictationStreamer.start();
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      console.error('[ipc] dictation-stream-start failed:', msg, err?.stack);
+      // Recovery: if the streamer thinks it's already active but isn't
+      // really, try to reset and start once more before surfacing the error.
+      if (msg.includes('already active')) {
+        try {
+          await dictationStreamer.stop().catch(() => {});
+          if (typeof native.addon?.resetPipelineState === 'function') {
+            native.addon.resetPipelineState();
+          }
+          return await dictationStreamer.start();
+        } catch (retryErr: any) {
+          throw new Error(`stream-start (retry): ${retryErr?.message || retryErr}`);
+        }
+      }
+      throw new Error(`stream-start: ${msg}`);
+    }
   });
   ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_STOP, async () => {
-    return dictationStreamer.stop();
+    try {
+      return await dictationStreamer.stop();
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      console.error('[ipc] dictation-stream-stop failed:', msg, err?.stack);
+      throw new Error(`stream-stop: ${msg}`);
+    }
   });
 
   // Fire-and-forget: renderer tells the summarizer that user notes changed.
@@ -1021,6 +1127,93 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_LEAVE, async () => {
     await meetingRoomClient.disconnect();
     return { ok: true };
+  });
+
+  // Transport-only leave: closes WebSocket but PRESERVES the participant's
+  // localSessionId / lastSummary / lastTitle so the renderer's
+  // finalizeAndExitMeeting can use them. Renderer MUST follow up with
+  // MEETING_ROOM_PARTICIPANT_FINALIZED once finalize is done. Renderer-driven
+  // finalize replaces the legacy MEETING_ROOM_LEAVE flow that double-stopped
+  // the recorder.
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_LEAVE_TRANSPORT, async () => {
+    await meetingRoomClient.disconnectTransport();
+    return { ok: true };
+  });
+
+  // Renderer signals "I'm done finalizing the local mirror session — you can
+  // wipe the durable client state now". 30-second watchdog in MeetingRoomClient
+  // handles the case where this never arrives (renderer crash).
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_PARTICIPANT_FINALIZED, async () => {
+    meetingRoomClient.participantFinalized();
+    return { ok: true };
+  });
+
+  // Host-only: explicit final-summary broadcast just before stop(). The
+  // host renderer awaits meetingStopRecording() (which flushes the live
+  // summarizer), then fires this so participants see the final summary
+  // BEFORE the meeting_ended packet arrives. meeting_ended also carries
+  // it as a durable fallback.
+  ipcMain.handle(IPC_CHANNELS.MEETING_ROOM_BROADCAST_FINAL_SUMMARY, async (_e, sessionId: string, summary: string) => {
+    assertString(sessionId, 'sessionId');
+    if (typeof summary !== 'string' || summary.trim().length === 0) return { ok: false };
+    meetingRoomServer.broadcastFinalSummary(sessionId, summary);
+    return { ok: true };
+  });
+
+  // Set the live meeting title (host-only authority).
+  // Accept paths:
+  //   (a) solo mode  — server NOT active, client NOT connected
+  //   (b) host mode  — server.isActive() && server.sessionId === sessionId
+  // Reject path:
+  //   (c) participant — client.isConnected()  → 403 (UI is also disabled, but
+  //                                              this is the security boundary)
+  ipcMain.handle(IPC_CHANNELS.MEETING_SET_TITLE, async (_e, sessionId: string, title: string | null) => {
+    assertString(sessionId, 'sessionId');
+    const safeTitle = typeof title === 'string' ? title : null;
+
+    const serverActive = meetingRoomServer.isActive();
+    const serverInfo = serverActive ? meetingRoomServer.getInfo() : null;
+    const isHost = serverActive && serverInfo?.sessionId === sessionId;
+    const isParticipant = meetingRoomClient.isConnected();
+    const isSolo = !serverActive && !isParticipant;
+
+    if (!isHost && !isSolo) {
+      throw new Error('Only the host (or solo user) may set the meeting title');
+    }
+
+    if (isHost) {
+      // Host path: server owns persistence + broadcast.
+      meetingRoomServer.setTitle(safeTitle);
+    } else {
+      // Solo path: write directly to structured_output, no broadcast.
+      try {
+        let merged: Record<string, unknown> = {};
+        const raw = native.addon.getMeetingSession(sessionId);
+        if (raw && raw !== 'null') {
+          const session = JSON.parse(raw);
+          const structuredRaw = session?.structured_output;
+          if (typeof structuredRaw === 'string') {
+            const parsed = JSON.parse(structuredRaw);
+            if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+          }
+        }
+        if (safeTitle === null || safeTitle.length === 0) {
+          delete merged.title;
+        } else {
+          merged.title = safeTitle.slice(0, 256);
+        }
+        native.setMeetingStructuredOutput(sessionId, JSON.stringify(merged));
+      } catch (err) {
+        console.warn('[ipc] MEETING_SET_TITLE solo persist failed:', err);
+      }
+    }
+    return { ok: true };
+  });
+
+  // Indexed sequence lookup — replaces the renderer's full-table JSON scan
+  // on every meeting-create.
+  ipcMain.handle(IPC_CHANNELS.MEETING_GET_MAX_SEQUENCE, async () => {
+    return native.getMaxMeetingSequence();
   });
 
   // ── Transcript Segments ──
@@ -1194,6 +1387,324 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle(IPC_CHANNELS.MEETING_COLLAB_REQUEST_FIREWALL_ELEVATION, async () => {
     return meetingNotesCollabServer.requestMacFirewallElevation();
   });
+
+  // ── Forge mode handlers ─────────────────────────────────────────────────
+  // The Forge bar is a separate BrowserWindow; main owns the lifecycle. The
+  // Rust engine (audio capture, STT, dictionary) runs in this same process
+  // and is shared with main — Forge is a thin client of the same pipeline.
+
+  ipcMain.handle(IPC_CHANNELS.FORGE_ENTER, () => {
+    const main = BrowserWindow.getAllWindows().find(
+      (w) => !w.isDestroyed() && w.webContents.id !== undefined,
+    );
+    enterForgeMode(main || null);
+  });
+
+  ipcMain.handle(IPC_CHANNELS.FORGE_EXIT, () => {
+    // The first non-Forge window is the main window. We can't import it
+    // directly without a circular dep with index.ts, so we look it up.
+    const main = BrowserWindow.getAllWindows().find(
+      (w) => !w.isDestroyed() && w.getTitle() === 'IronMic',
+    );
+    exitForgeMode(main || null);
+  });
+
+  // Single source of truth for AX gating — uses macOS's refreshing
+  // AXIsProcessTrustedWithOptions via Electron's bridge. Returns true on
+  // non-mac platforms.
+  const isAxTrustedNow = (): boolean => {
+    if (process.platform !== 'darwin') return true;
+    try {
+      return systemPreferences.isTrustedAccessibilityClient(false);
+    } catch {
+      return false;
+    }
+  };
+
+  /**
+   * Post Cmd+V on macOS via AppleScript / System Events. PRIMARY paste path
+   * on macOS — `enigo`'s CGEventPost path drops the modifier flag in race
+   * conditions and the receiving app sees a plain "v" character. AppleScript
+   * routes through `System Events`, which builds the synthetic event with
+   * the modifier baked in correctly.
+   *
+   * Requires Accessibility permission for the running process — same gate
+   * that the AX check uses.
+   */
+  const pasteViaAppleScript = (): Promise<{ ok: true } | { ok: false; error: string }> => {
+    return new Promise((resolve) => {
+      execFile(
+        '/usr/bin/osascript',
+        ['-e', 'tell application "System Events" to keystroke "v" using command down'],
+        { timeout: 2000 },
+        (err, _stdout, stderr) => {
+          if (err) {
+            const msg = stderr?.toString().trim() || err.message || 'osascript failed';
+            resolve({ ok: false, error: msg });
+            return;
+          }
+          resolve({ ok: true });
+        },
+      );
+    });
+  };
+
+  /**
+   * Windows equivalent: post Ctrl+V via PowerShell + WScript.Shell SendKeys.
+   * SendKeys uses Windows' high-level keyboard automation which handles
+   * modifier flags reliably (^ = Ctrl). We use this as the PRIMARY path
+   * on Windows for parity with the AppleScript path on macOS, with `enigo`
+   * (`SendInput`) as the fallback. SendInput on Windows is generally fine
+   * but SendKeys has decades of compatibility with apps that intercept
+   * raw input (Office, Teams, some banking sites).
+   *
+   * Note: SendKeys cannot inject into elevated windows from a non-elevated
+   * process — same UIPI rule applies to enigo's SendInput, so this isn't
+   * a regression.
+   */
+  const pasteViaSendKeys = (): Promise<{ ok: true } | { ok: false; error: string }> => {
+    return new Promise((resolve) => {
+      // Powershell -NoProfile keeps cold-start under ~150ms on warm machines.
+      // The SendKeys "^v" syntax is unambiguous and doesn't need quoting tricks.
+      const script =
+        "$ws = New-Object -ComObject WScript.Shell; Start-Sleep -Milliseconds 30; $ws.SendKeys('^v')";
+      execFile(
+        'powershell.exe',
+        ['-NoProfile', '-NonInteractive', '-Command', script],
+        { timeout: 3000, windowsHide: true },
+        (err, _stdout, stderr) => {
+          if (err) {
+            const msg = stderr?.toString().trim() || err.message || 'powershell failed';
+            resolve({ ok: false, error: msg });
+            return;
+          }
+          resolve({ ok: true });
+        },
+      );
+    });
+  };
+
+  ipcMain.handle(
+    IPC_CHANNELS.FORGE_PASTE_TEXT,
+    async (_e, text: string, restoreClipboard: boolean) => {
+      assertString(text, 'text');
+      assertMaxLength(text, 100_000, 'text');
+      if (!isAxTrustedNow()) {
+        console.warn('[forge] paste blocked — AX not granted');
+        return { ok: false, error: 'accessibility-required' };
+      }
+
+      // ── 1. Capture prior clipboard text (for restore) ───────────────────
+      const { clipboard } = require('electron') as typeof import('electron');
+      let prior: string | null = null;
+      if (restoreClipboard) {
+        try {
+          const t = clipboard.readText();
+          if (t && typeof t === 'string') prior = t;
+        } catch {
+          // ignore — best-effort restore
+        }
+      }
+
+      // ── 2. Write transcript to clipboard ────────────────────────────────
+      try {
+        clipboard.writeText(text);
+      } catch (err: any) {
+        return { ok: false, error: `clipboard.write: ${err?.message || err}` };
+      }
+
+      // Brief settle so the OS pasteboard generation count propagates to
+      // any apps that sample asynchronously (Electron, Chromium-based).
+      await new Promise((r) => setTimeout(r, 30));
+
+      // ── 3. Trigger paste ────────────────────────────────────────────────
+      // Per-platform primary path (the OS's blessed automation API) with
+      // Rust+enigo as the universal fallback:
+      //   macOS:   osascript "System Events keystroke v using command down"
+      //   Windows: PowerShell WScript.Shell SendKeys "^v"
+      //   Linux:   enigo (xdotool/Wayland virtual-keyboard underneath)
+      let pasteOk = false;
+      let pasteError: string | null = null;
+
+      if (process.platform === 'darwin') {
+        const r = await pasteViaAppleScript();
+        if (r.ok) pasteOk = true;
+        else pasteError = `applescript: ${r.error}`;
+      } else if (process.platform === 'win32') {
+        const r = await pasteViaSendKeys();
+        if (r.ok) pasteOk = true;
+        else pasteError = `sendkeys: ${r.error}`;
+      }
+
+      if (!pasteOk) {
+        // Primary path failed (or Linux) — fall back to Rust + enigo.
+        if (typeof native.addon?.pasteText === 'function') {
+          try {
+            // restoreClipboard=false: we already captured prior text in
+            // step 1 and will restore in step 4. Don't double-handle.
+            native.addon.pasteText(text, false);
+            pasteOk = true;
+          } catch (err: any) {
+            const msg = err?.message || String(err);
+            pasteError = pasteError ? `${pasteError}; enigo: ${msg}` : `enigo: ${msg}`;
+          }
+        } else if (!pasteError) {
+          pasteError = 'paste-unavailable: rebuild rust-core with --features forge';
+        }
+      }
+
+      // ── 4. Restore prior clipboard after a delay ────────────────────────
+      if (pasteOk && prior !== null) {
+        setTimeout(() => {
+          try { clipboard.writeText(prior!); } catch { /* ignore */ }
+        }, 500);
+      }
+
+      if (pasteOk) return { ok: true };
+      console.warn('[forge] paste failed:', pasteError);
+      return { ok: false, error: pasteError || 'unknown paste error' };
+    },
+  );
+
+  ipcMain.handle(IPC_CHANNELS.FORGE_TYPE_TEXT, async (_e, text: string) => {
+    assertString(text, 'text');
+    assertMaxLength(text, 100_000, 'text');
+    if (!isAxTrustedNow()) {
+      console.warn('[forge] type blocked — AX not granted');
+      return { ok: false, error: 'accessibility-required' };
+    }
+    try {
+      if (typeof native.addon?.typeText !== 'function') {
+        throw new Error('Forge type not available — rebuild rust-core with --features forge');
+      }
+      native.addon.typeText(text);
+      return { ok: true };
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      console.warn('[forge] typeText threw:', msg);
+      return { ok: false, error: msg };
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.FORGE_CHECK_ACCESSIBILITY, () => {
+    if (process.platform !== 'darwin') return true;
+    // Electron's `systemPreferences.isTrustedAccessibilityClient(prompt)` is
+    // a thin wrapper around macOS's `AXIsProcessTrustedWithOptions` that
+    // correctly handles Electron's bundle ID + code signature edge cases.
+    // Calling it with prompt=false also triggers a TCC re-evaluation, so
+    // grants applied while the process is running propagate without the
+    // user having to relaunch IronMic.
+    try {
+      return systemPreferences.isTrustedAccessibilityClient(false);
+    } catch (err) {
+      console.warn('[forge] AX check via systemPreferences failed:', err);
+      // Fall back to the Rust addon path if it's compiled in.
+      if (typeof native.addon?.isAccessibilityTrusted === 'function') {
+        try { return !!native.addon.isAccessibilityTrusted(); } catch { /* ignore */ }
+      }
+      return false;
+    }
+  });
+
+  ipcMain.handle(IPC_CHANNELS.FORGE_OPEN_ACCESSIBILITY_PREFS, async () => {
+    await openAccessibilityPrefs();
+  });
+
+  // Resize the bar between compact (64 px), expanded (150 px while
+  // recording — shows live transcript preview), and the macOS permission
+  // panel size. Renderer calls this when status or AX trust changes.
+  // Accepts the legacy 'bar' alias for compact for safety.
+  ipcMain.handle(
+    'ironmic:forge-set-window-mode',
+    (_e, mode: 'compact' | 'expanded' | 'permission' | 'bar') => {
+      const normalized: 'compact' | 'expanded' | 'permission' =
+        mode === 'permission' ? 'permission' : mode === 'expanded' ? 'expanded' : 'compact';
+      setForgeWindowMode(normalized);
+    },
+  );
+
+  // Forge polish — DIFFERENT from POLISH_TEXT. Cloud is allowed only when
+  // BOTH global polish_allow_cloud AND forge_polish_allow_cloud are 'true'.
+  // The global setting remains the upper bound; Forge can be stricter than
+  // main but never looser. Honors `forge_polish_enabled` as a hard gate.
+  ipcMain.handle(IPC_CHANNELS.FORGE_POLISH_TEXT, async (_e, rawText: string) => {
+    assertString(rawText, 'rawText');
+    assertMaxLength(rawText, MAX_PROMPT_LENGTH, 'rawText');
+
+    let polishEnabled = false;
+    let globalAllowCloud = false;
+    let forgeAllowCloud = false;
+    try { polishEnabled = native.getSetting('forge_polish_enabled') === 'true'; } catch {}
+    try { globalAllowCloud = native.getSetting('polish_allow_cloud') === 'true'; } catch {}
+    try { forgeAllowCloud = native.getSetting('forge_polish_allow_cloud') === 'true'; } catch {}
+
+    if (!polishEnabled) {
+      // Polish off — return text unchanged. Forge falls back to corrected
+      // text on the renderer side.
+      return rawText;
+    }
+
+    const allowCloud = globalAllowCloud && forgeAllowCloud;
+    try {
+      const result = await aiManager.polish(rawText, { allowCloud });
+      return result.text;
+    } catch (err: any) {
+      // Renderer expects a string back. On failure, fall back to raw text.
+      if (err?.message?.includes('Cleanup model not downloaded')) {
+        return rawText;
+      }
+      throw err;
+    }
+  });
+
+  // Renderer→main handshake fired on success or error so main can clear the
+  // dictation owner and accept the next hotkey. Sent as `send` (no return)
+  // since the renderer doesn't need to wait.
+  ipcMain.on(IPC_CHANNELS.FORGE_DICTATION_COMPLETE, (_e, error?: string | null) => {
+    if (error) {
+      console.warn('[forge] dictation completed with error:', error);
+    }
+    clearForgeOwner();
+  });
+
+  // Theme sync across windows. Centralizes resolution: when a renderer
+  // calls broadcastTheme(setting), main resolves 'system' → light/dark via
+  // Electron's nativeTheme and broadcasts the APPLIED value. Renderers
+  // never have to do system-resolution themselves — that's prone to flake
+  // on transparent BrowserWindows.
+  const resolveApplied = (setting: string): 'light' | 'dark' => {
+    if (setting === 'dark') return 'dark';
+    if (setting === 'light') return 'light';
+    return nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
+  };
+
+  const broadcastApplied = (applied: 'light' | 'dark'): void => {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (!w.isDestroyed()) {
+        w.webContents.send('ironmic:theme-changed', applied);
+      }
+    }
+  };
+
+  ipcMain.handle('ironmic:broadcast-theme', (_e, theme: string) => {
+    broadcastApplied(resolveApplied(theme));
+  });
+
+  // When the OS prefers-color-scheme flips (user toggles dark mode in
+  // Control Center / System Settings) AND we're on the 'system' setting,
+  // re-broadcast so all windows update.
+  nativeTheme.on('updated', () => {
+    let setting: string | null = null;
+    try { setting = native.getSetting('theme'); } catch { /* ignore */ }
+    if (setting && setting !== 'system') return; // explicit theme — ignore OS flip
+    broadcastApplied(nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
+  });
+
+  // Suppress unused-import lint: setForgeOwnerProcessing / isForgeMode are
+  // referenced from main/index.ts; importing them here keeps the module
+  // graph honest (one place wires Forge IPC, one place dispatches hotkeys).
+  void setForgeOwnerProcessing;
+  void isForgeMode;
 
   console.log('[ipc-handlers] All IPC handlers registered');
 }

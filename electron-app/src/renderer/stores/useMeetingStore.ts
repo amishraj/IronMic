@@ -35,6 +35,11 @@ interface MeetingStore {
   roomParticipants: RoomParticipantSummary[];
   roomDisplayName: string;
   roomError: string | null;
+  /** Self-mute during a live meeting. Source of truth is backend
+   *  MeetingRecorder.state.isMicMuted, mirrored here via MEETING_RECORDING_STATE
+   *  events. When true, no local STT and no segment broadcast. */
+  isMicMuted: boolean;
+  setIsMicMuted: (muted: boolean) => void;
   setRoomMode: (mode: RoomMode) => void;
   setRoomDisplayName: (name: string) => void;
   setRoomError: (err: string | null) => void;
@@ -98,7 +103,7 @@ interface MeetingStore {
 }
 
 const DEFAULT_ROOM_STATE = {
-  roomMode: 'solo' as RoomMode,
+  roomMode: 'host' as RoomMode,
   roomCode: null as string | null,
   roomHostIp: null as string | null,
   roomHostPort: null as number | null,
@@ -124,7 +129,9 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   processingMeetings: [],
   ...DEFAULT_ROOM_STATE,
   roomDisplayName: 'Me',
+  isMicMuted: false,
 
+  setIsMicMuted: (muted) => set({ isMicMuted: muted }),
   setRoomMode: (mode) => set({ roomMode: mode }),
   setRoomDisplayName: (name) => {
     set({ roomDisplayName: name });
@@ -160,7 +167,7 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
       set(state => ({ roomParticipants: state.roomParticipants.filter(p => p.id !== msg.participantId) }));
     }
   },
-  resetRoomState: () => set({ ...DEFAULT_ROOM_STATE, roomMode: 'solo' }),
+  resetRoomState: () => set({ ...DEFAULT_ROOM_STATE, isMicMuted: false }),
 
   loadTemplates: async () => {
     try {
@@ -239,7 +246,13 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
     window.ironmic?.setSetting?.('meeting_audio_device', device ?? '').catch(() => {});
   },
 
-  setIsGranolaRecording: (recording) => set({ isGranolaRecording: recording }),
+  setIsGranolaRecording: (recording) => set({
+    isGranolaRecording: recording,
+    // Reset self-mute on every recording state transition (start AND stop) so
+    // mute can never carry across sessions. This is the renderer-side mirror
+    // of the backend reset in MeetingRecorder; backend remains source of truth.
+    isMicMuted: false,
+  }),
   setIsGranolaStopping: (stopping) => set({ isGranolaStopping: stopping }),
   setGranolaSessionId: (id) => set({ granolaSessionId: id }),
   setGranolaRecordingStartedAt: (ts) => set({ granolaRecordingStartedAt: ts }),

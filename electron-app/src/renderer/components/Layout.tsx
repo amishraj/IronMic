@@ -3,6 +3,7 @@ import { ErrorBoundary } from './ErrorBoundary';
 import {
   Mic, Settings, List, Sparkles, StickyNote, Search, Home,
   ChevronLeft, ChevronRight, Volume2, PenTool, BarChart3, Users,
+  Hammer,
 } from 'lucide-react';
 import { RecordingIndicator } from './RecordingIndicator';
 import { Timeline } from './Timeline';
@@ -84,6 +85,16 @@ export function Layout() {
 
     // Debounce: ignore presses while the pipeline is winding down.
     if (status === 'stopping') return;
+
+    // Meeting takes precedence over dictation: if a meeting is currently
+    // recording (or its notes are still generating), the mic shield is the
+    // user's "take me back to my meeting" affordance — never start a new
+    // dictation on top of an active meeting.
+    const meetingState = useMeetingStore.getState();
+    if (meetingState.isGranolaRecording || meetingState.isGranolaStopping) {
+      if (currentPage !== 'meetings') setPage('meetings');
+      return;
+    }
 
     if (status === 'recording') {
       // Stop the active recording. Never set newNoteRequested here — that
@@ -309,8 +320,24 @@ export function Layout() {
           <NavSection label="Tools" items={toolItems} page={page} setPage={setPage} expanded={sidebarExpanded} />
         </nav>
 
-        {/* Bottom: system nav + collapse toggle */}
+        {/* Bottom: system nav + Forge toggle + collapse toggle */}
         <div className="px-2 pb-3 space-y-1">
+          {/* Forge mode entry — hides the main window and shows the floating
+              bar. The Rust engine keeps running so the user can dictate into
+              any focused desktop app. */}
+          <button
+            onClick={() => {
+              (window as any).ironmic?.enterForge?.().catch(() => {});
+            }}
+            className={`w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors text-iron-text-secondary hover:bg-iron-surface-hover hover:text-iron-text ${
+              sidebarExpanded ? '' : 'justify-center'
+            }`}
+            title="Switch to Forge mode (dictate into any app)"
+          >
+            <Hammer className="w-4 h-4" strokeWidth={2.2} />
+            {sidebarExpanded && <span>Forge mode</span>}
+          </button>
+
           {systemItems.map((item) => (
             <NavButton key={item.id} item={item} active={page === item.id} onClick={() => setPage(item.id)} expanded={sidebarExpanded} />
           ))}
@@ -366,7 +393,7 @@ export function Layout() {
 
         {/* Content */}
         <div className="flex-1 overflow-hidden">
-          {page === 'home' && <WelcomePage onNavigate={handleNavigate} />}
+          {page === 'home' && <WelcomePage onNavigate={handleNavigate} onQuickDictate={handleRecord} />}
           {page === 'main' && (
             <ErrorBoundary label="Timeline">
               <Timeline />

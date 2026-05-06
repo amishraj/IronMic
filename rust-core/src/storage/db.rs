@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 8;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -137,6 +137,14 @@ impl Database {
 
         if current_version < 6 {
             self.migrate_v6(&conn)?;
+        }
+
+        if current_version < 7 {
+            self.migrate_v7(&conn)?;
+        }
+
+        if current_version < 8 {
+            self.migrate_v8(&conn)?;
         }
 
         // Update version
@@ -519,6 +527,96 @@ impl Database {
         .map_err(|e| IronMicError::Storage(format!("Migration v6 failed: {e}")))?;
 
         info!("Migration v6 applied: rich-text JSON columns on entries");
+        Ok(())
+    }
+
+    /// Migration v7: Add a `participants` JSON column to `meeting_sessions`
+    /// so the historical roster (host + joiners + leftAt timestamps) is
+    /// persisted alongside the meeting. Idempotent — checks PRAGMA
+    /// table_info first so a partially-applied state (column exists but
+    /// schema_version still below 7) does not error.
+    fn migrate_v7(&self, conn: &Connection) -> Result<(), IronMicError> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(meeting_sessions)")
+            .map_err(|e| IronMicError::Storage(format!("Migration v7 prepare failed: {e}")))?;
+
+        let mut already_exists = false;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| IronMicError::Storage(format!("Migration v7 query failed: {e}")))?;
+        for col in rows.flatten() {
+            if col == "participants" {
+                already_exists = true;
+                break;
+            }
+        }
+        drop(stmt);
+
+        if !already_exists {
+            conn.execute_batch(
+                "ALTER TABLE meeting_sessions ADD COLUMN participants TEXT NOT NULL DEFAULT '[]';",
+            )
+            .map_err(|e| IronMicError::Storage(format!("Migration v7 failed: {e}")))?;
+            info!("Migration v7 applied: meeting_sessions.participants column added");
+        } else {
+            info!("Migration v7 skipped: meeting_sessions.participants already exists");
+        }
+
+        Ok(())
+    }
+
+    /// Migration v8: Cross-machine segment identity for rejoin dedup, plus
+    /// expression indexes that turn the renderer's full-table sequence/linkage
+    /// scans into indexed lookups.
+    ///
+    /// Adds `transcript_segments.remote_segment_id` (defensive — checks
+    /// PRAGMA table_info first), a partial unique index on
+    /// `(session_id, remote_segment_id)` so re-ingesting a welcome snapshot
+    /// after a participant rejoin is a no-op, and two expression indexes on
+    /// `meeting_sessions.structured_output` JSON paths used by rejoin lookup
+    /// and `Meeting #N` numbering.
+    fn migrate_v8(&self, conn: &Connection) -> Result<(), IronMicError> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(transcript_segments)")
+            .map_err(|e| IronMicError::Storage(format!("Migration v8 prepare failed: {e}")))?;
+
+        let mut already_exists = false;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(|e| IronMicError::Storage(format!("Migration v8 query failed: {e}")))?;
+        for col in rows.flatten() {
+            if col == "remote_segment_id" {
+                already_exists = true;
+                break;
+            }
+        }
+        drop(stmt);
+
+        if !already_exists {
+            conn.execute_batch(
+                "ALTER TABLE transcript_segments ADD COLUMN remote_segment_id TEXT;",
+            )
+            .map_err(|e| IronMicError::Storage(format!("Migration v8 ALTER failed: {e}")))?;
+        }
+
+        conn.execute_batch(
+            "
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_segments_remote
+                ON transcript_segments(session_id, remote_segment_id)
+                WHERE remote_segment_id IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_meetings_linked_remote
+                ON meeting_sessions(json_extract(structured_output, '$.linkedRemoteSessionId'))
+                WHERE structured_output IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_meetings_sequence
+                ON meeting_sessions(CAST(json_extract(structured_output, '$.sequence') AS INTEGER))
+                WHERE structured_output IS NOT NULL;
+            ",
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v8 indexes failed: {e}")))?;
+
+        info!("Migration v8 applied: remote_segment_id + expression indexes");
         Ok(())
     }
 

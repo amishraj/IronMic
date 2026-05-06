@@ -131,6 +131,12 @@ export const IPC_CHANNELS = {
   ADD_WORD: 'ironmic:add-word',
   REMOVE_WORD: 'ironmic:remove-word',
   LIST_DICTIONARY: 'ironmic:list-dictionary',
+  /** Reload SQLite dictionary into the active engine. Cheap; called on
+   *  boot and meeting start as a drift safety net. */
+  REFRESH_TRANSCRIPTION_DICTIONARY: 'ironmic:refresh-transcription-dictionary',
+  /** main → renderer broadcast fired after addWord/removeWord so
+   *  renderer caches (useRecordingStore) refetch their term list. */
+  DICTIONARY_CHANGED: 'ironmic:dictionary-changed',
 
   // Settings
   GET_SETTING: 'ironmic:get-setting',
@@ -220,6 +226,7 @@ export const IPC_CHANNELS = {
   // Meeting Recording (Granola-style — device-select + chunk drain)
   MEETING_START_RECORDING: 'ironmic:meeting-start-recording',
   MEETING_STOP_RECORDING: 'ironmic:meeting-stop-recording',
+  MEETING_SET_MIC_MUTED: 'ironmic:meeting-set-mic-muted',      // renderer → main (toggle self-mute)
   MEETING_SEGMENT_READY: 'ironmic:meeting-segment-ready',      // main → renderer push (committed final)
   MEETING_DRAFT_READY: 'ironmic:meeting-draft-ready',          // main → renderer push (live grey hypothesis)
   MEETING_RECORDING_STATE: 'ironmic:meeting-recording-state',  // main → renderer push
@@ -243,6 +250,9 @@ export const IPC_CHANNELS = {
   MEETING_DELETE: 'ironmic:meeting-delete',
   MEETING_CREATE_WITH_TEMPLATE: 'ironmic:meeting-create-with-template',
   MEETING_SET_STRUCTURED_OUTPUT: 'ironmic:meeting-set-structured-output',
+  /** Read the historical participant roster (host + every joiner with
+   *  leftAt timestamps) for a meeting. Returns MeetingParticipant[]. */
+  MEETING_GET_PARTICIPANTS: 'ironmic:meeting-get-participants',
 
   // Meeting Rooms (LAN multi-user collaboration)
   MEETING_ROOM_HOST_START: 'ironmic:meeting-room-host-start',
@@ -250,8 +260,15 @@ export const IPC_CHANNELS = {
   MEETING_ROOM_HOST_INFO: 'ironmic:meeting-room-host-info',
   MEETING_ROOM_JOIN: 'ironmic:meeting-room-join',
   MEETING_ROOM_LEAVE: 'ironmic:meeting-room-leave',
+  MEETING_ROOM_LEAVE_TRANSPORT: 'ironmic:meeting-room-leave-transport',  // renderer-owned finalize
+  MEETING_ROOM_BROADCAST_FINAL_SUMMARY: 'ironmic:meeting-room-broadcast-final-summary',
+  MEETING_ROOM_PARTICIPANT_FINALIZED: 'ironmic:meeting-room-participant-finalized',
   MEETING_ROOM_STATE: 'ironmic:meeting-room-state',                // main → renderer push
   MEETING_ROOM_PARTICIPANT_UPDATE: 'ironmic:meeting-room-participant-update', // main → renderer push
+  MEETING_ROOM_HOST_ENDED: 'ironmic:meeting-room-host-ended',      // main → renderer push (durable last state)
+  MEETING_ROOM_TITLE_UPDATE: 'ironmic:meeting-room-title-update',  // main → renderer push (host title sync)
+  MEETING_SET_TITLE: 'ironmic:meeting-set-title',                  // host-only invoke
+  MEETING_GET_MAX_SEQUENCE: 'ironmic:meeting-get-max-sequence',    // indexed sequence lookup
 
   // Meeting Templates
   TEMPLATE_CREATE: 'ironmic:template-create',
@@ -325,6 +342,29 @@ export const IPC_CHANNELS = {
 
   // Debug logs (main → renderer push, gated on debug_audio_logging setting)
   DEBUG_LOG: 'ironmic:debug-log',
+
+  // ── Forge mode (floating-bar dictate-anywhere) ──
+  // Toggle the bar window in/out. enterForge hides the main window, creates
+  // the always-on-top non-focusable bar; exitForge tears the bar down and
+  // restores the main window. Hotkey routing follows `forgeMode` in main.
+  FORGE_ENTER: 'ironmic:enter-forge',
+  FORGE_EXIT: 'ironmic:exit-forge',
+
+  // Synthetic keystroke / paste-anywhere (Rust enigo).
+  FORGE_PASTE_TEXT: 'ironmic:forge-paste-text',
+  FORGE_TYPE_TEXT: 'ironmic:forge-type-text',
+
+  // macOS Accessibility check + deep-link to System Settings.
+  FORGE_CHECK_ACCESSIBILITY: 'ironmic:forge-check-accessibility',
+  FORGE_OPEN_ACCESSIBILITY_PREFS: 'ironmic:forge-open-accessibility-prefs',
+
+  // Forge-specific polish path. Honors AND of (polish_allow_cloud,
+  // forge_polish_allow_cloud) — never looser than the global setting.
+  FORGE_POLISH_TEXT: 'ironmic:forge-polish-text',
+
+  // Renderer→main handshake fired when a Forge dictation finishes (ok or
+  // error) so main can clear `dictationOwner` and accept the next hotkey.
+  FORGE_DICTATION_COMPLETE: 'ironmic:forge-dictation-complete',
 } as const;
 
 // ── Model hosting on GitHub Releases ──

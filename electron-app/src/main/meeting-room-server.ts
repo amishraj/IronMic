@@ -15,7 +15,9 @@
  * Message protocol (JSON over WebSocket):
  *   client → host: { type: "join", roomCode, displayName }
  *   host   → client: { type: "welcome", sessionId, hostName, templateId,
- *                      notesHtml, notesVersion }
+ *                      notesHtml, notesVersion,
+ *                      segments, summary, summaryGeneratedAt,
+ *                      summaryInsufficient, summarySegmentCount }
  *                 OR { type: "rejected", reason }
  *   client → host: { type: "segment", participantId, displayName, startMs, endMs, text }
  *   client → host: { type: "notes_update", html, originId }
@@ -62,12 +64,27 @@ export interface RoomInfo {
   notesHtml: string;
   /** Monotonic version of the shared Your Notes document. 0 = empty seed. */
   notesVersion: number;
+  /** Current host-set meeting title. Null = participant should fall back to
+   *  the local default (e.g. `Meeting #N`). */
+  title: string | null;
 }
 
 /** Maximum size (bytes/utf16 length) of a single notes_update html payload.
  *  Prevents a hostile/buggy peer from blowing up the host with unbounded
  *  content. 1 MB is comfortably above any realistic note. */
 const MAX_NOTES_HTML_LENGTH = 1_000_000;
+
+/** Wire-only extension on TranscriptSegment carrying the originator's segment
+ *  id for cross-machine dedup. Older clients ignore the unknown field. */
+type WireSegment = TranscriptSegment & { originSegmentId?: string | null };
+
+/** Compute originSegmentId from a stored row:
+ *  - participant-forwarded segments persist `remote_segment_id = participant's local id`
+ *  - host-mic segments have no remote_segment_id; their own `id` is the origin */
+function annotateOriginId(seg: TranscriptSegment): WireSegment {
+  const origin = (seg as any).remote_segment_id || seg.id;
+  return { ...seg, originSegmentId: origin };
+}
 
 interface ClientState {
   socket: WebSocket;
@@ -98,6 +115,27 @@ class MeetingRoomServerManager {
    *  update. Sent in welcome payload and every notes_update broadcast so
    *  clients can drop genuinely-out-of-order packets. */
   private notesVersion: number = 0;
+
+  /** Latest live-summary payload broadcast by the LiveSummarizer for this
+   *  hosted session, cached so a late-joiner's welcome carries the AI Notes
+   *  the host already sees. Cleared on start()/stop() and only written when
+   *  payload.sessionId matches the active hosted session. */
+  private cachedSummaryPayload: {
+    sessionId: string;
+    summary: string;
+    segmentCount: number;
+    generatedAt: number;
+    insufficient: boolean;
+  } | null = null;
+
+  /** Current host-set meeting title. Hydrated from structured_output.title at
+   *  start(), updated by setTitle() (host UI debounce), included in welcome
+   *  payloads + broadcast as title_update + included in meeting_ended.finalTitle
+   *  so participants converge to the same name even on dropped packets. */
+  private currentTitle: string | null = null;
+  /** Debounce handle for persisting title writes to SQLite — title typing
+   *  shouldn't flood the DB. */
+  private titlePersistDebounce: NodeJS.Timeout | null = null;
 
   /**
    * Detect the most likely LAN IPv4 address. Prefers private ranges (10/8,
@@ -159,6 +197,7 @@ class MeetingRoomServerManager {
       participants: Array.from(this.participants.values()),
       notesHtml: this.currentNotesHtml,
       notesVersion: this.notesVersion,
+      title: this.currentTitle,
     };
   }
 
@@ -178,6 +217,57 @@ class MeetingRoomServerManager {
     } catch {
       return '';
     }
+  }
+
+  /** Read the host session's existing title from structured_output so a
+   *  reopened/host-resumed meeting carries the user's prior name into the
+   *  welcome payload. Returns null if unset. */
+  private readSeedTitle(sessionId: string): string | null {
+    try {
+      const raw = native.addon.getMeetingSession(sessionId);
+      if (!raw || raw === 'null') return null;
+      const session = JSON.parse(raw);
+      const structuredRaw = session?.structured_output;
+      if (typeof structuredRaw !== 'string') return null;
+      const structured = JSON.parse(structuredRaw);
+      const t = structured?.title;
+      return typeof t === 'string' && t.trim().length > 0 ? t : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Persist the current title to host session's structured_output. Debounced
+   *  so a fast typist doesn't generate a SQLite write per keystroke. */
+  private persistTitleToHost(title: string | null): void {
+    if (!this.sessionId) return;
+    if (this.titlePersistDebounce) clearTimeout(this.titlePersistDebounce);
+    const targetSessionId = this.sessionId;
+    this.titlePersistDebounce = setTimeout(() => {
+      this.titlePersistDebounce = null;
+      try {
+        let merged: Record<string, unknown> = {};
+        try {
+          const raw = native.addon.getMeetingSession(targetSessionId);
+          if (raw && raw !== 'null') {
+            const session = JSON.parse(raw);
+            const structuredRaw = session?.structured_output;
+            if (typeof structuredRaw === 'string') {
+              const parsed = JSON.parse(structuredRaw);
+              if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+            }
+          }
+        } catch { /* fall through with empty merged */ }
+        if (title === null || title.length === 0) {
+          delete merged.title;
+        } else {
+          merged.title = title;
+        }
+        native.setMeetingStructuredOutput(targetSessionId, JSON.stringify(merged));
+      } catch (err) {
+        console.warn('[MeetingRoomServer] persistTitleToHost failed:', (err as Error)?.message);
+      }
+    }, 200);
   }
 
   /** Persist the current shared notes to the host session's structured_output. */
@@ -227,6 +317,11 @@ class MeetingRoomServerManager {
     const seed = this.readSeedNotes(opts.sessionId);
     this.currentNotesHtml = seed;
     this.notesVersion = seed.length > 0 ? 1 : 0;
+    this.cachedSummaryPayload = null;
+    // Title hydrates from existing structured_output so a host who already
+    // named the meeting (e.g. before opening the room, or via a prior session)
+    // sees that name in the live UI and broadcasts it to joiners on welcome.
+    this.currentTitle = this.readSeedTitle(opts.sessionId);
 
     const ip = this.detectLanIp();
     if (!ip) {
@@ -262,13 +357,33 @@ class MeetingRoomServerManager {
     return this.getInfo();
   }
 
-  /** Stop the WebSocket server and notify participants. */
+  /** Stop the WebSocket server and notify participants.
+   *
+   *  The `meeting_ended` packet is the durable last-state envelope: it carries
+   *  finalSummary, finalSummaryAt, finalTitle, and finalSegmentCount so a
+   *  participant whose connection drops the trailing summary_broadcast still
+   *  finalizes against the host's authoritative state. The renderer-side
+   *  caller (handleGranolaStop / finalizeAndExitMeeting) MUST have awaited
+   *  meetingStopRecording() before calling this — that's how the host's
+   *  final-chunk segment + final live summary land in cachedSummaryPayload
+   *  and on the wire BEFORE the room tears down.
+   */
   async stop(): Promise<void> {
     if (!this.wss) return;
-    this.broadcast({ type: 'meeting_ended' });
+    this.broadcast({
+      type: 'meeting_ended',
+      finalSummary: this.cachedSummaryPayload?.summary ?? null,
+      finalSummaryAt: this.cachedSummaryPayload?.generatedAt ?? null,
+      finalTitle: this.currentTitle,
+      finalSegmentCount: this.cachedSummaryPayload?.segmentCount ?? null,
+    });
     if (this.unsubSegment) {
       this.unsubSegment();
       this.unsubSegment = null;
+    }
+    if (this.titlePersistDebounce) {
+      clearTimeout(this.titlePersistDebounce);
+      this.titlePersistDebounce = null;
     }
     for (const client of this.clients.keys()) {
       try { client.close(1000, 'meeting ended'); } catch { /* ignore */ }
@@ -287,7 +402,42 @@ class MeetingRoomServerManager {
     this.boundPort = null;
     this.currentNotesHtml = '';
     this.notesVersion = 0;
+    this.cachedSummaryPayload = null;
+    this.currentTitle = null;
     this.pushStateToRenderer();
+  }
+
+  /** Set the meeting title (host-only authority). Persists debounced into
+   *  structured_output.title and broadcasts immediately to all authenticated
+   *  participants. Returns synchronously — the broadcast is fire-and-forget. */
+  setTitle(title: string | null): void {
+    const next = title === null ? null : String(title).slice(0, 256);
+    if (next === this.currentTitle) return;
+    this.currentTitle = next;
+    this.persistTitleToHost(next);
+    if (this.wss) {
+      this.broadcast({ type: 'title_update', title: next });
+    }
+    this.pushStateToRenderer();
+  }
+
+  /** Explicit final-summary broadcast. Called by the renderer after
+   *  meetingStopRecording() returns and BEFORE stop(); ensures participants
+   *  see the freshly-flushed summary even though the live-summarizer would
+   *  also push it asynchronously. Idempotent — also updates cachedSummaryPayload
+   *  so stop()'s meeting_ended packet carries the same content. */
+  broadcastFinalSummary(sessionId: string, summary: string): void {
+    if (!this.sessionId || sessionId !== this.sessionId) return;
+    if (!summary || summary.trim().length === 0) return;
+    const payload = {
+      sessionId: this.sessionId,
+      summary,
+      segmentCount: this.cachedSummaryPayload?.segmentCount ?? 0,
+      generatedAt: Date.now(),
+      insufficient: false,
+    };
+    this.cachedSummaryPayload = { ...payload };
+    if (this.wss) this.broadcast({ type: 'summary_broadcast', ...payload });
   }
 
   private handleConnection(socket: WebSocket, remoteAddress: string): void {
@@ -332,6 +482,21 @@ class MeetingRoomServerManager {
       };
       this.participants.set(participantId, participant);
 
+      // Snapshot the host's unified transcript (host-local + remote-ingested)
+      // so the late-joiner sees every segment that landed before they joined.
+      // Filter by active sessionId defensively — the recorder resets segments
+      // on each startMeetingRecording but the filter is cheap insurance.
+      // Each segment carries `originSegmentId` (the originator's id — host's
+      // own id for host-spoken, the participant's local id for participant-
+      // spoken segments forwarded earlier). The participant rejoin path
+      // dedups on this so re-ingested welcome segments don't duplicate the
+      // participant's own pre-leave speech.
+      const transcriptSnapshot = this.sessionId
+        ? meetingRecorder.getSegments()
+            .filter((s) => s.session_id === this.sessionId)
+            .map((s) => annotateOriginId(s))
+        : [];
+
       try {
         state.socket.send(JSON.stringify({
           type: 'welcome',
@@ -343,10 +508,39 @@ class MeetingRoomServerManager {
           // an empty editor while waiting for the next notes_update event.
           notesHtml: this.currentNotesHtml,
           notesVersion: this.notesVersion,
+          title: this.currentTitle,
+          // Full meeting state up to this moment so the late joiner doesn't
+          // start with an empty transcript / AI Notes panel. Forward-compatible
+          // additions: older clients ignore unknown fields.
+          segments: transcriptSnapshot,
+          summary: this.cachedSummaryPayload?.summary ?? '',
+          summaryGeneratedAt: this.cachedSummaryPayload?.generatedAt ?? null,
+          summaryInsufficient: this.cachedSummaryPayload?.insufficient ?? true,
+          summarySegmentCount: this.cachedSummaryPayload?.segmentCount ?? 0,
         }));
       } catch (err) {
         console.warn('[MeetingRoomServer] failed to send welcome:', err);
       }
+
+      // Persist the join to the meeting_sessions.participants roster + push
+      // the display name into the recorder's contextTerms so transcription
+      // chunks from now on are biased / fuzzy-corrected toward this joiner's
+      // name. Persistence is owned by the room server; the recorder owns the
+      // in-memory cache only.
+      if (this.sessionId) {
+        try {
+          native.addMeetingParticipant(this.sessionId, JSON.stringify({
+            id: participantId,
+            displayName,
+            isHost: false,
+            joinedAt: Date.now(),
+          }));
+        } catch (err) {
+          console.warn('[MeetingRoomServer] failed to persist participant:', err);
+        }
+      }
+      try { meetingRecorder.addContextParticipant(displayName); }
+      catch (err) { console.warn('[MeetingRoomServer] addContextParticipant failed:', err); }
 
       // Broadcast join + push state to host UI
       this.broadcast({ type: 'participant_joined', participantId, displayName }, state.socket);
@@ -367,34 +561,32 @@ class MeetingRoomServerManager {
       const text = String(msg.text ?? '').slice(0, 50_000);
       if (!text || !this.sessionId) return;
       const source = `participant:${state.displayName}`;
+      // The participant's own local segment id is the origin identity. Without
+      // it, the participant's rejoin-time welcome snapshot would replay their
+      // own pre-leave speech with a host-minted id and the dedup index
+      // wouldn't match — so they'd see their own speech twice. Fall back to
+      // a fresh UUID if the participant client is older than the originSegmentId
+      // round-trip (older clients still get dedupable host-side persistence).
+      const originSegmentId = typeof msg.originSegmentId === 'string' && msg.originSegmentId.length > 0
+        ? msg.originSegmentId
+        : `legacy-${crypto.randomUUID()}`;
 
       let persisted: TranscriptSegment;
       const speakerLabel = state.displayName;
       try {
-        if (typeof native.addon.addTranscriptSegment === 'function') {
-          const json = native.addon.addTranscriptSegment(
-            this.sessionId,
-            speakerLabel,
-            startMs,
-            endMs,
-            text,
-            source,
-          );
-          persisted = JSON.parse(json) as TranscriptSegment;
-        } else {
-          persisted = {
-            id: `remote-${crypto.randomUUID()}`,
-            session_id: this.sessionId,
-            speaker_label: speakerLabel,
-            start_ms: startMs,
-            end_ms: endMs,
-            text,
-            source,
-            participant_id: state.participantId,
-            confidence: null,
-            created_at: new Date().toISOString(),
-          };
-        }
+        // Prefer the dedup-aware variant — `(session_id, remote_segment_id)`
+        // unique index makes ingest idempotent even if the participant
+        // re-forwards the same segment after a brief reconnect.
+        const json = native.addTranscriptSegmentWithRemoteId(
+          this.sessionId,
+          speakerLabel,
+          startMs,
+          endMs,
+          text,
+          source,
+          originSegmentId,
+        );
+        persisted = JSON.parse(json) as TranscriptSegment;
       } catch (err) {
         console.warn('[MeetingRoomServer] Failed to persist remote segment:', err);
         persisted = {
@@ -418,8 +610,10 @@ class MeetingRoomServerManager {
       // in its live transcript view alongside its own segments.
       meetingRecorder.ingestRemoteSegment(persisted);
 
-      // Rebroadcast to all OTHER participants so everyone sees a unified view
-      this.broadcast({ type: 'segment_broadcast', segment: persisted }, state.socket);
+      // Rebroadcast to all OTHER participants so everyone sees a unified view.
+      // Carry the originSegmentId so participants dedup correctly on rejoin.
+      const wireSeg: WireSegment = { ...persisted, originSegmentId };
+      this.broadcast({ type: 'segment_broadcast', segment: wireSeg }, state.socket);
       return;
     }
 
@@ -491,7 +685,10 @@ class MeetingRoomServerManager {
     });
   }
 
-  /** Fan a host-produced live summary out to every authenticated participant. */
+  /** Fan a host-produced live summary out to every authenticated participant.
+   *  Also caches the latest payload so a late-joiner's welcome carries it.
+   *  Drops payloads from a non-active session (e.g. a slow async run from a
+   *  prior meeting) so cache + broadcast can't be poisoned with stale state. */
   broadcastLiveSummary(payload: {
     sessionId: string;
     summary: string;
@@ -499,6 +696,8 @@ class MeetingRoomServerManager {
     generatedAt: number;
     insufficient: boolean;
   }): void {
+    if (!this.sessionId || payload.sessionId !== this.sessionId) return;
+    this.cachedSummaryPayload = { ...payload };
     if (!this.wss) return;
     this.broadcast({ type: 'summary_broadcast', ...payload });
   }
@@ -520,6 +719,18 @@ class MeetingRoomServerManager {
     if (state.participantId) {
       const p = this.participants.get(state.participantId);
       this.participants.delete(state.participantId);
+      // Stamp leftAt on the persisted roster (do NOT delete — historical
+      // attendance is the whole point of the v7 schema). Best-effort; the
+      // disconnect should never be blocked by a DB error.
+      if (this.sessionId) {
+        try {
+          native.markMeetingParticipantLeft(this.sessionId, state.participantId, Date.now());
+        } catch (err) {
+          console.warn('[MeetingRoomServer] markMeetingParticipantLeft failed:', err);
+        }
+      }
+      try { meetingRecorder.markContextParticipantLeft(state.participantId, Date.now()); }
+      catch { /* recorder is no-op on unknown ids */ }
       this.broadcast({
         type: 'participant_left',
         participantId: state.participantId,
@@ -550,7 +761,17 @@ class MeetingRoomServerManager {
   private broadcastSegment(seg: TranscriptSegment): void {
     // Don't loop-broadcast segments that originated from a remote participant.
     if (seg.source.startsWith('participant:')) return;
-    this.broadcast({ type: 'segment_broadcast', segment: seg });
+    // Privacy backstop: if the host is self-muted, suppress outbound broadcast
+    // of the host's own mic-derived segments. The audio gate inside
+    // MeetingRecorder normally prevents these segments from existing in the
+    // first place; this is defense-in-depth in case a segment was already
+    // committed before the mute toggle was observed by the streaming loop.
+    // Remote-participant segments (handled above by the source check) are
+    // unaffected — host mute must never silence what other people say.
+    if (meetingRecorder.isMicMuted()) return;
+    // Stamp originSegmentId so participant ingest dedups against any prior
+    // welcome snapshot replay.
+    this.broadcast({ type: 'segment_broadcast', segment: annotateOriginId(seg) });
   }
 
   private pushStateToRenderer(): void {

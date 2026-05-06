@@ -211,6 +211,7 @@ mod tests {
             template_id: None,
             structured_output: None,
             detected_app: None,
+            participants: "[]".to_string(),
         };
         let md = meeting_to_markdown(&session);
         assert!(md.contains("# Meeting Notes"));

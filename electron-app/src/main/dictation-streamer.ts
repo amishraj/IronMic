@@ -32,6 +32,8 @@ import {
 } from './transcribe-clean';
 import { audioStream } from './audio-stream-manager';
 import { debugLog } from './debug-log';
+import { correctTranscript } from '../shared/transcript-correction';
+import { getWords as getDictionaryWords } from './dictionary-cache';
 
 const TRANSCRIBE_TIMEOUT_MS = 8_000;
 const FIRST_TRANSCRIBE_TIMEOUT_MS = 20_000;
@@ -264,7 +266,14 @@ class DictationStreamer {
     this.emitDraft('');
     try {
       const finalText = await native.addon.moonshineSessionCommit!();
-      const cleaned = sanitizeTranscribedText(finalText);
+      let cleaned = sanitizeTranscribedText(finalText);
+      // Fuzzy correction at COMMIT only (never on draft hypotheses — would
+      // cause flicker in the grey-typing UI). Catches Moonshine misses on
+      // dictionary words. Empty term set returns the input unchanged.
+      const dict = getDictionaryWords();
+      if (cleaned && dict.length > 0) {
+        cleaned = correctTranscript(cleaned, dict);
+      }
       debugLog('session.commit', { cleaned: cleaned.slice(0, 80), isFinalStop });
       if (cleaned) {
         this.fullText = (this.fullText + ' ' + cleaned).replace(/\s+/g, ' ').trim();
@@ -375,6 +384,14 @@ class DictationStreamer {
     // Strip overlap region from output if we prepended context.
     if (isMoonshine && overlapBuffer.length > 0 && previousChunkText && cleaned) {
       cleaned = stripOverlapPrefix(previousChunkText, cleaned);
+    }
+
+    // Fuzzy correction at chunk finalize. Same guardrails as the streaming
+    // path — single-word terms, conservative edit-distance caps, stop-list
+    // protection. Empty dictionary returns unchanged.
+    const dict = getDictionaryWords();
+    if (cleaned && dict.length > 0) {
+      cleaned = correctTranscript(cleaned, dict);
     }
 
     // Save new overlap tail (Moonshine only) for the next chunk.

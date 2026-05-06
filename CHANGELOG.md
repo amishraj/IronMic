@@ -2,6 +2,20 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.6.0] - 2026-05-04
+
+### Changed
+
+- **Simplified meeting model** — The Meetings page now defaults to two modes: **Host Room** and **Join Room**. Solo mode is no longer the default; it remains accessible by enabling **Developer features** in Settings → Security & Privacy.
+- **Repurposed Collaborate button** — During a live host meeting, the toolbar now has a **Collaborate** toggle that shows or hides the invite details (IP, port, code). Useful for hiding the invite during screen-share. Participants list stays visible regardless.
+- **Removed "Join Shared Meetings" card** — The finished-meeting notes-share entry point on the Meetings page has been removed. Note collaboration in the dictation flow is unchanged.
+
+### Added
+
+- **Mid-meeting mic on/off** — A new mic toggle in the live meeting toolbar lets users mute their microphone without stopping the meeting. Mute is a hard privacy boundary: no local STT, no segment broadcast to peers, no final-drain commit on stop, and any in-flight streaming draft is dropped on mute.
+- **`dev_features_enabled` setting** — New toggle in **Settings → Security & Privacy → Developer** that exposes legacy/experimental controls (Solo meeting mode, etc.). Off by default.
+- **Hardened invite-code inputs** — Invite-code fields now uniformly enforce uppercase display, `autoCapitalize="characters"`, `autoComplete="off"`, and `spellCheck={false}` for consistent, error-resistant entry.
+
 ## [1.5.0] - 2026-04-30
 
 ### Added

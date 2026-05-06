@@ -29,6 +29,8 @@ import {
 } from './transcribe-clean';
 import { audioStream } from './audio-stream-manager';
 import { debugLog } from './debug-log';
+import { correctTranscript } from '../shared/transcript-correction';
+import { getWords as getDictionaryWords } from './dictionary-cache';
 
 /** Upper bound on how long we wait for a single transcribe call to return
  *  before moving on. If the native call hangs (rare under Moonshine ONNX,
@@ -80,9 +82,16 @@ export interface MeetingRecordingState {
    * "live transcription" copy and the "segments every ~15s" copy.
    */
   streamingMode: boolean;
+  /**
+   * Self-mute flag during a live meeting. When true: drained audio is
+   * discarded before STT, no segments emitted locally, and outbound segment
+   * broadcast on the room server/client is suppressed. Reset to `false` on
+   * every recording start and stop — never carries across sessions.
+   */
+  isMicMuted: boolean;
 }
 
-const DIARIZATION_PROMPT = `You are a meeting transcript analyzer. Given the following raw transcript from a single audio stream, identify speaker changes and label each paragraph with [Speaker 1], [Speaker 2], etc. based on conversational context, topic shifts, and speaking style.
+const DIARIZATION_PROMPT_BASE = `You are a meeting transcript analyzer. Given the following raw transcript from a single audio stream, identify speaker changes and label each paragraph with [Speaker 1], [Speaker 2], etc. based on conversational context, topic shifts, and speaking style.
 
 Rules:
 - Label each paragraph or speaker turn with [Speaker N] at the start
@@ -93,6 +102,22 @@ Rules:
 
 Transcript:
 `;
+
+/**
+ * Build the diarization prompt, optionally prepending a "Known participants"
+ * hint so the LLM can use real names ([Alice], [Bob]) instead of generic
+ * [Speaker N] labels when conversational context fits.
+ *
+ * The renderer parser already accepts arbitrary `[Name]` tags, so the LLM
+ * is free to mix named and generic labels (e.g. when an unrecognized
+ * speaker shows up alongside known participants).
+ */
+function buildDiarizationPrompt(participantNames: string[]): string {
+  if (participantNames.length === 0) return DIARIZATION_PROMPT_BASE;
+  const names = participantNames.join(', ');
+  const hint = `Known participants: ${names}. When conversational context fits a known participant (their name is mentioned, they are addressed, or speaking style matches), label that paragraph with their name in brackets, e.g. [${participantNames[0]}]. For speakers you cannot match, fall back to [Speaker 1], [Speaker 2], etc.\n\n`;
+  return hint + DIARIZATION_PROMPT_BASE;
+}
 
 class MeetingRecorderManager {
   // Default — overridden by the startMeetingRecording IPC which reads
@@ -112,6 +137,38 @@ class MeetingRecorderManager {
   private currentSegmentStartMs = 0;
   private lastSpeechEndMs = 0;
 
+  /**
+   * Monotonic counter bumped on every mic-mute toggle. Private to the recorder
+   * (not part of MeetingRecordingState — the renderer only sees `isMicMuted`).
+   * The streaming loop reads it to detect mute transitions and drop any
+   * in-flight Moonshine draft so post-unmute speech can never bond with
+   * pre-mute content.
+   */
+  private muteGeneration = 0;
+
+  /**
+   * Total chunk windows that have elapsed in the legacy chunked path —
+   * advances on every drain, including silent and muted chunks. Used as the
+   * timing basis for segment start_ms so post-mute (or post-silence) segments
+   * land at the correct point on the meeting timeline. `segmentCount` only
+   * tracks emitted segments and is used for IDs.
+   */
+  private chunkIndex = 0;
+
+  /**
+   * In-memory copy of participant display names for the active meeting.
+   * Updated by addContextParticipant / markContextParticipantLeft when the
+   * room server processes joins and disconnects, plus seeded with the host
+   * name at startMeetingRecording. Used per-chunk:
+   *   • Whisper transcription: passed as `context_terms` so initial_prompt
+   *     biases recognition toward attendee names.
+   *   • Moonshine: passed to fuzzy post-correction so near-misses
+   *     ("Aarrav" → "Aarav") are caught at finalize time.
+   * Names are NOT removed when participants leave — they may have spoken
+   * earlier in the same chunk window.
+   */
+  private contextTerms: string[] = [];
+
   private state: MeetingRecordingState = {
     status: 'idle',
     sessionId: null,
@@ -119,7 +176,42 @@ class MeetingRecorderManager {
     segmentCount: 0,
     deviceName: null,
     streamingMode: false,
+    isMicMuted: false,
   };
+
+  /**
+   * Returns the term set used by transcript post-correction in this
+   * meeting: dictionary words ∪ participant names. Reads the dictionary
+   * cache lazily so live edits mid-meeting take effect on the next
+   * finalized segment automatically.
+   */
+  private correctionTerms(): string[] {
+    const dict = getDictionaryWords();
+    if (dict.length === 0 && this.contextTerms.length === 0) return [];
+    return [...this.contextTerms, ...dict];
+  }
+
+  /**
+   * Add a participant's display name to the in-memory contextTerms. Called
+   * by meeting-room-server.ts on `participant_joined`. Persisted-roster
+   * write is the room server's responsibility, not the recorder's.
+   */
+  addContextParticipant(displayName: string): void {
+    const trimmed = (displayName ?? '').trim();
+    if (!trimmed) return;
+    if (this.contextTerms.some(t => t.toLowerCase() === trimmed.toLowerCase())) return;
+    this.contextTerms.push(trimmed);
+  }
+
+  /**
+   * Symmetric to addContextParticipant. Intentionally does NOT remove the
+   * name from contextTerms — a participant who left mid-meeting may still
+   * appear in the next chunk if they spoke earlier in the buffer. Kept as
+   * a hook in case future logic needs to react to disconnects.
+   */
+  markContextParticipantLeft(_participantId: string, _leftAt: number): void {
+    /* intentionally no-op for biasing — see comment above */
+  }
 
   isActive(): boolean {
     return this.state.status !== 'idle';
@@ -127,6 +219,46 @@ class MeetingRecorderManager {
 
   getState(): MeetingRecordingState {
     return { ...this.state };
+  }
+
+  /**
+   * Read-only accessor used by meeting-room-server / meeting-room-client to
+   * gate outbound segment broadcast on self-mute (defense-in-depth — the
+   * audio gate inside the recorder already prevents most muted segments
+   * from being produced in the first place).
+   */
+  isMicMuted(): boolean {
+    return this.state.isMicMuted;
+  }
+
+  /**
+   * Toggle mic mute during an active meeting. Sourced from the renderer via
+   * MEETING_SET_MIC_MUTED. Validated against the active session id so a
+   * stale renderer event from a previous meeting can't flip the wrong run.
+   *
+   * Mute is a hard privacy boundary:
+   *   • Discards drained audio at the recorder level (no STT, no segment).
+   *   • Resets any in-flight Moonshine session/draft so post-unmute speech
+   *     cannot bond with pre-mute content (drop, never commit).
+   *   • Skips the final-drain commit on stop while muted.
+   *   • Suppresses outbound segment broadcast on the room layer (gated by
+   *     room-server / room-client reading isMicMuted()).
+   */
+  setMicMuted(sessionId: string, muted: boolean): void {
+    if (this.state.status === 'idle') {
+      throw new Error('Cannot set mic mute — meeting not active');
+    }
+    if (sessionId !== this.state.sessionId) {
+      throw new Error('Mic mute session mismatch — refusing stale toggle');
+    }
+    if (this.state.isMicMuted === muted) return;
+    this.state = { ...this.state, isMicMuted: muted };
+    // Bumping the generation is what tells the streaming loop to drop any
+    // in-flight draft on the next tick. Bump on every transition (both
+    // mute-on and mute-off) so a quick toggle still triggers a clean reset.
+    this.muteGeneration++;
+    debugLog('meeting.mute', { sessionId, muted, generation: this.muteGeneration });
+    this.pushStateToRenderer();
   }
 
   /**
@@ -145,11 +277,16 @@ class MeetingRecorderManager {
    *                   Falls back to startRecording() until Rust is rebuilt with
    *                   startRecordingFromDevice().
    * @param chunkIntervalS  Chunk interval in seconds (default 15).
+   * @param hostDisplayName Optional host display name. Seeds the persisted
+   *                   roster and contextTerms (Whisper bias + fuzzy
+   *                   correction). Read from `roomDisplayName` in Zustand
+   *                   at the call site since the recorder lives in main.
    */
   async startMeetingRecording(
     sessionId: string,
     deviceName?: string | null,
     chunkIntervalS = 15,
+    hostDisplayName?: string | null,
   ): Promise<void> {
     if (this.state.status !== 'idle') {
       throw new Error('Meeting recording is already active');
@@ -190,6 +327,34 @@ class MeetingRecorderManager {
     this.totalDrainedAudioMs = 0;
     this.currentSegmentStartMs = 0;
     this.lastSpeechEndMs = 0;
+    this.muteGeneration = 0;
+    this.chunkIndex = 0;
+
+    // Seed the participant context with the host's display name (if set)
+    // and persist an initial roster row. Joiners are appended later by
+    // meeting-room-server.ts; the recorder owns only the in-memory cache.
+    this.contextTerms = [];
+    const trimmedHost = (hostDisplayName ?? '').trim();
+    if (trimmedHost) {
+      this.contextTerms.push(trimmedHost);
+      try {
+        const roster = [{
+          id: 'host',
+          displayName: trimmedHost,
+          isHost: true,
+          joinedAt: Date.now(),
+        }];
+        native.setMeetingParticipants(sessionId, JSON.stringify(roster));
+      } catch (err) {
+        console.warn('[MeetingRecorder] failed to seed participant roster:', err);
+      }
+    }
+
+    // Drift safety net: re-push the persisted dictionary into the active
+    // engine so words added mid-app-session take effect for this meeting.
+    // The Rust addon already syncs on every addWord/removeWord, so this is
+    // belt-and-suspenders. Cheap.
+    try { native.refreshTranscriptionDictionary(); } catch { /* ignore */ }
 
     // ── Decide path: streaming session vs. fixed-interval chunks ──
     // Mirrors the full 4-check gate in dictation-streamer.ts: engine must be
@@ -233,6 +398,7 @@ class MeetingRecorderManager {
       segmentCount: 0,
       deviceName: deviceName ?? null,
       streamingMode: canStream,
+      isMicMuted: false,
     };
 
     this.pushStateToRenderer();
@@ -364,6 +530,7 @@ class MeetingRecorderManager {
         segmentCount: 0,
         deviceName: null,
         streamingMode: false,
+        isMicMuted: false,
       };
       // Reset streaming-session bookkeeping so a stop-without-start path or
       // an exception still leaves the manager in a clean state.
@@ -371,6 +538,8 @@ class MeetingRecorderManager {
       this.totalDrainedAudioMs = 0;
       this.currentSegmentStartMs = 0;
       this.lastSpeechEndMs = 0;
+      this.muteGeneration = 0;
+      this.chunkIndex = 0;
       // Make sure the grey line is cleared on stop, in case the streaming
       // loop's catch handler didn't run.
       this.pushDraftToRenderer('');
@@ -396,7 +565,13 @@ class MeetingRecorderManager {
     this.isProcessingChunk = true;
 
     try {
-      const chunkStartMs = segmentCount * this.chunkIntervalMs;
+      // Use a wall-clock chunk index that advances on EVERY chunk window —
+      // including silent and muted chunks — so segment.start_ms reflects when
+      // speech actually happened relative to meeting start. Segment IDs and
+      // the emitted-segments count remain on `segmentCount`, untouched here.
+      const currentChunkIndex = this.chunkIndex;
+      this.chunkIndex++;
+      const chunkStartMs = currentChunkIndex * this.chunkIntervalMs;
       const chunkEndMs = isFinal
         ? Date.now() - startedAt
         : chunkStartMs + this.chunkIntervalMs;
@@ -407,14 +582,14 @@ class MeetingRecorderManager {
         audioBuffer = native.addon.stopRecording();
         debugLog('capture.drained', {
           owner: 'meeting',
-          chunkIndex: segmentCount,
+          chunkIndex: currentChunkIndex,
           byteLength: audioBuffer.length,
           rms: computeRmsPcm16(audioBuffer),
           isFinal,
         });
       } catch (err: any) {
         console.warn('[MeetingRecorder] Failed to stop for chunk drain:', err);
-        debugLog('capture.drained', { owner: 'meeting', chunkIndex: segmentCount, isFinal, error: err?.message ?? String(err) });
+        debugLog('capture.drained', { owner: 'meeting', chunkIndex: currentChunkIndex, isFinal, error: err?.message ?? String(err) });
         return;
       }
 
@@ -432,6 +607,16 @@ class MeetingRecorderManager {
           this.pushStateToRenderer();
           return;
         }
+      }
+
+      // ── Mic-muted gate (privacy: no STT, no segment, no broadcast) ──
+      // Drained audio is dropped on the floor. We've already restarted
+      // capture above, so the next chunk window will be ready as normal.
+      // chunkIndex has already advanced, so post-unmute segments will land
+      // at the correct meeting timestamp.
+      if (this.state.isMicMuted) {
+        debugLog('meeting.chunk.muted', { chunkIndex: currentChunkIndex, byteLength: audioBuffer.length, isFinal });
+        return;
       }
 
       // ── Silence / low-energy gate ──
@@ -453,17 +638,20 @@ class MeetingRecorderManager {
         try { return native.getTranscriptionEngine?.() ?? 'unknown'; }
         catch { return 'unknown'; }
       })();
-      debugLog('whisper.in', { engine: engineKind, owner: 'meeting', chunkIndex: segmentCount, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000 });
+      debugLog('whisper.in', { engine: engineKind, owner: 'meeting', chunkIndex: currentChunkIndex, byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000 });
       let rawText: string | null = null;
       try {
+        // Pass participant names + dictionary words as per-call context.
+        // Whisper layers them onto initial_prompt; Moonshine ignores them
+        // (the fuzzy correction below catches near-misses for Moonshine).
         rawText = await transcribeWithTimeout(
-          Promise.resolve(native.addon.transcribe(audioBuffer)),
+          native.transcribeWithContext(audioBuffer, this.contextTerms),
           TRANSCRIBE_TIMEOUT_MS,
           'MeetingRecorder.transcribe',
         );
-        debugLog('whisper.raw', { engine: engineKind, owner: 'meeting', chunkIndex: segmentCount, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart });
+        debugLog('whisper.raw', { engine: engineKind, owner: 'meeting', chunkIndex: currentChunkIndex, rawText: rawText ?? '<null/timeout>', length: rawText?.length ?? 0, latencyMs: Date.now() - whisperStart, contextTerms: this.contextTerms.length });
       } catch (err: any) {
-        debugLog('whisper.error', { engine: engineKind, owner: 'meeting', chunkIndex: segmentCount, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
+        debugLog('whisper.error', { engine: engineKind, owner: 'meeting', chunkIndex: currentChunkIndex, message: err?.message ?? String(err), latencyMs: Date.now() - whisperStart });
         throw err;
       }
       if (rawText == null) return;
@@ -471,8 +659,18 @@ class MeetingRecorderManager {
       // ── Text hygiene ──
       // Strip bracket markers, collapse repetition loops, drop exact-match
       // hallucinations. Keeps junk out of the transcript AND the AI notes.
-      const text = sanitizeTranscribedText(rawText);
+      let text = sanitizeTranscribedText(rawText);
       if (!text) return;
+
+      // Fuzzy post-correction. Catches near-misses for participant names
+      // and custom dictionary words — especially important for Moonshine,
+      // which has no vocabulary API. Whisper's initial_prompt already
+      // biases sampling but isn't 100% so we run this for both engines.
+      // Empty term set = early return inside the helper, no overhead.
+      const terms = this.correctionTerms();
+      if (terms.length > 0) {
+        text = correctTranscript(text, terms);
+      }
 
       // Build the segment object and store in memory
       const segment: TranscriptSegment = {
@@ -530,12 +728,29 @@ class MeetingRecorderManager {
       return null;
     }
 
+    // Pull the persisted roster (if any) so the diarization prompt can hint
+    // the LLM toward real names. Falls back to a generic prompt when no
+    // session id is available or the roster fetch fails.
+    let participantNames: string[] = [];
+    if (this.state.sessionId) {
+      try {
+        const json = native.getMeetingParticipants(this.state.sessionId);
+        const roster = JSON.parse(json) as Array<{ displayName?: string }>;
+        participantNames = (Array.isArray(roster) ? roster : [])
+          .map(p => (p?.displayName ?? '').trim())
+          .filter(name => name.length > 0);
+      } catch (err) {
+        console.warn('[MeetingRecorder] failed to read roster for diarization prompt:', err);
+      }
+    }
+    const prompt = buildDiarizationPrompt(participantNames);
+
     try {
       const labeled = await llmSubprocess.chatComplete({
         modelPath: resolved.modelPath,
         modelType: resolved.modelType,
         messages: [
-          { role: 'user', content: DIARIZATION_PROMPT + fullTranscript },
+          { role: 'user', content: prompt + fullTranscript },
         ],
         maxTokens: Math.min(fullTranscript.length * 2, 8192),
         temperature: 0.1,
@@ -555,20 +770,33 @@ class MeetingRecorderManager {
    * before diarization completes.
    */
   private applyDiarizationLabels(labeledTranscript: string, segmentsToLabel?: TranscriptSegment[]): void {
-    const speakerPattern = /\[Speaker (\d+)\][:：]?\s*([\s\S]*?)(?=\[Speaker \d+\]|$)/g;
+    // Accept either a numeric Speaker label ("[Speaker 1]") or an arbitrary
+    // bracketed name ("[Alice]") so the LLM can use real participant names
+    // when the prompt gives it the roster. The capture group is the label
+    // contents; the label itself is the verbatim bracket text.
+    const speakerPattern = /\[([^\]]+)\][:：]?\s*([\s\S]*?)(?=\[[^\]]+\]|$)/g;
     const labeledChunks: Array<{ label: string; text: string }> = [];
     let match: RegExpExecArray | null;
     while ((match = speakerPattern.exec(labeledTranscript)) !== null) {
-      labeledChunks.push({
-        label: `Speaker ${match[1]}`,
-        text: match[2].trim(),
-      });
+      const rawLabel = match[1].trim();
+      const text = match[2].trim();
+      // Defensive: ignore obviously-noise brackets like timestamps "[00:01:23]"
+      // or sound-effect markers "[laughter]" so they don't become speaker
+      // labels. Real speaker labels are either "Speaker N" or a name.
+      if (!rawLabel || /^\d+$/.test(rawLabel) || /\d{1,2}:\d{2}/.test(rawLabel)) continue;
+      labeledChunks.push({ label: rawLabel, text });
     }
 
     if (labeledChunks.length === 0) return;
 
     const targets = segmentsToLabel ?? this.segments;
     for (const segment of targets) {
+      // Don't overwrite labels already assigned by the room server (remote
+      // joiner segments arrive with their displayName already on
+      // speaker_label — see meeting-room-server.ts handleMessage). LLM
+      // diarization only fills in unlabeled local/mixed segments.
+      if (segment.speaker_label) continue;
+
       const segWords = new Set(segment.text.toLowerCase().split(/\s+/).filter(w => w.length > 3));
       let bestLabel = labeledChunks[0].label;
       let bestScore = 0;
@@ -614,10 +842,29 @@ class MeetingRecorderManager {
     let silentAudioMs = 0;
     let sessionHasContent = false;
     let sessionAudioMs = 0;
+    // Snapshot the mute generation so we detect transitions inside the loop.
+    // setMicMuted() only flips the boolean and bumps this counter; it never
+    // reaches into the loop's locals — we observe it here on the next tick.
+    let observedMuteGen = this.muteGeneration;
 
     while (this.state.status === 'recording') {
       await sleep(SESSION_DRAIN_INTERVAL_MS);
       if (this.state.status !== 'recording') break;
+
+      // ── Mute transition: drop any in-flight draft to keep mute as a hard
+      //    privacy boundary. We do this BEFORE the drain so an unmute
+      //    transition also lands on a clean slate (no stale grey line).
+      if (this.muteGeneration !== observedMuteGen) {
+        observedMuteGen = this.muteGeneration;
+        if (this.state.isMicMuted) {
+          this.pushDraftToRenderer('');
+          try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+          sessionHasContent = false;
+          sessionAudioMs = 0;
+          silentAudioMs = 0;
+          debugLog('meeting.mute.draft-drop', { generation: observedMuteGen });
+        }
+      }
 
       let audioBuffer: Buffer;
       try {
@@ -627,6 +874,16 @@ class MeetingRecorderManager {
         continue;
       }
       if (!audioBuffer || audioBuffer.length < 500) continue;
+
+      // ── Mic-muted gate (audio is drained but discarded) ──
+      // We still advance totalDrainedAudioMs so the meeting-wide timeline
+      // stays accurate; post-unmute segments will then have correct start_ms
+      // relative to meeting start. The buffer itself is dropped on the floor.
+      if (this.state.isMicMuted) {
+        const bufferAudioMs = (audioBuffer.length / 2 / 16_000) * 1_000;
+        this.totalDrainedAudioMs += bufferAudioMs;
+        continue;
+      }
 
       const silent = isAudioSilent(audioBuffer);
       const bufferAudioMs = (audioBuffer.length / 2 / 16_000) * 1_000;
@@ -704,10 +961,33 @@ class MeetingRecorderManager {
     }
 
     // ── Final drain after status flipped to 'stopping' ─────────────────────
+    // Privacy gate: if the user is currently muted at stop time, the final
+    // buffer (whatever happened in the last ~200ms while we were muted) must
+    // not be transcribed or committed. This closes the "mute → immediately
+    // stop" leak path. We still drain to release the native buffer, but the
+    // contents are discarded.
+    //
+    // Race fix: if the user clicked Mute and Stop in the same tick (faster
+    // than the loop's 200ms heartbeat), the loop never observed the mute
+    // transition — but the in-flight Moonshine session may still hold
+    // pre-mute content. Reset the session here too so the privacy invariant
+    // holds even under that race.
+    if (this.state.isMicMuted) {
+      try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+      sessionHasContent = false;
+      sessionAudioMs = 0;
+      silentAudioMs = 0;
+      this.pushDraftToRenderer('');
+      debugLog('meeting.mute.stop-race-drop', { generation: this.muteGeneration });
+    }
     let appendedFinalAudio = false;
     try {
       const finalBuffer = native.addon.drainRecordingBuffer!();
-      if (finalBuffer && finalBuffer.length >= 500 && !isAudioSilent(finalBuffer)) {
+      if (
+        !this.state.isMicMuted
+        && finalBuffer && finalBuffer.length >= 500
+        && !isAudioSilent(finalBuffer)
+      ) {
         const bufferAudioMs = (finalBuffer.length / 2 / 16_000) * 1_000;
         this.totalDrainedAudioMs += bufferAudioMs;
         if (!sessionHasContent) {
@@ -759,9 +1039,18 @@ class MeetingRecorderManager {
       return;
     }
 
-    const text = sanitizeTranscribedText(finalText);
+    let text = sanitizeTranscribedText(finalText);
     debugLog('meeting.session.commit', { textLength: text.length, isFinalStop });
     if (!text) return;
+
+    // Fuzzy post-correction at the streaming-COMMIT boundary only — never on
+    // draft hypotheses (would cause grey-typing flicker). Catches Moonshine
+    // misses on participant names + dictionary words. Empty term set short-
+    // circuits inside the helper.
+    const correctionTerms = this.correctionTerms();
+    if (correctionTerms.length > 0) {
+      text = correctTranscript(text, correctionTerms);
+    }
 
     const { sessionId } = this.state;
     if (!sessionId) return;

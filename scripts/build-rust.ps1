@@ -16,7 +16,7 @@ Write-Host ""
 # it, build_engine() returns NullEngine and dictation fails at transcribe time
 # with "Engine 'moonshine-base' is not available". transcribe-rs reuses the same
 # ort/ndarray versions tts already pulls in, so there is no dependency conflict.
-cargo build --release --features napi-export,whisper,tts,engine-multi
+cargo build --release --features napi-export,whisper,tts,engine-multi,forge
 
 Write-Host ""
 Write-Host "Building LLM binary..."

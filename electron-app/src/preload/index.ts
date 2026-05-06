@@ -39,6 +39,16 @@ const api = {
   addWord: (word: string) => ipcRenderer.invoke('ironmic:add-word', word),
   removeWord: (word: string) => ipcRenderer.invoke('ironmic:remove-word', word),
   listDictionary: () => ipcRenderer.invoke('ironmic:list-dictionary'),
+  refreshTranscriptionDictionary: () =>
+    ipcRenderer.invoke('ironmic:refresh-transcription-dictionary'),
+  /** Subscribe to dictionary-mutation events so the renderer can refresh
+   *  any cached term lists used for transcript post-correction. Returns a
+   *  cleanup function. */
+  onDictionaryChanged: (callback: () => void) => {
+    const handler = () => callback();
+    ipcRenderer.on('ironmic:dictionary-changed', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictionary-changed', handler);
+  },
 
   // Settings
   getSetting: (key: string) => ipcRenderer.invoke('ironmic:get-setting', key),
@@ -208,11 +218,22 @@ const api = {
   meetingDelete: (id: string) => ipcRenderer.invoke('ironmic:meeting-delete', id),
   meetingCreateWithTemplate: (templateId: string | null, detectedApp: string | null) => ipcRenderer.invoke('ironmic:meeting-create-with-template', templateId, detectedApp),
   meetingSetStructuredOutput: (id: string, structuredOutput: string) => ipcRenderer.invoke('ironmic:meeting-set-structured-output', id, structuredOutput),
+  meetingGetParticipants: (id: string) => ipcRenderer.invoke('ironmic:meeting-get-participants', id),
 
   // ── Meeting Recording (Granola-style chunk loop) ──
-  meetingStartRecording: (sessionId: string, deviceName?: string | null, chunkIntervalS?: number) =>
-    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS),
+  meetingStartRecording: (
+    sessionId: string,
+    deviceName?: string | null,
+    chunkIntervalS?: number,
+    hostDisplayName?: string | null,
+  ) =>
+    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS, hostDisplayName),
   meetingStopRecording: () => ipcRenderer.invoke('ironmic:meeting-stop-recording'),
+  /** Toggle self-mute during an active meeting. Backend is the source of
+   *  truth — the renderer should mirror state via onMeetingRecordingState
+   *  rather than flipping its store optimistically. */
+  meetingSetMicMuted: (sessionId: string, muted: boolean) =>
+    ipcRenderer.invoke('ironmic:meeting-set-mic-muted', sessionId, muted),
 
   // ── Streaming dictation (near-real-time) ──
   dictationStreamStart: () => ipcRenderer.invoke('ironmic:dictation-stream-start'),
@@ -248,6 +269,14 @@ const api = {
   meetingRoomJoin: (opts: { hostIp: string; hostPort: number; roomCode: string; displayName: string; deviceName?: string | null }) =>
     ipcRenderer.invoke('ironmic:meeting-room-join', opts),
   meetingRoomLeave: () => ipcRenderer.invoke('ironmic:meeting-room-leave'),
+  meetingRoomLeaveTransport: () => ipcRenderer.invoke('ironmic:meeting-room-leave-transport'),
+  meetingRoomBroadcastFinalSummary: (sessionId: string, summary: string) =>
+    ipcRenderer.invoke('ironmic:meeting-room-broadcast-final-summary', sessionId, summary),
+  meetingRoomParticipantFinalized: () =>
+    ipcRenderer.invoke('ironmic:meeting-room-participant-finalized'),
+  meetingSetTitle: (sessionId: string, title: string | null) =>
+    ipcRenderer.invoke('ironmic:meeting-set-title', sessionId, title),
+  meetingGetMaxSequence: () => ipcRenderer.invoke('ironmic:meeting-get-max-sequence'),
 
   // ── Transcript Segments ──
   listTranscriptSegments: (sessionId: string) => ipcRenderer.invoke('ironmic:list-transcript-segments', sessionId),
@@ -368,6 +397,16 @@ const api = {
     ipcRenderer.on('ironmic:meeting-room-participant-update', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-room-participant-update', handler);
   },
+  onMeetingRoomHostEnded: (callback: (payload: { localSessionId: string | null; finalSummary: string | null; finalSummaryAt: number | null; finalTitle: string | null; finalSegmentCount: number | null }) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-room-host-ended', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-host-ended', handler);
+  },
+  onMeetingRoomTitleUpdate: (callback: (payload: { sessionId: string | null; title: string | null }) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-room-title-update', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-title-update', handler);
+  },
 
   // ── BlackHole (macOS system audio) ──
   blackholeCheck: (deviceListJson?: string) =>
@@ -436,6 +475,81 @@ const api = {
     const handler = (_event: any, data: { message: string; permanent: boolean }) => callback(data);
     ipcRenderer.on('ironmic:whisper-load-failed', handler);
     return () => ipcRenderer.removeListener('ironmic:whisper-load-failed', handler);
+  },
+
+  // ── Forge mode ──
+  // The Forge bar is a separate BrowserWindow. Both windows load this same
+  // preload, so the API surface is identical — what differs is which page
+  // the renderer mounts (Layout vs. ForgeApp). The main window invokes
+  // enterForge from a sidebar/tray button; the Forge window invokes
+  // exitForge from its ✕ button.
+  enterForge: () => ipcRenderer.invoke('ironmic:enter-forge'),
+  exitForge: () => ipcRenderer.invoke('ironmic:exit-forge'),
+
+  /** Paste `text` at the OS keyboard cursor (whatever app is focused).
+   *  When `restoreClipboard` is true, the prior clipboard text (if any) is
+   *  restored ~500ms after paste — text only, not images/files/HTML. */
+  pasteText: (text: string, restoreClipboard: boolean) =>
+    ipcRenderer.invoke('ironmic:forge-paste-text', text, restoreClipboard),
+
+  /** Type `text` character-by-character at the OS keyboard cursor. Slower
+   *  than paste; for use in apps that intercept Cmd/Ctrl+V. */
+  typeText: (text: string) => ipcRenderer.invoke('ironmic:forge-type-text', text),
+
+  /** macOS: returns whether IronMic has Accessibility permission.
+   *  Other platforms: returns true. Non-prompting. */
+  isAccessibilityTrusted: () => ipcRenderer.invoke('ironmic:forge-check-accessibility'),
+
+  /** Open System Settings → Privacy & Security → Accessibility (macOS).
+   *  No-op on other platforms. */
+  openAccessibilityPrefs: () =>
+    ipcRenderer.invoke('ironmic:forge-open-accessibility-prefs'),
+
+  /** Forge-specific polish path. Honors the AND of (polish_allow_cloud,
+   *  forge_polish_allow_cloud) — global setting is the upper bound. */
+  forgePolishText: (rawText: string) =>
+    ipcRenderer.invoke('ironmic:forge-polish-text', rawText),
+
+  /** Renderer→main handshake fired when a Forge dictation finishes (success
+   *  or error) so main can clear the dictation owner record and accept the
+   *  next hotkey. Fire-and-forget. */
+  notifyForgeDictationComplete: (error?: string | null) =>
+    ipcRenderer.send('ironmic:forge-dictation-complete', error ?? null),
+
+  /** Switch the Forge window between the compact bar (56 px) and the
+   *  taller permission-panel size (~130 px). The bar is fixed-size so the
+   *  AX prompt's action buttons don't fit inside it without resizing. */
+  forgeSetWindowMode: (mode: 'bar' | 'permission' | 'compact' | 'expanded') =>
+    ipcRenderer.invoke('ironmic:forge-set-window-mode', mode),
+
+  /** Push-to-talk start (Fn / Ctrl+Win pressed, past the chord-grace window). */
+  onForgePushToTalkStart: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-start', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-start', callback);
+  },
+  /** Push-to-talk end (modifier(s) released — stop dictation, paste). */
+  onForgePushToTalkEnd: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-end', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-end', callback);
+  },
+  /** Push-to-talk aborted (user added Space → chord). Roll back without paste. */
+  onForgePushToTalkCancel: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-cancel', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-cancel', callback);
+  },
+
+  /** Broadcast a theme change to all windows. Called from useSettingsStore
+   *  whenever the user picks light/dark/system. Each window's onThemeChanged
+   *  listener applies the change. */
+  broadcastTheme: (theme: 'light' | 'dark' | 'system') =>
+    ipcRenderer.invoke('ironmic:broadcast-theme', theme),
+
+  /** Listen for theme changes from any window. Forge bar uses this to stay
+   *  in sync with the main IronMic theme picker. */
+  onThemeChanged: (callback: (theme: 'light' | 'dark' | 'system') => void) => {
+    const handler = (_event: any, theme: 'light' | 'dark' | 'system') => callback(theme);
+    ipcRenderer.on('ironmic:theme-changed', handler);
+    return () => ipcRenderer.removeListener('ironmic:theme-changed', handler);
   },
 };
 

@@ -212,6 +212,62 @@ CREATE TABLE settings (
 5. User can continue dictating (append) or edit manually
 6. Entry is auto-saved to SQLite on every change
 
+### Flow 2b: Forge Mode — Dictate Into Any App
+Forge is the "Wispr-Flow-style" minimal floating bar that lets the user dictate
+text directly into whatever desktop app they're focused on (Outlook, Teams,
+Chrome address bar, VS Code, native Notes, etc.).
+
+1. User clicks "Forge mode" in the IronMic sidebar (or tray menu).
+2. Main IronMic window hides; a small always-on-top, **non-focusable** bar
+   appears (top-right by default). Because the bar is non-focusable, the
+   user's target app keeps the keyboard caret.
+3. User presses the same global hotkey → bar shows "Listening…", same Rust
+   audio capture, same Moonshine STT, same dictionary correction.
+4. Optional `forge_polish_enabled` LLM polish (default off — latency).
+5. **`paste_text` (Rust + `enigo`)** writes the transcript to the clipboard
+   and simulates `Cmd+V` / `Ctrl+V`. After ~500ms the prior clipboard text
+   is restored (token-cancellable so back-to-back dictations don't race).
+6. **No SQLite save by default** (`forge_persist_history = 'false'`).
+7. Audio buffer is zeroed and dropped, identical to Flow 1.
+
+Architecture details:
+- **Separate Vite entry** — `forge.html` + `forge-main.tsx` ship as their
+  own ~2 KB-gz bundle. No TipTap, no charts, no AI chat in the bar.
+- **Single Rust engine** — both windows share `CAPTURE_ENGINE` /
+  `WHISPER_ENGINE`; no duplicate audio capture or model load.
+- **Mode-aware hotkey dispatch** — main process tracks `forgeMode` and a
+  `dictationOwner: { owner, phase } | null` record (see
+  [main/dictation-owner.ts](electron-app/src/main/dictation-owner.ts)).
+  Hotkey routes to the active window; second-press from same owner is the
+  recording → processing transition; cross-owner presses are rejected.
+- **macOS Accessibility** — `enigo` posts synthetic events via
+  `CGEventPost`, which requires the host process to be trusted in
+  System Settings → Privacy & Security → Accessibility. The Forge bar
+  preflight-checks via `AXIsProcessTrusted()` and shows a permission
+  panel deep-linking to System Settings if trust is missing.
+- **Cloud polish in Forge** — gated by the AND of `polish_allow_cloud`
+  AND `forge_polish_allow_cloud`. The global setting is the upper bound;
+  Forge can be stricter than main but never looser.
+- **Clipboard restore is text only.** `arboard` does not preserve images,
+  files, HTML, or rich formats. If the user had non-text on the clipboard
+  before dictating, restore is skipped and the dictated transcript stays
+  on the clipboard until the user's next copy.
+
+Forge settings (all in the `settings` table; UI lives in main app's Settings):
+- `forge_persist_history` — default `'false'`. Save Forge dictations.
+- `forge_polish_enabled` — default `'false'`. Run polish before paste.
+- `forge_polish_allow_cloud` — default `'false'`. Cloud polish gate.
+- `forge_paste_method` — `'paste'` (default) or `'type'`. Char-by-char
+  fallback for paste-blocking apps.
+- `forge_clipboard_restore` — default `'true'`. Restore prior clipboard.
+- `forge_bar_position` — default `'top-right'`.
+
+Build: requires `--features forge` in the Rust core build (already in
+[scripts/build-rust.sh](scripts/build-rust.sh) and
+[scripts/build-rust.ps1](scripts/build-rust.ps1)). Linux X11 needs
+`libxdo-dev` at link time. Wayland keystroke posting is partial in
+`enigo` — Forge surfaces a clear error and is best supported on X11.
+
 ### Flow 3: Browse History (Timeline)
 1. User toggles to Timeline view
 2. All entries displayed as cards, newest first

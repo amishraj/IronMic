@@ -5,14 +5,17 @@ import { ModelManager } from './ModelManager';
 import { ModelImportSection, ModelImportBanner } from './ModelImportBanner';
 import { InputSettings } from './InputSettings';
 import { DataManager } from './DataManager';
-import { HotkeyRecorder } from './HotkeyRecorder';
+// HotkeyRecorder is no longer used — dictation gesture is hardcoded in
+// main/keyboard-listener.ts. We render `DictationGestureDisplay` (defined
+// below) as a read-only replacement.
+import { getDictationGesture } from '../../shared/dictation-gesture';
 import { Toggle, Card } from './ui';
 import {
   Settings, Bot, Volume2, Monitor, Sun, Moon, Shield, Keyboard,
   Cpu, Database, BookOpen, Lock, ClipboardCheck, Eye, EyeOff,
   Clock, AlertTriangle, CheckCircle, Info, Wifi, WifiOff, FileWarning,
   Trash2, HardDrive, Sparkles, RefreshCw, Download, Brain,
-  Mic, Route, Users, Search, Bell, Workflow, Sliders,
+  Mic, Route, Users, Search, Bell, Workflow, Sliders, FlaskConical,
 } from 'lucide-react';
 
 type SettingsTab = 'general' | 'audio' | 'speech' | 'ai' | 'models' | 'data' | 'security' | 'voice-ai';
@@ -80,12 +83,19 @@ export function SettingsPanel() {
 function GeneralSettings() {
   const { hotkey, llmCleanupEnabled, theme, setHotkey, setLlmCleanup, setTheme } =
     useSettingsStore();
+  // `hotkey` / `setHotkey` retained for backward compat with older settings
+  // payloads; the dictation gesture itself is now hardcoded in
+  // main/keyboard-listener.ts. Keep these in scope so changing the hotkey
+  // recorder (if a user has the old setting screen up via cache) still
+  // round-trips harmlessly.
+  void hotkey;
+  void setHotkey;
 
   return (
     <>
       <SectionHeader icon={Settings} title="General" description="Core preferences and behavior" />
 
-      <HotkeyRecorder value={hotkey} onChange={setHotkey} />
+      <DictationGestureDisplay />
 
       <SettingRow
         title="LLM Text Cleanup"
@@ -781,6 +791,7 @@ function SecuritySettings() {
   const [allowCloudPolish, setAllowCloudPolish] = useState(false);
   const [proxyUrl, setProxyUrl] = useState('');
   const [proxySaved, setProxySaved] = useState(false);
+  const [devFeaturesEnabled, setDevFeaturesEnabled] = useState(false);
 
   useEffect(() => {
     loadSecuritySettings();
@@ -788,7 +799,7 @@ function SecuritySettings() {
 
   async function loadSecuritySettings() {
     const api = window.ironmic;
-    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl, polishCloud] = await Promise.all([
+    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl, polishCloud, devFeatures] = await Promise.all([
       api.getSetting('security_clipboard_auto_clear'),
       api.getSetting('security_session_timeout'),
       api.getSetting('security_clear_on_exit'),
@@ -797,6 +808,7 @@ function SecuritySettings() {
       api.getSetting('proxy_enabled'),
       api.getSetting('proxy_url'),
       api.getSetting('polish_allow_cloud'),
+      api.getSetting('dev_features_enabled'),
     ]);
     if (clip) setClipboardAutoClear(clip);
     if (timeout) setSessionTimeout(timeout);
@@ -806,6 +818,7 @@ function SecuritySettings() {
     setProxyEnabled(pEnabled === 'true');
     if (pUrl) setProxyUrl(pUrl);
     setAllowCloudPolish(polishCloud === 'true');
+    setDevFeaturesEnabled(devFeatures === 'true');
   }
 
   /** Confirm before turning on cloud polish — it's the one setting that
@@ -1065,6 +1078,22 @@ function SecuritySettings() {
           </div>
         </div>
       </Card>
+
+      {/* Developer features (last subsection — gated experimental controls) */}
+      <div className="pt-2">
+        <p className="text-xs font-semibold text-iron-text-muted uppercase tracking-wider mb-2">Developer</p>
+        <SettingRow
+          icon={FlaskConical}
+          title="Developer features"
+          description="Exposes legacy and experimental controls (Solo meeting mode, etc.). Off by default."
+          control={
+            <Toggle
+              checked={devFeaturesEnabled}
+              onChange={(v) => { setDevFeaturesEnabled(v); updateSetting('dev_features_enabled', String(v)); }}
+            />
+          }
+        />
+      </div>
     </>
   );
 }
@@ -1274,6 +1303,43 @@ function VoiceAISettings() {
 // ═══════════════════════════════════════════
 // Shared components
 // ═══════════════════════════════════════════
+
+/**
+ * Read-only display of the active dictation gesture. Replaces the legacy
+ * HotkeyRecorder because dictation is now triggered by a low-level keyboard
+ * gesture in main/keyboard-listener.ts (uiohook), not Electron's
+ * globalShortcut. The gesture isn't user-configurable yet — we surface what
+ * it is so the user knows the keys to press.
+ */
+function DictationGestureDisplay() {
+  const gesture = getDictationGesture();
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <Keyboard className="w-4 h-4 text-iron-text-muted" />
+        <label className="text-sm font-medium text-iron-text">Dictation gesture</label>
+      </div>
+      <div className="rounded-xl border border-iron-border bg-iron-surface px-4 py-3 space-y-2">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-xs text-iron-text-muted">Hands-free (tap to start, tap to stop)</div>
+            <div className="text-sm font-semibold text-iron-text mt-0.5">{gesture.handsFree}</div>
+          </div>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-xs text-iron-text-muted">Push-to-talk (hold to talk, release to paste)</div>
+            <div className="text-sm font-semibold text-iron-text mt-0.5">{gesture.pushToTalk}</div>
+          </div>
+        </div>
+      </div>
+      <p className="text-[11px] text-iron-text-muted">
+        These gestures work both in the main app and in Forge mode. They're handled by a
+        low-level keyboard listener so they can't be remapped here yet.
+      </p>
+    </div>
+  );
+}
 
 function SectionHeader({ icon: Icon, title, description, children }: { icon: typeof Settings; title: string; description: string; children?: React.ReactNode }) {
   return (

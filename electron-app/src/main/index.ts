@@ -8,6 +8,16 @@ import { registerIpcHandlers } from './ipc-handlers';
 import { debugLog } from './debug-log';
 import { createTray, destroyTray, updateTrayState } from './tray';
 import {
+  isForgeMode,
+  getForgeWindow,
+} from './forge-window';
+import { tryDispatchHotkey, getOwner, clearMainOwner, clearOwner } from './dictation-owner';
+import {
+  startKeyboardListener,
+  stopKeyboardListener,
+  type ForgeKeyEvent,
+} from './keyboard-listener';
+import {
   ensureBundledVoices,
   ensureBundledTFJSModels,
   ensureBundledMoonshineBase,
@@ -138,20 +148,108 @@ function blockAllNetworkRequests(): void {
   });
 }
 
-function registerGlobalHotkey(): void {
-  const hotkey = native.getSetting('hotkey_record') || 'CommandOrControl+Shift+V';
+/**
+ * Wispr-Flow-style hotkey routing.
+ *
+ * The native keyboard listener (uiohook) emits three high-level events:
+ *   - 'push-to-talk-start'  → user is holding Fn (Mac) or Ctrl+Win (Win)
+ *   - 'push-to-talk-end'    → user released the modifier(s)
+ *   - 'hands-free-toggle'   → user tapped Fn+Space or Ctrl+Win+Space
+ *
+ * We forward each as an IPC channel to whichever window owns the active
+ * mode. The owner serialization (`tryDispatchHotkey`) prevents the toggle
+ * variant from triggering twice if the user double-taps mid-dictation.
+ */
+function dispatchForgeKeyEvent(ev: ForgeKeyEvent): void {
+  const forge = isForgeMode();
+  const target: 'forge' | 'main' = forge ? 'forge' : 'main';
 
-  try {
-    globalShortcut.register(hotkey, () => {
-      console.log('[hotkey] Global hotkey pressed');
-      if (mainWindow) {
-        mainWindow.webContents.send('ironmic:hotkey-pressed');
-      }
-    });
-    console.log(`[hotkey] Registered global hotkey: ${hotkey}`);
-  } catch (err) {
-    console.error(`[hotkey] Failed to register hotkey ${hotkey}:`, err);
+  // Owner serialization is required for FORGE because Forge has explicit
+  // PTT-start / PTT-end semantics that need to be paired. For MAIN, the
+  // existing useRecordingStore already has its own actionInProgress guard;
+  // adding owner tracking here would deadlock if main's complete-handshake
+  // ever desyncs (and main doesn't fire `notifyForgeDictationComplete`, so
+  // the owner would never clear). We dispatch directly to main and let
+  // its renderer-side store handle re-entrancy.
+  // PTT-cancel resets the owner immediately so the hands-free-toggle that
+  // arrives right after starts cleanly instead of transitioning into a
+  // 'processing' phase.
+  if (ev.kind === 'push-to-talk-cancel') {
+    clearOwner();
   }
+
+  if (target === 'forge' && ev.kind === 'hands-free-toggle') {
+    const decision = tryDispatchHotkey('forge');
+    if (!decision.dispatch) {
+      console.log(`[forge-keys] hands-free dropped (forge): ${decision.reason}`);
+      return;
+    }
+    console.log(`[forge-keys] hands-free → forge (${decision.phase})`);
+  } else if (target === 'main') {
+    // Belt-and-braces: if owner state was somehow stuck pointing at main
+    // (shouldn't happen, but harmless to clean), reset it so we never wedge.
+    const owner = getOwner();
+    if (owner?.owner === 'main') clearMainOwner();
+    console.log(`[forge-keys] ${ev.kind} → main`);
+  }
+
+  const channel =
+    ev.kind === 'push-to-talk-start'
+      ? 'ironmic:forge-ptt-start'
+      : ev.kind === 'push-to-talk-end'
+        ? 'ironmic:forge-ptt-end'
+        : ev.kind === 'push-to-talk-cancel'
+          ? 'ironmic:forge-ptt-cancel'
+          : 'ironmic:hotkey-pressed';
+
+  if (target === 'forge') {
+    const fw = getForgeWindow();
+    if (fw && !fw.isDestroyed()) {
+      fw.webContents.send(channel);
+    } else if (ev.kind === 'hands-free-toggle' && mainWindow && !mainWindow.isDestroyed()) {
+      // Forge mode flag was on but the bar is gone — graceful fallback.
+      mainWindow.webContents.send(channel);
+    }
+  } else if (mainWindow && !mainWindow.isDestroyed()) {
+    // Main app receives only the hands-free toggle event today. PTT in main
+    // is a future enhancement (would require main's recording store to
+    // expose explicit start/end methods like Forge has).
+    if (ev.kind === 'hands-free-toggle') {
+      mainWindow.webContents.send(channel);
+    }
+  }
+}
+
+function registerGlobalHotkey(): void {
+  const ok = startKeyboardListener(dispatchForgeKeyEvent);
+  if (ok) {
+    console.log(
+      '[hotkey] native listener active — Mac: Fn (hold) / Fn+Space (toggle), Win: Ctrl+Win (hold) / Ctrl+Win+Space (toggle)',
+    );
+  } else {
+    console.warn(
+      '[hotkey] native listener fell back to globalShortcut — push-to-talk disabled, hands-free works via Cmd+Shift+Space (Mac) / Ctrl+Win+Space (Win)',
+    );
+  }
+}
+
+// ── Single-instance lock ─────────────────────────────────────────────────
+// IronMic owns a system-wide hotkey, the Rust audio capture, and global
+// model loaders — running two copies in parallel would race on the mic and
+// double-load 100MB+ of models. If a second launch is attempted (e.g. user
+// double-clicks the dock icon while Forge is active and the main window is
+// hidden), we focus the existing instance and exit.
+const gotInstanceLock = app.requestSingleInstanceLock();
+if (!gotInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    }
+  });
 }
 
 app.whenReady().then(async () => {
@@ -304,6 +402,19 @@ app.whenReady().then(async () => {
           // the legacy name kept for backwards compatibility).
           native.loadWhisperModel();
           console.log('[engine] Active engine model pre-loaded successfully');
+
+          // Push the persisted custom dictionary into the just-loaded engine.
+          // The Rust addon already syncs on every addWord/removeWord, but the
+          // engine is freshly constructed at boot — this seeds it from SQLite
+          // so the user's vocabulary biases the very first dictation. Cheap
+          // (single SELECT + HashSet rebuild). Skip silently on older addon
+          // binaries that lack the export.
+          try {
+            const wordCount = native.refreshTranscriptionDictionary();
+            console.log(`[dictionary] Loaded ${wordCount} custom words into active engine`);
+          } catch (dictErr) {
+            console.warn('[dictionary] refreshTranscriptionDictionary at boot failed:', dictErr);
+          }
           // Log CPU feature flags to DevTools so AVX/AVX512 issues are
           // visible without checking the terminal. E.g.:
           //   [ironmic:debug] whisper.sysinfo {system_info: "AVX = 1 | AVX512 = 0 | ..."}
@@ -353,6 +464,7 @@ app.on('activate', () => {
 });
 
 app.on('will-quit', () => {
+  stopKeyboardListener();
   globalShortcut.unregisterAll();
   destroyTray();
 

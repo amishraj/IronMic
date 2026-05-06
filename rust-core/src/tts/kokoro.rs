@@ -3,7 +3,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use tracing::{info, warn};
+
+/// Windows process-creation flag that suppresses the console window normally
+/// allocated for a console-subsystem child spawned by a GUI parent. Without
+/// it, every espeak-ng invocation flashes a black CMD window on screen.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use crate::error::IronMicError;
 use crate::tts::timestamps::estimate_timestamps;
@@ -266,8 +275,12 @@ fn phonemize_and_tokenize(text: &str, vocab: &HashMap<char, i64>) -> Result<(Vec
 fn phonemize_with_espeak(text: &str) -> Result<String, IronMicError> {
     use std::process::Command;
 
-    let output = Command::new("espeak-ng")
-        .args(["--ipa", "-q", "-v", "en-us", text])
+    let mut cmd = Command::new("espeak-ng");
+    cmd.args(["--ipa", "-q", "-v", "en-us", text]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = cmd
         .output()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {

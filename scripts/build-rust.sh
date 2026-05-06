@@ -28,9 +28,13 @@ fi
 #                   NullEngine for moonshine-* and dictation silently produces
 #                   empty chunks. Pulls in transcribe-rs which reuses the same
 #                   ort/ndarray versions tts already brings in (no conflict).
+#   forge         — Forge mode: synthetic keystroke / paste-anywhere via enigo.
+#                   On Linux requires libxdo-dev at link time (X11). macOS
+#                   needs Accessibility permission at runtime; the renderer
+#                   surfaces a permission panel via isAccessibilityTrusted().
 # LLM intentionally omitted from this build to avoid ggml symbol collision
 # with whisper.cpp; it ships as a separate ironmic-llm binary below.
-cargo build --release --features napi-export,metal,tts,engine-multi
+cargo build --release --features napi-export,metal,tts,engine-multi,forge
 
 # Build the standalone LLM binary (separate process)
 echo ""

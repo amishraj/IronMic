@@ -226,3 +226,63 @@ fn shared_whisper_engine_load_missing() {
     #[cfg(not(feature = "whisper"))]
     assert!(result.is_ok());
 }
+
+// ── Context-aware prompt building (v1.6 dictionary + participant names) ──
+
+#[test]
+fn build_prompt_with_extras_orders_extras_first() {
+    let dict = Dictionary::with_words(vec!["alpha".into(), "beta".into()]);
+    let prompt = dict
+        .build_whisper_prompt_with_extras(&["Alice".into(), "Bob".into()])
+        .unwrap();
+    let alice_pos = prompt.find("Alice").expect("Alice in prompt");
+    let alpha_pos = prompt.find("alpha").expect("alpha in prompt");
+    assert!(
+        alice_pos < alpha_pos,
+        "names should come before dict words: {prompt}"
+    );
+}
+
+#[test]
+fn build_prompt_with_extras_dedupes_case_insensitive() {
+    let dict = Dictionary::with_words(vec!["Alice".into()]);
+    let prompt = dict
+        .build_whisper_prompt_with_extras(&["alice".into(), "Bob".into()])
+        .unwrap();
+    assert_eq!(prompt.matches("lice").count(), 1, "dedup folded: {prompt}");
+    assert!(prompt.contains("Bob"));
+}
+
+#[test]
+fn build_prompt_with_extras_respects_char_cap() {
+    let dict = Dictionary::with_words(
+        (0..50).map(|i| format!("longword{:04}", i)).collect(),
+    );
+    let prompt = dict.build_whisper_prompt_with_extras(&[]).unwrap();
+    assert!(prompt.len() <= 200, "prompt too long: {}", prompt.len());
+}
+
+#[test]
+fn dictionary_replace_words_in_one_lock() {
+    let dict = Dictionary::new();
+    dict.add_word("old1");
+    dict.add_word("old2");
+    dict.replace_words(vec!["new1".into(), "new2".into(), "new3".into()]);
+    let words = dict.list_words();
+    assert_eq!(words, vec!["new1", "new2", "new3"]);
+}
+
+#[test]
+fn build_prompt_empty_extras_and_empty_dict_returns_none() {
+    let dict = Dictionary::new();
+    assert!(dict.build_whisper_prompt_with_extras(&[]).is_none());
+}
+
+#[test]
+fn build_prompt_only_extras_no_dict() {
+    let dict = Dictionary::new();
+    let prompt = dict
+        .build_whisper_prompt_with_extras(&["Charlie".into()])
+        .unwrap();
+    assert!(prompt.contains("Charlie"));
+}

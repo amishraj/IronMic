@@ -54,6 +54,20 @@ impl Dictionary {
         removed
     }
 
+    /// Replace the entire word set in one lock acquisition. Used by
+    /// `engine::replace_active_dictionary` after the N-API layer reads
+    /// the persisted word list from SQLite.
+    pub fn replace_words(&self, words: Vec<String>) {
+        let mut set = self.words.write().unwrap();
+        set.clear();
+        for word in words {
+            let trimmed = word.trim();
+            if !trimmed.is_empty() {
+                set.insert(trimmed.to_string());
+            }
+        }
+    }
+
     /// List all words in the dictionary.
     pub fn list_words(&self) -> Vec<String> {
         let words = self.words.read().unwrap();
@@ -77,18 +91,62 @@ impl Dictionary {
     /// The prompt is a comma-separated list of words, which helps Whisper
     /// understand the expected vocabulary without being too prescriptive.
     pub fn build_whisper_prompt(&self) -> Option<String> {
-        let words = self.words.read().unwrap();
-        if words.is_empty() {
+        self.build_whisper_prompt_with_extras(&[])
+    }
+
+    /// Build an initial prompt that combines the stored dictionary with
+    /// per-call `extra_terms` (e.g. meeting participant names). The merge
+    /// order prioritizes `extra_terms` first, then dictionary words; longer
+    /// terms come earlier within each group; ~200 char cap protects against
+    /// pathological inputs (Whisper's prompt is bounded by token budget).
+    ///
+    /// Returns `None` only when the combined deduped set is empty.
+    pub fn build_whisper_prompt_with_extras(&self, extra_terms: &[String]) -> Option<String> {
+        let dict_words = self.words.read().unwrap();
+        if dict_words.is_empty() && extra_terms.is_empty() {
             return None;
         }
 
-        let mut sorted: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
-        sorted.sort();
+        const PROMPT_CHAR_BUDGET: usize = 200;
 
-        let prompt = sorted.join(", ");
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut ordered: Vec<String> = Vec::new();
+
+        let mut extras_sorted: Vec<&str> =
+            extra_terms.iter().map(|s| s.as_str()).filter(|s| !s.is_empty()).collect();
+        extras_sorted.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+
+        let mut dict_sorted: Vec<&str> = dict_words.iter().map(|s| s.as_str()).collect();
+        dict_sorted.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+
+        for term in extras_sorted.into_iter().chain(dict_sorted.into_iter()) {
+            let key = term.to_lowercase();
+            if seen.insert(key) {
+                ordered.push(term.to_string());
+            }
+        }
+
+        let mut prompt = String::new();
+        for term in &ordered {
+            let sep_len = if prompt.is_empty() { 0 } else { 2 };
+            if prompt.len() + sep_len + term.len() > PROMPT_CHAR_BUDGET {
+                break;
+            }
+            if !prompt.is_empty() {
+                prompt.push_str(", ");
+            }
+            prompt.push_str(term);
+        }
+
+        if prompt.is_empty() {
+            return None;
+        }
+
         info!(
-            word_count = words.len(),
-            "Built Whisper initial prompt from dictionary"
+            word_count = ordered.len(),
+            extras_count = extra_terms.len(),
+            chars = prompt.len(),
+            "Built Whisper initial prompt"
         );
         Some(prompt)
     }
@@ -180,5 +238,53 @@ mod tests {
         assert!(prompt.contains("Kubernetes"));
         assert!(prompt.contains("gRPC"));
         assert!(prompt.contains(", "));
+    }
+
+    #[test]
+    fn build_whisper_prompt_with_extras_orders_extras_first() {
+        let dict = Dictionary::with_words(vec!["alpha".into(), "beta".into()]);
+        let prompt = dict
+            .build_whisper_prompt_with_extras(&["Alice".into(), "Bob".into()])
+            .unwrap();
+        let alice_pos = prompt.find("Alice").unwrap();
+        let alpha_pos = prompt.find("alpha").unwrap();
+        assert!(alice_pos < alpha_pos, "names should come before dict words: {prompt}");
+    }
+
+    #[test]
+    fn build_whisper_prompt_with_extras_dedupes_case_insensitive() {
+        let dict = Dictionary::with_words(vec!["Alice".into()]);
+        let prompt = dict
+            .build_whisper_prompt_with_extras(&["alice".into(), "Bob".into()])
+            .unwrap();
+        let occurrences = prompt.matches("lice").count();
+        assert_eq!(occurrences, 1, "dedup should fold Alice/alice: {prompt}");
+        assert!(prompt.contains("Bob"));
+    }
+
+    #[test]
+    fn build_whisper_prompt_with_extras_respects_char_cap() {
+        let dict = Dictionary::with_words(
+            (0..50).map(|i| format!("longword{:04}", i)).collect(),
+        );
+        let prompt = dict.build_whisper_prompt_with_extras(&[]).unwrap();
+        assert!(prompt.len() <= 200, "prompt exceeded 200 chars: {}", prompt.len());
+    }
+
+    #[test]
+    fn build_whisper_prompt_with_extras_empty_returns_none() {
+        let dict = Dictionary::new();
+        assert!(dict.build_whisper_prompt_with_extras(&[]).is_none());
+    }
+
+    #[test]
+    fn build_whisper_prompt_with_extras_orders_longest_first_within_group() {
+        let dict = Dictionary::new();
+        let prompt = dict
+            .build_whisper_prompt_with_extras(&["Bo".into(), "Alexandra".into(), "Ed".into()])
+            .unwrap();
+        let alex_pos = prompt.find("Alexandra").unwrap();
+        let bo_pos = prompt.find("Bo").unwrap();
+        assert!(alex_pos < bo_pos, "longest first: {prompt}");
     }
 }

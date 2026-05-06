@@ -22,11 +22,9 @@ interface Props {
   session: MeetingSession;
   onDelete: (id: string) => void;
   onOpen?: (id: string) => void;
-  /** Called when user clicks "Share & Collaborate" — opens detail page with collab panel. */
-  onCollaborate?: (id: string) => void;
 }
 
-export function MeetingSessionCard({ session, onDelete, onOpen, onCollaborate }: Props) {
+export function MeetingSessionCard({ session, onDelete, onOpen }: Props) {
   const [expanded, setExpanded] = useState(false);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
 
@@ -154,9 +152,6 @@ export function MeetingSessionCard({ session, onDelete, onOpen, onCollaborate }:
           <ShareMenu
             meetingId={session.id}
             text={session.summary}
-            onCollaborate={
-              onCollaborate ? () => onCollaborate(session.id) : undefined
-            }
           />
           <button
             onClick={(e) => {

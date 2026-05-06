@@ -28,6 +28,11 @@ tts = ["dep:ort", "dep:ndarray"]
 # already links whisper.cpp via the existing `whisper-rs` crate; pulling
 # in a second whisper.cpp would create duplicate symbols.
 engine-multi = ["dep:transcribe-rs"]
+# forge: synthetic keystroke / paste-anywhere support for Forge mode.
+# Pulls in `enigo` for cross-platform input simulation. On Linux this requires
+# libxdo (X11) at link time; document in CLAUDE.md. macOS additionally needs
+# Accessibility permission at runtime — see keystroke::macos.
+forge = ["dep:enigo"]
 
 [[bin]]
 name = "ironmic-llm"
@@ -55,6 +60,7 @@ llama-cpp-2 = { version = "0.1", optional = true }
 ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
 ndarray = { version = "0.17", optional = true }
 transcribe-rs = { version = "0.3", features = ["onnx"], optional = true }
+enigo = { version = "0.6", optional = true }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }

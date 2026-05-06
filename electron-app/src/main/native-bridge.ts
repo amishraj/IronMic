@@ -63,6 +63,8 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     addWord: () => {},
     removeWord: () => {},
     listDictionary: () => [],
+    refreshTranscriptionDictionary: () => 0,
+    transcribeWithContext: async () => '[stub transcription with context]',
     getSetting: (key: string) => {
       const defaults: Record<string, string> = {
         hotkey_record: 'CommandOrControl+Shift+V',
@@ -138,6 +140,16 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     deleteMeetingSession: () => {},
     setMeetingStructuredOutput: () => {},
     setMeetingStructuredOutputJson: () => {},
+    setMeetingParticipants: () => {},
+    addMeetingParticipant: () => {},
+    markMeetingParticipantLeft: () => {},
+    getMeetingParticipants: () => '[]',
+    // 1.6 meeting overhaul stubs
+    addTranscriptSegmentWithRemoteId: (sessionId: string, _label: any, startMs: number, endMs: number, text: string, source: string, remoteId: string) =>
+      JSON.stringify({ id: `stub-${Date.now()}`, session_id: sessionId, speaker_label: null, start_ms: startMs, end_ms: endMs, text, source, participant_id: null, confidence: null, created_at: new Date().toISOString(), remote_segment_id: remoteId }),
+    findLatestLocalSessionForRemote: () => 'null',
+    getMaxMeetingSequence: () => 0,
+    reopenMeetingSession: () => {},
   };
 }
 
@@ -163,6 +175,28 @@ export const native = {
   addWord(word: string): void { this.addon.addWord(word); },
   removeWord(word: string): void { this.addon.removeWord(word); },
   listDictionary(): string[] { return this.addon.listDictionary(); },
+  /**
+   * Reload the persisted dictionary from SQLite into the active transcription
+   * engine. Cheap, idempotent. Older addon binaries lack this export — we
+   * silently no-op so the app stays compatible.
+   */
+  refreshTranscriptionDictionary(): number {
+    if (typeof this.addon.refreshTranscriptionDictionary === 'function') {
+      return this.addon.refreshTranscriptionDictionary() ?? 0;
+    }
+    return 0;
+  },
+  /**
+   * Transcribe with per-call context terms (meeting participant names).
+   * Whisper layers them onto initial_prompt; Moonshine ignores them.
+   * Falls back to plain `transcribe()` on older addon binaries.
+   */
+  transcribeWithContext(audioBuffer: Buffer, terms: string[]): Promise<string> {
+    if (typeof this.addon.transcribeWithContext === 'function') {
+      return this.addon.transcribeWithContext(audioBuffer, JSON.stringify(terms));
+    }
+    return this.addon.transcribe(audioBuffer);
+  },
 
   getSetting(key: string): string | null { return this.addon.getSetting(key); },
   setSetting(key: string, value: string): void { this.addon.setSetting(key, value); },
@@ -276,6 +310,84 @@ export const native = {
       this.addon.setMeetingStructuredOutputJson(id, structuredOutput);
     } else {
       console.warn('[native-bridge] setMeetingStructuredOutput not found in addon — notes will not be persisted to DB');
+    }
+  },
+
+  // ── Meeting participant roster (v1.6) ────────────────────────────────────
+  // Persists historical roster (host + every joiner with leftAt timestamps).
+  // All four exports degrade silently on older addon binaries that predate
+  // the v7 schema migration — the renderer tolerates missing rosters.
+  setMeetingParticipants(sessionId: string, participantsJson: string): void {
+    if (typeof this.addon.setMeetingParticipants === 'function') {
+      this.addon.setMeetingParticipants(sessionId, participantsJson);
+    }
+  },
+  addMeetingParticipant(sessionId: string, participantJson: string): void {
+    if (typeof this.addon.addMeetingParticipant === 'function') {
+      this.addon.addMeetingParticipant(sessionId, participantJson);
+    }
+  },
+  markMeetingParticipantLeft(sessionId: string, participantId: string, leftAt: number): void {
+    if (typeof this.addon.markMeetingParticipantLeft === 'function') {
+      this.addon.markMeetingParticipantLeft(sessionId, participantId, leftAt);
+    }
+  },
+  getMeetingParticipants(sessionId: string): string {
+    if (typeof this.addon.getMeetingParticipants === 'function') {
+      return this.addon.getMeetingParticipants(sessionId);
+    }
+    return '[]';
+  },
+
+  // ── 1.6 meeting overhaul ────────────────────────────────────────────────
+  // Cross-machine segment identity for participant rejoin dedup.
+  // Falls back to the old non-deduping path on older addon binaries (which
+  // means rejoin-after-leave duplicates segments — acceptable degradation
+  // since legacy builds also lack the unique index).
+  addTranscriptSegmentWithRemoteId(
+    sessionId: string,
+    speakerLabel: string | null,
+    startMs: number,
+    endMs: number,
+    text: string,
+    source: string,
+    remoteSegmentId: string,
+  ): string {
+    if (typeof this.addon.addTranscriptSegmentWithRemoteId === 'function') {
+      return this.addon.addTranscriptSegmentWithRemoteId(sessionId, speakerLabel, startMs, endMs, text, source, remoteSegmentId);
+    }
+    if (typeof this.addon.addTranscriptSegment === 'function') {
+      return this.addon.addTranscriptSegment(sessionId, speakerLabel, startMs, endMs, text, source);
+    }
+    return JSON.stringify({ id: `local-${Date.now()}`, session_id: sessionId, speaker_label: speakerLabel, start_ms: startMs, end_ms: endMs, text, source, participant_id: null, confidence: null, created_at: new Date().toISOString() });
+  },
+
+  /** Returns `{ id, ended_at } | null` (already JSON-decoded) for the most
+   *  recent local mirror session linked to a remote (host) session id —
+   *  including ended rows. Used by the participant rejoin flow. */
+  findLatestLocalSessionForRemote(remoteId: string): { id: string; ended_at: string | null } | null {
+    if (typeof this.addon.findLatestLocalSessionForRemote !== 'function') return null;
+    try {
+      const raw = this.addon.findLatestLocalSessionForRemote(remoteId);
+      if (!raw || raw === 'null') return null;
+      return JSON.parse(raw);
+    } catch (err) {
+      console.warn('[native-bridge] findLatestLocalSessionForRemote parse failed:', err);
+      return null;
+    }
+  },
+
+  getMaxMeetingSequence(): number {
+    if (typeof this.addon.getMaxMeetingSequence === 'function') {
+      try { return Number(this.addon.getMaxMeetingSequence()) || 0; }
+      catch { return 0; }
+    }
+    return 0;
+  },
+
+  reopenMeetingSession(id: string): void {
+    if (typeof this.addon.reopenMeetingSession === 'function') {
+      this.addon.reopenMeetingSession(id);
     }
   },
 
