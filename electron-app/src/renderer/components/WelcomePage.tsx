@@ -9,6 +9,7 @@ import { useEntryStore } from '../stores/useEntryStore';
 import { useAiChatStore } from '../stores/useAiChatStore';
 import { useNotesStore } from '../stores/useNotesStore';
 import { TRANSCRIPTION_ENGINES } from '../../shared/constants';
+import { getDictationGesture } from '../../shared/dictation-gesture';
 import micIdleImg from '../assets/mic-idle.png';
 
 interface ModelInfo {
@@ -43,7 +44,13 @@ export function WelcomePage({ onNavigate, onQuickDictate }: WelcomePageProps) {
   // Base means this should normally resolve to true on a fresh install.
   const [hasAnyTranscriptionEngine, setHasAnyTranscriptionEngine] = useState<boolean | null>(null);
   const [loading, setLoading] = useState(true);
-  const [hotkey, setHotkey] = useState('Cmd+Shift+V');
+  // Dictation hotkey is now a low-level gesture (Right Option + Space on Mac,
+  // Ctrl + Win + Space on Windows) handled by main/keyboard-listener.ts. The
+  // legacy `hotkey_record` setting no longer drives behavior — we read the
+  // canonical gesture string from a shared util so this stays in sync with
+  // the actual key listener.
+  const gesture = getDictationGesture();
+  const [hotkey, setHotkey] = useState(gesture.primary);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchPage, setSearchPage] = useState(0);
   const [entryCount, setEntryCount] = useState<number | null>(null);
@@ -74,7 +81,10 @@ export function WelcomePage({ onNavigate, onQuickDictate }: WelcomePageProps) {
       // shouldn't see "Download" — surfacing the .onnx as "downloaded" is the
       // right onboarding signal; Settings handles the rest.
       const ttsDownloaded = ttsReadiness?.modelPresent ?? ttsReadiness?.ready ?? false;
-      if (hk) setHotkey(hk.replace('CommandOrControl', 'Cmd'));
+      // Ignore the legacy `hotkey_record` value — the gesture is now hardcoded
+      // in keyboard-listener.ts. We display via getDictationGesture() so the
+      // home page always matches what actually triggers dictation.
+      void hk;
       setEntryCount(allEntries?.length ?? 0);
 
       const files = status?.files || {};
@@ -222,7 +232,7 @@ export function WelcomePage({ onNavigate, onQuickDictate }: WelcomePageProps) {
               <StepCard
                 step={1}
                 title="Try your first dictation"
-                description={`Press ${hotkey} from anywhere on your computer, speak, then press it again. Your speech is transcribed and copied to your clipboard — ready to paste.`}
+                description={`${gesture.description} Your speech is transcribed and dropped at your cursor.`}
                 action={engineReady ? { label: 'Open Dictate', onClick: onQuickDictate } : undefined}
                 done={hasContent}
                 disabled={!engineReady}
@@ -382,7 +392,7 @@ export function WelcomePage({ onNavigate, onQuickDictate }: WelcomePageProps) {
               {isFirstTime ? 'Features' : 'Quick Start'}
             </h2>
             <div className="grid grid-cols-2 gap-3">
-              <QuickAction icon={Mic} title="Dictate" description={`Press ${hotkey} anywhere to record`} onClick={onQuickDictate} color="accent" disabled={!engineReady} />
+              <QuickAction icon={Mic} title="Dictate" description={`${gesture.handsFree} or hold ${gesture.pushToTalk.replace('Hold ', '')}`} onClick={onQuickDictate} color="accent" disabled={!engineReady} />
               <QuickAction icon={Sparkles} title="AI Assistant" description="Chat with a local AI" onClick={() => onNavigate('ai')} color="purple" />
               <QuickAction icon={Volume2} title="Listen" description="Hear text read aloud" onClick={() => onNavigate('listen')} color="emerald" disabled={!models.tts?.downloaded} />
               <QuickAction icon={Brain} title="Notes" description="Organize thoughts in notebooks" onClick={() => onNavigate('notes')} color="amber" />

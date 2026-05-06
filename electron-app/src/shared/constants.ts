@@ -342,6 +342,29 @@ export const IPC_CHANNELS = {
 
   // Debug logs (main → renderer push, gated on debug_audio_logging setting)
   DEBUG_LOG: 'ironmic:debug-log',
+
+  // ── Forge mode (floating-bar dictate-anywhere) ──
+  // Toggle the bar window in/out. enterForge hides the main window, creates
+  // the always-on-top non-focusable bar; exitForge tears the bar down and
+  // restores the main window. Hotkey routing follows `forgeMode` in main.
+  FORGE_ENTER: 'ironmic:enter-forge',
+  FORGE_EXIT: 'ironmic:exit-forge',
+
+  // Synthetic keystroke / paste-anywhere (Rust enigo).
+  FORGE_PASTE_TEXT: 'ironmic:forge-paste-text',
+  FORGE_TYPE_TEXT: 'ironmic:forge-type-text',
+
+  // macOS Accessibility check + deep-link to System Settings.
+  FORGE_CHECK_ACCESSIBILITY: 'ironmic:forge-check-accessibility',
+  FORGE_OPEN_ACCESSIBILITY_PREFS: 'ironmic:forge-open-accessibility-prefs',
+
+  // Forge-specific polish path. Honors AND of (polish_allow_cloud,
+  // forge_polish_allow_cloud) — never looser than the global setting.
+  FORGE_POLISH_TEXT: 'ironmic:forge-polish-text',
+
+  // Renderer→main handshake fired when a Forge dictation finishes (ok or
+  // error) so main can clear `dictationOwner` and accept the next hotkey.
+  FORGE_DICTATION_COMPLETE: 'ironmic:forge-dictation-complete',
 } as const;
 
 // ── Model hosting on GitHub Releases ──

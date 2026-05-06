@@ -13,12 +13,20 @@
 import { Tray, Menu, nativeImage, app, BrowserWindow } from 'electron';
 import path from 'path';
 import type { PipelineState } from '../renderer/types';
+import { isForgeMode, enterForgeMode, exitForgeMode } from './forge-window';
 
 let tray: Tray | null = null;
 let quitHandler: (() => void) | null = null;
 let currentState: PipelineState = 'idle';
 
 export type QuickAction = 'start-dictation' | 'start-meeting';
+
+/** Re-render the tray menu. Exported so forge-window.ts can refresh the
+ *  "Switch to / Exit" toggle when the user enters or exits Forge mode via
+ *  routes other than the tray (sidebar button, bar ✕). */
+export function refreshTrayMenu(): void {
+  rebuildMenu();
+}
 
 function focusMainWindow(): BrowserWindow | null {
   const windows = BrowserWindow.getAllWindows();
@@ -80,20 +88,45 @@ export function updateTrayState(state: PipelineState): void {
 function rebuildMenu(): void {
   if (!tray) return;
   const stateLabel = currentState.charAt(0).toUpperCase() + currentState.slice(1);
+  const inForge = isForgeMode();
 
   const menu = Menu.buildFromTemplate([
-    { label: `IronMic — ${stateLabel}`, enabled: false },
+    { label: `IronMic — ${stateLabel}${inForge ? ' (Forge)' : ''}`, enabled: false },
     { type: 'separator' },
     {
       label: 'Quick Start Dictation',
       accelerator: 'CommandOrControl+Shift+V',
       click: () => sendQuickAction('start-dictation'),
+      enabled: !inForge,
     },
     {
       label: 'Quick Start Meeting',
       accelerator: 'CommandOrControl+Shift+M',
       click: () => sendQuickAction('start-meeting'),
+      enabled: !inForge,
     },
+    { type: 'separator' },
+    inForge
+      ? {
+          label: 'Exit Forge mode',
+          click: () => {
+            const main = BrowserWindow.getAllWindows().find(
+              (w) => !w.isDestroyed() && w.getTitle() === 'IronMic',
+            );
+            exitForgeMode(main || null);
+            rebuildMenu();
+          },
+        }
+      : {
+          label: 'Switch to Forge mode',
+          click: () => {
+            const main = BrowserWindow.getAllWindows().find(
+              (w) => !w.isDestroyed() && w.getTitle() === 'IronMic',
+            );
+            enterForgeMode(main || null);
+            rebuildMenu();
+          },
+        },
     { type: 'separator' },
     { label: 'Open IronMic', click: () => { focusMainWindow(); } },
     { type: 'separator' },

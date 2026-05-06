@@ -72,5 +72,13 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     await window.ironmic.setSetting('theme', theme);
     localStorage.setItem('ironmic-theme', theme);
     set({ theme });
+    // Broadcast to all other windows (Forge bar, secondary windows). The
+    // main process re-emits as 'ironmic:theme-changed' so they re-evaluate
+    // light/dark and toggle the `dark` class atomically.
+    try {
+      await (window as any).ironmic?.broadcastTheme?.(theme);
+    } catch (err) {
+      console.warn('[settings] broadcastTheme failed:', err);
+    }
   },
 }));

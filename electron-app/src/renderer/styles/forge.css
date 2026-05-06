@@ -1,0 +1,324 @@
+/* Forge bar styles. Reuses globals.css theme variables; adds the
+   floating-bar chrome (transparent body, drag region, pill shape). */
+
+html, body, #root {
+  background: transparent !important;
+  margin: 0;
+  padding: 0;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Tight shadow margin — just enough to keep the CSS box-shadow from being
+   clipped by the window edges. The bar fills this via flex below. */
+#root {
+  display: flex;
+  align-items: stretch;
+  justify-content: stretch;
+  padding: 4px;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: rgb(var(--iron-text));
+}
+
+/* Drag region for moving the frameless bar. The bar root is draggable; any
+   interactive child opts back out via .forge-no-drag. */
+.forge-drag {
+  -webkit-app-region: drag;
+}
+.forge-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* The bar shell. Sized to fit the BrowserWindow minus the #root shadow
+   padding. The CSS box-shadow replaces Electron's native shadow which we
+   disable to avoid the rectangular halo around the rounded corners. */
+.forge-bar {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px;
+  gap: 6px;
+  border-radius: 14px;
+  background: rgb(var(--iron-surface));
+  border: 1px solid rgb(var(--iron-border) / var(--iron-border-alpha));
+  /* Single soft shadow — natural, doesn't dominate. Matches the light
+     elevation style used elsewhere in IronMic (cards, popovers). */
+  box-shadow: 0 6px 18px -8px rgba(0, 0, 0, 0.18);
+  box-sizing: border-box;
+  overflow: hidden;
+  transition:
+    height 180ms ease,
+    background-color 180ms ease,
+    border-color 180ms ease;
+}
+.dark .forge-bar {
+  box-shadow: 0 6px 22px -6px rgba(0, 0, 0, 0.55);
+}
+
+/* Top row inside the bar — mic + status + buttons. */
+.forge-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+/* Live transcript preview shown while recording. Two emphasis levels:
+   committed (high) for finalized words, draft (medium) for live hypothesis.
+   Contrast values are tuned per Apple HIG / Material Design dark-theme
+   guidance: high-emphasis ≈ 87% white, medium-emphasis ≈ 60% white in
+   dark mode; high ≈ 87% black, medium ≈ 56% black in light mode. */
+.forge-preview {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 4px 6px 2px 46px; /* indent under the mic icon */
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--iron-border) / 0.25) transparent;
+}
+.forge-preview::-webkit-scrollbar { width: 4px; }
+.forge-preview::-webkit-scrollbar-thumb {
+  background: rgb(var(--iron-border) / 0.25);
+  border-radius: 2px;
+}
+
+/* Light mode */
+.forge-preview-committed {
+  color: rgba(0, 0, 0, 0.86);  /* high-emphasis */
+}
+.forge-preview-draft {
+  color: rgba(0, 0, 0, 0.55);  /* medium-emphasis */
+  font-style: italic;
+}
+.forge-preview-placeholder {
+  color: rgba(0, 0, 0, 0.40);
+}
+
+/* Dark mode — brighter, more readable on dark backgrounds */
+.dark .forge-preview-committed {
+  color: rgba(255, 255, 255, 0.92);  /* near-white for finalized words */
+}
+.dark .forge-preview-draft {
+  color: rgba(255, 255, 255, 0.65);  /* clearly visible but distinguishable */
+  font-style: italic;
+}
+.dark .forge-preview-placeholder {
+  color: rgba(255, 255, 255, 0.45);
+}
+
+/* In-bar toast — auto-copy confirmations, success/error after stop. */
+.forge-toast {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  margin: 0 -2px -2px -2px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  animation: forge-toast-in 160ms ease-out;
+}
+.forge-toast-success {
+  background: rgb(var(--iron-success) / 0.12);
+  color: rgb(var(--iron-success));
+}
+.forge-toast-info {
+  background: rgb(var(--iron-accent) / 0.10);
+  color: rgb(var(--iron-accent));
+}
+.forge-toast-error {
+  background: rgb(var(--iron-danger) / 0.12);
+  color: rgb(var(--iron-danger));
+}
+@keyframes forge-toast-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Mic / status pill — also a real button now (hands-free trigger). */
+.forge-mic-button {
+  flex-shrink: 0;
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(var(--iron-accent) / 0.10);
+  color: rgb(var(--iron-accent));
+  border: 0;
+  cursor: pointer;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease,
+    transform 120ms ease,
+    box-shadow 200ms ease;
+}
+.forge-mic-button:hover {
+  background: rgb(var(--iron-accent) / 0.18);
+  transform: scale(1.04);
+}
+.forge-mic-button:active {
+  transform: scale(0.96);
+}
+.forge-mic-button.recording {
+  background: rgb(var(--iron-danger) / 0.14);
+  color: rgb(var(--iron-danger));
+  animation: forge-pulse 1.4s ease-in-out infinite;
+}
+.forge-mic-button.processing {
+  background: rgb(var(--iron-warning) / 0.14);
+  color: rgb(var(--iron-warning));
+  animation: none;
+}
+
+/* Mode badge — "PTT" / "Hands-free" pill next to status label */
+.forge-mode-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: rgb(var(--iron-accent) / 0.14);
+  color: rgb(var(--iron-accent));
+  vertical-align: middle;
+}
+
+@keyframes forge-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(var(--iron-danger) / 0.35); }
+  50%      { box-shadow: 0 0 0 8px rgb(var(--iron-danger) / 0); }
+}
+
+/* Status text + level meter region */
+.forge-status {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.forge-status-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: rgb(var(--iron-text));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.forge-status-hint {
+  font-size: 11px;
+  color: rgb(var(--iron-text-muted));
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* When the bar shows an error at idle, allow the hint to wrap so the user
+   actually sees the underlying cause. The bar height adapts via .error class. */
+.forge-bar.error .forge-status-hint {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  font-size: 11px;
+  line-height: 1.35;
+  color: rgb(var(--iron-danger));
+  max-height: 80px;
+  overflow-y: auto;
+}
+
+/* Right-side icon buttons (settings, close). */
+.forge-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  color: rgb(var(--iron-text-secondary));
+  border: 0;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+.forge-btn:hover {
+  background: rgb(var(--iron-surface-hover));
+  color: rgb(var(--iron-text));
+}
+.forge-btn:active {
+  background: rgb(var(--iron-surface-active));
+}
+/* Auto-paste toggle states. ON = accent color (active feature), OFF = muted. */
+.forge-btn.on {
+  background: rgb(var(--iron-accent) / 0.10);
+  color: rgb(var(--iron-accent));
+}
+.forge-btn.on:hover {
+  background: rgb(var(--iron-accent) / 0.18);
+}
+.forge-btn.off {
+  color: rgb(var(--iron-text-muted));
+  background: transparent;
+}
+.forge-btn.off:hover {
+  background: rgb(var(--iron-surface-hover));
+  color: rgb(var(--iron-text-secondary));
+}
+
+/* Permission panel — shown on macOS when Accessibility is not granted. */
+.forge-perm {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: rgb(var(--iron-surface));
+  border: 1px solid rgb(var(--iron-warning) / 0.4);
+  box-shadow: var(--iron-shadow-depth-lg);
+  box-sizing: border-box;
+}
+.forge-perm-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: rgb(var(--iron-warning));
+}
+.forge-perm-body {
+  font-size: 11px;
+  color: rgb(var(--iron-text-secondary));
+  line-height: 1.35;
+}
+.forge-perm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+.forge-perm-action {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: rgb(var(--iron-accent));
+  color: white;
+  border: 0;
+  cursor: pointer;
+}
+.forge-perm-action.secondary {
+  background: rgb(var(--iron-surface-hover));
+  color: rgb(var(--iron-text));
+}

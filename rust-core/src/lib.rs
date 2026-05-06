@@ -3,6 +3,8 @@ pub mod clipboard;
 pub mod error;
 pub mod export;
 pub mod hotkey;
+#[cfg(feature = "forge")]
+pub mod keystroke;
 pub mod llm;
 pub mod storage;
 pub mod transcription;
@@ -506,6 +508,7 @@ mod napi_exports {
             "metal": cfg!(feature = "metal"),
             "llm": cfg!(feature = "llm"),
             "tts": cfg!(feature = "tts"),
+            "forge": cfg!(feature = "forge"),
             "platform": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
         });
@@ -950,6 +953,36 @@ mod napi_exports {
     #[napi]
     pub fn copy_to_clipboard(text: String) -> napi::Result<()> {
         crate::clipboard::manager::copy_to_clipboard(&text).map_err(Into::into)
+    }
+
+    // ── Forge keystroke / paste-anywhere N-API exports ──
+    //
+    // Compiled only when the `forge` feature is enabled (pulls in `enigo`).
+    // The renderer should feature-detect via `nativeFeatures()` before
+    // calling, so older addon binaries built without `forge` degrade
+    // gracefully with a clear error rather than crashing the IPC layer.
+    #[cfg(feature = "forge")]
+    #[napi]
+    pub fn paste_text(text: String, restore_clipboard: bool) -> napi::Result<()> {
+        crate::keystroke::paste_text(&text, restore_clipboard)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[cfg(feature = "forge")]
+    #[napi]
+    pub fn type_text(text: String) -> napi::Result<()> {
+        crate::keystroke::type_text(&text)
+            .map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    /// macOS: returns whether the process holds Accessibility permission.
+    /// Other platforms: always `true`. Non-prompting — safe to call on every
+    /// Forge dictation. To trigger the system prompt, the renderer opens
+    /// System Settings via `shell.openExternal`.
+    #[cfg(feature = "forge")]
+    #[napi]
+    pub fn is_accessibility_trusted() -> bool {
+        crate::keystroke::is_accessibility_trusted()
     }
 
     // ── Hotkey & Pipeline N-API exports ──

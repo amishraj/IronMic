@@ -476,6 +476,81 @@ const api = {
     ipcRenderer.on('ironmic:whisper-load-failed', handler);
     return () => ipcRenderer.removeListener('ironmic:whisper-load-failed', handler);
   },
+
+  // ── Forge mode ──
+  // The Forge bar is a separate BrowserWindow. Both windows load this same
+  // preload, so the API surface is identical — what differs is which page
+  // the renderer mounts (Layout vs. ForgeApp). The main window invokes
+  // enterForge from a sidebar/tray button; the Forge window invokes
+  // exitForge from its ✕ button.
+  enterForge: () => ipcRenderer.invoke('ironmic:enter-forge'),
+  exitForge: () => ipcRenderer.invoke('ironmic:exit-forge'),
+
+  /** Paste `text` at the OS keyboard cursor (whatever app is focused).
+   *  When `restoreClipboard` is true, the prior clipboard text (if any) is
+   *  restored ~500ms after paste — text only, not images/files/HTML. */
+  pasteText: (text: string, restoreClipboard: boolean) =>
+    ipcRenderer.invoke('ironmic:forge-paste-text', text, restoreClipboard),
+
+  /** Type `text` character-by-character at the OS keyboard cursor. Slower
+   *  than paste; for use in apps that intercept Cmd/Ctrl+V. */
+  typeText: (text: string) => ipcRenderer.invoke('ironmic:forge-type-text', text),
+
+  /** macOS: returns whether IronMic has Accessibility permission.
+   *  Other platforms: returns true. Non-prompting. */
+  isAccessibilityTrusted: () => ipcRenderer.invoke('ironmic:forge-check-accessibility'),
+
+  /** Open System Settings → Privacy & Security → Accessibility (macOS).
+   *  No-op on other platforms. */
+  openAccessibilityPrefs: () =>
+    ipcRenderer.invoke('ironmic:forge-open-accessibility-prefs'),
+
+  /** Forge-specific polish path. Honors the AND of (polish_allow_cloud,
+   *  forge_polish_allow_cloud) — global setting is the upper bound. */
+  forgePolishText: (rawText: string) =>
+    ipcRenderer.invoke('ironmic:forge-polish-text', rawText),
+
+  /** Renderer→main handshake fired when a Forge dictation finishes (success
+   *  or error) so main can clear the dictation owner record and accept the
+   *  next hotkey. Fire-and-forget. */
+  notifyForgeDictationComplete: (error?: string | null) =>
+    ipcRenderer.send('ironmic:forge-dictation-complete', error ?? null),
+
+  /** Switch the Forge window between the compact bar (56 px) and the
+   *  taller permission-panel size (~130 px). The bar is fixed-size so the
+   *  AX prompt's action buttons don't fit inside it without resizing. */
+  forgeSetWindowMode: (mode: 'bar' | 'permission' | 'compact' | 'expanded') =>
+    ipcRenderer.invoke('ironmic:forge-set-window-mode', mode),
+
+  /** Push-to-talk start (Fn / Ctrl+Win pressed, past the chord-grace window). */
+  onForgePushToTalkStart: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-start', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-start', callback);
+  },
+  /** Push-to-talk end (modifier(s) released — stop dictation, paste). */
+  onForgePushToTalkEnd: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-end', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-end', callback);
+  },
+  /** Push-to-talk aborted (user added Space → chord). Roll back without paste. */
+  onForgePushToTalkCancel: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-cancel', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-cancel', callback);
+  },
+
+  /** Broadcast a theme change to all windows. Called from useSettingsStore
+   *  whenever the user picks light/dark/system. Each window's onThemeChanged
+   *  listener applies the change. */
+  broadcastTheme: (theme: 'light' | 'dark' | 'system') =>
+    ipcRenderer.invoke('ironmic:broadcast-theme', theme),
+
+  /** Listen for theme changes from any window. Forge bar uses this to stay
+   *  in sync with the main IronMic theme picker. */
+  onThemeChanged: (callback: (theme: 'light' | 'dark' | 'system') => void) => {
+    const handler = (_event: any, theme: 'light' | 'dark' | 'system') => callback(theme);
+    ipcRenderer.on('ironmic:theme-changed', handler);
+    return () => ipcRenderer.removeListener('ironmic:theme-changed', handler);
+  },
 };
 
 contextBridge.exposeInMainWorld('ironmic', api);
