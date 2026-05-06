@@ -14,13 +14,13 @@ jobs:
         include:
           - os: macos-latest
             rust-target: aarch64-apple-darwin
-            cargo-features: '--features metal,tts,engine-multi'
+            cargo-features: '--features metal,tts,engine-multi,forge'
           - os: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
-            cargo-features: '--features whisper,tts,engine-multi'
+            cargo-features: '--features whisper,tts,engine-multi,forge'
           - os: windows-latest
             rust-target: x86_64-pc-windows-msvc
-            cargo-features: '--features whisper,tts,engine-multi'
+            cargo-features: '--features whisper,tts,engine-multi,forge'
     steps:
       - uses: actions/checkout@v4
 
@@ -29,7 +29,22 @@ jobs:
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+        run: |
+          sudo apt-get update
+          # Audio (cpal/ALSA) + X11 display (uiohook-napi keyboard hook)
+          # uiohook builds libuiohook from source via node-gyp and requires:
+          #   libx11-dev    — X11/keysym.h, Xlib headers
+          #   libxtst-dev   — XTest extension (synthetic key/mouse events)
+          #   libxinerama-dev — multi-monitor support
+          #   libxrandr-dev — screen resolution queries
+          # Without these the @electron/rebuild step fails with
+          # "fatal error: X11/keysym.h: No such file or directory".
+          sudo apt-get install -y \
+            libasound2-dev \
+            libx11-dev \
+            libxtst-dev \
+            libxinerama-dev \
+            libxrandr-dev
 
       - name: Build Rust addon
         shell: bash
