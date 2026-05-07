@@ -221,37 +221,50 @@ Chrome address bar, VS Code, native Notes, etc.).
 2. Main IronMic window hides; a small always-on-top, **non-focusable** bar
    appears (top-right by default). Because the bar is non-focusable, the
    user's target app keeps the keyboard caret.
-3. User presses the same global hotkey → bar shows "Listening…", same Rust
-   audio capture, same Moonshine STT, same dictionary correction.
-4. Optional `forge_polish_enabled` LLM polish (default off — latency).
-5. **`paste_text` (Rust + `enigo`)** writes the transcript to the clipboard
-   and simulates `Cmd+V` / `Ctrl+V`. After ~500ms the prior clipboard text
-   is restored (token-cancellable so back-to-back dictations don't race).
-6. **No SQLite save by default** (`forge_persist_history = 'false'`).
-7. Audio buffer is zeroed and dropped, identical to Flow 1.
+3. **Push-to-talk** — Hold ⌥ Option (either key, macOS) or Ctrl+Win (Windows).
+   **Hands-free toggle** — ⌥+Space (macOS) / Ctrl+Win+Space (Windows). An 80 ms
+   chord-grace window disambiguates tap vs. hold.
+4. Bar shows "Listening…" — same Rust audio capture, same Moonshine STT.
+   Dictionary correction is applied; LLM polish is optional (default off).
+5. Live hypothesis streams into the bar in italic; committed words render at
+   full contrast. Auto-copy at 10/30/60/120/240/500-word milestones.
+6. **Platform-native paste** — macOS: `osascript "System Events keystroke v
+   using command down"` (reliable modifier timing); Windows: `WScript.Shell
+   .SendKeys("^v")`; Linux / fallback: Rust `enigo`. After ~500 ms the prior
+   clipboard text is restored (token-cancellable, text-only).
+7. **No SQLite save by default** (`forge_persist_history = 'false'`).
+8. Audio buffer is zeroed and dropped, identical to Flow 1.
 
 Architecture details:
 - **Separate Vite entry** — `forge.html` + `forge-main.tsx` ship as their
-  own ~2 KB-gz bundle. No TipTap, no charts, no AI chat in the bar.
+  own ~3.66 KB-gz bundle. No TipTap, no charts, no AI chat in the bar.
 - **Single Rust engine** — both windows share `CAPTURE_ENGINE` /
   `WHISPER_ENGINE`; no duplicate audio capture or model load.
+- **Kernel-level keyboard listener** (`keyboard-listener.ts`) — uses
+  `uiohook-napi` for gestures Electron's `globalShortcut` cannot express
+  (held modifiers, Fn key). `syncModifiersFromMask()` on every event
+  self-corrects missed key-ups. Falls back to `globalShortcut` (hands-free
+  only) when the `uiohook` prebuild is missing for the current Electron ABI.
 - **Mode-aware hotkey dispatch** — main process tracks `forgeMode` and a
   `dictationOwner: { owner, phase } | null` record (see
   [main/dictation-owner.ts](electron-app/src/main/dictation-owner.ts)).
-  Hotkey routes to the active window; second-press from same owner is the
-  recording → processing transition; cross-owner presses are rejected.
-- **macOS Accessibility** — `enigo` posts synthetic events via
-  `CGEventPost`, which requires the host process to be trusted in
-  System Settings → Privacy & Security → Accessibility. The Forge bar
-  preflight-checks via `AXIsProcessTrusted()` and shows a permission
-  panel deep-linking to System Settings if trust is missing.
-- **Cloud polish in Forge** — gated by the AND of `polish_allow_cloud`
-  AND `forge_polish_allow_cloud`. The global setting is the upper bound;
-  Forge can be stricter than main but never looser.
+  Hotkey routes to the active window; cross-owner presses are rejected.
+- **macOS Accessibility** — Forge preflight-checks via
+  `systemPreferences.isTrustedAccessibilityClient(false)` (live, not the
+  stale Rust `AXIsProcessTrusted()`) and shows a permission panel deep-
+  linking to System Settings → Accessibility if trust is missing.
+- **Forge window** — `focusable: false`, `type: 'panel'` on macOS (floats
+  above fullscreen apps), `alwaysOnTop: true`. Three height states: compact
+  (64 px idle), expanded (170 px recording), permission (150 px AX prompt).
+  Height transitions use `setBounds()` (not `setSize()`) so they work on
+  Windows regardless of `resizable: false`.
+- **Theme** — resolved in main process via `nativeTheme` + SQLite setting,
+  passed as `?theme=dark|light` query param for zero-flicker first paint.
+- **Cloud polish in Forge** — gated by AND of `polish_allow_cloud` AND
+  `forge_polish_allow_cloud`. The global setting is the upper bound.
 - **Clipboard restore is text only.** `arboard` does not preserve images,
   files, HTML, or rich formats. If the user had non-text on the clipboard
-  before dictating, restore is skipped and the dictated transcript stays
-  on the clipboard until the user's next copy.
+  before dictating, restore is skipped.
 
 Forge settings (all in the `settings` table; UI lives in main app's Settings):
 - `forge_persist_history` — default `'false'`. Save Forge dictations.
@@ -265,8 +278,30 @@ Forge settings (all in the `settings` table; UI lives in main app's Settings):
 Build: requires `--features forge` in the Rust core build (already in
 [scripts/build-rust.sh](scripts/build-rust.sh) and
 [scripts/build-rust.ps1](scripts/build-rust.ps1)). Linux X11 needs
-`libxdo-dev` at link time. Wayland keystroke posting is partial in
+`libxt-dev` at link time. Wayland keystroke posting is partial in
 `enigo` — Forge surfaces a clear error and is best supported on X11.
+
+### Flow 2c: AI Chat Voice Input
+The mic button inside the AI Assistant chat panel uses the same streaming
+dictation path as Forge and Notes.
+
+1. User clicks the mic button in the AI Chat panel.
+2. `dictationStreamStart({ source: 'ai-chat' })` starts Moonshine streaming.
+3. A live grey-italic draft overlays the textarea showing the in-flight
+   hypothesis. Committed words render at full contrast over transparent
+   textarea text (same inline-overlay UX as Notes' `DraftHypothesisExtension`).
+4. On stop, final text is committed to the textarea for the user to review and
+   edit before sending. No auto-send.
+5. **No LLM polish, no dictionary correction** — AI Chat intentionally skips
+   `sanitizeTranscribedText` and `correctTranscript` so the user sees raw
+   Moonshine output and can type corrections naturally.
+6. **No entry persisted** — AI Chat dictations do not create SQLite entries.
+7. Source-tagged IPC events (`source: 'ai-chat'`) mean Notes and Forge
+   listeners filter them out — cross-surface state bleed is impossible.
+
+Key implementation files:
+- [electron-app/src/main/dictation-streamer.ts](electron-app/src/main/dictation-streamer.ts) — carries `source` through all chunk/draft/idle events; `finalizeNativeState` emits the source on the final idle event before clearing it
+- [electron-app/src/renderer/components/AIChat.tsx](electron-app/src/renderer/components/AIChat.tsx) — inline overlay (hidden sizer mirror + absolute draft span) that auto-grows the textarea
 
 ### Flow 3: Browse History (Timeline)
 1. User toggles to Timeline view
@@ -449,12 +484,20 @@ IronMic/
 │   │   │   ├── index.ts           # App entry, window creation, tray setup
 │   │   │   ├── ipc-handlers.ts    # IPC handlers that bridge to Rust native addon
 │   │   │   ├── native-bridge.ts   # Loads and wraps the napi-rs Rust addon
-│   │   │   └── tray.ts            # System tray icon and menu
+│   │   │   ├── tray.ts            # System tray icon and menu
+│   │   │   ├── forge-window.ts    # Forge bar window lifecycle + height state machine
+│   │   │   ├── keyboard-listener.ts # uiohook-napi push-to-talk + hands-free chords
+│   │   │   ├── dictation-owner.ts # Serialises active dictation owner across windows
+│   │   │   └── dictation-streamer.ts # Source-tagged streaming IPC events
+│   │   │
+│   │   ├── forge/                 # Forge bar micro-bundle (separate Vite entry)
+│   │   │   ├── forge.html
+│   │   │   └── forge-main.tsx     # Forge bar React root (~3.66 KB gz)
 │   │   │
 │   │   ├── preload/
 │   │   │   └── index.ts           # contextBridge exposing typed API to renderer
 │   │   │
-│   │   ├── renderer/              # React app
+│   │   ├── renderer/              # React app (main window)
 │   │   │   ├── App.tsx            # Root component, view router
 │   │   │   ├── main.tsx           # React entry point
 │   │   │   ├── index.html
@@ -464,6 +507,8 @@ IronMic/
 │   │   │   │   ├── NoteEditor.tsx         # TipTap rich text editor for active note
 │   │   │   │   ├── Timeline.tsx           # Card feed of all dictation entries
 │   │   │   │   ├── EntryCard.tsx          # Single entry in timeline view
+│   │   │   │   ├── ForgeBar.tsx           # Forge floating bar UI component
+│   │   │   │   ├── AIChat.tsx             # AI assistant chat panel with voice input
 │   │   │   │   ├── RecordingIndicator.tsx # Visual mic status (idle/recording/processing)
 │   │   │   │   ├── SearchBar.tsx          # Full-text search input
 │   │   │   │   ├── ViewToggle.tsx         # Switch between editor and timeline
@@ -475,6 +520,7 @@ IronMic/
 │   │   │   ├── stores/
 │   │   │   │   ├── useEntryStore.ts       # Zustand store for entries
 │   │   │   │   ├── useRecordingStore.ts   # Zustand store for recording state
+│   │   │   │   ├── useForgeStore.ts       # Forge recording + paste state machine
 │   │   │   │   └── useSettingsStore.ts    # Zustand store for settings
 │   │   │   │
 │   │   │   ├── hooks/

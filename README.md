@@ -29,9 +29,24 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 ### Core Dictation
 - **Voice-to-clipboard** — Press a global hotkey, speak, press again. Polished text lands in your clipboard, ready to paste anywhere.
 - **Voice-to-note** — Dictate directly into a rich text editor (TipTap/ProseMirror) with formatting, headings, lists, code blocks, and more.
-- **Whisper large-v3-turbo** — State-of-the-art local speech recognition with GPU acceleration (Metal on macOS).
+- **Moonshine Base (default)** — Ships bundled with the installer (~146 MB). Transcription starts on first launch — no download required. 16× faster than Whisper Tiny on short speech with better WER.
+- **Whisper large-v3-turbo** — State-of-the-art local speech recognition for multilingual or high-accuracy use cases. Downloadable from Settings.
 - **LLM text cleanup** — A local Mistral 7B model removes filler words, fixes grammar, and preserves your meaning. Toggleable per-entry.
 - **Custom dictionary** — Add domain-specific terms, names, and jargon to improve transcription accuracy.
+- **Streaming transcription** — Partial tokens stream into the editor in real-time as you speak. No waiting for silence.
+
+### Forge Mode — Dictate Into Any App <sup>NEW in 1.7.0</sup>
+
+IronMic Forge is a Wispr-Flow-style floating bar that lets you dictate text directly into **any desktop application** — Outlook, Teams, Chrome, VS Code, terminal, native Notes, spreadsheets — without switching windows.
+
+- **Always-on-top, non-focusable** — Target app keeps the keyboard caret. Your text appears exactly where the cursor is.
+- **Push-to-talk** — Hold ⌥ Option (macOS) or Ctrl+Win (Windows) to record. Release to transcribe and paste instantly.
+- **Hands-free toggle** — ⌥+Space (macOS) / Ctrl+Win+Space (Windows) toggles recording on/off.
+- **Live transcript preview** — Committed words appear at full contrast; the live hypothesis streams in italic at reduced opacity — same visual language as Apple's dictation widget.
+- **Platform-native paste** — macOS uses `System Events keystroke v`; Windows uses `WScript.Shell.SendKeys`. Fallback to Rust `enigo` for Linux and edge cases.
+- **Token-cancellable clipboard restore** — Prior clipboard content is restored ~500 ms after paste (text-only).
+- **Micro-bundle** — The Forge window is a separate Vite entry (~3.66 KB gz) with no TipTap, no charts, no AI chat — keeps the bar instant to open.
+- **Shared Rust engine** — Forge and the main window share the same audio capture and Moonshine/Whisper model. No duplicate loading.
 
 ### Text-to-Speech Read-Back
 - **Kokoro 82M TTS** — Hear your dictations read back through a local neural voice engine.
@@ -44,6 +59,7 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 - **Built-in AI chat** — Wrapper around GitHub Copilot CLI and Claude Code CLI.
 - **Context-aware** — Ask questions, refine text, brainstorm — powered by your existing AI subscriptions.
 - **Streaming responses** — Real-time token-by-token output.
+- **Voice dictation in chat** — The mic button in the chat panel uses the same streaming Moonshine path as Forge and Notes. Raw transcript streams directly into the input field (no LLM polish, no dictionary correction) so you always review before sending.
 - **Privacy-first** — The AI feature is off by default. When enabled, it uses your own CLI tools and credentials.
 
 ### On-Device Machine Learning <sup>NEW in 1.1.0</sup>
@@ -96,28 +112,34 @@ IronMic includes 5 TensorFlow.js-powered ML features that learn from your usage 
 
 ```
 Electron UI ← IPC (contextBridge) → Rust Core (napi-rs)
-  ├── React 18 + Zustand                ├── Audio capture (cpal)
-  ├── TF.js ML Web Worker               ├── Whisper.cpp (speech-to-text)
+  ├── Main window (React 18 + Zustand)   ├── Audio capture (cpal)
+  ├── Forge bar (forge-main.tsx)         ├── Moonshine ONNX (default STT)
+  ├── TF.js ML Web Worker               ├── Whisper.cpp (optional STT)
   │   ├── VAD (Silero)                   ├── llama.cpp (text cleanup)
   │   ├── Intent classifier              ├── Kokoro ONNX (text-to-speech)
   │   ├── Semantic search (USE)          ├── Audio playback (cpal)
   │   ├── Notification ranker            ├── SQLite (storage + FTS5)
-  │   └── Workflow predictor             └── Clipboard (arboard)
+  │   └── Workflow predictor             ├── Clipboard (arboard)
+  ├── uiohook-napi (Forge keyboard)      └── enigo (Forge paste, Linux)
   └── Web Audio API (AudioWorklet)
 ```
 
 | Layer | Tech | Purpose |
 |-------|------|---------|
 | UI | Electron + React 18 + Tailwind CSS + Zustand | Desktop shell, component UI, state management |
+| Forge bar | forge-main.tsx (separate Vite entry) | Always-on-top floating dictation bar, ~3.66 KB gz |
+| Keyboard | uiohook-napi | Kernel-level push-to-talk / hands-free gesture detection |
 | Editor | TipTap (ProseMirror) | Rich text editing |
 | Bridge | napi-rs (N-API) | Typed Rust ↔ Node.js communication |
 | Audio | cpal + Web Audio API | Cross-platform mic input, real-time VAD frames |
-| STT | whisper-rs (whisper.cpp) | Local speech-to-text |
+| STT (default) | ort (ONNX Runtime) + Moonshine Base | Fast local speech-to-text, bundled with installer |
+| STT (optional) | whisper-rs (whisper.cpp) | Multilingual / high-accuracy speech-to-text |
 | LLM | llama-cpp-rs (llama.cpp) | Local text cleanup |
 | TTS | ort (ONNX Runtime) + Kokoro 82M | Local neural text-to-speech |
 | ML | TensorFlow.js (Web Worker) | VAD, intent, search, notifications, workflows |
 | Storage | rusqlite (SQLite + FTS5) | Entries, settings, ML data, embeddings |
 | Clipboard | arboard | Cross-platform clipboard |
+| Paste (Forge) | osascript / WScript / enigo | Platform-native paste-at-cursor |
 
 ---
 
@@ -261,11 +283,18 @@ IronMic/
 ├── electron-app/              # Electron + React frontend
 │   └── src/
 │       ├── main/              # Electron main process + IPC handlers
-│       │   └── ai/            # AI chat adapter (Copilot/Claude CLI)
+│       │   ├── ai/            # AI chat adapter (Copilot/Claude CLI)
+│       │   ├── forge-window.ts          # Forge bar window lifecycle
+│       │   ├── keyboard-listener.ts     # uiohook push-to-talk + hands-free
+│       │   ├── dictation-owner.ts       # Serialises which window owns a dictation
+│       │   └── dictation-streamer.ts    # Source-tagged streaming IPC (notes/forge/ai-chat)
 │       ├── preload/           # Typed contextBridge API
 │       └── renderer/          # React UI
 │           ├── components/    # 30+ components
+│           │   ├── ForgeBar.tsx          # Forge floating bar UI
+│           │   └── AIChat.tsx            # AI assistant chat panel
 │           ├── stores/        # Zustand state (11 stores)
+│           │   └── useForgeStore.ts      # Forge recording + paste state
 │           ├── services/tfjs/ # TensorFlow.js ML services
 │           │   ├── VADService.ts         # Voice activity detection
 │           │   ├── TurnDetector.ts       # End-of-turn detection
@@ -291,10 +320,11 @@ The Rust core uses Cargo feature flags to conditionally compile heavy dependenci
 | Feature | Dependencies | Purpose |
 |---------|-------------|---------|
 | `napi-export` (default) | — | Enables N-API function exports |
-| `whisper` | whisper-rs | Speech-to-text |
+| `whisper` | whisper-rs | Whisper speech-to-text backend |
 | `metal` | whisper + whisper-rs/metal | GPU acceleration on macOS |
 | `llm` | llama_cpp_rs | LLM text cleanup |
 | `tts` | ort, ndarray | Kokoro TTS inference |
+| `forge` | enigo | Forge paste engine (Rust keystroke fallback for Linux/Wayland) |
 
 Tests run with `--no-default-features` to avoid N-API linker dependencies.
 

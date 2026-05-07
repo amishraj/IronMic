@@ -2,6 +2,44 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.7.1] - 2026-05-07
+
+### Fixed
+
+- **AI Chat mic — streaming Moonshine, no polish** — The AI Assistant's mic button now uses the same streaming `DictationStreamer` path as Forge and Notes instead of the old single-shot recording path. LLM polish and dictionary fuzzy-correction are intentionally skipped; the user always gets raw Moonshine output in the chat input so they can review before sending. Source-tagged IPC events (`source: 'ai-chat'`) ensure Notes and Forge no longer flip their state or persist entries on AI Chat dictations, and vice versa.
+- **AI Chat dictation draft overlay** — Placeholder text is hidden while a grey draft (live hypothesis) is visible so they no longer overlap. The committed and draft spans now use explicit `rgba` colors matching the Forge bar's contrast palette (92 % / 65 % white in dark mode; 86 % / 50 % black in light mode) instead of `iron-text-muted`, which was nearly invisible on dark backgrounds.
+- **AI Chat input row alignment** — Input row switched from `items-end` to `items-center`; mic and send buttons are now visually centered with the textarea at all textarea heights.
+- **AI Chat textarea height** — Added `leading-5` to the textarea and its sizer mirror so line-height is pinned at 20 px. Combined with `py-2.5` padding and 2 px border this gives a 42 px single-line height, flush with the 40 px (`h-10`) icon buttons.
+
+---
+
+## [1.7.0] - 2026-05-06
+
+### Added
+
+#### Forge Mode — Dictate Into Any Desktop App
+- **Floating dictation bar** — A compact (64 px), always-on-top, non-focusable panel that lets users speak text directly into any desktop application (Outlook, Teams, Chrome, VS Code, terminal, Notes, etc.) without leaving it. Activated from the sidebar or tray menu; dismissed with the ✕ button.
+- **Push-to-talk** — Hold either ⌥ Option (macOS) or Ctrl+Win (Windows) to record. Release to transcribe and paste.
+- **Hands-free toggle** — ⌥+Space (macOS) / Ctrl+Win+Space (Windows) toggles recording on/off. An 80 ms chord-grace window disambiguates tap-vs-hold to prevent accidental Space key fires.
+- **Kernel-level keyboard listener** — Uses `uiohook-napi` for gestures Electron's `globalShortcut` cannot express (held modifiers, Fn key). Automatically falls back to `globalShortcut` (hands-free only) when the `uiohook` prebuild is unavailable for the current Electron ABI.
+- **Live transcript preview** — Committed (finalised) words appear at full contrast; the live hypothesis streams in italic at reduced opacity, matching Apple HIG and Material Design guidance for in-flight text.
+- **Platform-native paste engine** — macOS uses `osascript "System Events keystroke v using command down"` for reliable modifier-key handling; Windows uses `WScript.Shell.SendKeys("^v")`; Linux / fallback uses Rust `enigo`. Token-cancellable clipboard restore runs ~500 ms after paste (text-only; non-text clipboard is left as-is).
+- **Auto-copy at milestones** — Clipboard is refreshed at 10 / 30 / 60 / 120 / 240 / 500-word thresholds so a fresh copy is always available even if paste-at-cursor fails.
+- **Accessibility preflight** — Checks `systemPreferences.isTrustedAccessibilityClient(false)` (live, not stale) and shows a permission panel deep-linking to System Settings → Accessibility if trust is missing.
+- **Separate micro-bundle** — `forge.html` / `forge-main.tsx` ship as their own Vite entry (~3.66 KB gz). No TipTap, no charts, no AI chat in the bar — keeps the floating window fast and lean.
+- **Shared Rust engine** — Both the main window and Forge share `CAPTURE_ENGINE` / `WHISPER_ENGINE`; no duplicate model loading or audio capture.
+- **Mode-aware hotkey dispatch** — `dictation-owner.ts` serialises which window currently owns a dictation so hotkey presses route correctly and cross-owner presses are rejected.
+- **Dark-mode-aware theming** — Theme resolved in the main process (`nativeTheme` + SQLite setting) and passed via URL query (`?theme=dark|light`) for zero-flicker first paint on transparent windows. Runtime updates via `nativeTheme.on('updated')` IPC broadcast.
+- **Forge settings** — `forge_persist_history` (default `false`), `forge_paste_method` (`paste` / `type`), `forge_clipboard_restore` (default `true`), `forge_bar_position` (default `top-right`), `forge_polish_enabled` (default `false`), `forge_polish_allow_cloud` (default `false`).
+- **Tray + Welcome page integration** — Tray menu shows Forge state and offers Enter/Exit toggle. Welcome page updated with Forge feature card.
+
+### Fixed
+
+- **Forge window resize on Windows** — Switched from `setSize()` to `setBounds()` for height transitions; `setSize()` is silently ignored on Windows for windows created with `resizable: false` (no `WS_SIZEBOX`). `setBounds()` sets all four dimensions atomically and works regardless of the resizable flag. Animation is now only requested on macOS.
+- **CI (Ubuntu) — X11 headers for uiohook-napi** — Added `libxt-dev` and X11 development headers to the Ubuntu CI workflow so `uiohook-napi` compiles with `USE_XT` on GitHub Actions runners. Also wired the `forge` Rust feature flag into all CI build targets.
+
+---
+
 ## [1.6.0] - 2026-05-04
 
 ### Changed
