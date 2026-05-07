@@ -1,6 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Bot, Send, Mic, Square, RefreshCw, Sparkles, AlertCircle, Plus, MessageSquare, Trash2, X, Volume2, Pause, BookOpen, StickyNote, MessageCircle } from 'lucide-react';
-import { useRecordingStore } from '../stores/useRecordingStore';
 import { useAiChatStore, type ChatMessage, type AIProvider } from '../stores/useAiChatStore';
 import { useTtsStore } from '../stores/useTtsStore';
 import { NotePickerModal } from './NotePickerModal';
@@ -33,7 +32,16 @@ export function AIChat() {
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const { handleHotkeyPress, state: recordingState } = useRecordingStore();
+
+  // AI Chat mic uses the streaming dictation path directly (same engine as
+  // Forge / Notes). It does NOT go through useRecordingStore — that path
+  // runs the LLM polish pass and persists an `entries` row, both of which
+  // are wrong for chat input. See plan: bug-fix-required-in-abundant-duckling.md.
+  const [micState, setMicState] = useState<'idle' | 'recording' | 'stopping'>('idle');
+  const [draftText, setDraftText] = useState('');
+  // Track whether some OTHER consumer (Forge / Notes) holds the streamer
+  // so we can disable our button instead of letting `start()` reject silently.
+  const [foreignStreamActive, setForeignStreamActive] = useState(false);
 
   const session = activeSession();
   const messages = session?.messages ?? [];
@@ -91,6 +99,23 @@ export function AIChat() {
       console.error('Failed to load AI auth:', err);
     }
   }
+
+  // Defined here (above sendText) so sendText's auto-listen-after-TTS branch
+  // can reference it without a TDZ. Body kept minimal — UI state is mirrored
+  // by the onDictationStreamState subscription.
+  const startAiDictation = useCallback(async () => {
+    const api = (window as any).ironmic;
+    if (!api) return;
+    try {
+      await api.dictationStreamStart({ source: 'ai-chat' });
+      setMicState('recording');
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      setError(msg.includes('already active')
+        ? 'Dictation is already running in another window. Stop it first.'
+        : msg);
+    }
+  }, []);
 
   const sendText = useCallback(async (text: string): Promise<string | null> => {
     if (!text || loading || !provider) return null;
@@ -186,9 +211,10 @@ export function AIChat() {
               setTimeout(() => { clearInterval(check); resolve(); }, 120000);
             });
             await waitForTtsEnd();
-            // If still in conversational mode, auto-start recording
+            // If still in conversational mode, auto-start recording.
+            // Uses the streaming AI-chat path (no polish, review-before-send).
             if (conversationalRef.current) {
-              handleHotkeyPress('ai-chat');
+              void startAiDictation();
             }
           } catch { /* TTS optional */ }
         }
@@ -209,32 +235,73 @@ export function AIChat() {
       setLoading(false);
       setStreaming('');
     }
-  }, [loading, provider, addMessage, createSession, handleHotkeyPress]);
+  }, [loading, provider, addMessage, createSession, startAiDictation]);
 
   const handleSend = useCallback(() => {
     sendText(input.trim());
   }, [input, sendText]);
 
-  // When the sidebar mic is used on the AI tab, receive the dictation
+  // Programmatic prompt insertions still arrive via this event (e.g.
+  // ActionRouter "summarize"). Always review before send — drop the
+  // legacy conversational auto-send branch.
   useEffect(() => {
     const handler = (e: Event) => {
       const text = (e as CustomEvent).detail;
       if (!text || typeof text !== 'string') return;
       const trimmed = text.trim();
       if (!trimmed) return;
-
-      if (conversationalRef.current) {
-        // Conversational mode: auto-send immediately
-        sendText(trimmed);
-      } else {
-        // Normal mode: put in input field so user can review/edit before sending
-        setInput((prev) => prev ? prev + ' ' + trimmed : trimmed);
-        inputRef.current?.focus();
-      }
+      setInput((prev) => prev ? prev + ' ' + trimmed : trimmed);
+      inputRef.current?.focus();
     };
     window.addEventListener('ironmic:ai-dictation', handler);
     return () => window.removeEventListener('ironmic:ai-dictation', handler);
-  }, [sendText]);
+  }, []);
+
+  // ── Streaming dictation: subscribe to source-tagged events ──
+  // Listeners gate on `payload.source === 'ai-chat'` so Notes / Forge
+  // streams cannot leak into the chat textarea. Subscriptions live for the
+  // lifetime of the AIChat component. If the user navigates away mid-stream,
+  // the next mount re-subscribes; the streamer keeps running and the user
+  // can stop it from another surface or via the global owner reset.
+  useEffect(() => {
+    const api = (window as any).ironmic;
+    if (!api) return;
+    const offChunk = api.onDictationStreamChunk?.((payload: { text: string; isFinal: boolean; source?: string }) => {
+      if (payload.source && payload.source !== 'ai-chat') return;
+      const text = (payload.text || '').trim();
+      if (!text) return;
+      // Append every committed chunk (isFinal flags only the end-of-stream marker,
+      // not "this is the full transcript"). Drop the draft as it's now committed.
+      setInput((prev) => (prev ? prev + ' ' + text : text));
+      setDraftText('');
+    });
+    const offDraft = api.onDictationStreamDraft?.((payload: { hypothesis: string; source?: string }) => {
+      if (payload.source && payload.source !== 'ai-chat') return;
+      setDraftText(payload.hypothesis || '');
+    });
+    const offState = api.onDictationStreamState?.((s: { status: string; source?: string }) => {
+      // Track foreign streams so we can disable the AI Chat mic when Notes/Forge
+      // is recording. Our own state is mirrored only on matching source.
+      if (s.source && s.source !== 'ai-chat') {
+        setForeignStreamActive(s.status !== 'idle');
+        return;
+      }
+      setForeignStreamActive(false);
+      if (s.status === 'idle') {
+        setMicState('idle');
+        setDraftText('');
+      } else if (s.status === 'recording') {
+        setMicState('recording');
+      } else if (s.status === 'stopping') {
+        setMicState('stopping');
+      }
+    });
+    return () => {
+      try { offChunk?.(); } catch { /* noop */ }
+      try { offDraft?.(); } catch { /* noop */ }
+      try { offState?.(); } catch { /* noop */ }
+    };
+  }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -244,8 +311,24 @@ export function AIChat() {
   };
 
   const handleVoiceInput = useCallback(async () => {
-    await handleHotkeyPress('ai-chat');
-  }, [handleHotkeyPress]);
+    const api = (window as any).ironmic;
+    if (!api) return;
+    if (micState === 'idle') {
+      if (foreignStreamActive) {
+        setError('Dictation is already running in another window. Stop it first.');
+        return;
+      }
+      await startAiDictation();
+    } else if (micState === 'recording') {
+      setMicState('stopping');
+      try { await api.dictationStreamStop(); }
+      catch (err: any) {
+        // Force-reset local UI; the state event will follow.
+        console.warn('[ai-chat] dictationStreamStop failed:', err?.message || err);
+        setMicState('idle');
+      }
+    }
+  }, [micState, foreignStreamActive, startAiDictation]);
 
   const handleNewChat = () => {
     const id = createSession(provider);
@@ -256,6 +339,19 @@ export function AIChat() {
   };
 
   const noProvider = !provider;
+
+  // Hidden sizer mirror — measures the height the textarea would need to fit
+  // input + grey draft text, so the overlay never clips while Moonshine is
+  // streaming a long hypothesis. We avoid mutating the textarea's value
+  // (would fight React's controlled-component model).
+  const sizerRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const ta = inputRef.current;
+    const sizer = sizerRef.current;
+    if (!ta || !sizer) return;
+    const h = Math.min(sizer.scrollHeight, 120);
+    ta.style.height = Math.max(40, h) + 'px';
+  }, [input, draftText]);
 
   return (
     <div className="flex h-full bg-iron-bg">
@@ -456,7 +552,7 @@ export function AIChat() {
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-iron-success" />
               </span>
               <span className="text-[11px] text-iron-success font-medium">
-                {recordingState === 'recording' ? 'Listening...' : loading ? 'AI is thinking...' : 'Voice chat active — speak or type'}
+                {micState === 'recording' ? 'Listening...' : loading ? 'AI is thinking...' : 'Voice chat active — speak or type'}
               </span>
             </div>
           )}
@@ -479,12 +575,21 @@ export function AIChat() {
             {/* Mic button */}
             <button
               onClick={handleVoiceInput}
-              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all flex-shrink-0 ${
-                recordingState === 'recording'
+              disabled={foreignStreamActive || micState === 'stopping'}
+              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all flex-shrink-0 disabled:opacity-40 disabled:cursor-not-allowed ${
+                micState === 'recording'
                   ? 'bg-iron-danger text-white shadow-glow-danger animate-pulse-recording'
                   : 'bg-iron-surface-hover text-iron-text-muted hover:text-iron-text-secondary'
               }`}
-              title={recordingState === 'recording' ? 'Stop recording' : 'Dictate message'}
+              title={
+                foreignStreamActive
+                  ? 'Dictation is active in another window'
+                  : micState === 'recording'
+                    ? 'Stop recording'
+                    : micState === 'stopping'
+                      ? 'Stopping…'
+                      : 'Dictate message'
+              }
             >
               <Mic className="w-4 h-4" />
             </button>
@@ -502,23 +607,57 @@ export function AIChat() {
               <BookOpen className="w-4 h-4" />
             </button>
 
-            {/* Text input */}
-            <textarea
-              ref={inputRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder={noProvider ? 'No AI provider connected...' : 'Type a message or use the mic...'}
-              disabled={noProvider}
-              rows={1}
-              className="flex-1 min-w-0 text-sm bg-iron-surface border border-iron-border rounded-xl text-iron-text placeholder:text-iron-text-muted px-4 py-2.5 resize-none transition-all focus:outline-none focus:border-iron-accent/50 focus:shadow-glow disabled:opacity-40 disabled:cursor-not-allowed"
-              style={{ maxHeight: '120px', minHeight: '40px' }}
-              onInput={(e) => {
-                const target = e.target as HTMLTextAreaElement;
-                target.style.height = 'auto';
-                target.style.height = Math.min(target.scrollHeight, 120) + 'px';
-              }}
-            />
+            {/*
+              Text input + inline grey-draft overlay.
+
+              Notes uses TipTap with a ProseMirror widget that paints the live
+              Moonshine hypothesis as grey-italic inline text right after the
+              cursor. We can't put mixed-style spans inside a real <textarea>,
+              so we mimic the same UX with an absolutely-positioned overlay
+              that mirrors the textarea's geometry. While the draft is visible,
+              we hide the textarea's own glyphs (text-transparent) so only the
+              overlay paints — committed text in normal color, draft appended
+              inline in grey italic. Caret stays on the real textarea so typing
+              and editing keep working.
+            */}
+            <div className="flex-1 min-w-0 relative">
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={noProvider ? 'No AI provider connected...' : 'Type a message or use the mic...'}
+                disabled={noProvider}
+                rows={1}
+                className={`w-full text-sm bg-iron-surface border border-iron-border rounded-xl placeholder:text-iron-text-muted px-4 py-2.5 resize-none transition-all focus:outline-none focus:border-iron-accent/50 focus:shadow-glow disabled:opacity-40 disabled:cursor-not-allowed ${
+                  draftText ? 'text-transparent caret-iron-text' : 'text-iron-text'
+                }`}
+                style={{ maxHeight: '120px', minHeight: '40px' }}
+              />
+              {/* Hidden sizing mirror — same width/font/padding as the textarea.
+                  Used by the auto-resize effect to measure how tall the textarea
+                  needs to be to accommodate input + grey draft without clipping. */}
+              <div
+                ref={sizerRef}
+                aria-hidden="true"
+                className="invisible absolute top-0 left-0 right-0 text-sm px-4 py-2.5 whitespace-pre-wrap break-words"
+                style={{ font: 'inherit', minHeight: '40px' }}
+              >
+                {input}{input && draftText ? ' ' : ''}{draftText || ' '}
+              </div>
+              {draftText && (
+                <div
+                  aria-hidden="true"
+                  className="absolute inset-0 pointer-events-none text-sm px-4 py-2.5 whitespace-pre-wrap break-words overflow-hidden"
+                  style={{ font: 'inherit' }}
+                >
+                  <span className="text-iron-text">{input}</span>
+                  <span className="text-iron-text-muted italic opacity-60">
+                    {input ? ' ' : ''}{draftText}
+                  </span>
+                </div>
+              )}
+            </div>
 
             {/* Send / Stop button */}
             <button

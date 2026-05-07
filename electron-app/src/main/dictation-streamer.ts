@@ -49,20 +49,29 @@ const WHISPER_CHUNK_INTERVAL_MS = 8_000;
 // 800ms overlap at 16kHz PCM16 (2 bytes/sample)
 const MOONSHINE_OVERLAP_BYTES = 16_000 * 2 * 0.8;
 
+export type DictationSource = 'notes' | 'forge' | 'ai-chat';
+
 export interface DictationChunkEvent {
   index: number;
   text: string;
   isFinal: boolean;
+  source: DictationSource;
 }
 
 export interface DictationDraftEvent {
   hypothesis: string;
+  source: DictationSource;
 }
 
 export interface DictationStreamState {
   status: 'idle' | 'recording' | 'stopping';
   startedAt: number | null;
   chunkCount: number;
+  source: DictationSource;
+}
+
+export interface DictationStreamStartOpts {
+  source?: DictationSource;
 }
 
 /** Resolves after `ms` milliseconds. */
@@ -73,7 +82,13 @@ function sleep(ms: number): Promise<void> {
 class DictationStreamer {
   private streamLoopPromise: Promise<void> | null = null;
   private chunkIndex = 0;
-  private state: DictationStreamState = { status: 'idle', startedAt: null, chunkCount: 0 };
+  private activeSource: DictationSource = 'notes';
+  private state: DictationStreamState = {
+    status: 'idle',
+    startedAt: null,
+    chunkCount: 0,
+    source: 'notes',
+  };
   private fullText = '';
   private cleanupDone = false;
 
@@ -81,15 +96,20 @@ class DictationStreamer {
     return this.state.status !== 'idle';
   }
 
+  getActiveSource(): DictationSource | null {
+    return this.state.status === 'idle' ? null : this.activeSource;
+  }
+
   getFullText(): string {
     return this.fullText.trim();
   }
 
-  async start(): Promise<void> {
+  async start(opts?: DictationStreamStartOpts): Promise<void> {
     if (this.state.status !== 'idle') {
       throw new Error('Dictation is already active');
     }
 
+    this.activeSource = opts?.source ?? 'notes';
     this.cleanupDone = false;
     this.chunkIndex = 0;
     this.fullText = '';
@@ -112,7 +132,12 @@ class DictationStreamer {
       }
     }
 
-    this.state = { status: 'recording', startedAt: Date.now(), chunkCount: 0 };
+    this.state = {
+      status: 'recording',
+      startedAt: Date.now(),
+      chunkCount: 0,
+      source: this.activeSource,
+    };
     this.pushState();
 
     // Determine which path to use for this session.
@@ -222,7 +247,10 @@ class DictationStreamer {
         break;
       }
 
-      const cleaned = sanitizeTranscribedText(hypothesis);
+      // ai-chat: emit raw hypothesis. Notes/Forge get artifact-stripping.
+      const cleaned = this.activeSource === 'ai-chat'
+        ? (hypothesis || '').trim()
+        : sanitizeTranscribedText(hypothesis);
       this.emitDraft(cleaned);
 
       // 20s session cap — commit proactively to keep latency bounded.
@@ -243,7 +271,9 @@ class DictationStreamer {
       if (finalBuffer && finalBuffer.length >= 500 && !isAudioSilent(finalBuffer)) {
         try {
           const hyp = await native.addon.moonshineSessionAppend!(finalBuffer);
-          const cleaned = sanitizeTranscribedText(hyp);
+          const cleaned = this.activeSource === 'ai-chat'
+            ? (hyp || '').trim()
+            : sanitizeTranscribedText(hyp);
           if (cleaned) this.emitDraft(cleaned);
           appendedFinalAudio = true;
           debugLog('session.final-drain', { byteLength: finalBuffer.length, hypothesis: hyp.slice(0, 80) });
@@ -266,15 +296,20 @@ class DictationStreamer {
     this.emitDraft('');
     try {
       const finalText = await native.addon.moonshineSessionCommit!();
-      let cleaned = sanitizeTranscribedText(finalText);
-      // Fuzzy correction at COMMIT only (never on draft hypotheses — would
-      // cause flicker in the grey-typing UI). Catches Moonshine misses on
-      // dictionary words. Empty term set returns the input unchanged.
-      const dict = getDictionaryWords();
-      if (cleaned && dict.length > 0) {
-        cleaned = correctTranscript(cleaned, dict);
+      // AI Chat wants raw Moonshine output — no artifact-stripping, no
+      // dictionary fuzzy-correction. Both behave like silent rewrites
+      // ("polish") from the user's POV. Notes / Forge keep the cleanups.
+      let cleaned: string;
+      if (this.activeSource === 'ai-chat') {
+        cleaned = (finalText || '').trim();
+      } else {
+        cleaned = sanitizeTranscribedText(finalText);
+        const dict = getDictionaryWords();
+        if (cleaned && dict.length > 0) {
+          cleaned = correctTranscript(cleaned, dict);
+        }
       }
-      debugLog('session.commit', { cleaned: cleaned.slice(0, 80), isFinalStop });
+      debugLog('session.commit', { cleaned: cleaned.slice(0, 80), isFinalStop, source: this.activeSource });
       if (cleaned) {
         this.fullText = (this.fullText + ' ' + cleaned).replace(/\s+/g, ' ').trim();
         this.chunkIndex += 1;
@@ -379,19 +414,26 @@ class DictationStreamer {
       return;
     }
 
-    let cleaned = sanitizeTranscribedText(rawText);
+    // ai-chat: raw Moonshine/Whisper output. Skip artifact-stripping AND
+    // dictionary fuzzy-correction. Overlap-stripping still runs because
+    // it's a deduplication, not a rewrite.
+    let cleaned = this.activeSource === 'ai-chat'
+      ? (rawText || '').trim()
+      : sanitizeTranscribedText(rawText);
 
     // Strip overlap region from output if we prepended context.
     if (isMoonshine && overlapBuffer.length > 0 && previousChunkText && cleaned) {
       cleaned = stripOverlapPrefix(previousChunkText, cleaned);
     }
 
-    // Fuzzy correction at chunk finalize. Same guardrails as the streaming
-    // path — single-word terms, conservative edit-distance caps, stop-list
-    // protection. Empty dictionary returns unchanged.
-    const dict = getDictionaryWords();
-    if (cleaned && dict.length > 0) {
-      cleaned = correctTranscript(cleaned, dict);
+    if (this.activeSource !== 'ai-chat') {
+      // Fuzzy correction at chunk finalize. Same guardrails as the streaming
+      // path — single-word terms, conservative edit-distance caps, stop-list
+      // protection. Empty dictionary returns unchanged.
+      const dict = getDictionaryWords();
+      if (cleaned && dict.length > 0) {
+        cleaned = correctTranscript(cleaned, dict);
+      }
     }
 
     // Save new overlap tail (Moonshine only) for the next chunk.
@@ -414,7 +456,12 @@ class DictationStreamer {
   // ── Shared emit helpers ───────────────────────────────────────────────────
 
   private emitChunk(text: string, isFinal: boolean): void {
-    const payload: DictationChunkEvent = { index: this.chunkIndex, text, isFinal };
+    const payload: DictationChunkEvent = {
+      index: this.chunkIndex,
+      text,
+      isFinal,
+      source: this.activeSource,
+    };
     debugLog('chunk.emit', payload);
     const w = BrowserWindow.getAllWindows()[0];
     if (w && !w.isDestroyed()) {
@@ -423,8 +470,8 @@ class DictationStreamer {
   }
 
   private emitDraft(hypothesis: string): void {
-    const payload: DictationDraftEvent = { hypothesis };
-    debugLog('draft.emit', { hypothesis: hypothesis.slice(0, 80) });
+    const payload: DictationDraftEvent = { hypothesis, source: this.activeSource };
+    debugLog('draft.emit', { hypothesis: hypothesis.slice(0, 80), source: this.activeSource });
     const w = BrowserWindow.getAllWindows()[0];
     if (w && !w.isDestroyed()) {
       w.webContents.send(IPC_CHANNELS.DICTATION_STREAM_DRAFT, payload);
@@ -448,8 +495,17 @@ class DictationStreamer {
     try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
     try { native.addon.stopRecording(); } catch { /* already stopped */ }
     audioStream.release('streaming');
-    this.state = { status: 'idle', startedAt: null, chunkCount: 0 };
+    // Carry the active source onto the final idle state so source-filtering
+    // listeners receive their idle event. Clear activeSource only after
+    // the emit so the payload is correctly stamped.
+    this.state = {
+      status: 'idle',
+      startedAt: null,
+      chunkCount: 0,
+      source: this.activeSource,
+    };
     this.pushState();
+    this.activeSource = 'notes';
   }
 }
 

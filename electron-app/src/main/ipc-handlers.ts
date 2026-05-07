@@ -1021,9 +1021,16 @@ If the text is too short or unclear, output: ["General"]`;
   // Wrapped in try/catch so the renderer always gets a structured error
   // instead of the opaque "Error invoking remote method" wrapper. Forge
   // mode in particular needs the underlying cause visible in the bar.
-  ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_START, async () => {
+  ipcMain.handle(IPC_CHANNELS.DICTATION_STREAM_START, async (_evt, rawOpts?: { source?: string }) => {
+    // Whitelist source from untrusted renderer input; default 'notes' to
+    // preserve legacy callers that pass nothing.
+    const ALLOWED: ReadonlyArray<'notes' | 'forge' | 'ai-chat'> = ['notes', 'forge', 'ai-chat'];
+    const source = (rawOpts && ALLOWED.includes(rawOpts.source as any))
+      ? (rawOpts.source as 'notes' | 'forge' | 'ai-chat')
+      : 'notes';
+    const opts = { source };
     try {
-      return await dictationStreamer.start();
+      return await dictationStreamer.start(opts);
     } catch (err: any) {
       const msg = err?.message || String(err);
       console.error('[ipc] dictation-stream-start failed:', msg, err?.stack);
@@ -1035,7 +1042,7 @@ If the text is too short or unclear, output: ["General"]`;
           if (typeof native.addon?.resetPipelineState === 'function') {
             native.addon.resetPipelineState();
           }
-          return await dictationStreamer.start();
+          return await dictationStreamer.start(opts);
         } catch (retryErr: any) {
           throw new Error(`stream-start (retry): ${retryErr?.message || retryErr}`);
         }

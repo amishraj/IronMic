@@ -181,7 +181,7 @@ export const useDictationStore = create<DictationState>((set, get) => ({
     try { window.dispatchEvent(new CustomEvent('ironmic:entries-changed')); }
     catch { /* noop */ }
 
-    try { await api.dictationStreamStart(); }
+    try { await api.dictationStreamStart({ source: 'notes' }); }
     catch (err) {
       set({ status: 'idle' });
       throw err;
@@ -250,18 +250,25 @@ if (typeof window !== 'undefined' && (window as any).ironmic) {
     }
   }
 
-  api.onDictationStreamState?.((s: { status: string; chunkCount: number }) => {
+  // Source-gate: this store represents the Notes feature only. Forge and
+  // AI Chat now share the same streamer, so we must ignore their events
+  // — otherwise an AI Chat dictation would flip Notes status and (worse)
+  // append chunks into the last Notes entry.
+  api.onDictationStreamState?.((s: { status: string; chunkCount: number; source?: string }) => {
+    if (s.source && s.source !== 'notes') return;
     if (s.status === 'idle' || s.status === 'recording' || s.status === 'stopping') {
       useDictationStore.setState({ status: s.status });
       // When main flips to idle, it means the final chunk has flushed.
       // We keep entryId/fullText populated so UI can show "just finished".
     }
   });
-  api.onDictationStreamDraft?.((payload: { hypothesis: string }) => {
+  api.onDictationStreamDraft?.((payload: { hypothesis: string; source?: string }) => {
+    if (payload.source && payload.source !== 'notes') return;
     useDictationStore.setState({ draftHypothesis: payload.hypothesis });
   });
 
-  api.onDictationStreamChunk?.((payload: { index: number; text: string; isFinal: boolean }) => {
+  api.onDictationStreamChunk?.((payload: { index: number; text: string; isFinal: boolean; source?: string }) => {
+    if (payload.source && payload.source !== 'notes') return;
     if (!payload.text) {
       // eslint-disable-next-line no-console
       console.log('[ironmic:dictation] empty chunk dropped', payload);

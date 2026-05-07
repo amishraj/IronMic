@@ -179,7 +179,7 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
         toast: null,
       });
       try {
-        await api.dictationStreamStart();
+        await api.dictationStreamStart({ source: 'forge' });
         set({ status: 'recording', actionInProgress: false });
         console.log('[forge] hands-free streaming started');
       } catch (err: any) {
@@ -232,7 +232,7 @@ export const useForgeStore = create<ForgeState>((set, get) => ({
       toast: null,
     });
     try {
-      await api.dictationStreamStart();
+      await api.dictationStreamStart({ source: 'forge' });
       set({ status: 'recording', actionInProgress: false });
       console.log('[forge] push-to-talk streaming started');
     } catch (err: any) {

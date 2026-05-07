@@ -76,21 +76,24 @@ const ForgeBar: React.FC = () => {
     const api = (window as any).ironmic;
     if (!api) return;
     const offChunk = api.onDictationStreamChunk?.(
-      (payload: { index: number; text: string; isFinal: boolean }) => {
+      (payload: { index: number; text: string; isFinal: boolean; source?: string }) => {
+        if (payload.source && payload.source !== 'forge') return;
         const { status: forgeStatus } = useForgeStore.getState();
         if (forgeStatus === 'idle') return;
         useForgeStore.getState().handleChunk(payload.text, payload.isFinal);
       },
     );
     const offDraft = api.onDictationStreamDraft?.(
-      (payload: { hypothesis: string }) => {
+      (payload: { hypothesis: string; source?: string }) => {
+        if (payload.source && payload.source !== 'forge') return;
         const { status: forgeStatus } = useForgeStore.getState();
         if (forgeStatus !== 'recording') return;
         useForgeStore.getState().handleDraft(payload.hypothesis || '');
       },
     );
     const offState = api.onDictationStreamState?.(
-      (s: { status: string; chunkCount: number }) => {
+      (s: { status: string; chunkCount: number; source?: string }) => {
+        if (s.source && s.source !== 'forge') return;
         if (s.status === 'idle') {
           const { status: forgeStatus } = useForgeStore.getState();
           if (forgeStatus !== 'idle') {

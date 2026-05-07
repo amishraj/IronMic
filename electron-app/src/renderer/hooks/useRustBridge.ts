@@ -177,10 +177,11 @@ declare global {
       meetingSetMicMuted: (sessionId: string, muted: boolean) => Promise<void>;
       notifyMeetingUserNotesChanged: (sessionId: string) => void;
       // Streaming dictation (near-real-time chunked transcription)
-      dictationStreamStart: () => Promise<void>;
+      dictationStreamStart: (opts?: { source?: 'notes' | 'forge' | 'ai-chat' }) => Promise<void>;
       dictationStreamStop: () => Promise<{ text: string; chunkCount: number }>;
-      onDictationStreamChunk: (cb: (p: { index: number; text: string; isFinal: boolean }) => void) => () => void;
-      onDictationStreamState: (cb: (s: { status: string; startedAt: number | null; chunkCount: number }) => void) => () => void;
+      onDictationStreamChunk: (cb: (p: { index: number; text: string; isFinal: boolean; source: 'notes' | 'forge' | 'ai-chat' }) => void) => () => void;
+      onDictationStreamDraft: (cb: (p: { hypothesis: string; source: 'notes' | 'forge' | 'ai-chat' }) => void) => () => void;
+      onDictationStreamState: (cb: (s: { status: string; startedAt: number | null; chunkCount: number; source: 'notes' | 'forge' | 'ai-chat' }) => void) => () => void;
       // Meeting Room (LAN multi-user)
       meetingRoomHostStart: (sessionId: string, hostName: string, templateId?: string | null) => Promise<any>;
       meetingRoomHostStop: () => Promise<any>;

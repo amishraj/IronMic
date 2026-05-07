@@ -236,21 +236,24 @@ const api = {
     ipcRenderer.invoke('ironmic:meeting-set-mic-muted', sessionId, muted),
 
   // ── Streaming dictation (near-real-time) ──
-  dictationStreamStart: () => ipcRenderer.invoke('ironmic:dictation-stream-start'),
+  // `source` tags the stream so each consumer (Notes, Forge, AI Chat) only
+  // reacts to its own events. Defaults to 'notes' in main if omitted.
+  dictationStreamStart: (opts?: { source?: 'notes' | 'forge' | 'ai-chat' }) =>
+    ipcRenderer.invoke('ironmic:dictation-stream-start', opts),
   dictationStreamStop: () => ipcRenderer.invoke('ironmic:dictation-stream-stop'),
-  onDictationStreamChunk: (callback: (payload: { index: number; text: string; isFinal: boolean }) => void) => {
+  onDictationStreamChunk: (callback: (payload: { index: number; text: string; isFinal: boolean; source: 'notes' | 'forge' | 'ai-chat' }) => void) => {
     const handler = (_e: any, p: any) => callback(p);
     ipcRenderer.on('ironmic:dictation-stream-chunk', handler);
     return () => ipcRenderer.removeListener('ironmic:dictation-stream-chunk', handler);
   },
   /** Live hypothesis from the Moonshine session path — replaces, does not append.
    *  Not persisted; cleared when a committed chunk arrives or recording stops. */
-  onDictationStreamDraft: (callback: (payload: { hypothesis: string }) => void) => {
+  onDictationStreamDraft: (callback: (payload: { hypothesis: string; source: 'notes' | 'forge' | 'ai-chat' }) => void) => {
     const handler = (_e: any, p: any) => callback(p);
     ipcRenderer.on('ironmic:dictation-stream-draft', handler);
     return () => ipcRenderer.removeListener('ironmic:dictation-stream-draft', handler);
   },
-  onDictationStreamState: (callback: (state: { status: string; startedAt: number | null; chunkCount: number }) => void) => {
+  onDictationStreamState: (callback: (state: { status: string; startedAt: number | null; chunkCount: number; source: 'notes' | 'forge' | 'ai-chat' }) => void) => {
     const handler = (_e: any, s: any) => callback(s);
     ipcRenderer.on('ironmic:dictation-stream-state', handler);
     return () => ipcRenderer.removeListener('ironmic:dictation-stream-state', handler);
