@@ -629,7 +629,7 @@ export function AIChat() {
                 placeholder={draftText ? '' : noProvider ? 'No AI provider connected...' : 'Type a message or use the mic...'}
                 disabled={noProvider}
                 rows={1}
-                className={`w-full text-sm bg-iron-surface border border-iron-border rounded-xl placeholder:text-iron-text-muted px-4 py-2.5 resize-none transition-all focus:outline-none focus:border-iron-accent/50 focus:shadow-glow disabled:opacity-40 disabled:cursor-not-allowed ${
+                className={`w-full text-sm leading-5 bg-iron-surface border border-iron-border rounded-xl placeholder:text-iron-text-muted px-4 py-2.5 resize-none transition-all focus:outline-none focus:border-iron-accent/50 focus:shadow-glow disabled:opacity-40 disabled:cursor-not-allowed ${
                   draftText ? 'text-transparent caret-iron-text' : 'text-iron-text'
                 }`}
                 style={{ maxHeight: '120px', minHeight: '40px' }}
@@ -640,7 +640,7 @@ export function AIChat() {
               <div
                 ref={sizerRef}
                 aria-hidden="true"
-                className="invisible absolute top-0 left-0 right-0 text-sm px-4 py-2.5 whitespace-pre-wrap break-words"
+                className="invisible absolute top-0 left-0 right-0 text-sm leading-5 px-4 py-2.5 whitespace-pre-wrap break-words"
                 style={{ font: 'inherit', minHeight: '40px' }}
               >
                 {input}{input && draftText ? ' ' : ''}{draftText || ' '}
@@ -648,7 +648,7 @@ export function AIChat() {
               {draftText && (
                 <div
                   aria-hidden="true"
-                  className="absolute inset-0 pointer-events-none text-sm px-4 py-2.5 whitespace-pre-wrap break-words overflow-hidden"
+                  className="absolute inset-0 pointer-events-none text-sm leading-5 px-4 py-2.5 whitespace-pre-wrap break-words overflow-hidden"
                   style={{ font: 'inherit' }}
                 >
                   <span className="ai-chat-dictation-committed">{input}</span>
