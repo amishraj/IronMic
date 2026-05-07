@@ -398,3 +398,24 @@
 .ProseMirror *::selection {
   background: var(--iron-selection-bg);
 }
+
+/* ── AI Chat dictation overlay colors ─────────────────────────────────────────
+   Committed (finalized) and draft (in-flight hypothesis) text painted over the
+   textarea. Intentionally matches the Forge bar's forge-preview-* palette so
+   both surfaces feel consistent.
+   Light mode: near-black committed, medium-grey draft.
+   Dark mode:  near-white committed, clearly-visible-but-softer draft.          */
+.ai-chat-dictation-committed {
+  color: rgba(0, 0, 0, 0.86);
+}
+.ai-chat-dictation-draft {
+  color: rgba(0, 0, 0, 0.50);
+  font-style: italic;
+}
+.dark .ai-chat-dictation-committed {
+  color: rgba(255, 255, 255, 0.92);
+}
+.dark .ai-chat-dictation-draft {
+  color: rgba(255, 255, 255, 0.65);
+  font-style: italic;
+}
