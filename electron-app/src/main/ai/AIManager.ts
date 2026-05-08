@@ -15,6 +15,9 @@ import { native } from '../native-bridge';
 import { getScopedSpawnEnv } from '../utils/shell-env';
 import type { AIProvider, AuthStatus, AIAuthState, ICLIAdapter, IAIAdapter, AIModel } from './types';
 
+/** Narrowed to CLI-only providers so per-provider state can't accidentally include local. */
+type CLIProvider = 'copilot' | 'claude';
+
 const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 /** Maximum number of conversation history messages to keep for local LLM context. */
@@ -44,7 +47,13 @@ export class AIManager {
   private claude = new ClaudeAdapter();
   private local = new LocalLLMAdapter();
   private authCache: Partial<Record<AIProvider, AuthStatus>> = {};
-  private turnCount = 0;
+  /**
+   * Per-CLI-provider turn counts. Incremented only on code === 0 so a failed
+   * turn can't poison the next one. Isolated per-provider so switching tabs
+   * doesn't carry a Claude session into a fresh Copilot turn. Local chat uses
+   * localHistories instead and is intentionally excluded from this map.
+   */
+  private cliTurnCounts: Partial<Record<CLIProvider, number>> = {};
   private activeProcess: ChildProcess | null = null;
 
   /**
@@ -251,7 +260,6 @@ export class AIManager {
       }
 
       this.getLocalHistory(contextKey).push({ role: 'assistant', content: result });
-      this.turnCount++;
       return result;
     } catch (err: unknown) {
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -275,7 +283,7 @@ export class AIManager {
    */
   private async sendCLIMessage(
     prompt: string,
-    provider: AIProvider,
+    provider: CLIProvider,
     window: BrowserWindow | null,
     model?: string,
   ): Promise<string> {
@@ -307,7 +315,7 @@ export class AIManager {
     }
 
     const binary = auth.binaryPath!;
-    const continueSession = this.turnCount > 0;
+    const continueSession = (this.cliTurnCounts[provider] ?? 0) > 0;
     const args = provider === 'copilot'
       ? this.copilot.buildArgsForBinary(binary, prompt, continueSession, model)
       : adapter.buildArgs(prompt, continueSession, model);
@@ -370,20 +378,24 @@ export class AIManager {
 
       proc.on('close', (code) => {
         this.activeProcess = null;
-        this.turnCount++;
 
         if (window && !window.isDestroyed()) {
           window.webContents.send('ai:turn-end', { provider });
         }
 
-        if (code !== 0 && !fullOutput.trim()) {
-          // Surface stderr in the error so the user / logs can actually see
-          // *why* the CLI failed (missing extension, auth lapsed, model not
-          // entitled, etc.) instead of a bare "exited with code 1".
+        if (code === 0) {
+          // Only count a clean exit as a successful turn. A non-zero exit
+          // (even with partial stdout) means we shouldn't --continue from
+          // a half-finished session on the next turn.
+          this.cliTurnCounts[provider] = (this.cliTurnCounts[provider] ?? 0) + 1;
+          resolve(fullOutput.trim());
+        } else if (fullOutput.trim()) {
+          // Non-zero exit but we got stdout — surface it, don't increment.
+          resolve(fullOutput.trim());
+        } else {
+          // Surface stderr so the user can see why it failed.
           const detail = stderrBuf.trim().slice(0, 800) || '(no stderr)';
           reject(new Error(`${provider} exited with code ${code}: ${detail}`));
-        } else {
-          resolve(fullOutput.trim());
         }
       });
     });
@@ -399,7 +411,7 @@ export class AIManager {
    *   - otherwise → throw (renderer pattern-matches for "Cleanup model not downloaded")
    *
    * Crucially separate from `sendMessage` / `sendCLIMessage`:
-   *   - never touches `this.turnCount`
+   *   - never touches `this.cliTurnCounts`
    *   - never assigns `this.activeProcess` (chat cancel won't kill polish)
    *   - never emits `ai:turn-*` events (no chat UI bleed)
    *   - always one-shot (continueSession=false) — polish has no conversation
@@ -528,10 +540,10 @@ export class AIManager {
     }
   }
 
-  /** Reset turn count and all conversation history contexts (new conversation). */
+  /** Reset turn counts and all conversation history contexts (new conversation). */
   resetSession(): void {
     this.cancel();
-    this.turnCount = 0;
+    this.cliTurnCounts = {};
     this.localHistories.clear();
   }
 }

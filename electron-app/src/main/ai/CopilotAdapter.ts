@@ -69,13 +69,19 @@ export class CopilotAdapter implements ICLIAdapter {
     return ['models', 'run', this.normalizeGhModelId(model), prompt];
   }
 
-  buildArgsForBinary(binaryPath: string, prompt: string, _continueSession: boolean, model?: string): string[] {
+  buildArgsForBinary(binaryPath: string, prompt: string, continueSession: boolean, model?: string): string[] {
     if (this.looksLikeCopilotBinary(binaryPath)) {
-      const args = ['--prompt', prompt];
+      // -s: silent mode — captured stdout is assistant text only (GitHub's
+      //     recommendation for programmatic capture).
+      // --continue: resume the most recent Copilot session so multi-turn
+      //     chat has memory. Only set when the prior turn succeeded.
+      const args = ['-s', '--prompt', prompt];
+      if (continueSession) args.push('--continue');
       const normalizedModel = this.normalizeCopilotModelId(model);
       if (normalizedModel) args.push('--model', normalizedModel);
       return args;
     }
+    // gh models run is genuinely stateless — no continuation flag exists.
     return this.buildArgs(prompt, false, model);
   }
 
@@ -180,12 +186,17 @@ export class CopilotAdapter implements ICLIAdapter {
 
   private isCopilotCliAuthenticated(): boolean {
     const env = getSpawnEnv();
-    if (env.GH_TOKEN || env.GITHUB_TOKEN) return true;
+    // Documented env precedence: COPILOT_GITHUB_TOKEN > GH_TOKEN > GITHUB_TOKEN.
+    if (env.COPILOT_GITHUB_TOKEN || env.GH_TOKEN || env.GITHUB_TOKEN) return true;
 
     try {
-      const configPath = join(homedir(), '.copilot', 'config.json');
+      // COPILOT_HOME overrides the default ~/.copilot config directory.
+      const copilotHome = env.COPILOT_HOME || join(homedir(), '.copilot');
+      const configPath = join(copilotHome, 'config.json');
       const parsed = JSON.parse(readFileSync(configPath, 'utf-8')) as Record<string, unknown>;
-      const users = parsed.logged_in_users;
+      // Current @github/copilot builds write `loggedInUsers` (camelCase);
+      // older builds wrote `logged_in_users`. Accept both.
+      const users = parsed.loggedInUsers ?? parsed.logged_in_users;
       return Array.isArray(users) && users.length > 0;
     } catch {
       return false;

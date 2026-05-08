@@ -17,7 +17,15 @@ const BASE_KEYS = [
 ];
 
 const PROVIDER_KEYS: Record<CliProvider, string[]> = {
-  copilot: ['GH_TOKEN', 'GITHUB_TOKEN', 'GITHUB_ASKPASS', 'COPILOT_CUSTOM_INSTRUCTIONS_DIRS'],
+  copilot: [
+    'COPILOT_GITHUB_TOKEN',
+    'COPILOT_HOME',
+    'COPILOT_GH_HOST',
+    'GH_TOKEN',
+    'GITHUB_TOKEN',
+    'GITHUB_ASKPASS',
+    'COPILOT_CUSTOM_INSTRUCTIONS_DIRS',
+  ],
   claude: ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_MODEL', 'ENABLE_TOOL_SEARCH'],
   local: [],
 };
