@@ -87,19 +87,20 @@ export class ClaudeAdapter implements ICLIAdapter {
     return null;
   }
 
-  buildArgs(prompt: string, continueSession: boolean, model?: string): string[] {
+  buildArgs(prompt: string, continueSession: boolean, model?: AIModel | string): string[] {
     const args: string[] = [];
-    if (model) args.push('--model', model);
+    const modelId = typeof model === 'object' ? model.id : model;
+    if (modelId) args.push('--model', modelId);
     if (continueSession) args.push('--continue');
     args.push('--print', prompt);
     return args;
   }
 
-  availableModels(): AIModel[] {
+  async listAvailableModels(): Promise<AIModel[]> {
     return [
-      { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4', provider: 'claude', free: false, description: 'Best balance of speed and capability' },
-      { id: 'claude-opus-4-20250514', label: 'Claude Opus 4', provider: 'claude', free: false, description: 'Most capable, slower' },
-      { id: 'claude-haiku-3-5-20241022', label: 'Claude Haiku 3.5', provider: 'claude', free: false, description: 'Fastest and most affordable' },
+      { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4', provider: 'claude', source: 'static', billing: 'paid', description: 'Best balance of speed and capability' },
+      { id: 'claude-opus-4-20250514', label: 'Claude Opus 4', provider: 'claude', source: 'static', billing: 'paid', description: 'Most capable, slower' },
+      { id: 'claude-haiku-3-5-20241022', label: 'Claude Haiku 3.5', provider: 'claude', source: 'static', billing: 'paid', description: 'Fastest and most affordable' },
     ];
   }
 

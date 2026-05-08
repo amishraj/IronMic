@@ -4,7 +4,7 @@
  * The local provider calls Rust N-API directly for on-device inference.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { ChildProcess } from 'child_process';
 import { BrowserWindow } from 'electron';
 import { CopilotAdapter } from './CopilotAdapter';
 import { ClaudeAdapter } from './ClaudeAdapter';
@@ -13,21 +13,40 @@ import { llmSubprocess } from './LlmSubprocess';
 import { CHAT_LLM_MODELS } from '../../shared/constants';
 import { native } from '../native-bridge';
 import { getScopedSpawnEnv } from '../utils/shell-env';
+import { spawnPortable } from '../utils/spawn-portable';
 import type { AIProvider, AuthStatus, AIAuthState, ICLIAdapter, IAIAdapter, AIModel } from './types';
 
 /** Narrowed to CLI-only providers so per-provider state can't accidentally include local. */
 type CLIProvider = 'copilot' | 'claude';
 
 /**
- * On Windows, .cmd batch files and extensionless npm shims cannot be executed
- * by CreateProcess() directly (spawn shell:false). Wrap them with cmd.exe /c.
- * On other platforms the binary and args pass through unchanged.
+ * Translate raw CLI stderr into a user-facing message when it looks like
+ * the selected model is not available on the user's plan / policy. Returns
+ * null if stderr doesn't match a known entitlement-error pattern, so callers
+ * fall back to the verbatim error.
  */
-function resolveSpawn(binary: string, args: string[]): { bin: string; spawnArgs: string[] } {
-  if (process.platform === 'win32' && (/\.cmd$/i.test(binary) || !/\.[a-z]+$/i.test(binary))) {
-    return { bin: process.env.COMSPEC || 'cmd.exe', spawnArgs: ['/c', binary, ...args] };
-  }
-  return { bin: binary, spawnArgs: args };
+function friendlyEntitlementError(stderr: string, model?: string): string | null {
+  const s = stderr.toLowerCase();
+  const entitlementPatterns = [
+    /not\s+(?:available|allowed|entitled|authorized)/,
+    /not\s+enabled\s+for\s+(?:your|this)\s+(?:plan|account|organization)/,
+    /access\s+denied/,
+    /forbidden/,
+    /403/,
+    /upgrade\s+(?:to|your)/,
+    /premium\s+request/,
+    /no\s+access\s+to\s+(?:model|the\s+model)/,
+    /model\s+not\s+(?:found|supported|available)/,
+    /unsupported\s+model/,
+    /quota\s+exceeded/,
+    /rate\s+limit/,
+  ];
+  if (!entitlementPatterns.some((re) => re.test(s))) return null;
+  const which = model ? ` "${model}"` : '';
+  return (
+    `The selected model${which} isn't available on your current GitHub Copilot plan or policy. ` +
+    `Pick a different model in Settings → AI Assist (try "Refresh models" to see what your plan supports).`
+  );
 }
 
 const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
@@ -75,9 +94,52 @@ export class AIManager {
    */
   private localHistories = new Map<string, Array<{ role: string; content: string }>>();
 
+  /**
+   * Per-provider lookup: id → AIModel. Updated whenever a list is returned
+   * from any path (cache-only, fallback, or fresh probe). Used by sendMessage
+   * and polish to translate the saved string id into the full AIModel that
+   * carries `runIds.copilotCli` / `runIds.ghModels`.
+   */
+  private modelLookup: Partial<Record<AIProvider, Map<string, AIModel>>> = {};
+
   private getLocalHistory(ctx: string): Array<{ role: string; content: string }> {
     if (!this.localHistories.has(ctx)) this.localHistories.set(ctx, []);
     return this.localHistories.get(ctx)!;
+  }
+
+  private rememberModels(provider: AIProvider, models: AIModel[]): AIModel[] {
+    const map = new Map<string, AIModel>();
+    for (const m of models) map.set(m.id, m);
+    this.modelLookup[provider] = map;
+    return models;
+  }
+
+  /**
+   * Resolve a saved model id to the cached AIModel. If the cache doesn't
+   * contain it (e.g. post-restart before any refresh, or a model the user
+   * typed manually), synthesize a minimal AIModel from the raw id so
+   * buildArgs paths still work.
+   */
+  resolveModel(provider: AIProvider, id: string | undefined | null): AIModel | undefined {
+    if (!id) return undefined;
+    const cached = this.modelLookup[provider]?.get(id);
+    if (cached) return cached;
+    return this.synthesizeModel(provider, id);
+  }
+
+  private synthesizeModel(provider: AIProvider, id: string): AIModel {
+    if (provider === 'copilot') {
+      // For Copilot we use the raw id as the backend run-id directly.
+      // Slash-prefixed ids are gh-models style; bare ids are copilot-cli style.
+      return {
+        id,
+        label: id,
+        provider: 'copilot',
+        billing: 'unknown',
+        runIds: id.includes('/') ? { ghModels: id } : { copilotCli: id },
+      };
+    }
+    return { id, label: id, provider };
   }
 
   private getAdapter(provider: AIProvider): IAIAdapter {
@@ -99,13 +161,22 @@ export class AIManager {
     return { copilot, claude, local };
   }
 
-  /** Force re-check auth for a provider. */
+  /**
+   * Force re-check auth for a provider. Also clears any cached model catalog
+   * so the next user-initiated `refreshModels` re-probes against the new auth
+   * state. Note: refreshAuth does NOT auto-trigger refreshModels — catalog
+   * probes remain a separate explicit user action.
+   */
   async refreshAuth(provider?: AIProvider): Promise<AIAuthState> {
     if (provider) {
       delete this.authCache[provider];
+      this.getAdapter(provider).clearModelCache?.();
       await this.checkAuth(provider);
     } else {
       this.authCache = {};
+      (this.copilot as IAIAdapter).clearModelCache?.();
+      (this.claude as IAIAdapter).clearModelCache?.();
+      (this.local as IAIAdapter).clearModelCache?.();
       return this.getAuthState();
     }
     return this.getAuthState();
@@ -137,18 +208,53 @@ export class AIManager {
     return status;
   }
 
-  /** Get available models for a provider. */
-  getModels(provider: AIProvider): AIModel[] {
-    return this.getAdapter(provider).availableModels();
+  /**
+   * Get cached models for a provider. **Cache-only** — never spawns a child
+   * process. Use refreshModels() to trigger a fresh probe.
+   */
+  async getModels(provider: AIProvider): Promise<AIModel[]> {
+    const list = await this.getAdapter(provider).listAvailableModels();
+    return this.rememberModels(provider, list);
   }
 
-  /** Get all available models across all providers. */
-  getAllModels(): AIModel[] {
-    return [
-      ...this.copilot.availableModels(),
-      ...this.claude.availableModels(),
-      ...this.local.availableModels(),
-    ];
+  /** Get all available models across all providers (cache-only). */
+  async getAllModels(): Promise<AIModel[]> {
+    const [c, cl, lo] = await Promise.all([
+      this.copilot.listAvailableModels(),
+      this.claude.listAvailableModels(),
+      this.local.listAvailableModels(),
+    ]);
+    this.rememberModels('copilot', c);
+    this.rememberModels('claude', cl);
+    this.rememberModels('local', lo);
+    return [...c, ...cl, ...lo];
+  }
+
+  /**
+   * Probe-and-refresh path. Only entry point that spawns child processes
+   * to enumerate models. Invoked via the explicit "Refresh models" UI.
+   * @param provider - target provider; omit to refresh all.
+   * @param opts.force - bypass adapter TTL.
+   */
+  async refreshModels(provider?: AIProvider, opts: { force?: boolean } = {}): Promise<AIModel[]> {
+    if (provider) {
+      const adapter = this.getAdapter(provider);
+      const fresh = adapter.refreshModels
+        ? await adapter.refreshModels(opts)
+        : await adapter.listAvailableModels();
+      return this.rememberModels(provider, fresh);
+    }
+    const refreshOne = (a: IAIAdapter) =>
+      a.refreshModels ? a.refreshModels(opts) : a.listAvailableModels();
+    const [c, cl, lo] = await Promise.all([
+      refreshOne(this.copilot),
+      refreshOne(this.claude),
+      refreshOne(this.local),
+    ]);
+    this.rememberModels('copilot', c);
+    this.rememberModels('claude', cl);
+    this.rememberModels('local', lo);
+    return [...c, ...cl, ...lo];
   }
 
   /** Pick the best available provider. Prefers Claude, then Copilot, then Local. */
@@ -328,9 +434,10 @@ export class AIManager {
 
     const binary = auth.binaryPath!;
     const continueSession = (this.cliTurnCounts[provider] ?? 0) > 0;
+    const resolvedModel = this.resolveModel(provider, model);
     const args = provider === 'copilot'
-      ? this.copilot.buildArgsForBinary(binary, prompt, continueSession, model)
-      : adapter.buildArgs(prompt, continueSession, model);
+      ? this.copilot.buildArgsForBinary(binary, prompt, continueSession, resolvedModel ?? model)
+      : adapter.buildArgs(prompt, continueSession, resolvedModel ?? model);
 
     if (process.env.NODE_ENV === 'development') {
       console.log(`[ai] Sending to ${provider}: ${binary} [${args.length} args, prompt_length=${prompt.length}]`);
@@ -344,12 +451,10 @@ export class AIManager {
 
       const scopedEnv = getScopedSpawnEnv(provider);
 
-      // On Windows .cmd files and extensionless npm shims can't be run by
-      // CreateProcess() directly — resolveSpawn wraps them with cmd.exe /c.
-      // We never use shell:true because that would require escaping the user
-      // prompt against cmd.exe metacharacter injection.
-      const { bin: spawnBin, spawnArgs } = resolveSpawn(binary, args);
-      const proc = spawn(spawnBin, spawnArgs, {
+      // spawnPortable wraps Windows .cmd shims via cmd.exe /c. We never use
+      // shell:true because that would require escaping user prompts against
+      // cmd.exe metacharacter injection.
+      const proc = spawnPortable(binary, args, {
         env: scopedEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
@@ -409,7 +514,8 @@ export class AIManager {
         } else {
           // Surface stderr so the user can see why it failed.
           const detail = stderrBuf.trim().slice(0, 800) || '(no stderr)';
-          reject(new Error(`${provider} exited with code ${code}: ${detail}`));
+          const friendly = friendlyEntitlementError(detail, model);
+          reject(new Error(friendly || `${provider} exited with code ${code}: ${detail}`));
         }
       });
     });
@@ -434,14 +540,25 @@ export class AIManager {
     rawText: string,
     opts: { allowCloud: boolean },
   ): Promise<{ text: string; providerUsed: AIProvider }> {
+    // Read the user's selected model so polish honors it. Previously the
+    // model was silently dropped — every polish ran against the CLI default.
+    let savedModelId: string | null = null;
+    let savedProvider: string | null = null;
+    try {
+      savedModelId = native.getSetting('ai_model');
+      savedProvider = native.getSetting('ai_provider');
+    } catch { /* ignore — settings unavailable */ }
+
     const claude = opts.allowCloud ? await this.checkAuth('claude') : null;
     if (claude?.authenticated) {
-      const text = await this.runCliOneShot('claude', rawText);
+      const claudeModel = savedProvider === 'claude' ? savedModelId : null;
+      const text = await this.runCliOneShot('claude', rawText, claudeModel || undefined);
       return { text, providerUsed: 'claude' };
     }
     const copilot = opts.allowCloud ? await this.checkAuth('copilot') : null;
     if (copilot?.authenticated) {
-      const text = await this.runCliOneShot('copilot', rawText);
+      const copilotModel = savedProvider === 'copilot' ? savedModelId : null;
+      const text = await this.runCliOneShot('copilot', rawText, copilotModel || undefined);
       return { text, providerUsed: 'copilot' };
     }
     const resolvedLocal = resolveActiveChatModel(native);
@@ -500,13 +617,13 @@ export class AIManager {
     // the CLI binaries take a single positional/argument prompt — there's no
     // separate system-message channel like chatComplete has.
     const prompt = `${CLEANUP_PROMPT}\n\nInput transcript:\n${rawText}`;
+    const resolvedModel = this.resolveModel(provider, model);
     const args = provider === 'copilot'
-      ? this.copilot.buildArgsForBinary(binary, prompt, false, model)
-      : adapter.buildArgs(prompt, false, model);
+      ? this.copilot.buildArgsForBinary(binary, prompt, false, resolvedModel ?? model)
+      : adapter.buildArgs(prompt, false, resolvedModel ?? model);
 
     return new Promise<string>((resolve, reject) => {
-      const { bin: spawnBin, spawnArgs } = resolveSpawn(binary, args);
-      const proc = spawn(spawnBin, spawnArgs, {
+      const proc = spawnPortable(binary, args, {
         env: getScopedSpawnEnv(provider),
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
@@ -530,7 +647,8 @@ export class AIManager {
         clearTimeout(timer);
         if (code !== 0 && !fullOutput.trim()) {
           const detail = stderrBuf.trim().slice(0, 800) || '(no stderr)';
-          reject(new Error(`${provider} exited with code ${code}: ${detail}`));
+          const friendly = friendlyEntitlementError(detail, model);
+          reject(new Error(friendly || `${provider} exited with code ${code}: ${detail}`));
           return;
         }
         // Strip ANSI for Copilot which can emit color codes; Claude doesn't.

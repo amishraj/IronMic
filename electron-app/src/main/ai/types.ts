@@ -36,19 +36,46 @@ export interface IAIAdapter {
   isAuthenticated(): Promise<boolean>;
   getVersion(): Promise<string | null>;
   getBinaryPath(): Promise<string | null>;
-  availableModels(): AIModel[];
+  /**
+   * Cache-only: returns the most recently cached catalog, or a conservative
+   * fallback. Must NOT spawn child processes. Use `refreshModels()` to probe.
+   */
+  listAvailableModels(): Promise<AIModel[]>;
+  /** Optional: probe-and-refresh path. Defaults to listAvailableModels(). */
+  refreshModels?(opts?: { force?: boolean }): Promise<AIModel[]>;
+  /** Optional: invalidate any cached catalog so next refresh re-probes. */
+  clearModelCache?(): void;
 }
 
-/** Extended adapter interface for CLI-based providers (Claude). */
+/** Extended adapter interface for CLI-based providers (Claude, Copilot). */
 export interface ICLIAdapter extends IAIAdapter {
-  buildArgs(prompt: string, continueSession: boolean, model?: string): string[];
+  buildArgs(prompt: string, continueSession: boolean, model?: AIModel | string): string[];
   parseOutput(data: string): ParsedOutput;
 }
 
+export interface AIModelRunIds {
+  /** Run-id passed to `copilot --model <id>` (unprefixed, e.g. 'claude-haiku-4.5'). */
+  copilotCli?: string;
+  /** Run-id passed to `gh models run <id>` (provider-prefixed, e.g. 'openai/gpt-4.1'). */
+  ghModels?: string;
+}
+
 export interface AIModel {
+  /**
+   * Stable internal key persisted in the `ai_model` setting.
+   *
+   * For Copilot dynamic entries we use the raw backend run-id directly
+   * ('claude-haiku-4.5' for copilot-cli, 'openai/gpt-4.1' for gh-models)
+   * so saved selections survive app restart even when the in-memory
+   * runIds map is empty.
+   */
   id: string;
   label: string;
   provider: AIProvider;
-  free: boolean;
-  description: string;
+  /** Origin of the entry. Optional — Claude='static', Local='local', Copilot='cli'|'fallback'. */
+  source?: 'cli' | 'fallback' | 'static' | 'local';
+  /** Replaces the previous `free: boolean`. 'unknown' for dynamically discovered models. */
+  billing?: 'free' | 'paid' | 'unknown';
+  description?: string;
+  runIds?: AIModelRunIds;
 }

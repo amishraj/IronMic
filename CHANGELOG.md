@@ -2,6 +2,26 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.7.3] - 2026-05-08
+
+### Added
+
+- **Dynamic GitHub Copilot model catalog** — Settings → AI Assist now reflects the models your actual Copilot subscription supports instead of two hardcoded options. A "Refresh models" button queries the active backend (`copilot help` for the `@github/copilot` CLI, `gh models list` for the `gh-models` extension) and populates the dropdown from the response. Free, Pro, Pro+, Business, and Enterprise users now see the full set their plan exposes.
+- **`ai:refresh-models` IPC** — Renderer-triggered catalog probe. The existing `ai:get-models` is now strictly cache-only and never spawns child processes, so opening Settings does not produce a network call. Catalog probes only run on explicit user action.
+- **Orphan-selection UI** — When a previously-saved Copilot model isn't in the visible catalog (e.g. immediately after app restart, before a refresh), the dropdown now shows it as a "Saved" entry with a Refresh CTA so the UI never silently drifts from what the backend will actually call.
+- **Cross-platform spawn helper** — New `utils/spawn-portable.ts` extracts the Windows `.cmd`/extensionless-shim wrapping previously private to `AIManager`, so adapter probes (`copilot help`, `gh models list`, `gh auth status`) work correctly on Windows where shim binaries can't be invoked via `execFile` directly.
+
+### Fixed
+
+- **Polish ignored selected model** — `AIManager.polish()` was silently dropping the user's selected model and always running CLI defaults. The cleanup pass now reads `ai_model` from settings and forwards it via `--model`, so a user who picked Claude Sonnet 4 or `claude-haiku-4.5` in Copilot actually gets that model for transcript polish.
+- **Friendly entitlement-error messages** — When the CLI rejects a model the user's plan doesn't grant (overlisting from `copilot help` is possible), the chat surfaces a clear "model isn't available on your plan" message instead of raw stderr.
+- **Async, non-blocking model probes** — Catalog probes use promisified `execFile` with hard timeouts (≤5 s) so the Electron main process never freezes while waiting on `gh` or `copilot`.
+
+### Changed
+
+- **`AIModel.free: boolean` → `billing: 'free' | 'paid' | 'unknown'`** — Dynamically discovered models from `gh models list` / `copilot help` don't expose plan tier, so they're tagged `unknown` instead of guessing. The "Free" badge is preserved for known-free entries; "Saved" badge tags orphaned post-restart selections.
+- **`AIModel.runIds`** — New optional field carrying backend-specific run identifiers (`copilotCli`, `ghModels`) so saved selections always invoke the correct argument form regardless of which backend is active. Legacy pre-1.7.3 string IDs continue to work via the existing alias normalizer.
+
 ## [1.7.2] - 2026-05-08
 
 ### Fixed

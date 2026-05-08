@@ -140,17 +140,20 @@ interface AIModelOption {
   id: string;
   label: string;
   provider: string;
-  free: boolean;
-  description: string;
+  source?: 'cli' | 'fallback' | 'static' | 'local';
+  billing?: 'free' | 'paid' | 'unknown';
+  description?: string;
+  runIds?: { copilotCli?: string; ghModels?: string };
 }
 
 function AIAssistSettings() {
   const { aiEnabled, setAiEnabled } = useSettingsStore();
   const [provider, setProvider] = useState<string>('copilot');
-  const [model, setModel] = useState<string>('gpt-4.1-mini');
+  const [model, setModel] = useState<string>('');
   const [models, setModels] = useState<AIModelOption[]>([]);
   const [authState, setAuthState] = useState<any>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [refreshingModels, setRefreshingModels] = useState(false);
   const [localModels, setLocalModels] = useState<any[]>([]);
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
@@ -210,12 +213,30 @@ function AIAssistSettings() {
       }
     } else {
       const providerModels = models.filter((m) => m.provider === p);
-      const defaultModel = providerModels.find((m) => m.free) || providerModels[0];
+      const defaultModel =
+        providerModels.find((m) => m.billing === 'free') || providerModels[0];
       if (defaultModel) {
         setModel(defaultModel.id);
         await window.ironmic.setSetting('ai_model', defaultModel.id);
       }
     }
+  }
+
+  async function handleRefreshModels() {
+    setRefreshingModels(true);
+    try {
+      const fresh = await (window.ironmic as any).aiRefreshModels?.('copilot');
+      if (Array.isArray(fresh)) {
+        // Replace just the copilot entries; keep claude + local from the
+        // existing aggregated `models` so the dropdown for those providers
+        // doesn't disappear if the user is mid-switch.
+        setModels((prev) => [
+          ...prev.filter((m) => m.provider !== 'copilot'),
+          ...fresh,
+        ]);
+      }
+    } catch { /* ignore — UI shows fallback */ }
+    setRefreshingModels(false);
   }
 
   async function handleModelChange(m: string) {
@@ -329,40 +350,80 @@ function AIAssistSettings() {
           </div>
 
           {/* Model selection — CLI providers */}
-          {provider !== 'local' && (
-            <div className="space-y-1.5">
-              <label className="text-sm font-medium text-iron-text">Model</label>
-              <p className="text-xs text-iron-text-muted">
-                {provider === 'copilot'
-                  ? 'Select which model GitHub Copilot should use'
-                  : 'Select which Claude model to use'}
-              </p>
-              <div className="space-y-1 mt-2">
-                {providerModels.map((m) => (
-                  <button
-                    key={m.id}
-                    onClick={() => handleModelChange(m.id)}
-                    className={`w-full text-left px-3 py-2.5 rounded-lg text-xs transition-all ${
-                      model === m.id
-                        ? 'bg-iron-accent/15 text-iron-accent-light border border-iron-accent/20'
-                        : 'bg-iron-surface text-iron-text-secondary border border-iron-border hover:border-iron-border-hover'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <span className="font-medium">{m.label}</span>
-                        {m.free && (
-                          <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-iron-success/15 text-iron-success border border-iron-success/20">Free</span>
+          {provider !== 'local' && (() => {
+            // For Copilot: surface the saved selection as an "orphaned" option
+            // when it's not in the visible list. This keeps the dropdown in
+            // sync with what sendMessage / polish will actually call —
+            // critical post-restart before the user clicks Refresh models.
+            const savedInList = providerModels.some((m) => m.id === model);
+            const orphan =
+              provider === 'copilot' && model && !savedInList
+                ? { id: model, label: model, provider: 'copilot' as const, source: undefined, billing: 'unknown' as const, description: 'Last selection — click Refresh models to verify availability' }
+                : null;
+            const visible = orphan ? [orphan, ...providerModels] : providerModels;
+            const copilotSource =
+              provider === 'copilot' && providerModels.length > 0
+                ? providerModels[0].source
+                : undefined;
+            return (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-medium text-iron-text">Model</label>
+                  {provider === 'copilot' && (
+                    <button
+                      onClick={handleRefreshModels}
+                      disabled={refreshingModels}
+                      className="flex items-center gap-1.5 text-[11px] text-iron-accent-light hover:underline"
+                      title="Query GitHub Copilot for the models your subscription supports"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${refreshingModels ? 'animate-spin' : ''}`} />
+                      {refreshingModels ? 'Loading...' : 'Refresh models'}
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-iron-text-muted">
+                  {provider === 'copilot'
+                    ? copilotSource === 'cli'
+                      ? 'From your GitHub Copilot subscription'
+                      : 'Default catalog — click "Refresh models" to load your subscription'
+                    : 'Select which Claude model to use'}
+                </p>
+                <div className="space-y-1 mt-2">
+                  {visible.map((m) => {
+                    const isOrphan = orphan && m.id === orphan.id;
+                    const isFree = m.billing === 'free';
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => handleModelChange(m.id)}
+                        className={`w-full text-left px-3 py-2.5 rounded-lg text-xs transition-all ${
+                          model === m.id
+                            ? 'bg-iron-accent/15 text-iron-accent-light border border-iron-accent/20'
+                            : 'bg-iron-surface text-iron-text-secondary border border-iron-border hover:border-iron-border-hover'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <span className="font-medium">{m.label}</span>
+                            {isFree && (
+                              <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-iron-success/15 text-iron-success border border-iron-success/20">Free</span>
+                            )}
+                            {isOrphan && (
+                              <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-iron-warning/15 text-iron-warning border border-iron-warning/20">Saved</span>
+                            )}
+                          </div>
+                          {model === m.id && <CheckCircle className="w-3.5 h-3.5 text-iron-accent-light" />}
+                        </div>
+                        {m.description && (
+                          <span className="block text-[10px] text-iron-text-muted mt-0.5">{m.description}</span>
                         )}
-                      </div>
-                      {model === m.id && <CheckCircle className="w-3.5 h-3.5 text-iron-accent-light" />}
-                    </div>
-                    <span className="block text-[10px] text-iron-text-muted mt-0.5">{m.description}</span>
-                  </button>
-                ))}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Model selection — Local LLM with download */}
           {provider === 'local' && (

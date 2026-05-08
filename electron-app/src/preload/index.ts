@@ -123,6 +123,8 @@ const api = {
   aiPickProvider: () => ipcRenderer.invoke('ai:pick-provider'),
   aiSendMessage: (prompt: string, provider: string, model?: string) => ipcRenderer.invoke('ai:send-message', prompt, provider, model),
   aiGetModels: (provider?: string) => ipcRenderer.invoke('ai:get-models', provider),
+  aiRefreshModels: (provider?: string, opts?: { force?: boolean }) =>
+    ipcRenderer.invoke('ai:refresh-models', provider, opts),
   aiCancel: () => ipcRenderer.invoke('ai:cancel'),
   aiResetSession: () => ipcRenderer.invoke('ai:reset-session'),
   aiGetLocalModelStatus: () => ipcRenderer.invoke('ai:local-model-status'),

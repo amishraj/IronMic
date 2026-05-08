@@ -639,9 +639,15 @@ If the text is too short or unclear, output: ["General"]`;
     const window = BrowserWindow.getFocusedWindow();
     return aiManager.sendMessage(prompt, provider, window, model || undefined);
   });
-  ipcMain.handle('ai:get-models', (_e, provider?: AIProvider) => {
+  ipcMain.handle('ai:get-models', async (_e, provider?: AIProvider) => {
     if (provider) return aiManager.getModels(provider);
     return aiManager.getAllModels();
+  });
+  // Catalog probe — explicit user action only. This is the only AI IPC route
+  // that may shell out to enumerate models. `force: true` bypasses the
+  // adapter's TTL cache (used for a hard-refresh affordance).
+  ipcMain.handle('ai:refresh-models', async (_e, provider?: AIProvider, opts?: { force?: boolean }) => {
+    return aiManager.refreshModels(provider, opts ?? {});
   });
   ipcMain.handle('ai:cancel', () => aiManager.cancel());
   ipcMain.handle('ai:reset-session', () => aiManager.resetSession());

@@ -102,12 +102,13 @@ export class LocalLLMAdapter implements IAIAdapter {
     return llmSubprocess.getBinaryPath();
   }
 
-  availableModels(): AIModel[] {
+  async listAvailableModels(): Promise<AIModel[]> {
     return CHAT_LLM_MODELS.map((m) => ({
       id: m.id,
       label: m.label,
       provider: 'local' as AIProvider,
-      free: true,
+      source: 'local',
+      billing: 'free',
       description: m.description,
     }));
   }
