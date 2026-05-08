@@ -97,7 +97,16 @@ export async function resolveInShell(name: string): Promise<string | null> {
         timeout: 5000,
         env: getSpawnEnv(),
       });
-      return stdout.split(/\r?\n/).find((line) => line.trim().length > 0)?.trim() || null;
+      const lines = stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+      // `where` returns all matches — extensionless npm shim first, then .cmd,
+      // then .ps1. The shim cannot be spawned by CreateProcess directly.
+      // Prefer .exe > .cmd over the extensionless file.
+      return (
+        lines.find((l) => /\.exe$/i.test(l)) ||
+        lines.find((l) => /\.cmd$/i.test(l)) ||
+        lines[0] ||
+        null
+      );
     } catch {
       return null;
     }

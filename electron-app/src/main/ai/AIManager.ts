@@ -18,6 +18,18 @@ import type { AIProvider, AuthStatus, AIAuthState, ICLIAdapter, IAIAdapter, AIMo
 /** Narrowed to CLI-only providers so per-provider state can't accidentally include local. */
 type CLIProvider = 'copilot' | 'claude';
 
+/**
+ * On Windows, .cmd batch files and extensionless npm shims cannot be executed
+ * by CreateProcess() directly (spawn shell:false). Wrap them with cmd.exe /c.
+ * On other platforms the binary and args pass through unchanged.
+ */
+function resolveSpawn(binary: string, args: string[]): { bin: string; spawnArgs: string[] } {
+  if (process.platform === 'win32' && (/\.cmd$/i.test(binary) || !/\.[a-z]+$/i.test(binary))) {
+    return { bin: process.env.COMSPEC || 'cmd.exe', spawnArgs: ['/c', binary, ...args] };
+  }
+  return { bin: binary, spawnArgs: args };
+}
+
 const AUTH_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 /** Maximum number of conversation history messages to keep for local LLM context. */
@@ -332,10 +344,12 @@ export class AIManager {
 
       const scopedEnv = getScopedSpawnEnv(provider);
 
-      // No shell:true — `gh.exe` and `claude` (or `claude.cmd`) are real
-      // executables resolvable directly. shell:true would require escaping
-      // the user prompt to avoid cmd.exe metachar injection, which is risky.
-      const proc = spawn(binary, args, {
+      // On Windows .cmd files and extensionless npm shims can't be run by
+      // CreateProcess() directly — resolveSpawn wraps them with cmd.exe /c.
+      // We never use shell:true because that would require escaping the user
+      // prompt against cmd.exe metacharacter injection.
+      const { bin: spawnBin, spawnArgs } = resolveSpawn(binary, args);
+      const proc = spawn(spawnBin, spawnArgs, {
         env: scopedEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
@@ -491,7 +505,8 @@ export class AIManager {
       : adapter.buildArgs(prompt, false, model);
 
     return new Promise<string>((resolve, reject) => {
-      const proc = spawn(binary, args, {
+      const { bin: spawnBin, spawnArgs } = resolveSpawn(binary, args);
+      const proc = spawn(spawnBin, spawnArgs, {
         env: getScopedSpawnEnv(provider),
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
