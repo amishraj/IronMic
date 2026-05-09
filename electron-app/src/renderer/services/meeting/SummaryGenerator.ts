@@ -44,6 +44,16 @@ export interface StructuredOutput {
   sections: StructuredSection[];
   plainSummary?: string;
   title?: string;
+  /**
+   * Provenance for `title`. `'user'` means the user typed it (live edit,
+   * detail-page header, host override). `'ai'` means it was generated from
+   * the content. Absent means no title has ever been set — `Meeting #N`
+   * fallback is shown. Used by regenerate to decide whether to overwrite
+   * or preserve the existing title. Do NOT overload `hasUserEdits` for
+   * this — that field tracks body edits and would either clobber user
+   * titles on regen or block AI titles after a body-only edit.
+   */
+  titleSource?: 'user' | 'ai';
   processingState: ProcessingState;
   templateId?: string;
   templateName?: string;
@@ -66,6 +76,7 @@ export interface VersionEntry {
     sections: StructuredSection[];
     plainSummary?: string;
     title?: string;
+    titleSource?: 'user' | 'ai';
   };
 }
 
@@ -394,6 +405,7 @@ export function appendVersion(
     sections: current.sections ?? [],
     plainSummary: current.plainSummary,
     title: current.title,
+    titleSource: current.titleSource,
   };
   const entry: VersionEntry = {
     id: `v-${Date.now().toString(36)}`,
@@ -419,7 +431,74 @@ export function restoreVersion(
     sections: version.snapshot.sections,
     plainSummary: version.snapshot.plainSummary,
     title: version.snapshot.title,
+    titleSource: version.snapshot.titleSource,
     hasUserEdits: false,
     // Keep the versions array intact so history doesn't disappear after restore.
   };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// AI title generation
+// ──────────────────────────────────────────────────────────────────────────
+
+/** Below this many plain-text chars we don't bother — the model has nothing
+ *  to title against, and `Meeting #N` is the better fallback. */
+const MIN_CHARS_FOR_AI_TITLE = 40;
+
+/** Soft clamp for the produced title. Anything longer than this is almost
+ *  certainly the model failing to obey "3-7 words". */
+const MAX_TITLE_CHARS = 80;
+
+/**
+ * Generate a short title from meeting content. Always runs through the
+ * **strictly local** polish IPC — never routes to a cloud provider regardless
+ * of `polish_allow_cloud`. Returns `null` whenever generation can't produce a
+ * faithful title (content too thin, model missing, error, model said NONE);
+ * callers should fall back to the sequence-based `Meeting #N` title.
+ *
+ * Never throws. Never blocks finalize.
+ */
+export async function generateMeetingTitle(
+  content: string,
+): Promise<string | null> {
+  const text = (content ?? '').trim();
+  if (text.length < MIN_CHARS_FOR_AI_TITLE) return null;
+
+  const ironmic = (window as any).ironmic;
+  if (!ironmic?.polishTextLocal) return null;
+
+  const prompt =
+    'Produce a 3–7 word, sentence-case title for the following meeting ' +
+    'content. Output the title only — no quotes, no trailing period, no ' +
+    'preamble. If content is too thin, output the single token NONE.\n\n' +
+    `Content: ${text}`;
+
+  let raw: string;
+  try {
+    // requireModel: true so a missing local cleanup model throws instead of
+    // returning the prompt unchanged (which would otherwise get clamped into
+    // a bogus title).
+    raw = await ironmic.polishTextLocal(prompt, { requireModel: true });
+  } catch {
+    return null;
+  }
+
+  return sanitizeTitle(raw);
+}
+
+function sanitizeTitle(raw: string | null | undefined): string | null {
+  if (!raw) return null;
+  let t = String(raw).trim();
+  if (!t) return null;
+  // Take first non-empty line — models occasionally emit a preamble.
+  t = t.split('\n').map(s => s.trim()).find(Boolean) ?? '';
+  if (!t) return null;
+  // Strip surrounding quotes (curly + straight).
+  t = t.replace(/^["'“”‘’]+|["'“”‘’]+$/g, '').trim();
+  // Strip trailing punctuation that titles shouldn't carry.
+  t = t.replace(/[.!?,;:\-–—]+$/g, '').trim();
+  if (!t) return null;
+  if (t.toUpperCase() === 'NONE') return null;
+  if (t.length > MAX_TITLE_CHARS) t = t.slice(0, MAX_TITLE_CHARS).trim();
+  return t || null;
 }

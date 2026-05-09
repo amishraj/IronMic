@@ -20,6 +20,11 @@ const api = {
   // badge after a successful polish. Existing callers stay on polishText.
   polishTextDetailed: (rawText: string, opts?: { requireModel?: boolean }) =>
     ipcRenderer.invoke('ironmic:polish-text-detailed', rawText, opts),
+  // Strictly local-only polish — bypasses polish_allow_cloud. For callers
+  // that must never route to a cloud provider (e.g. AI meeting-title
+  // generation) regardless of the user's polish setting.
+  polishTextLocal: (rawText: string, opts?: { requireModel?: boolean }) =>
+    ipcRenderer.invoke('ironmic:polish-text-local', rawText, opts),
 
   // Entries
   createEntry: (entry: any) => ipcRenderer.invoke('ironmic:create-entry', entry),

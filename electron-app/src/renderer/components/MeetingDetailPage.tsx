@@ -14,6 +14,8 @@ import {
 } from '../services/meeting/SummaryGenerator';
 import { useMeetingStore } from '../stores/useMeetingStore';
 import { upsertMeetingNoteEntry } from '../services/notebooks';
+import { resolveMeetingTitle } from '../services/meetingTitle';
+import { generateMeetingTitle } from '../services/meeting/SummaryGenerator';
 
 interface MeetingSession {
   id: string;
@@ -59,7 +61,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
         const s = JSON.parse(raw) as MeetingSession;
         setSession(s);
         setDraftSummary(extractEditableSummary(s));
-        setDraftTitle(extractTitle(s));
+        setDraftTitle(extractRawTitle(s));
       } catch (err) {
         console.error('[MeetingDetailPage] Failed to load session:', err);
       }
@@ -113,19 +115,36 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
     return s.summary ?? '';
   }
 
+  /** Display title for the header — always a non-empty string. Falls
+   *  through `Meeting #N` → detected-app → `Meeting`. Single source of
+   *  truth lives in services/meetingTitle.ts so this stays in sync with
+   *  the meetings card and the auto-filed Notes-sidebar entry. */
   function extractTitle(s: MeetingSession): string {
-    let sequence: number | null = null;
+    let parsed: any = null;
     if (s.structured_output) {
-      try {
-        const parsed = JSON.parse(s.structured_output);
-        if (parsed.title && typeof parsed.title === 'string') return parsed.title;
-        if (typeof parsed.sequence === 'number' && parsed.sequence > 0) sequence = parsed.sequence;
-      } catch { /* ignore */ }
+      try { parsed = JSON.parse(s.structured_output); } catch { /* ignore */ }
     }
-    if (sequence != null) return `Meeting #${sequence}`;
-    return s.detected_app
-      ? `${s.detected_app.charAt(0).toUpperCase() + s.detected_app.slice(1)} Meeting`
-      : 'Meeting';
+    return resolveMeetingTitle(s, parsed);
+  }
+
+  /** The bare *user-typed* title only — empty when no title has been
+   *  authored yet. Used to seed the editable input so the user sees a
+   *  blank field (with `Meeting #N` as the placeholder) rather than a
+   *  pre-filled fallback string they'd have to delete. */
+  function extractRawTitle(s: MeetingSession): string {
+    if (!s.structured_output) return '';
+    try {
+      const parsed = JSON.parse(s.structured_output);
+      const t = parsed?.title;
+      // Only return user-authored titles in the editable input — AI titles
+      // are still displayed in the header via extractTitle but should not
+      // pre-fill the input, otherwise the user's "clear it" action and a
+      // user-provided edit are indistinguishable on save.
+      if (typeof t === 'string' && t.trim() && parsed?.titleSource !== 'ai') {
+        return t;
+      }
+    } catch { /* ignore */ }
+    return '';
   }
 
   function extractProcessingState(s: MeetingSession | null): string | null {
@@ -194,9 +213,9 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       if (session.structured_output) {
         try { existing = JSON.parse(session.structured_output); } catch { /* ignore */ }
       }
+      const trimmedTitle = draftTitle.trim();
       const merged: any = {
         ...existing,
-        title: draftTitle.trim(),
         sections: [{ key: 'summary', title: 'Summary', content: draftSummary }],
         plainSummary: draftSummary,
         // Clear any formatted HTML from the Notes page — the user is now editing
@@ -205,6 +224,17 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
         processingState: existing.processingState === 'empty' ? 'empty' : 'done',
         hasUserEdits: true,
       };
+      if (trimmedTitle) {
+        // Non-empty → user-authored. Stamp provenance so regenerate
+        // preserves it.
+        merged.title = trimmedTitle;
+        merged.titleSource = 'user';
+      } else {
+        // Blank → "no authored title". Drop both fields so
+        // resolveMeetingTitle falls back to Meeting #N.
+        delete merged.title;
+        delete merged.titleSource;
+      }
 
       // Keep the Notes sidebar in sync — upsert the linked notebook entry so
       // edits made here are immediately reflected in the Notes > Meeting Notes
@@ -214,7 +244,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
         const entryId = await upsertMeetingNoteEntry({
           existingEntryId: merged.notebookEntryId ?? null,
           sessionId: session.id,
-          title: draftTitle.trim() || 'Meeting',
+          title: resolveMeetingTitle(session, merged),
           plainText: draftSummary,
         });
         merged.notebookEntryId = entryId;
@@ -307,6 +337,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
         sections: existing?.sections ?? [],
         plainSummary: existing?.plainSummary,
         title: existing?.title,
+        titleSource: existing?.titleSource,
         processingState: 'generating',
         templateId: args.template?.id,
         templateName: args.template?.name,
@@ -320,9 +351,16 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       const fresh = await generateMeetingSummary(transcript, args.template);
 
       // 4. Preserve title + carried versions in the fresh output.
+      //    Title preservation rules (do NOT overload hasUserEdits — that
+      //    tracks body edits):
+      //    - User-authored title (titleSource === 'user'): always keep.
+      //    - AI title (titleSource === 'ai') or unset: regenerate from
+      //      the new content. Falls through to `Meeting #N` if too thin.
+      const userAuthored = existing?.titleSource === 'user' && !!existing?.title;
       const merged: StructuredOutput = {
         ...fresh,
-        title: existing?.title,
+        title: userAuthored ? existing!.title : undefined,
+        titleSource: userAuthored ? 'user' : undefined,
         versions: carriedVersions,
         hasUserEdits: false,
         // AI-generated output is always plain — clear any user-formatted HTML.
@@ -337,13 +375,21 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
           .map(s => `## ${s.title}\n${s.content}`)
           .join('\n\n');
 
+      if (!userAuthored && summaryForColumn.trim()) {
+        const aiTitle = await generateMeetingTitle(summaryForColumn);
+        if (aiTitle) {
+          merged.title = aiTitle;
+          (merged as any).titleSource = 'ai';
+        }
+      }
+
       // Upsert the Meeting Notes notebook entry for this session so the
       // regenerated summary is reflected in the unified notes corpus.
       try {
         const entryId = await upsertMeetingNoteEntry({
           existingEntryId: (merged as any).notebookEntryId ?? null,
           sessionId: session.id,
-          title: merged.title || `Meeting ${new Date().toLocaleString()}`,
+          title: resolveMeetingTitle(session, merged as any),
           plainText: summaryForColumn,
         });
         (merged as any).notebookEntryId = entryId;
@@ -365,7 +411,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       const updated = { ...session, summary: summaryForColumn, structured_output: newStructured };
       setSession(updated);
       setDraftSummary(extractEditableSummary(updated));
-      setDraftTitle(extractTitle(updated));
+      setDraftTitle(extractRawTitle(updated));
       patchSession(session.id, { summary: summaryForColumn, structured_output: newStructured });
       setRegenerateOpen(false);
       onUpdated?.();
@@ -404,7 +450,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       const updated = { ...session, summary: summaryForColumn, structured_output: newStructured };
       setSession(updated);
       setDraftSummary(extractEditableSummary(updated));
-      setDraftTitle(extractTitle(updated));
+      setDraftTitle(extractRawTitle(updated));
       patchSession(session.id, { summary: summaryForColumn, structured_output: newStructured });
       setHistoryOpen(false);
       onUpdated?.();
@@ -459,7 +505,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
     if (editing) {
       const persisted = extractEditableSummary(session);
       if (draftSummary.trim() !== persisted.trim()) return true;
-      if (draftTitle.trim() !== extractTitle(session).trim()) return true;
+      if (draftTitle.trim() !== extractRawTitle(session).trim()) return true;
     }
     return false;
   })();
@@ -483,7 +529,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
               <input
                 value={draftTitle}
                 onChange={(e) => setDraftTitle(e.target.value)}
-                placeholder="Meeting title"
+                placeholder={titleText}
                 className="w-full bg-iron-surface-hover border border-iron-border rounded px-2 py-1 text-sm font-medium text-iron-text focus:outline-none focus:border-iron-accent/40"
               />
             ) : (
@@ -528,7 +574,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
                 onClick={() => {
                   setEditing(false);
                   setDraftSummary(extractEditableSummary(session));
-                  setDraftTitle(extractTitle(session));
+                  setDraftTitle(extractRawTitle(session));
                 }}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-iron-text-muted rounded-lg border border-iron-border hover:bg-iron-surface-hover transition-colors"
               >

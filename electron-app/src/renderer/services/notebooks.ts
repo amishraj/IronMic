@@ -277,7 +277,11 @@ export async function upsertMeetingNoteEntry(params: {
 }): Promise<string> {
   const api = window.ironmic;
   await ensureMeetingNotesNotebook();
-  const title = params.title?.trim() || `Meeting ${new Date().toLocaleString()}`;
+  // Defensive fallback only. Callers are now responsible for resolving the
+  // display title via resolveMeetingTitle(); this branch fires only if a
+  // caller still passes nothing — and we *never* want a date-stamped name
+  // because that disagrees with the meeting card's own `Meeting #N` header.
+  const title = params.title?.trim() || 'Meeting';
 
   // Resolve the target entry. Order:
   //  1) caller-provided id (fast path, typical)
