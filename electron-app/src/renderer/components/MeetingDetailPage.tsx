@@ -1,9 +1,13 @@
-import { useEffect, useState } from 'react';
-import { ArrowLeft, Clock, Users, ChevronDown, ChevronRight, Pencil, Save, X, Loader2, RefreshCw, History } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { ArrowLeft, Clock, Users, ChevronDown, ChevronRight, Pencil, Save, X, Loader2, RefreshCw, History, Mic, MicOff, Volume2, Pause, Users as UsersIcon } from 'lucide-react';
+import { type Editor } from '@tiptap/react';
 import { MeetingTranscriptPanel, type TranscriptSegment } from './MeetingTranscriptPanel';
 import { MeetingNotesPanel } from './MeetingNotesPanel';
 import { MeetingRegenerateModal, type EditsDisposition } from './MeetingRegenerateModal';
 import { MeetingVersionsDrawer } from './MeetingVersionsDrawer';
+import { RichTextEditorShell } from './RichTextEditorShell';
+import { RawPolishedToggle } from './RawPolishedToggle';
+import { NotesCollaborateModal } from './NotesCollaborateModal';
 import type { MeetingTemplate, StructuredMeetingOutput } from '../services/tfjs/MeetingTemplateEngine';
 import {
   generateMeetingSummary,
@@ -13,9 +17,11 @@ import {
   type VersionEntry,
 } from '../services/meeting/SummaryGenerator';
 import { useMeetingStore } from '../stores/useMeetingStore';
+import { useTtsStore } from '../stores/useTtsStore';
 import { upsertMeetingNoteEntry } from '../services/notebooks';
 import { resolveMeetingTitle } from '../services/meetingTitle';
 import { generateMeetingTitle } from '../services/meeting/SummaryGenerator';
+import { textToHtml, htmlToText, isHtmlEmpty } from '../services/tiptapText';
 
 interface MeetingSession {
   id: string;
@@ -40,11 +46,28 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
   const [transcriptOpen, setTranscriptOpen] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draftSummary, setDraftSummary] = useState('');
+  /** TipTap-formatted HTML being edited. Seeded from `htmlContent` (if the
+   *  user previously saved with formatting) or by promoting `plainSummary`
+   *  via `textToHtml` so paragraph breaks survive. Plain text is derived
+   *  from this on save — `draftSummary` is just a cached mirror used by
+   *  the unsaved-edits diff. */
+  const [editingHtml, setEditingHtml] = useState('');
   const [draftTitle, setDraftTitle] = useState('');
   const [saving, setSaving] = useState(false);
   const [regenerateOpen, setRegenerateOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
+  /** Read-mode: which view is shown in the body — the polished AI notes
+   *  (default) or the raw transcript. Edit mode forces 'polished' since
+   *  the editor only operates on polished notes. */
+  const [displayMode, setDisplayMode] = useState<'raw' | 'polished'>('polished');
+  const [collabOpen, setCollabOpen] = useState(false);
+  /** Local dictate-append state — scoped to this editor instance, NOT
+   *  global. Avoids the NoteEditor pattern of "fetch latest entry on
+   *  pipeline-idle" which would inject the wrong content into the wrong
+   *  surface. We capture the audio buffer ourselves and insert at cursor. */
+  const [dictateState, setDictateState] = useState<'idle' | 'recording' | 'processing'>('idle');
+  const editorRef = useRef<Editor | null>(null);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
   const markMeetingProcessing = useMeetingStore(s => s.markMeetingProcessing);
   const unmarkMeetingProcessing = useMeetingStore(s => s.unmarkMeetingProcessing);
@@ -62,6 +85,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
         setSession(s);
         setDraftSummary(extractEditableSummary(s));
         setDraftTitle(extractRawTitle(s));
+        setEditingHtml(extractEditableHtml(s));
       } catch (err) {
         console.error('[MeetingDetailPage] Failed to load session:', err);
       }
@@ -113,6 +137,23 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       } catch { /* fallthrough */ }
     }
     return s.summary ?? '';
+  }
+
+  /** TipTap-formatted HTML to seed the editor. Prefers a previously
+   *  saved `htmlContent` (preserves user formatting like bold + lists);
+   *  falls back to promoting the plain summary so paragraph breaks survive
+   *  the round-trip. Used only by the load effect — the editor itself
+   *  drives `editingHtml` while editing. */
+  function extractEditableHtml(s: MeetingSession): string {
+    if (s.structured_output) {
+      try {
+        const parsed = JSON.parse(s.structured_output);
+        if (typeof parsed?.htmlContent === 'string' && parsed.htmlContent.trim()) {
+          return parsed.htmlContent;
+        }
+      } catch { /* ignore */ }
+    }
+    return textToHtml(extractEditableSummary(s));
   }
 
   /** Display title for the header — always a non-empty string. Falls
@@ -214,13 +255,17 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
         try { existing = JSON.parse(session.structured_output); } catch { /* ignore */ }
       }
       const trimmedTitle = draftTitle.trim();
+      // The TipTap shell is the source of truth while editing. Derive plain
+      // text from its HTML so the rest of the app (FTS, exports, sidebar
+      // previews) keeps reading a clean string, while we persist the HTML
+      // alongside it so the formatting survives reload.
+      const finalHtml = editingHtml;
+      const finalPlain = isHtmlEmpty(finalHtml) ? '' : htmlToText(finalHtml);
       const merged: any = {
         ...existing,
-        sections: [{ key: 'summary', title: 'Summary', content: draftSummary }],
-        plainSummary: draftSummary,
-        // Clear any formatted HTML from the Notes page — the user is now editing
-        // in the plain-text textarea, so the HTML would be stale after this save.
-        htmlContent: null,
+        sections: [{ key: 'summary', title: 'Summary', content: finalPlain }],
+        plainSummary: finalPlain,
+        htmlContent: isHtmlEmpty(finalHtml) ? null : finalHtml,
         processingState: existing.processingState === 'empty' ? 'empty' : 'done',
         hasUserEdits: true,
       };
@@ -245,7 +290,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
           existingEntryId: merged.notebookEntryId ?? null,
           sessionId: session.id,
           title: resolveMeetingTitle(session, merged),
-          plainText: draftSummary,
+          plainText: finalPlain,
         });
         merged.notebookEntryId = entryId;
       } catch (err) {
@@ -257,14 +302,15 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       await window.ironmic.meetingEnd(
         session.id,
         session.speaker_count || 1,
-        draftSummary,
+        finalPlain,
         '',
         session.total_duration_seconds ?? 0,
         '',
       );
-      const updated = { ...session, summary: draftSummary, structured_output: newStructured };
+      const updated = { ...session, summary: finalPlain, structured_output: newStructured };
       setSession(updated);
-      patchSession(session.id, { summary: draftSummary, structured_output: newStructured });
+      setDraftSummary(finalPlain);
+      patchSession(session.id, { summary: finalPlain, structured_output: newStructured });
       setEditing(false);
       onUpdated?.();
     } catch (err) {
@@ -412,6 +458,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       setSession(updated);
       setDraftSummary(extractEditableSummary(updated));
       setDraftTitle(extractRawTitle(updated));
+      setEditingHtml(extractEditableHtml(updated));
       patchSession(session.id, { summary: summaryForColumn, structured_output: newStructured });
       setRegenerateOpen(false);
       onUpdated?.();
@@ -451,6 +498,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       setSession(updated);
       setDraftSummary(extractEditableSummary(updated));
       setDraftTitle(extractRawTitle(updated));
+      setEditingHtml(extractEditableHtml(updated));
       patchSession(session.id, { summary: summaryForColumn, structured_output: newStructured });
       setHistoryOpen(false);
       onUpdated?.();
@@ -492,6 +540,11 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
     if (!id) return null;
     return templates.find(t => t.id === id) ?? null;
   })();
+  /** Linked notebook-entry id used as the target for Collaborate / TTS.
+   *  Empty meetings (no auto-filed entry yet) get the controls disabled
+   *  with a tooltip telling the user to save first — clicking Save lazily
+   *  upserts via `handleSave`, which makes them light up. */
+  const notebookEntryIdForTools = parsedStructured?.notebookEntryId ?? null;
 
   /**
    * "Unsaved edits" for the regenerate prompt.
@@ -503,8 +556,17 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
   const hasUnsavedEdits = (() => {
     if (parsedStructured?.hasUserEdits) return true;
     if (editing) {
-      const persisted = extractEditableSummary(session);
-      if (draftSummary.trim() !== persisted.trim()) return true;
+      // Compare HTML when an htmlContent baseline exists (the user typed
+      // formatted notes that we'd otherwise miss with a plain-text diff);
+      // fall back to plain-text diff against the editable summary.
+      const persistedHtml = parsedStructured?.htmlContent ?? '';
+      if (persistedHtml) {
+        if (editingHtml !== persistedHtml) return true;
+      } else {
+        const persistedPlain = extractEditableSummary(session);
+        const draftPlain = isHtmlEmpty(editingHtml) ? '' : htmlToText(editingHtml);
+        if (draftPlain.trim() !== persistedPlain.trim()) return true;
+      }
       if (draftTitle.trim() !== extractRawTitle(session).trim()) return true;
     }
     return false;
@@ -575,6 +637,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
                   setEditing(false);
                   setDraftSummary(extractEditableSummary(session));
                   setDraftTitle(extractRawTitle(session));
+                  setEditingHtml(extractEditableHtml(session));
                 }}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-iron-text-muted rounded-lg border border-iron-border hover:bg-iron-surface-hover transition-colors"
               >
@@ -592,6 +655,31 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
             </>
           ) : (
             <>
+              {/* Raw/Polished — shown only in read mode. Edit operates on
+                  the polished notes, so we hide the toggle when editing
+                  to avoid implying you can switch what's in the editor. */}
+              {!isProcessing && !isEmpty && segments.length > 0 && (
+                <RawPolishedToggle
+                  displayMode={displayMode}
+                  onToggle={setDisplayMode}
+                />
+              )}
+              <ReadAloudButton
+                getText={() => editing ? (editorRef.current?.getText() || '') : (plainSummary || '')}
+                ttsKey={notebookEntryIdForTools}
+                disabled={isProcessing || (!editing && !plainSummary)}
+              />
+              <button
+                onClick={() => setCollabOpen(true)}
+                disabled={!notebookEntryIdForTools}
+                title={notebookEntryIdForTools
+                  ? 'Collaborate on these notes'
+                  : 'Save the meeting first to enable collaboration'}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-iron-text-muted rounded-lg border border-iron-border hover:bg-iron-surface-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                <UsersIcon className="w-3.5 h-3.5" />
+                Collaborate
+              </button>
               {versions.length > 0 && (
                 <button
                   onClick={() => setHistoryOpen(true)}
@@ -620,7 +708,12 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
                 Regenerate
               </button>
               <button
-                onClick={() => setEditing(true)}
+                onClick={() => {
+                  // Forcing 'polished' on edit-entry — the editor only
+                  // operates on polished notes, and Raw is a read-only view.
+                  setDisplayMode('polished');
+                  setEditing(true);
+                }}
                 disabled={isProcessing}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-iron-text-muted rounded-lg border border-iron-border hover:bg-iron-surface-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 title={isProcessing ? 'Notes are being generated — edit will be available shortly' : 'Edit notes'}
@@ -641,12 +734,52 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
             <div>
               <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider mb-2">Notes</p>
               {editing ? (
-                <textarea
-                  value={draftSummary}
-                  onChange={(e) => setDraftSummary(e.target.value)}
-                  className="w-full min-h-[300px] bg-iron-surface border border-iron-border rounded-lg px-3 py-2 text-sm text-iron-text leading-relaxed focus:outline-none focus:border-iron-accent/40 font-mono"
-                  placeholder="Write your meeting notes here…"
-                />
+                <div className="min-h-[300px] bg-iron-surface border border-iron-border rounded-lg overflow-hidden">
+                  <RichTextEditorShell
+                    valueHtml={editingHtml}
+                    onChangeHtml={setEditingHtml}
+                    placeholder="Write your meeting notes here…"
+                    onReady={(ed) => { editorRef.current = ed; }}
+                    rightToolbarSlot={
+                      <DictateButton
+                        state={dictateState}
+                        onStart={async () => {
+                          setDictateState('recording');
+                          try { await window.ironmic.startRecording(); }
+                          catch (err) {
+                            console.error('[MeetingDetailPage] startRecording failed:', err);
+                            setDictateState('idle');
+                          }
+                        }}
+                        onStop={async () => {
+                          setDictateState('processing');
+                          try {
+                            const buf = await window.ironmic.stopRecording();
+                            const text = await window.ironmic.transcribe(buf);
+                            const trimmed = (text || '').trim();
+                            if (trimmed && editorRef.current) {
+                              // Insert at cursor — scoped to this editor only.
+                              // No global onPipelineStateChanged listener,
+                              // so other surfaces are unaffected.
+                              editorRef.current.commands.insertContent(trimmed + ' ');
+                            }
+                          } catch (err) {
+                            console.error('[MeetingDetailPage] dictate stop failed:', err);
+                          } finally {
+                            setDictateState('idle');
+                          }
+                        }}
+                      />
+                    }
+                    className="flex flex-col bg-iron-surface min-h-[300px]"
+                  />
+                </div>
+              ) : displayMode === 'raw' ? (
+                <div className="bg-iron-surface border border-iron-border rounded-lg px-4 py-3 text-sm text-iron-text leading-relaxed whitespace-pre-wrap max-h-[60vh] overflow-y-auto">
+                  {reconstructTranscript() || (
+                    <span className="text-iron-text-muted">No transcript captured.</span>
+                  )}
+                </div>
               ) : isProcessing ? (
                 <div className="flex items-center gap-2 text-sm text-amber-400 bg-amber-500/5 border border-amber-500/20 rounded-lg px-4 py-3">
                   <Loader2 className="w-4 h-4 animate-spin" />
@@ -739,6 +872,142 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
           onRestore={handleRestoreVersion}
         />
       )}
+
+      {/* Collaborate modal — targets the linked notebook entry so the
+          existing meeting-collab WebSocket plumbing applies unchanged. */}
+      {collabOpen && notebookEntryIdForTools && (
+        <NotesCollaborateModal
+          noteId={notebookEntryIdForTools}
+          initialNotes={editing
+            ? (editorRef.current?.getText() || htmlToText(editingHtml))
+            : (plainSummary || '')}
+          onJoined={() => { /* Meetings host doesn't expose join here. */ }}
+          onClose={() => setCollabOpen(false)}
+        />
+      )}
     </div>
+  );
+}
+
+/* ─── Read-aloud button ─── */
+
+/**
+ * Header button that reads the current notes via the shared TTS store.
+ *
+ * `getText` is a thunk so we can pull live editor text in edit mode
+ * without coupling this component to the editor instance — the parent
+ * decides where the text comes from.
+ *
+ * `ttsKey` is the linked notebook entry id when one exists; we pass it
+ * through to the store so the play/pause state correctly tracks "this
+ * meeting" across navigations and so caption highlights scope correctly.
+ */
+function ReadAloudButton({
+  getText,
+  ttsKey,
+  disabled,
+}: {
+  getText: () => string;
+  ttsKey: string | null;
+  disabled?: boolean;
+}) {
+  const { state, synthesizeAndPlay, pause, play, activeEntryId } = useTtsStore();
+  const isThisOne = !!ttsKey && activeEntryId === ttsKey;
+  const isPlayingThis = isThisOne && state === 'playing';
+  const isPausedThis = isThisOne && state === 'paused';
+  const isSynthThis = isThisOne && state === 'synthesizing';
+
+  const handleClick = async () => {
+    if (isPlayingThis) { await pause(); return; }
+    if (isPausedThis) { await play(); return; }
+    const text = getText();
+    if (text.trim()) {
+      await synthesizeAndPlay(text, ttsKey || undefined);
+    }
+  };
+
+  const Icon = isPlayingThis ? Pause : Volume2;
+  const title = isPlayingThis
+    ? 'Pause'
+    : isPausedThis
+    ? 'Resume'
+    : isThisOne
+    ? 'Read aloud'
+    : activeEntryId
+    ? 'Read aloud (replaces current playback)'
+    : 'Read aloud';
+
+  return (
+    <button
+      onClick={handleClick}
+      disabled={disabled || isSynthThis}
+      title={title}
+      className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-lg border transition-colors ${
+        isPlayingThis || isPausedThis
+          ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
+          : 'text-iron-text-muted border-iron-border hover:bg-iron-surface-hover'
+      } disabled:opacity-40 disabled:cursor-not-allowed`}
+    >
+      {isSynthThis ? (
+        <div className="w-3.5 h-3.5 border-2 border-emerald-400 border-t-transparent rounded-full animate-spin" />
+      ) : (
+        <Icon className="w-3.5 h-3.5" />
+      )}
+      <span className="hidden sm:inline">
+        {isPlayingThis ? 'Pause' : isPausedThis ? 'Resume' : 'Read aloud'}
+      </span>
+    </button>
+  );
+}
+
+/* ─── Dictate-append button (toolbar slot, edit mode only) ─── */
+
+/**
+ * Three-state toggle: idle → recording (red Stop) → processing → idle.
+ *
+ * Uses the SCOPED start/stop/transcribe API rather than the global
+ * dictation streamer or `onPipelineStateChanged` listeners — that lets
+ * the meeting editor receive its own transcript without other surfaces
+ * (Notes, Forge, AI Chat) racing for the chunk on idle.
+ */
+function DictateButton({
+  state,
+  onStart,
+  onStop,
+}: {
+  state: 'idle' | 'recording' | 'processing';
+  onStart: () => void;
+  onStop: () => void;
+}) {
+  const isRecording = state === 'recording';
+  const isProcessing = state === 'processing';
+
+  return (
+    <button
+      onClick={isRecording ? onStop : onStart}
+      disabled={isProcessing}
+      title={
+        isProcessing
+          ? 'Transcribing…'
+          : isRecording
+          ? 'Stop dictation and insert at cursor'
+          : 'Dictate (insert at cursor)'
+      }
+      className={`p-1.5 rounded-md transition-all ${
+        isRecording
+          ? 'bg-red-500/20 text-red-400 animate-pulse'
+          : isProcessing
+          ? 'bg-amber-500/15 text-amber-400'
+          : 'text-iron-text-muted hover:text-iron-text-secondary hover:bg-iron-surface-hover'
+      } disabled:opacity-40 disabled:cursor-not-allowed`}
+    >
+      {isProcessing ? (
+        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+      ) : isRecording ? (
+        <MicOff className="w-3.5 h-3.5" />
+      ) : (
+        <Mic className="w-3.5 h-3.5" />
+      )}
+    </button>
   );
 }
