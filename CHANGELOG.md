@@ -2,6 +2,31 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.7.4] - 2026-05-08
+
+### Fixed
+
+- **Copilot model dropdown showed "Model..." after Refresh** — The orphan-selection row rendered the raw saved id verbatim, which after CSS truncation read as "Model...". The orphan label now goes through `prettifyModelId` so saved selections always render cleanly (e.g. `gpt-4o-mini (openai)` instead of the raw string). The post-restart synthesis path in `AIManager.synthesizeModel` does the same.
+- **Polish "model isn't available on your plan or policy" error** — When `copilot help` parsing returned nothing (current `@github/copilot` builds don't expose models in `--help`), the catalog fell through to a two-entry hardcoded list whose lead model can be refused on free-tier accounts. The catalog now uses a 5-entry curated baseline (`openai/gpt-4.1`, `openai/gpt-4o`, `openai/gpt-5-mini`, `anthropic/claude-sonnet-4.5`, `anthropic/claude-haiku-4.5`) with both `runIds.copilotCli` and `runIds.ghModels` populated, giving users free-tier-friendly options out of the box.
+
+### Added
+
+- **`copilot --list-models` probe** — Tried first as a structured probe before the heuristic `copilot help` text-scrape, in case future CLI builds expose a non-interactive enumeration flag.
+- **Source-aware merge of probed vs. curated catalog** — High-confidence probes (`gh models list`, `--list-models`) replace the curated list; low-confidence probes (help-text scrape) supplement it. Bare-id-vs-slash-id matching (e.g. probe `gpt-5-mini` matches curated `openai/gpt-5-mini`) prevents duplicate rows, and `runIds` are deep-merged so a copilot-cli probe never drops a curated `ghModels` mapping.
+- **Probe log file** — Raw stdout/stderr/exit-code for every Copilot CLI probe is appended as one JSON line per probe to `<userData>/logs/copilot-probe.log` (Windows: `%APPDATA%\IronMic\logs\copilot-probe.log`). The absolute path is printed once on first probe to the dev console. Used for diagnosing parser regressions without needing a Settings UI surface. 1 MB rotation; silent no-op outside Electron so unit tests don't break.
+- **`'curated'` source on `AIModel`** — New union member alongside `'cli' | 'fallback' | 'static' | 'local'`. The Settings caption now classifies the visible list as all-cli ("From your GitHub Copilot subscription"), all-curated ("Built-in catalog"), or mixed ("Live probe plus built-in fallback entries").
+
+### Changed
+
+- **TTL fast path on `refreshModels()` excludes both `'fallback'` and `'curated'`** — Previously only `'fallback'` was skipped, so once a curated cache was warm the Refresh button could short-circuit on subsequent clicks. Refresh now always re-probes when no real probe data is cached.
+- **Tightened `looksLikeCopilotModelId` heuristic** — Candidate must contain `/` or start with a known vendor prefix (`gpt-`, `claude-`, `o3-`, `o4-`, `gemini-`, `mistral-`, `llama-`, `phi-`). Rejects prose tokens (`available`, `default`, `none`) that the previous loose char regex would admit.
+- **Pure-helper extraction** — `getCuratedCopilotModels()` and `mergeProbedIntoCurated()` now live in `electron-app/src/main/ai/copilot-catalog.ts` so they're easy to unit-test without instantiating the adapter. Returned objects are deep-cloned each call.
+- **`aiRefreshModels` properly typed on the renderer Window** — Drops the `(window.ironmic as any).aiRefreshModels?.(...)` cast in SettingsPanel.
+
+### Tests
+
+- **First Copilot adapter unit tests** (`src/main/ai/CopilotAdapter.test.ts`, 15 cases) — parser false-positive rejection, JSON/table parsing, curated catalog shape immutability, and merge semantics for high/low/empty probe confidence.
+
 ## [1.7.3] - 2026-05-08
 
 ### Added

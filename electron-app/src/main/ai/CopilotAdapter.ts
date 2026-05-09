@@ -4,6 +4,12 @@ import { basename, join } from 'path';
 import type { ICLIAdapter, AIProvider, AIModel, ParsedOutput } from './types';
 import { getScopedSpawnEnv, getSpawnEnv, resolveInShell } from '../utils/shell-env';
 import { execFilePortable } from '../utils/spawn-portable';
+import { logCopilotProbe } from '../utils/copilot-probe-log';
+import {
+  getCuratedCopilotModels,
+  mergeProbedIntoCurated,
+  type ProbeResult,
+} from './copilot-catalog';
 
 type CopilotBackend = 'copilot-cli' | 'gh-models';
 
@@ -14,13 +20,29 @@ interface ResolvedBackend {
 
 interface CachedCatalog {
   models: AIModel[];
-  backend: CopilotBackend | 'fallback';
+  /**
+   * Backend whose probe produced these models. 'fallback' = no backend
+   * resolved, 'curated' = built-in baseline (probe empty / failed). Both
+   * are excluded from the TTL fast path so a fresh Refresh always probes.
+   */
+  backend: CopilotBackend | 'fallback' | 'curated';
   fetchedAt: number;
 }
 
 const ANSI_RE = /\x1b(?:[@-Z\\-_]|\[[0-9;]*[ -/]*[@-~])/g;
 const PROBE_TIMEOUT_MS = 5000;
 const CACHE_TTL_MS = 10 * 60 * 1000;
+
+const VENDOR_PREFIXES = [
+  'gpt-',
+  'claude-',
+  'o3-',
+  'o4-',
+  'gemini-',
+  'mistral-',
+  'llama-',
+  'phi-',
+];
 
 /**
  * GitHub Copilot adapter.
@@ -74,22 +96,26 @@ export class CopilotAdapter implements ICLIAdapter {
 
   /**
    * Cache-only catalog read. Returns the last refreshed list, or the
-   * conservative fallback if no refresh has occurred. Does not spawn.
+   * curated baseline if no refresh has occurred. Does not spawn.
    */
   async listAvailableModels(): Promise<AIModel[]> {
     if (this.cachedCatalog) return this.cachedCatalog.models;
-    const fallback = this.getConservativeFallback();
+    const curated = getCuratedCopilotModels();
     this.cachedCatalog = {
-      models: fallback,
-      backend: 'fallback',
+      models: curated,
+      backend: 'curated',
       fetchedAt: Date.now(),
     };
-    return fallback;
+    return curated;
   }
 
   /**
    * Probe the active backend for the user's actual model catalog.
    * @param opts.force - bypass TTL and always probe.
+   *
+   * TTL fast path applies only when we have *real probe data* — both
+   * 'fallback' and 'curated' are excluded so the Refresh button always
+   * triggers a fresh probe.
    */
   async refreshModels(opts: { force?: boolean } = {}): Promise<AIModel[]> {
     const force = opts.force === true;
@@ -97,6 +123,7 @@ export class CopilotAdapter implements ICLIAdapter {
       !force &&
       this.cachedCatalog &&
       this.cachedCatalog.backend !== 'fallback' &&
+      this.cachedCatalog.backend !== 'curated' &&
       Date.now() - this.cachedCatalog.fetchedAt < CACHE_TTL_MS
     ) {
       return this.cachedCatalog.models;
@@ -104,70 +131,48 @@ export class CopilotAdapter implements ICLIAdapter {
 
     const resolved = await this.resolveBackend(true);
     if (!resolved) {
-      const fallback = this.getConservativeFallback();
+      const curated = getCuratedCopilotModels();
       this.cachedCatalog = {
-        models: fallback,
+        models: curated,
         backend: 'fallback',
         fetchedAt: Date.now(),
       };
-      return fallback;
+      return curated;
     }
 
-    let models: AIModel[] = [];
+    let probed: ProbeResult = { models: [], confidence: 'low' };
     try {
       if (resolved.backend === 'copilot-cli') {
-        models = await this.fetchCopilotCliModels(resolved.binaryPath);
+        probed = await this.fetchCopilotCliModels(resolved.binaryPath);
       } else {
-        models = await this.fetchGhModelsList(resolved.binaryPath);
+        probed = await this.fetchGhModelsList(resolved.binaryPath);
       }
     } catch {
-      models = [];
+      probed = { models: [], confidence: 'low' };
     }
 
-    if (models.length === 0) {
-      const fallback = this.getConservativeFallback();
+    const curated = getCuratedCopilotModels();
+    const merged = mergeProbedIntoCurated(probed, curated);
+
+    if (probed.models.length === 0) {
       this.cachedCatalog = {
-        models: fallback,
-        backend: 'fallback',
+        models: merged,
+        backend: 'curated',
         fetchedAt: Date.now(),
       };
-      return fallback;
+      return merged;
     }
 
     this.cachedCatalog = {
-      models,
+      models: merged,
       backend: resolved.backend,
       fetchedAt: Date.now(),
     };
-    return models;
+    return merged;
   }
 
   clearModelCache(): void {
     this.cachedCatalog = null;
-  }
-
-  /** Conservative fallback used when no probe has run, or a probe failed. */
-  private getConservativeFallback(): AIModel[] {
-    return [
-      {
-        id: 'openai/gpt-4.1',
-        label: 'GPT-4.1',
-        provider: 'copilot',
-        source: 'fallback',
-        billing: 'paid',
-        description: 'GitHub Copilot / GitHub Models',
-        runIds: { copilotCli: 'gpt-4.1', ghModels: 'openai/gpt-4.1' },
-      },
-      {
-        id: 'openai/gpt-4o-mini',
-        label: 'GPT-4o Mini',
-        provider: 'copilot',
-        source: 'fallback',
-        billing: 'free',
-        description: 'Fast GitHub Copilot / GitHub Models option',
-        runIds: { copilotCli: '4o-mini', ghModels: 'openai/gpt-4o-mini' },
-      },
-    ];
   }
 
   /** Build args against a generic gh-models invocation (used outside a resolved backend). */
@@ -206,10 +211,30 @@ export class CopilotAdapter implements ICLIAdapter {
 
   // ─── Catalog probes ───────────────────────────────────────────────────────
 
-  private async fetchCopilotCliModels(binaryPath: string): Promise<AIModel[]> {
+  private async fetchCopilotCliModels(binaryPath: string): Promise<ProbeResult> {
+    // Try a structured `--list-models` flag first (some CLI builds expose it).
+    // Cheap, harmless probe-fail if not supported.
+    const listOut = await this.runProbe(binaryPath, ['--list-models']);
+    if (listOut) {
+      const ids = listOut
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => this.looksLikeCopilotModelId(l));
+      if (ids.length > 0) {
+        return {
+          models: Array.from(new Set(ids)).map((id) => this.copilotCliModel(id)),
+          confidence: 'high',
+        };
+      }
+    }
+
+    // Fall through to help-text scrape — heuristic, often partial.
     const helpText = await this.runProbe(binaryPath, ['help']);
-    if (!helpText) return [];
-    return this.parseCopilotHelpModels(helpText);
+    if (!helpText) return { models: [], confidence: 'low' };
+    return {
+      models: this.parseCopilotHelpModels(helpText),
+      confidence: 'low',
+    };
   }
 
   /**
@@ -224,7 +249,7 @@ export class CopilotAdapter implements ICLIAdapter {
    *
    * The exact phrasing has varied across releases, so we match a few common
    * patterns and de-duplicate. If we can't find anything that looks like a
-   * model list, return [] so the caller falls back to the conservative list.
+   * model list, return [] so the caller falls back to the curated list.
    */
   parseCopilotHelpModels(helpText: string): AIModel[] {
     const ids = new Set<string>();
@@ -256,18 +281,19 @@ export class CopilotAdapter implements ICLIAdapter {
     return Array.from(ids).map((id) => this.copilotCliModel(id));
   }
 
+  /**
+   * Tightened heuristic: candidate must either contain '/' (provider/model
+   * form) or start with a known vendor prefix. This rejects prose tokens
+   * like 'available', 'default', 'none' that the loose char regex would
+   * otherwise admit.
+   */
   private looksLikeCopilotModelId(id: string): boolean {
     if (!id) return false;
     if (id.length < 3 || id.length > 80) return false;
-    // Reasonable chars for a model id: letters, digits, dot, dash, slash, underscore.
     if (!/^[a-z0-9][a-z0-9._/-]+$/i.test(id)) return false;
-    // Reject common false-positive words.
-    const stopwords = new Set([
-      'help', 'available', 'options', 'flag', 'flags', 'usage', 'example',
-      'true', 'false', 'string', 'boolean', 'default', 'none',
-    ]);
-    if (stopwords.has(id.toLowerCase())) return false;
-    return true;
+    if (id.includes('/')) return true;
+    const lower = id.toLowerCase();
+    return VENDOR_PREFIXES.some((p) => lower.startsWith(p));
   }
 
   private copilotCliModel(runId: string): AIModel {
@@ -283,7 +309,7 @@ export class CopilotAdapter implements ICLIAdapter {
     };
   }
 
-  private async fetchGhModelsList(binaryPath: string): Promise<AIModel[]> {
+  private async fetchGhModelsList(binaryPath: string): Promise<ProbeResult> {
     // Detect whether `gh models list` supports --json. Docs only show --json
     // for `gh models eval`, so the most reliable test is parsing the help.
     let supportsJson = false;
@@ -294,13 +320,13 @@ export class CopilotAdapter implements ICLIAdapter {
       const jsonOut = await this.runProbe(binaryPath, ['models', 'list', '--json']);
       if (jsonOut) {
         const parsed = this.parseGhModelsJson(jsonOut);
-        if (parsed.length > 0) return parsed;
+        if (parsed.length > 0) return { models: parsed, confidence: 'high' };
       }
     }
 
     const tableOut = await this.runProbe(binaryPath, ['models', 'list']);
-    if (!tableOut) return [];
-    return this.parseGhModelsTable(tableOut);
+    if (!tableOut) return { models: [], confidence: 'high' };
+    return { models: this.parseGhModelsTable(tableOut), confidence: 'high' };
   }
 
   parseGhModelsJson(jsonText: string): AIModel[] {
@@ -367,7 +393,7 @@ export class CopilotAdapter implements ICLIAdapter {
   }
 
   private prettifyId(id: string): string {
-    // 'openai/gpt-4o-mini' -> 'GPT-4o-mini (openai)'
+    // 'openai/gpt-4o-mini' -> 'gpt-4o-mini (openai)'
     // 'claude-haiku-4.5'   -> 'Claude Haiku 4.5'
     if (id.includes('/')) {
       const [vendor, name] = id.split('/');
@@ -379,15 +405,35 @@ export class CopilotAdapter implements ICLIAdapter {
       .join(' ');
   }
 
+  /**
+   * Probe a Copilot/gh binary, log raw stdout/stderr/exitCode to the
+   * file-only probe log, and return stdout on success or null on failure.
+   *
+   * Return shape preserved (`string | null`) so callers don't need to
+   * know about the logging side-effect.
+   */
   private async runProbe(binaryPath: string, args: string[]): Promise<string | null> {
     try {
-      const { stdout } = await execFilePortable(binaryPath, args, {
+      const { stdout, stderr } = await execFilePortable(binaryPath, args, {
         timeout: PROBE_TIMEOUT_MS,
         env: getScopedSpawnEnv('copilot'),
         maxBuffer: 1024 * 1024,
       });
+      void logCopilotProbe({
+        args: [basename(binaryPath), ...args],
+        exitCode: 0,
+        stdout: typeof stdout === 'string' ? stdout : String(stdout ?? ''),
+        stderr: typeof stderr === 'string' ? stderr : String(stderr ?? ''),
+      });
       return stdout;
-    } catch {
+    } catch (err) {
+      const e = err as { stdout?: unknown; stderr?: unknown; code?: number | string; signal?: string };
+      void logCopilotProbe({
+        args: [basename(binaryPath), ...args],
+        exitCode: e?.code ?? e?.signal ?? null,
+        stdout: coerce(e?.stdout),
+        stderr: coerce(e?.stderr),
+      });
       return null;
     }
   }
@@ -603,4 +649,11 @@ export class CopilotAdapter implements ICLIAdapter {
     const file = basename(binaryPath).toLowerCase();
     return file === 'copilot' || file === 'copilot.exe' || file === 'copilot.cmd';
   }
+}
+
+function coerce(v: unknown): string {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (Buffer.isBuffer(v)) return v.toString('utf-8');
+  return String(v);
 }

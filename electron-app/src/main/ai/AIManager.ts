@@ -16,6 +16,26 @@ import { getScopedSpawnEnv } from '../utils/shell-env';
 import { spawnPortable } from '../utils/spawn-portable';
 import type { AIProvider, AuthStatus, AIAuthState, ICLIAdapter, IAIAdapter, AIModel } from './types';
 
+/**
+ * Pretty-print a raw model id for UI display. Mirrors the renderer-side
+ * helper at src/renderer/utils/prettify-model-id.ts and CopilotAdapter's
+ * private prettifyId — duplicated rather than cross-imported because main
+ * and renderer can't share a module cleanly.
+ *   'openai/gpt-4o-mini'   -> 'gpt-4o-mini (openai)'
+ *   'claude-haiku-4.5'     -> 'Claude Haiku 4.5'
+ */
+function prettifyModelId(id: string): string {
+  if (!id) return '';
+  if (id.includes('/')) {
+    const [vendor, name] = id.split('/');
+    return `${name} (${vendor})`;
+  }
+  return id
+    .split(/[-_]/)
+    .map((p) => (p.length === 0 ? p : p[0].toUpperCase() + p.slice(1)))
+    .join(' ');
+}
+
 /** Narrowed to CLI-only providers so per-provider state can't accidentally include local. */
 type CLIProvider = 'copilot' | 'claude';
 
@@ -133,13 +153,13 @@ export class AIManager {
       // Slash-prefixed ids are gh-models style; bare ids are copilot-cli style.
       return {
         id,
-        label: id,
+        label: prettifyModelId(id),
         provider: 'copilot',
         billing: 'unknown',
         runIds: id.includes('/') ? { ghModels: id } : { copilotCli: id },
       };
     }
-    return { id, label: id, provider };
+    return { id, label: prettifyModelId(id), provider };
   }
 
   private getAdapter(provider: AIProvider): IAIAdapter {

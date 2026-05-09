@@ -9,6 +9,7 @@ import { DataManager } from './DataManager';
 // main/keyboard-listener.ts. We render `DictationGestureDisplay` (defined
 // below) as a read-only replacement.
 import { getDictationGesture } from '../../shared/dictation-gesture';
+import { prettifyModelId } from '../utils/prettify-model-id';
 import { Toggle, Card } from './ui';
 import {
   Settings, Bot, Volume2, Monitor, Sun, Moon, Shield, Keyboard,
@@ -140,7 +141,7 @@ interface AIModelOption {
   id: string;
   label: string;
   provider: string;
-  source?: 'cli' | 'fallback' | 'static' | 'local';
+  source?: 'cli' | 'fallback' | 'static' | 'local' | 'curated';
   billing?: 'free' | 'paid' | 'unknown';
   description?: string;
   runIds?: { copilotCli?: string; ghModels?: string };
@@ -225,7 +226,7 @@ function AIAssistSettings() {
   async function handleRefreshModels() {
     setRefreshingModels(true);
     try {
-      const fresh = await (window.ironmic as any).aiRefreshModels?.('copilot');
+      const fresh = await window.ironmic.aiRefreshModels('copilot');
       if (Array.isArray(fresh)) {
         // Replace just the copilot entries; keep claude + local from the
         // existing aggregated `models` so the dropdown for those providers
@@ -358,13 +359,32 @@ function AIAssistSettings() {
             const savedInList = providerModels.some((m) => m.id === model);
             const orphan =
               provider === 'copilot' && model && !savedInList
-                ? { id: model, label: model, provider: 'copilot' as const, source: undefined, billing: 'unknown' as const, description: 'Last selection — click Refresh models to verify availability' }
+                ? { id: model, label: prettifyModelId(model), provider: 'copilot' as const, source: undefined, billing: 'unknown' as const, description: 'Last selection — click Refresh models to verify availability' }
                 : null;
             const visible = orphan ? [orphan, ...providerModels] : providerModels;
-            const copilotSource =
-              provider === 'copilot' && providerModels.length > 0
-                ? providerModels[0].source
-                : undefined;
+            // Caption classifier: inspect the full list, not just [0].
+            // all 'cli'      -> live subscription
+            // all 'curated'  -> built-in catalog
+            // mixed          -> low-confidence probe + curated supplements
+            let copilotCaption: string | undefined;
+            if (provider === 'copilot') {
+              const sources = new Set(
+                providerModels
+                  .map((m) => m.source)
+                  .filter((s): s is NonNullable<typeof s> => Boolean(s)),
+              );
+              if (providerModels.length === 0) {
+                copilotCaption = 'Built-in catalog — click "Refresh models" to load your subscription';
+              } else if (sources.size === 1 && sources.has('cli')) {
+                copilotCaption = 'From your GitHub Copilot subscription';
+              } else if (sources.size === 1 && sources.has('curated')) {
+                copilotCaption = 'Built-in catalog — click "Refresh models" for your live subscription list';
+              } else if (sources.has('cli') && sources.has('curated')) {
+                copilotCaption = 'Live probe plus built-in fallback entries — click "Refresh models" again to retry';
+              } else {
+                copilotCaption = 'Built-in catalog — click "Refresh models" to load your subscription';
+              }
+            }
             return (
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between">
@@ -383,9 +403,7 @@ function AIAssistSettings() {
                 </div>
                 <p className="text-xs text-iron-text-muted">
                   {provider === 'copilot'
-                    ? copilotSource === 'cli'
-                      ? 'From your GitHub Copilot subscription'
-                      : 'Default catalog — click "Refresh models" to load your subscription'
+                    ? copilotCaption
                     : 'Select which Claude model to use'}
                 </p>
                 <div className="space-y-1 mt-2">

@@ -114,6 +114,7 @@ declare global {
       aiPickProvider: () => Promise<'copilot' | 'claude' | 'local' | null>;
       aiSendMessage: (prompt: string, provider: string, model?: string) => Promise<string>;
       aiGetModels: (provider?: string) => Promise<any[]>;
+      aiRefreshModels: (provider?: string, opts?: { force?: boolean }) => Promise<any[]>;
       aiCancel: () => Promise<void>;
       aiResetSession: () => Promise<void>;
       aiGetLocalModelStatus: () => Promise<any[]>;

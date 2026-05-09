@@ -72,8 +72,8 @@ export interface AIModel {
   id: string;
   label: string;
   provider: AIProvider;
-  /** Origin of the entry. Optional — Claude='static', Local='local', Copilot='cli'|'fallback'. */
-  source?: 'cli' | 'fallback' | 'static' | 'local';
+  /** Origin of the entry. Optional — Claude='static', Local='local', Copilot='cli'|'curated'|'fallback'. */
+  source?: 'cli' | 'fallback' | 'static' | 'local' | 'curated';
   /** Replaces the previous `free: boolean`. 'unknown' for dynamically discovered models. */
   billing?: 'free' | 'paid' | 'unknown';
   description?: string;
