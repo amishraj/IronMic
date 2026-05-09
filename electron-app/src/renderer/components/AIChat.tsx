@@ -3,6 +3,7 @@ import { Bot, Send, Mic, Square, RefreshCw, Sparkles, AlertCircle, Plus, Message
 import { useAiChatStore, type ChatMessage, type AIProvider } from '../stores/useAiChatStore';
 import { useTtsStore } from '../stores/useTtsStore';
 import { NotePickerModal } from './NotePickerModal';
+import { VoiceChatOverlay } from './voice-chat/VoiceChatOverlay';
 import type { Note } from '../stores/useNotesStore';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -27,6 +28,19 @@ export function AIChat() {
   const conversationalRef = useRef(false);
   conversationalRef.current = conversational;
 
+  // Refs synced each render so the dictation listener (mounted with [] deps)
+  // and other long-lived callbacks read fresh values without re-binding.
+  // Avoids stale-closure bugs in the end-of-turn auto-send path.
+  const loadingRef = useRef(false);
+  const providerRef = useRef<AIProvider | null>(null);
+  const autoSendingRef = useRef(false);
+  const sendTextRef = useRef<((text: string) => Promise<string | null>) | null>(null);
+  const engineRef = useRef<'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown'>('unknown');
+  const micStateRef = useRef<'idle' | 'recording' | 'stopping'>('idle');
+  // Engine surfaces in the conversational banner so the user knows when
+  // hands-free auto-send is unavailable (Whisper / chunked-Moonshine fallback).
+  const [engine, setEngine] = useState<'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown'>('unknown');
+
   const { sessions, activeSessionId, activeSession, createSession, setActiveSession, addMessage, deleteSession } =
     useAiChatStore();
 
@@ -38,6 +52,10 @@ export function AIChat() {
   // runs the LLM polish pass and persists an `entries` row, both of which
   // are wrong for chat input. See plan: bug-fix-required-in-abundant-duckling.md.
   const [micState, setMicState] = useState<'idle' | 'recording' | 'stopping'>('idle');
+  loadingRef.current = loading;
+  providerRef.current = provider;
+  micStateRef.current = micState;
+  engineRef.current = engine;
   const [draftText, setDraftText] = useState('');
   // Track whether some OTHER consumer (Forge / Notes) holds the streamer
   // so we can disable our button instead of letting `start()` reject silently.
@@ -237,7 +255,36 @@ export function AIChat() {
     }
   }, [loading, provider, addMessage, createSession, startAiDictation]);
 
-  const handleSend = useCallback(() => {
+  // Keep a ref to the latest sendText so the long-lived dictation listener
+  // (mounted once with [] deps) can call it without re-binding on every change.
+  sendTextRef.current = sendText;
+
+  const handleSend = useCallback(async () => {
+    const api = (window as any).ironmic;
+    // Manual-send fallback: in chunked / Whisper mode, end-of-turn IPC will
+    // never fire. The user must press Enter / click Send. We must stop the
+    // active dictation session FIRST so we get the authoritative final text
+    // — `setInput` from chunk events may not have flushed yet — and so the
+    // stream doesn't keep emitting chunks mid-AI-response.
+    if (
+      api
+      && conversationalRef.current
+      && micStateRef.current === 'recording'
+      && engineRef.current !== 'moonshine-session'
+    ) {
+      try {
+        const stopResult = await api.dictationStreamStop();
+        const stopText = (stopResult?.text ?? '').trim();
+        const liveText = (inputRef.current?.value ?? '').trim();
+        const finalText = stopText.length >= liveText.length ? stopText : liveText;
+        if (finalText) {
+          await sendTextRef.current?.(finalText);
+        }
+      } catch (err: any) {
+        console.warn('[ai-chat] manual-send fallback stop failed:', err?.message || err);
+      }
+      return;
+    }
     sendText(input.trim());
   }, [input, sendText]);
 
@@ -279,7 +326,7 @@ export function AIChat() {
       if (payload.source && payload.source !== 'ai-chat') return;
       setDraftText(payload.hypothesis || '');
     });
-    const offState = api.onDictationStreamState?.((s: { status: string; source?: string }) => {
+    const offState = api.onDictationStreamState?.((s: { status: string; source?: string; engine?: 'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown' }) => {
       // Track foreign streams so we can disable the AI Chat mic when Notes/Forge
       // is recording. Our own state is mirrored only on matching source.
       if (s.source && s.source !== 'ai-chat') {
@@ -287,6 +334,7 @@ export function AIChat() {
         return;
       }
       setForeignStreamActive(false);
+      if (s.engine) setEngine(s.engine);
       if (s.status === 'idle') {
         setMicState('idle');
         setDraftText('');
@@ -296,19 +344,123 @@ export function AIChat() {
         setMicState('stopping');
       }
     });
+    // Voice Chat hands-free auto-send. Fires only on silence-driven commits
+    // for `ai-chat` source — never on cap commits or final-stop. Use the
+    // event payload directly; React `setInput` from chunk events is async and
+    // may not have flushed by the time this handler runs.
+    const offEot = api.onDictationStreamEndOfTurn?.(async (payload: { source: 'ai-chat'; text: string }) => {
+      if (!conversationalRef.current) return;
+      if (autoSendingRef.current || loadingRef.current) return;
+      const eotText = (payload?.text || '').trim();
+      if (!eotText) return;
+      // v1 cloud guard: refuse + tear down. Never silently auto-send raw
+      // dictated speech to a cloud provider.
+      if (providerRef.current !== 'local') {
+        try { await api.dictationStreamStop?.(); } catch { /* ignore */ }
+        setConversational(false);
+        conversationalRef.current = false;
+        setError('Voice Chat requires the local provider.');
+        return;
+      }
+      autoSendingRef.current = true;
+      try {
+        // Stop FIRST so the streamer commits any tail and releases audio.
+        // `stop()` returns the authoritative full text; if its tail is
+        // longer than the EOT payload (final-drain caught extra audio),
+        // prefer the stop result.
+        let finalText = eotText;
+        try {
+          const stopResult = await api.dictationStreamStop?.();
+          const stopText = (stopResult?.text ?? '').trim();
+          if (stopText.length > eotText.length) finalText = stopText;
+        } catch { /* best effort — fall through with EOT payload */ }
+        await sendTextRef.current?.(finalText);
+      } finally {
+        autoSendingRef.current = false;
+      }
+    });
     return () => {
       try { offChunk?.(); } catch { /* noop */ }
       try { offDraft?.(); } catch { /* noop */ }
       try { offState?.(); } catch { /* noop */ }
+      try { offEot?.(); } catch { /* noop */ }
     };
   }, []);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSend();
+      void handleSend();
     }
   };
+
+  // Voice Chat toggle. Sequence matters: provider guard → start dictation →
+  // flip flag last so a failed start doesn't leave a fake conversational state.
+  // OFF must tear down dictation, TTS, and any in-flight AI request.
+  const handleVoiceChatToggle = useCallback(async () => {
+    const api = (window as any).ironmic;
+    if (!api) return;
+    if (conversationalRef.current) {
+      // Toggle OFF
+      try { await api.dictationStreamStop?.(); } catch { /* ignore */ }
+      try { useTtsStore.getState().stop(); } catch { /* ignore */ }
+      if (loadingRef.current) {
+        try { await api.aiCancel?.(); } catch { /* ignore */ }
+      }
+      setConversational(false);
+      conversationalRef.current = false;
+      // Clear lingering AI streaming state. A late `ai:output` event can
+      // arrive between cancel and resolution; clear once here, the existing
+      // ai:turn-end handler will clear again when it fires.
+      setStreaming('');
+      setLoading(false);
+      setDraftText('');
+      return;
+    }
+    // Toggle ON — refuse if non-local provider (v1 privacy posture).
+    if (provider !== 'local') {
+      setError('Voice Chat requires the local provider. Switch to Local first.');
+      return;
+    }
+    if (foreignStreamActive) {
+      setError('Dictation is already running in another window. Stop it first.');
+      return;
+    }
+    setError(null);
+    try {
+      await api.dictationStreamStart({ source: 'ai-chat' });
+      setMicState('recording');
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      setError(msg.includes('already')
+        ? 'Dictation is already running in another window. Stop it first.'
+        : msg);
+      return; // Toggle stays off — failed start must not leave a fake state.
+    }
+    setConversational(true);
+    conversationalRef.current = true;
+  }, [provider, foreignStreamActive]);
+
+  // Mid-loop provider switch: if the user flips to a cloud provider while
+  // Voice Chat is active, tear down immediately. Don't wait for the next EOT.
+  useEffect(() => {
+    if (!conversationalRef.current) return;
+    if (provider === 'local') return;
+    const api = (window as any).ironmic;
+    if (!api) return;
+    (async () => {
+      try { await api.dictationStreamStop?.(); } catch { /* ignore */ }
+      try { useTtsStore.getState().stop(); } catch { /* ignore */ }
+      if (loadingRef.current) {
+        try { await api.aiCancel?.(); } catch { /* ignore */ }
+      }
+      setConversational(false);
+      conversationalRef.current = false;
+      setStreaming('');
+      setLoading(false);
+      setError('Voice Chat disabled — switched to a non-local provider.');
+    })();
+  }, [provider]);
 
   const handleVoiceInput = useCallback(async () => {
     const api = (window as any).ironmic;
@@ -352,6 +504,16 @@ export function AIChat() {
     const h = Math.min(sizer.scrollHeight, 120);
     ta.style.height = Math.max(40, h) + 'px';
   }, [input, draftText]);
+
+  // Last assistant reply (for the Voice Chat overlay caption — gives the user
+  // visual context for what's being spoken aloud). Falls back to null on
+  // first turn or if only system messages exist.
+  const lastAiReply = (() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'assistant') return messages[i].content;
+    }
+    return null;
+  })();
 
   return (
     <div className="flex h-full bg-iron-bg">
@@ -403,7 +565,21 @@ export function AIChat() {
       )}
 
       {/* Main chat area */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 relative">
+        {/* Voice Chat overlay — focused listening surface, only when active */}
+        {conversational && (
+          <VoiceChatOverlay
+            micState={micState}
+            loading={loading}
+            streaming={streaming}
+            draftText={draftText}
+            committedText={input}
+            engine={engine}
+            lastAiReply={lastAiReply}
+            onClose={() => void handleVoiceChatToggle()}
+            onMicClick={() => void handleVoiceInput()}
+          />
+        )}
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-iron-border">
           <div className="flex items-center gap-2.5">
@@ -457,18 +633,18 @@ export function AIChat() {
                 />
               </div>
             )}
-            {/* Conversational mode toggle */}
+            {/* Voice Chat toggle (hands-free conversational mode) */}
             <button
-              onClick={() => setConversational(!conversational)}
+              onClick={() => void handleVoiceChatToggle()}
               className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-medium transition-all ${
                 conversational
                   ? 'bg-iron-success/15 text-iron-success border border-iron-success/20'
                   : 'text-iron-text-muted hover:bg-iron-surface-hover'
               }`}
-              title={conversational ? 'Conversational mode ON — click to turn off' : 'Turn on conversational mode (voice back-and-forth)'}
+              title={conversational ? 'Voice Chat ON — click to turn off' : 'Turn on Voice Chat (hands-free voice back-and-forth)'}
             >
               <MessageCircle className="w-3.5 h-3.5" />
-              {conversational ? 'Voice Chat' : 'Voice Chat'}
+              Voice Chat
             </button>
             <button
               onClick={() => loadAuth()}
@@ -661,7 +837,7 @@ export function AIChat() {
 
             {/* Send / Stop button */}
             <button
-              onClick={loading ? () => window.ironmic.aiCancel() : handleSend}
+              onClick={loading ? () => window.ironmic.aiCancel() : () => void handleSend()}
               disabled={noProvider || (!input.trim() && !loading)}
               className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 transition-all disabled:opacity-30 disabled:cursor-not-allowed ${
                 loading

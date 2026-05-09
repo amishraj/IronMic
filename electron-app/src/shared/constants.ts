@@ -112,6 +112,7 @@ export const IPC_CHANNELS = {
   DICTATION_STREAM_CHUNK: 'ironmic:dictation-stream-chunk',    // main → renderer push (committed)
   DICTATION_STREAM_DRAFT: 'ironmic:dictation-stream-draft',    // main → renderer push (live hypothesis, not persisted)
   DICTATION_STREAM_STATE: 'ironmic:dictation-stream-state',    // main → renderer push
+  DICTATION_STREAM_END_OF_TURN: 'ironmic:dictation-stream-end-of-turn', // main → renderer push (silence-driven, ai-chat only)
 
   // Transcription
   TRANSCRIBE: 'ironmic:transcribe',

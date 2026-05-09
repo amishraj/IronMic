@@ -42,6 +42,15 @@ const FIRST_TRANSCRIBE_TIMEOUT_MS = 20_000;
 const SESSION_DRAIN_INTERVAL_MS = 200;
 const SESSION_CAP_MS = 20_000;
 const SESSION_SILENCE_COMMIT_MS = 1_000;
+// AI Chat (Voice Chat) uses a slightly longer silence window so a natural
+// mid-sentence pause doesn't auto-send. Range-clamped here to avoid drift.
+const AI_CHAT_SILENCE_COMMIT_MS = 1_200;
+const SILENCE_COMMIT_MIN_MS = 700;
+const SILENCE_COMMIT_MAX_MS = 2_500;
+
+function clampSilenceMs(ms: number): number {
+  return Math.max(SILENCE_COMMIT_MIN_MS, Math.min(SILENCE_COMMIT_MAX_MS, ms));
+}
 
 // Chunked mode constants (engine-aware intervals chosen at start())
 const MOONSHINE_CHUNK_INTERVAL_MS = 5_000;
@@ -50,6 +59,13 @@ const WHISPER_CHUNK_INTERVAL_MS = 8_000;
 const MOONSHINE_OVERLAP_BYTES = 16_000 * 2 * 0.8;
 
 export type DictationSource = 'notes' | 'forge' | 'ai-chat';
+export type DictationEngine = 'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown';
+type CommitReason = 'silence' | 'cap' | 'final-stop';
+
+export interface DictationEndOfTurnEvent {
+  source: DictationSource;
+  text: string;
+}
 
 export interface DictationChunkEvent {
   index: number;
@@ -68,6 +84,13 @@ export interface DictationStreamState {
   startedAt: number | null;
   chunkCount: number;
   source: DictationSource;
+  /**
+   * Resolved transcription path for this session. Set before the first
+   * `pushState()` after start() so renderers never see `'unknown'` while
+   * a session is active. Only `'moonshine-session'` supports hands-free
+   * end-of-turn (silence-driven auto-send for Voice Chat).
+   */
+  engine: DictationEngine;
 }
 
 export interface DictationStreamStartOpts {
@@ -83,11 +106,13 @@ class DictationStreamer {
   private streamLoopPromise: Promise<void> | null = null;
   private chunkIndex = 0;
   private activeSource: DictationSource = 'notes';
+  private activeEngine: DictationEngine = 'unknown';
   private state: DictationStreamState = {
     status: 'idle',
     startedAt: null,
     chunkCount: 0,
     source: 'notes',
+    engine: 'unknown',
   };
   private fullText = '';
   private cleanupDone = false;
@@ -132,15 +157,8 @@ class DictationStreamer {
       }
     }
 
-    this.state = {
-      status: 'recording',
-      startedAt: Date.now(),
-      chunkCount: 0,
-      source: this.activeSource,
-    };
-    this.pushState();
-
-    // Determine which path to use for this session.
+    // Determine which path to use for this session BEFORE the first pushState
+    // so renderers never see `engine: 'unknown'` while a session is active.
     const engineKind = (() => {
       try { return native.getTranscriptionEngine?.() ?? 'moonshine-base'; }
       catch { return 'moonshine-base'; }
@@ -151,7 +169,20 @@ class DictationStreamer {
       && typeof native.addon.drainRecordingBuffer === 'function'
       && (native.addon.moonshineSessionSupports?.() ?? false);
 
-    debugLog('dictation.start', { engineKind, isMoonshine, canStream });
+    this.activeEngine = canStream
+      ? 'moonshine-session'
+      : isMoonshine ? 'moonshine-chunked' : 'whisper-chunked';
+
+    debugLog('dictation.start', { engineKind, isMoonshine, canStream, engine: this.activeEngine });
+
+    this.state = {
+      status: 'recording',
+      startedAt: Date.now(),
+      chunkCount: 0,
+      source: this.activeSource,
+      engine: this.activeEngine,
+    };
+    this.pushState();
 
     const intervalMs = isMoonshine ? MOONSHINE_CHUNK_INTERVAL_MS : WHISPER_CHUNK_INTERVAL_MS;
 
@@ -188,6 +219,12 @@ class DictationStreamer {
     let sessionHasContent = false;
     let sessionAudioMs = 0;
 
+    // Per-source silence threshold. Voice Chat (ai-chat) gets a slightly
+    // longer window so a natural mid-sentence pause doesn't auto-send.
+    const silenceCommitMs = clampSilenceMs(
+      this.activeSource === 'ai-chat' ? AI_CHAT_SILENCE_COMMIT_MS : SESSION_SILENCE_COMMIT_MS,
+    );
+
     // Reset any leftover state from a previous session.
     native.addon.moonshineSessionReset?.();
 
@@ -216,8 +253,8 @@ class DictationStreamer {
 
       if (silent) {
         silentAudioMs += bufferAudioMs;
-        if (sessionHasContent && silentAudioMs >= SESSION_SILENCE_COMMIT_MS) {
-          await this.commitSessionAndClearDraft(false);
+        if (sessionHasContent && silentAudioMs >= silenceCommitMs) {
+          await this.commitSessionAndClearDraft('silence');
           sessionHasContent = false;
           sessionAudioMs = 0;
           silentAudioMs = 0;
@@ -254,9 +291,12 @@ class DictationStreamer {
       this.emitDraft(cleaned);
 
       // 20s session cap — commit proactively to keep latency bounded.
+      // NOTE: cap commits intentionally do NOT trigger end-of-turn for ai-chat;
+      // the user is still mid-utterance, and auto-sending here would split a
+      // long answer mid-sentence.
       if (sessionAudioMs >= SESSION_CAP_MS) {
         debugLog('session.cap', { sessionAudioMs });
-        await this.commitSessionAndClearDraft(false);
+        await this.commitSessionAndClearDraft('cap');
         sessionHasContent = false;
         sessionAudioMs = 0;
         silentAudioMs = 0;
@@ -285,15 +325,16 @@ class DictationStreamer {
     try { native.addon.stopRecording(); } catch { /* already stopped */ }
 
     if (sessionHasContent || appendedFinalAudio) {
-      await this.commitSessionAndClearDraft(true);
+      await this.commitSessionAndClearDraft('final-stop');
     } else {
       this.emitDraft('');
     }
     native.addon.moonshineSessionReset?.();
   }
 
-  private async commitSessionAndClearDraft(isFinalStop: boolean): Promise<void> {
+  private async commitSessionAndClearDraft(reason: CommitReason): Promise<void> {
     this.emitDraft('');
+    const isFinalStop = reason === 'final-stop';
     try {
       const finalText = await native.addon.moonshineSessionCommit!();
       // AI Chat wants raw Moonshine output — no artifact-stripping, no
@@ -309,12 +350,23 @@ class DictationStreamer {
           cleaned = correctTranscript(cleaned, dict);
         }
       }
-      debugLog('session.commit', { cleaned: cleaned.slice(0, 80), isFinalStop, source: this.activeSource });
+      debugLog('session.commit', { cleaned: cleaned.slice(0, 80), reason, source: this.activeSource });
       if (cleaned) {
         this.fullText = (this.fullText + ' ' + cleaned).replace(/\s+/g, ' ').trim();
         this.chunkIndex += 1;
         this.state = { ...this.state, chunkCount: this.chunkIndex };
         this.emitChunk(cleaned, isFinalStop);
+      }
+      // Voice Chat hands-free: a silence-driven commit with non-empty
+      // accumulated text is the user's turn end. Cap commits and final-stop
+      // commits never fire end-of-turn — cap is mid-utterance, final-stop
+      // means the toggle was already turned off.
+      if (
+        reason === 'silence'
+        && this.activeSource === 'ai-chat'
+        && this.fullText.trim().length > 0
+      ) {
+        this.emitEndOfTurn(this.fullText.trim());
       }
     } catch (err) {
       console.error('[DictationStreamer] session_commit failed:', err);
@@ -478,6 +530,15 @@ class DictationStreamer {
     }
   }
 
+  private emitEndOfTurn(text: string): void {
+    const payload: DictationEndOfTurnEvent = { source: this.activeSource, text };
+    debugLog('end-of-turn.emit', { textLength: text.length, source: this.activeSource });
+    const w = BrowserWindow.getAllWindows()[0];
+    if (w && !w.isDestroyed()) {
+      w.webContents.send(IPC_CHANNELS.DICTATION_STREAM_END_OF_TURN, payload);
+    }
+  }
+
   private pushState(): void {
     const w = BrowserWindow.getAllWindows()[0];
     if (w && !w.isDestroyed()) {
@@ -503,9 +564,11 @@ class DictationStreamer {
       startedAt: null,
       chunkCount: 0,
       source: this.activeSource,
+      engine: this.activeEngine,
     };
     this.pushState();
     this.activeSource = 'notes';
+    this.activeEngine = 'unknown';
   }
 }
 
