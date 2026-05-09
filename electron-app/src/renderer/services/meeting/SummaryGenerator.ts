@@ -64,6 +64,13 @@ export interface StructuredOutput {
   versions?: VersionEntry[];
   /** Set by the meeting-room-client when the host's notes are synced in. */
   syncedFromHostSessionId?: string;
+  /** TipTap-formatted HTML written by the rich-text meeting editor. When
+   *  set, it is the source of truth for body display and regenerate must
+   *  null it out so an AI body refresh doesn't keep showing stale formatting. */
+  htmlContent?: string | null;
+  /** Linked entry id in the Notes "Meeting Notes" notebook. Persisted so
+   *  upserts on regenerate / save update in place instead of stacking. */
+  notebookEntryId?: string;
 }
 
 export interface VersionEntry {
