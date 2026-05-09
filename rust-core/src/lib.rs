@@ -1576,6 +1576,101 @@ mod napi_exports {
         DATABASE.delete_old_notifications(retention_days).map_err(Into::into)
     }
 
+    // ── AI Chat Persistence (v1.8.0) ──
+
+    #[napi]
+    pub fn ai_chat_create_session(
+        id: Option<String>,
+        title: String,
+        provider: Option<String>,
+        created_at: Option<String>,
+        updated_at: Option<String>,
+    ) -> napi::Result<String> {
+        let s = DATABASE
+            .ai_chat_create_session(
+                id.as_deref(),
+                &title,
+                provider.as_deref(),
+                created_at.as_deref(),
+                updated_at.as_deref(),
+            )
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&s).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn ai_chat_list_sessions(
+        limit: u32,
+        offset: u32,
+        include_archived: bool,
+    ) -> napi::Result<String> {
+        let sessions = DATABASE
+            .ai_chat_list_sessions(limit, offset, include_archived)
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&sessions).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn ai_chat_get_session(id: String) -> napi::Result<String> {
+        let session = DATABASE
+            .ai_chat_get_session(&id)
+            .map_err(Into::<napi::Error>::into)?;
+        match session {
+            Some(s) => serde_json::to_string(&s).map_err(|e| napi::Error::from_reason(e.to_string())),
+            None => Ok("null".to_string()),
+        }
+    }
+
+    #[napi]
+    pub fn ai_chat_rename_session(id: String, title: String) -> napi::Result<()> {
+        DATABASE.ai_chat_rename_session(&id, &title).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn ai_chat_pin_session(id: String, pinned: bool) -> napi::Result<()> {
+        DATABASE.ai_chat_pin_session(&id, pinned).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn ai_chat_archive_session(id: String, archived: bool) -> napi::Result<()> {
+        DATABASE.ai_chat_archive_session(&id, archived).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn ai_chat_delete_session(id: String) -> napi::Result<()> {
+        DATABASE.ai_chat_delete_session(&id).map_err(Into::into)
+    }
+
+    #[napi]
+    pub fn ai_chat_append_message(
+        session_id: String,
+        role: String,
+        content: String,
+        provider: Option<String>,
+        id: Option<String>,
+        created_at: Option<String>,
+    ) -> napi::Result<String> {
+        let m = DATABASE
+            .ai_chat_append_message(
+                &session_id,
+                &role,
+                &content,
+                provider.as_deref(),
+                id.as_deref(),
+                created_at.as_deref(),
+            )
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&m).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
+    #[napi]
+    pub fn ai_chat_search_sessions(query: String, limit: u32) -> napi::Result<String> {
+        let results = DATABASE
+            .ai_chat_search_sessions(&query, limit)
+            .map_err(Into::<napi::Error>::into)?;
+        serde_json::to_string(&results).map_err(|e| napi::Error::from_reason(e.to_string()))
+    }
+
     // ── ML Features: Action Log ──
 
     #[napi]

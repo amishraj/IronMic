@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Bot, Send, Mic, Square, RefreshCw, Sparkles, AlertCircle, Plus, MessageSquare, Trash2, X, Volume2, Pause, BookOpen, StickyNote, MessageCircle } from 'lucide-react';
+import { Bot, Send, Mic, Square, RefreshCw, Sparkles, AlertCircle, Plus, MessageSquare, X, Volume2, Pause, BookOpen, StickyNote, MessageCircle } from 'lucide-react';
 import { useAiChatStore, type ChatMessage, type AIProvider } from '../stores/useAiChatStore';
+import { useSettingsIntentStore } from '../stores/useSettingsIntentStore';
 import { useTtsStore } from '../stores/useTtsStore';
 import { NotePickerModal } from './NotePickerModal';
 import { VoiceChatOverlay } from './voice-chat/VoiceChatOverlay';
+import { AIChatHistoryDrawer } from './ai-chat/AIChatHistoryDrawer';
 import type { Note } from '../stores/useNotesStore';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -21,7 +23,6 @@ export function AIChat() {
   const [provider, setProvider] = useState<AIProvider | null>(null);
   const [authState, setAuthState] = useState<{ copilot: AuthStatus; claude: AuthStatus; local: AuthStatus } | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showSessions, setShowSessions] = useState(false);
   const [showNotePicker, setShowNotePicker] = useState(false);
   const [attachedNotes, setAttachedNotes] = useState<Note[]>([]);
   const [conversational, setConversational] = useState(false);
@@ -41,11 +42,46 @@ export function AIChat() {
   // hands-free auto-send is unavailable (Whisper / chunked-Moonshine fallback).
   const [engine, setEngine] = useState<'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown'>('unknown');
 
-  const { sessions, activeSessionId, activeSession, createSession, setActiveSession, addMessage, deleteSession } =
+  const { activeSession, createSession, setActiveSession, addMessage } =
     useAiChatStore();
+
+  /** Live read of `voice_chat_allow_cloud`. Always re-fetched at decision
+   *  time — Settings can flip it OFF in another tab mid-session and we must
+   *  honor the new value on the very next EOT. */
+  const readVoiceChatAllowCloud = useCallback(async (): Promise<boolean> => {
+    try {
+      const v = await window.ironmic.getSetting('voice_chat_allow_cloud');
+      return v === 'true';
+    } catch {
+      return false;
+    }
+  }, []);
+
+  /** Open Settings → AI Assist with the voice-chat toggle scrolled into view. */
+  const openCloudVoiceChatSetting = useCallback(() => {
+    useSettingsIntentStore.getState().setIntent({
+      pendingTab: 'ai',
+      focusKey: 'voice_chat_allow_cloud',
+    });
+    window.dispatchEvent(new CustomEvent('ironmic:navigate', { detail: 'settings' }));
+  }, []);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [containerWidth, setContainerWidth] = useState<number | null>(null);
+
+  // Track AI Chat container width for the right-side drawer's auto-rail.
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      if (typeof w === 'number') setContainerWidth(w);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // AI Chat mic uses the streaming dictation path directly (same engine as
   // Forge / Notes). It does NOT go through useRecordingStore — that path
@@ -188,7 +224,18 @@ export function AIChat() {
         // Cloud providers: accept the generic setting iff it's NOT a local id.
         modelId = genericModel && !genericModel.startsWith('llm') ? genericModel : undefined;
       }
-      const response = await window.ironmic.aiSendMessage(fullPrompt, provider, modelId);
+      // Build a bounded conversation tail for the main process. Sending the
+      // last 20 messages (capped server-side at MAX_HISTORY_MESSAGES) lets
+      // resumed sessions retain context across app restarts: local replays
+      // them into the LLM history, CLI bakes them into the prompt prefix.
+      const sessSnapshot = useAiChatStore.getState().sessions.find((s) => s.id === sessionId);
+      const priorMessages = sessSnapshot
+        ? sessSnapshot.messages
+            .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.id !== userMsg.id)
+            .slice(-20)
+            .map((m) => ({ role: m.role, content: m.content }))
+        : undefined;
+      const response = await window.ironmic.aiSendMessage(fullPrompt, provider, modelId, sessionId, priorMessages);
 
       const assistantMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),
@@ -353,14 +400,19 @@ export function AIChat() {
       if (autoSendingRef.current || loadingRef.current) return;
       const eotText = (payload?.text || '').trim();
       if (!eotText) return;
-      // v1 cloud guard: refuse + tear down. Never silently auto-send raw
-      // dictated speech to a cloud provider.
+      // Cloud guard — read live so a Settings flip in another tab takes
+      // effect on the very next turn. When `voice_chat_allow_cloud` is off,
+      // refuse + tear down so we never silently auto-send raw dictated
+      // speech to a cloud provider.
       if (providerRef.current !== 'local') {
-        try { await api.dictationStreamStop?.(); } catch { /* ignore */ }
-        setConversational(false);
-        conversationalRef.current = false;
-        setError('Voice Chat requires the local provider.');
-        return;
+        const allowed = await readVoiceChatAllowCloud();
+        if (!allowed) {
+          try { await api.dictationStreamStop?.(); } catch { /* ignore */ }
+          setConversational(false);
+          conversationalRef.current = false;
+          setError('Voice Chat is off for cloud providers. Enable it in Settings → AI Assist, or switch to Local.');
+          return;
+        }
       }
       autoSendingRef.current = true;
       try {
@@ -417,10 +469,22 @@ export function AIChat() {
       setDraftText('');
       return;
     }
-    // Toggle ON — refuse if non-local provider (v1 privacy posture).
+    // Toggle ON — for cloud providers, require both the opt-in setting and
+    // an authenticated provider. Without the auth preflight the user would
+    // record a turn only to fail at send time, breaking the conversational
+    // flow and wasting the spoken prompt.
     if (provider !== 'local') {
-      setError('Voice Chat requires the local provider. Switch to Local first.');
-      return;
+      const allowed = await readVoiceChatAllowCloud();
+      if (!allowed) {
+        setError('Voice Chat is off for cloud providers. Enable it in Settings → AI Assist, or switch to Local.');
+        return;
+      }
+      const auth = provider === 'claude' ? authState?.claude : authState?.copilot;
+      if (!auth?.authenticated) {
+        const label = provider === 'claude' ? 'Claude' : 'Copilot';
+        setError(`Sign in to ${label} first. Voice Chat needs an authenticated provider.`);
+        return;
+      }
     }
     if (foreignStreamActive) {
       setError('Dictation is already running in another window. Stop it first.');
@@ -439,16 +503,20 @@ export function AIChat() {
     }
     setConversational(true);
     conversationalRef.current = true;
-  }, [provider, foreignStreamActive]);
+  }, [provider, foreignStreamActive, authState, readVoiceChatAllowCloud]);
 
   // Mid-loop provider switch: if the user flips to a cloud provider while
-  // Voice Chat is active, tear down immediately. Don't wait for the next EOT.
+  // Voice Chat is active, only tear down when the cloud opt-in is OFF.
+  // When opt-in is ON, the loop keeps running against the new provider —
+  // the badge in the overlay tells the user where the next turn is going.
   useEffect(() => {
     if (!conversationalRef.current) return;
     if (provider === 'local') return;
     const api = (window as any).ironmic;
     if (!api) return;
     (async () => {
+      const allowed = await readVoiceChatAllowCloud();
+      if (allowed) return; // continue loop against the new cloud provider
       try { await api.dictationStreamStop?.(); } catch { /* ignore */ }
       try { useTtsStore.getState().stop(); } catch { /* ignore */ }
       if (loadingRef.current) {
@@ -458,9 +526,9 @@ export function AIChat() {
       conversationalRef.current = false;
       setStreaming('');
       setLoading(false);
-      setError('Voice Chat disabled — switched to a non-local provider.');
+      setError('Voice Chat disabled — cloud opt-in is off. Enable it in Settings → AI Assist, or switch back to Local.');
     })();
-  }, [provider]);
+  }, [provider, readVoiceChatAllowCloud]);
 
   const handleVoiceInput = useCallback(async () => {
     const api = (window as any).ironmic;
@@ -482,13 +550,15 @@ export function AIChat() {
     }
   }, [micState, foreignStreamActive, startAiDictation]);
 
-  const handleNewChat = () => {
+  const handleNewChat = useCallback(() => {
     const id = createSession(provider);
     setActiveSession(id);
     setStreaming('');
     setError(null);
-    window.ironmic.aiResetSession();
-  };
+    // Scoped reset: only clear the brand-new session's context. Other sessions
+    // keep their per-session context so resuming them retains continuity.
+    window.ironmic.aiResetSession(id);
+  }, [createSession, setActiveSession, provider]);
 
   const noProvider = !provider;
 
@@ -516,54 +586,7 @@ export function AIChat() {
   })();
 
   return (
-    <div className="flex h-full bg-iron-bg">
-      {/* Session sidebar */}
-      {showSessions && (
-        <div className="w-56 flex-shrink-0 border-r border-iron-border bg-iron-surface flex flex-col">
-          <div className="flex items-center justify-between px-3 py-2.5 border-b border-iron-border">
-            <span className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">Sessions</span>
-            <button
-              onClick={handleNewChat}
-              className="p-1 rounded-md text-iron-text-muted hover:text-iron-accent-light hover:bg-iron-surface-hover transition-colors"
-              title="New chat"
-            >
-              <Plus className="w-3.5 h-3.5" />
-            </button>
-          </div>
-          <div className="flex-1 overflow-y-auto py-1">
-            {sessions.length === 0 && (
-              <p className="text-[11px] text-iron-text-muted text-center py-6">No sessions yet</p>
-            )}
-            {sessions.map((s) => (
-              <button
-                key={s.id}
-                onClick={() => setActiveSession(s.id)}
-                className={`w-full flex items-start gap-2 px-3 py-2 text-left transition-colors group ${
-                  activeSessionId === s.id
-                    ? 'bg-iron-accent/10 text-iron-text'
-                    : 'text-iron-text-secondary hover:bg-iron-surface-hover'
-                }`}
-              >
-                <MessageSquare className="w-3.5 h-3.5 mt-0.5 flex-shrink-0 opacity-50" />
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs font-medium truncate">{s.title}</p>
-                  <p className="text-[10px] text-iron-text-muted mt-0.5">
-                    {s.messages.length} message{s.messages.length !== 1 ? 's' : ''}
-                  </p>
-                </div>
-                <button
-                  onClick={(e) => { e.stopPropagation(); deleteSession(s.id); }}
-                  className="p-0.5 rounded opacity-0 group-hover:opacity-100 text-iron-text-muted hover:text-iron-danger transition-all"
-                  title="Delete session"
-                >
-                  <Trash2 className="w-3 h-3" />
-                </button>
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-
+    <div ref={containerRef} className="flex h-full bg-iron-bg">
       {/* Main chat area */}
       <div className="flex-1 flex flex-col min-w-0 relative">
         {/* Voice Chat overlay — focused listening surface, only when active */}
@@ -576,6 +599,7 @@ export function AIChat() {
             committedText={input}
             engine={engine}
             lastAiReply={lastAiReply}
+            provider={provider}
             onClose={() => void handleVoiceChatToggle()}
             onMicClick={() => void handleVoiceInput()}
           />
@@ -583,15 +607,9 @@ export function AIChat() {
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-iron-border">
           <div className="flex items-center gap-2.5">
-            <button
-              onClick={() => setShowSessions(!showSessions)}
-              className={`w-7 h-7 rounded-lg flex items-center justify-center transition-colors ${
-                showSessions ? 'bg-iron-accent/15 text-iron-accent-light' : 'bg-iron-accent/10 text-iron-accent-light hover:bg-iron-accent/15'
-              }`}
-              title={showSessions ? 'Hide sessions' : 'Show sessions'}
-            >
+            <div className="w-7 h-7 rounded-lg flex items-center justify-center bg-iron-accent/10 text-iron-accent-light">
               <MessageSquare className="w-4 h-4" />
-            </button>
+            </div>
             <div>
               <h3 className="text-sm font-semibold text-iron-text">
                 {session?.title || 'AI Assistant'}
@@ -855,6 +873,12 @@ export function AIChat() {
           </div>
         </div>
       </div>
+
+      {/* Right-side chat history drawer (auto-rails on narrow widths) */}
+      <AIChatHistoryDrawer
+        containerWidth={containerWidth}
+        onNewChat={handleNewChat}
+      />
 
       {/* Note picker modal */}
       <NotePickerModal

@@ -99,12 +99,13 @@ export class AIManager {
   private local = new LocalLLMAdapter();
   private authCache: Partial<Record<AIProvider, AuthStatus>> = {};
   /**
-   * Per-CLI-provider turn counts. Incremented only on code === 0 so a failed
-   * turn can't poison the next one. Isolated per-provider so switching tabs
-   * doesn't carry a Claude session into a fresh Copilot turn. Local chat uses
-   * localHistories instead and is intentionally excluded from this map.
+   * Per-CLI-provider, per-session turn counts. Keyed by `${provider}:${sessionId}`
+   * (or `${provider}:_default` when sessionId is absent). Incremented only on
+   * code === 0 so a failed turn can't poison the next one. Per-session keys
+   * mean switching chat sessions never accidentally `--continue`s an unrelated
+   * conversation. Local chat uses localHistories instead.
    */
-  private cliTurnCounts: Partial<Record<CLIProvider, number>> = {};
+  private cliTurnCounts: Record<string, number> = {};
   private activeProcess: ChildProcess | null = null;
 
   /**
@@ -125,6 +126,54 @@ export class AIManager {
   private getLocalHistory(ctx: string): Array<{ role: string; content: string }> {
     if (!this.localHistories.has(ctx)) this.localHistories.set(ctx, []);
     return this.localHistories.get(ctx)!;
+  }
+
+  /** Compose the local-history / cli-turn-count key. */
+  private contextKeyFor(base: string, sessionId?: string | null): string {
+    return sessionId ? `${base}:${sessionId}` : base;
+  }
+  private cliTurnKey(provider: CLIProvider, sessionId?: string | null): string {
+    return sessionId ? `${provider}:${sessionId}` : `${provider}:_default`;
+  }
+
+  /**
+   * Hydrate the in-memory local history for a session from persisted messages.
+   * Idempotent: only seeds when the in-memory history is empty for the given
+   * key. Caps at MAX_HISTORY_MESSAGES to bound prompt size on long resumes.
+   */
+  private hydrateLocalHistory(
+    ctxKey: string,
+    priorMessages: ReadonlyArray<{ role: string; content: string }>,
+  ): void {
+    const existing = this.getLocalHistory(ctxKey);
+    if (existing.length > 0 || priorMessages.length === 0) return;
+    const tail = priorMessages
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .slice(-MAX_HISTORY_MESSAGES);
+    existing.push(...tail.map((m) => ({ role: m.role, content: m.content })));
+  }
+
+  /**
+   * Build a self-contained CLI prompt that bakes prior turns into the request.
+   * Used on a "cold resume" — when this `provider:sessionId` has no live turn
+   * count (e.g. after an app restart) but the session has a persisted history.
+   * The CLI sees a single self-contained prompt; it does not need --continue.
+   */
+  private buildCliReplayPrompt(
+    priorMessages: ReadonlyArray<{ role: string; content: string }>,
+    currentPrompt: string,
+  ): string {
+    const tail = priorMessages
+      .filter((m) => m.role === 'user' || m.role === 'assistant')
+      .slice(-MAX_HISTORY_MESSAGES);
+    if (tail.length === 0) return currentPrompt;
+    const lines: string[] = ['[Previous conversation in this session:]'];
+    for (const m of tail) {
+      const speaker = m.role === 'user' ? 'You' : 'Assistant';
+      lines.push(`${speaker}: ${m.content}`);
+    }
+    lines.push('', '[Current message:]', currentPrompt);
+    return lines.join('\n');
   }
 
   private rememberModels(provider: AIProvider, models: AIModel[]): AIModel[] {
@@ -299,11 +348,14 @@ export class AIManager {
     window: BrowserWindow | null,
     model?: string,
     contextKey = 'chat',
+    sessionId?: string | null,
+    priorMessages?: ReadonlyArray<{ role: string; content: string }>,
   ): Promise<string> {
+    const scopedKey = this.contextKeyFor(contextKey, sessionId);
     if (provider === 'local') {
-      return this.sendLocalMessage(prompt, window, model, contextKey);
+      return this.sendLocalMessage(prompt, window, model, scopedKey, priorMessages);
     }
-    return this.sendCLIMessage(prompt, provider, window, model);
+    return this.sendCLIMessage(prompt, provider, window, model, sessionId, priorMessages);
   }
 
   /**
@@ -314,6 +366,7 @@ export class AIManager {
     window: BrowserWindow | null,
     model?: string,
     contextKey = 'chat',
+    priorMessages?: ReadonlyArray<{ role: string; content: string }>,
   ): Promise<string> {
     // Resolve the model ID to a LOCAL model. The renderer may pass a stale
     // model ID here — most commonly when the user previously chose a cloud
@@ -357,6 +410,12 @@ export class AIManager {
 
     const modelPath = getChatModelPath(modelId);
     const modelType = modelMeta.modelType;
+
+    // Cold-resume: if the in-memory context for this session is empty but we
+    // received persisted messages, seed from them so the model gets continuity.
+    if (priorMessages && priorMessages.length > 0) {
+      this.hydrateLocalHistory(contextKey, priorMessages);
+    }
 
     const localHistory = this.getLocalHistory(contextKey);
     localHistory.push({ role: 'user', content: prompt });
@@ -424,6 +483,8 @@ export class AIManager {
     provider: CLIProvider,
     window: BrowserWindow | null,
     model?: string,
+    sessionId?: string | null,
+    priorMessages?: ReadonlyArray<{ role: string; content: string }>,
   ): Promise<string> {
     const adapter = this.getCLIAdapter(provider);
     const auth = await this.checkAuth(provider);
@@ -453,11 +514,19 @@ export class AIManager {
     }
 
     const binary = auth.binaryPath!;
-    const continueSession = (this.cliTurnCounts[provider] ?? 0) > 0;
+    const turnKey = this.cliTurnKey(provider, sessionId);
+    const continueSession = (this.cliTurnCounts[turnKey] ?? 0) > 0;
+    // Cold-resume: continueSession is false but the session has persisted
+    // history. Bake the prior turns into the prompt so the CLI can answer
+    // with continuity even though it has no continuation token.
+    const effectivePrompt =
+      !continueSession && priorMessages && priorMessages.length > 0
+        ? this.buildCliReplayPrompt(priorMessages, prompt)
+        : prompt;
     const resolvedModel = this.resolveModel(provider, model);
     const args = provider === 'copilot'
-      ? this.copilot.buildArgsForBinary(binary, prompt, continueSession, resolvedModel ?? model)
-      : adapter.buildArgs(prompt, continueSession, resolvedModel ?? model);
+      ? this.copilot.buildArgsForBinary(binary, effectivePrompt, continueSession, resolvedModel ?? model)
+      : adapter.buildArgs(effectivePrompt, continueSession, resolvedModel ?? model);
 
     if (process.env.NODE_ENV === 'development') {
       console.log(`[ai] Sending to ${provider}: ${binary} [${args.length} args, prompt_length=${prompt.length}]`);
@@ -526,7 +595,7 @@ export class AIManager {
           // Only count a clean exit as a successful turn. A non-zero exit
           // (even with partial stdout) means we shouldn't --continue from
           // a half-finished session on the next turn.
-          this.cliTurnCounts[provider] = (this.cliTurnCounts[provider] ?? 0) + 1;
+          this.cliTurnCounts[turnKey] = (this.cliTurnCounts[turnKey] ?? 0) + 1;
           resolve(fullOutput.trim());
         } else if (fullOutput.trim()) {
           // Non-zero exit but we got stdout — surface it, don't increment.
@@ -693,11 +762,27 @@ export class AIManager {
     }
   }
 
-  /** Reset turn counts and all conversation history contexts (new conversation). */
-  resetSession(): void {
+  /**
+   * Reset conversation context. With no args clears every chat:* context
+   * across all providers (used by Settings → "Clear all AI history"). With a
+   * `sessionId` clears only that one session's context — used by "New chat"
+   * and by switching to a different persisted session.
+   */
+  resetSession(sessionId?: string | null): void {
     this.cancel();
-    this.cliTurnCounts = {};
-    this.localHistories.clear();
+    if (!sessionId) {
+      this.cliTurnCounts = {};
+      this.localHistories.clear();
+      return;
+    }
+    // Scoped reset: only purge keys mentioning this sessionId.
+    for (const key of Object.keys(this.cliTurnCounts)) {
+      if (key.endsWith(`:${sessionId}`)) delete this.cliTurnCounts[key];
+    }
+    const localKeys = Array.from(this.localHistories.keys());
+    for (const key of localKeys) {
+      if (key.endsWith(`:${sessionId}`)) this.localHistories.delete(key);
+    }
   }
 }
 

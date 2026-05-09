@@ -121,12 +121,18 @@ const api = {
   aiGetAuthState: () => ipcRenderer.invoke('ai:get-auth-state'),
   aiRefreshAuth: (provider?: string) => ipcRenderer.invoke('ai:refresh-auth', provider),
   aiPickProvider: () => ipcRenderer.invoke('ai:pick-provider'),
-  aiSendMessage: (prompt: string, provider: string, model?: string) => ipcRenderer.invoke('ai:send-message', prompt, provider, model),
+  aiSendMessage: (
+    prompt: string,
+    provider: string,
+    model?: string,
+    sessionId?: string | null,
+    priorMessages?: Array<{ role: string; content: string }>,
+  ) => ipcRenderer.invoke('ai:send-message', prompt, provider, model, sessionId, priorMessages),
   aiGetModels: (provider?: string) => ipcRenderer.invoke('ai:get-models', provider),
   aiRefreshModels: (provider?: string, opts?: { force?: boolean }) =>
     ipcRenderer.invoke('ai:refresh-models', provider, opts),
   aiCancel: () => ipcRenderer.invoke('ai:cancel'),
-  aiResetSession: () => ipcRenderer.invoke('ai:reset-session'),
+  aiResetSession: (sessionId?: string | null) => ipcRenderer.invoke('ai:reset-session', sessionId),
   aiGetLocalModelStatus: () => ipcRenderer.invoke('ai:local-model-status'),
   onAiOutput: (callback: (data: any) => void) => {
     const handler = (_event: any, data: any) => callback(data);
@@ -160,6 +166,27 @@ const api = {
     ipcRenderer.invoke('ironmic:notification-get-interactions', sinceDate),
   notificationGetUnreadCount: () => ipcRenderer.invoke('ironmic:notification-get-unread-count'),
   notificationDeleteOld: (days: number) => ipcRenderer.invoke('ironmic:notification-delete-old', days),
+
+  // ── AI Chat Persistence (v1.8.x) ──
+  // All return JSON strings (or "null" / void) — caller parses.
+  aiChatCreateSession: (id: string | null, title: string, provider: string | null, createdAt?: string, updatedAt?: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-create-session', id, title, provider, createdAt, updatedAt),
+  aiChatListSessions: (limit: number, offset: number, includeArchived: boolean) =>
+    ipcRenderer.invoke('ironmic:ai-chat-list-sessions', limit, offset, includeArchived),
+  aiChatGetSession: (id: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-get-session', id),
+  aiChatRenameSession: (id: string, title: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-rename-session', id, title),
+  aiChatPinSession: (id: string, pinned: boolean) =>
+    ipcRenderer.invoke('ironmic:ai-chat-pin-session', id, pinned),
+  aiChatArchiveSession: (id: string, archived: boolean) =>
+    ipcRenderer.invoke('ironmic:ai-chat-archive-session', id, archived),
+  aiChatDeleteSession: (id: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-delete-session', id),
+  aiChatAppendMessage: (sessionId: string, role: string, content: string, provider: string | null, id?: string, createdAt?: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-append-message', sessionId, role, content, provider, id, createdAt),
+  aiChatSearchSessions: (query: string, limit: number) =>
+    ipcRenderer.invoke('ironmic:ai-chat-search-sessions', query, limit),
 
   // ── ML Features: Action Log ──
   logAction: (actionType: string, metadataJson?: string) =>

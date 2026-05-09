@@ -112,11 +112,11 @@ declare global {
       aiGetAuthState: () => Promise<any>;
       aiRefreshAuth: (provider?: string) => Promise<any>;
       aiPickProvider: () => Promise<'copilot' | 'claude' | 'local' | null>;
-      aiSendMessage: (prompt: string, provider: string, model?: string) => Promise<string>;
+      aiSendMessage: (prompt: string, provider: string, model?: string, sessionId?: string | null, priorMessages?: Array<{ role: string; content: string }>) => Promise<string>;
       aiGetModels: (provider?: string) => Promise<any[]>;
       aiRefreshModels: (provider?: string, opts?: { force?: boolean }) => Promise<any[]>;
       aiCancel: () => Promise<void>;
-      aiResetSession: () => Promise<void>;
+      aiResetSession: (sessionId?: string | null) => Promise<void>;
       aiGetLocalModelStatus: () => Promise<any[]>;
       // ML Notifications
       notificationCreate: (source: string, sourceId: string | null, type: string, title: string, body?: string) => Promise<string>;
@@ -129,6 +129,16 @@ declare global {
       notificationGetInteractions: (sinceDate: string) => Promise<string>;
       notificationGetUnreadCount: () => Promise<number>;
       notificationDeleteOld: (days: number) => Promise<number>;
+      // AI Chat persistence (v1.8.x)
+      aiChatCreateSession: (id: string | null, title: string, provider: string | null, createdAt?: string, updatedAt?: string) => Promise<string>;
+      aiChatListSessions: (limit: number, offset: number, includeArchived: boolean) => Promise<string>;
+      aiChatGetSession: (id: string) => Promise<string>;
+      aiChatRenameSession: (id: string, title: string) => Promise<void>;
+      aiChatPinSession: (id: string, pinned: boolean) => Promise<void>;
+      aiChatArchiveSession: (id: string, archived: boolean) => Promise<void>;
+      aiChatDeleteSession: (id: string) => Promise<void>;
+      aiChatAppendMessage: (sessionId: string, role: string, content: string, provider: string | null, id?: string, createdAt?: string) => Promise<string>;
+      aiChatSearchSessions: (query: string, limit: number) => Promise<string>;
       // ML Action Log
       logAction: (actionType: string, metadataJson?: string) => Promise<void>;
       queryActionLog: (from: string, to: string, filter?: string) => Promise<string>;

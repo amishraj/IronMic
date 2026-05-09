@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSettingsStore } from '../stores/useSettingsStore';
+import { useSettingsIntentStore } from '../stores/useSettingsIntentStore';
 import { DictionaryManager } from './DictionaryManager';
 import { ModelManager } from './ModelManager';
 import { ModelImportSection, ModelImportBanner } from './ModelImportBanner';
@@ -34,6 +35,19 @@ const TABS: { id: SettingsTab; label: string; icon: typeof Settings }[] = [
 
 export function SettingsPanel() {
   const [tab, setTab] = useState<SettingsTab>('general');
+
+  // Honor a cross-page intent (e.g. AIChat → "Enable cloud Voice Chat" deep-link).
+  // Read once on mount and consume — focusKey is forwarded to the inner section
+  // through the intent store, which keeps the value alive until the row scrolls
+  // into view (handled inside AIAssistSettings).
+  useEffect(() => {
+    const intent = useSettingsIntentStore.getState();
+    if (intent.pendingTab) {
+      setTab(intent.pendingTab);
+      // Don't consume focusKey here — the section consumes after scrolling.
+      useSettingsIntentStore.setState({ pendingTab: null });
+    }
+  }, []);
 
   return (
     <div className="flex h-full">
@@ -161,6 +175,44 @@ function AIAssistSettings() {
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
 
+  // Cloud opt-ins (relocated from Security & Privacy in v1.8.x). Kept in this
+  // panel so all "what does AI Assist talk to?" controls live together.
+  const [allowCloudPolish, setAllowCloudPolish] = useState(false);
+  const [allowCloudVoiceChat, setAllowCloudVoiceChat] = useState(false);
+  const [pendingFocusKey, setPendingFocusKey] = useState<string | null>(null);
+  const polishToggleRef = useRef<HTMLDivElement | null>(null);
+  const voiceChatToggleRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    // Inherit any focusKey set by the deep-link intent, then clear it from
+    // the global store. Local state survives long enough for the scroll
+    // effect below to fire after the row's ref attaches.
+    const intent = useSettingsIntentStore.getState();
+    if (intent.focusKey) {
+      setPendingFocusKey(intent.focusKey);
+      useSettingsIntentStore.getState().consume();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!pendingFocusKey || !aiEnabled) return;
+    const target =
+      pendingFocusKey === 'voice_chat_allow_cloud' ? voiceChatToggleRef.current :
+      pendingFocusKey === 'polish_allow_cloud' ? polishToggleRef.current :
+      null;
+    if (target) {
+      // Wait one frame for layout to settle, then scroll + flash the border.
+      requestAnimationFrame(() => {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.add('ring-2', 'ring-iron-accent', 'rounded-lg');
+        setTimeout(() => {
+          target.classList.remove('ring-2', 'ring-iron-accent', 'rounded-lg');
+          setPendingFocusKey(null);
+        }, 1800);
+      });
+    }
+  }, [pendingFocusKey, aiEnabled]);
+
   useEffect(() => {
     loadAiSettings();
     const cleanup = window.ironmic.onModelDownloadProgress((prog: any) => {
@@ -186,18 +238,55 @@ function AIAssistSettings() {
 
   async function loadAiSettings() {
     const api = window.ironmic;
-    const [prov, mod, auth, allModels, localModelStatus] = await Promise.all([
+    const [prov, mod, auth, allModels, localModelStatus, polishCloud, voiceChatCloud] = await Promise.all([
       api.getSetting('ai_provider'),
       api.getSetting('ai_model'),
       api.aiGetAuthState(),
       api.aiGetModels(),
       api.aiGetLocalModelStatus?.() || Promise.resolve([]),
+      api.getSetting('polish_allow_cloud'),
+      api.getSetting('voice_chat_allow_cloud'),
     ]);
     if (prov) setProvider(prov);
     if (mod) setModel(mod);
     setAuthState(auth);
     setModels(allModels || []);
     if (localModelStatus) setLocalModels(localModelStatus);
+    setAllowCloudPolish(polishCloud === 'true');
+    setAllowCloudVoiceChat(voiceChatCloud === 'true');
+  }
+
+  /** Confirm before turning ON either cloud opt-in — they route user content
+   *  off-device. Turning OFF is unconditional. Mirrors the prior pattern from
+   *  the Security panel. */
+  async function handleCloudPolishToggle(next: boolean) {
+    if (next) {
+      const ok = window.confirm(
+        'Allow cloud polishing?\n\n' +
+        'When enabled, IronMic will send your transcript text to the authenticated ' +
+        'Claude or Copilot CLI for higher-quality cleanups. This is the only feature ' +
+        'that sends transcript content off your device.\n\n' +
+        'You can turn this off again at any time.',
+      );
+      if (!ok) return;
+    }
+    setAllowCloudPolish(next);
+    await window.ironmic.setSetting('polish_allow_cloud', String(next));
+  }
+
+  async function handleCloudVoiceChatToggle(next: boolean) {
+    if (next) {
+      const ok = window.confirm(
+        'Allow cloud Voice Chat?\n\n' +
+        'When enabled, the conversational Voice Chat loop may send your raw spoken ' +
+        'transcripts to the authenticated Claude or Copilot CLI. Useful for faster, ' +
+        'higher-quality replies — but each turn auto-sends what you said.\n\n' +
+        'Local Voice Chat (with the on-device LLM) stays available regardless.',
+      );
+      if (!ok) return;
+    }
+    setAllowCloudVoiceChat(next);
+    await window.ironmic.setSetting('voice_chat_allow_cloud', String(next));
   }
 
   async function handleProviderChange(p: string) {
@@ -533,6 +622,79 @@ function AIAssistSettings() {
             </div>
           )}
 
+          {/* Cloud opt-ins — the two AI Assist features that route user
+              content off-device. Co-located here (relocated from Security &
+              Privacy in v1.8.x) so the user has one place to manage them. */}
+          <div ref={polishToggleRef}>
+            <Card
+              variant="default"
+              padding="md"
+              className={allowCloudPolish ? 'border-amber-500/40' : ''}
+            >
+              <div className="space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2 min-w-0 flex-1">
+                    <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-iron-text">Allow cloud polishing (Claude / Copilot)</p>
+                      <p className="text-xs text-iron-text-muted mt-0.5">
+                        Off by default. IronMic processes everything locally. Turning this on
+                        sends your transcript text to the authenticated Claude or Copilot CLI
+                        when you polish a note.
+                      </p>
+                    </div>
+                  </div>
+                  <Toggle checked={allowCloudPolish} onChange={handleCloudPolishToggle} />
+                </div>
+                {allowCloudPolish && (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300">
+                    <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                    <span>
+                      Cloud polish is enabled. Polish runs will use Claude or Copilot when authenticated;
+                      otherwise they fall back to the local LLM. The polish toggle in Notes shows a "via Claude" /
+                      "via Copilot" / "via local" badge so you can confirm where each polish ran.
+                    </span>
+                  </div>
+                )}
+              </div>
+            </Card>
+          </div>
+
+          <div ref={voiceChatToggleRef}>
+            <Card
+              variant="default"
+              padding="md"
+              className={allowCloudVoiceChat ? 'border-amber-500/40' : ''}
+            >
+              <div className="space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2 min-w-0 flex-1">
+                    <Mic className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-iron-text">Allow cloud Voice Chat (Claude / Copilot)</p>
+                      <p className="text-xs text-iron-text-muted mt-0.5">
+                        Off by default. The conversational Voice Chat loop auto-sends each turn the
+                        moment you stop speaking. Local Voice Chat is always available; this opt-in
+                        lets the same loop talk to your authenticated Claude or Copilot CLI.
+                      </p>
+                    </div>
+                  </div>
+                  <Toggle checked={allowCloudVoiceChat} onChange={handleCloudVoiceChatToggle} />
+                </div>
+                {allowCloudVoiceChat && (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300">
+                    <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                    <span>
+                      Cloud Voice Chat is enabled. Each turn auto-sends to Claude or Copilot when
+                      that provider is selected and authenticated. The overlay shows a "via Claude" /
+                      "via Copilot" badge per turn so you always see where your speech went.
+                    </span>
+                  </div>
+                )}
+              </div>
+            </Card>
+          </div>
+
           {/* Info card — contextual per provider */}
           <Card variant="default" padding="md">
             <div className="flex items-start gap-2.5">
@@ -863,11 +1025,6 @@ function SecuritySettings() {
   const [aiDataConfirm, setAiDataConfirm] = useState(false);
   const [privacyMode, setPrivacyMode] = useState(false);
   const [proxyEnabled, setProxyEnabled] = useState(false);
-  // polish_allow_cloud: off by default. When on, polish prefers an
-  // authenticated Claude/Copilot CLI — which sends transcript text to those
-  // CLIs, breaking IronMic's local-only default. Authentication never
-  // auto-flips this; the user must consciously opt in here.
-  const [allowCloudPolish, setAllowCloudPolish] = useState(false);
   const [proxyUrl, setProxyUrl] = useState('');
   const [proxySaved, setProxySaved] = useState(false);
   const [devFeaturesEnabled, setDevFeaturesEnabled] = useState(false);
@@ -878,7 +1035,7 @@ function SecuritySettings() {
 
   async function loadSecuritySettings() {
     const api = window.ironmic;
-    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl, polishCloud, devFeatures] = await Promise.all([
+    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl, devFeatures] = await Promise.all([
       api.getSetting('security_clipboard_auto_clear'),
       api.getSetting('security_session_timeout'),
       api.getSetting('security_clear_on_exit'),
@@ -886,7 +1043,6 @@ function SecuritySettings() {
       api.getSetting('security_privacy_mode'),
       api.getSetting('proxy_enabled'),
       api.getSetting('proxy_url'),
-      api.getSetting('polish_allow_cloud'),
       api.getSetting('dev_features_enabled'),
     ]);
     if (clip) setClipboardAutoClear(clip);
@@ -896,26 +1052,7 @@ function SecuritySettings() {
     setPrivacyMode(privacy === 'true');
     setProxyEnabled(pEnabled === 'true');
     if (pUrl) setProxyUrl(pUrl);
-    setAllowCloudPolish(polishCloud === 'true');
     setDevFeaturesEnabled(devFeatures === 'true');
-  }
-
-  /** Confirm before turning on cloud polish — it's the one setting that
-   *  routes user content off-device, so a misclick shouldn't be silently
-   *  destructive to the privacy posture. Turning OFF is unconditional. */
-  async function handleCloudPolishToggle(next: boolean) {
-    if (next) {
-      const ok = window.confirm(
-        'Allow cloud polishing?\n\n' +
-        'When enabled, IronMic will send your transcript text to the authenticated ' +
-        'Claude or Copilot CLI for higher-quality cleanups. This is the only feature ' +
-        'that sends content off your device.\n\n' +
-        'You can turn this off again at any time.',
-      );
-      if (!ok) return;
-    }
-    setAllowCloudPolish(next);
-    await updateSetting('polish_allow_cloud', String(next));
   }
 
   async function updateSetting(key: string, value: string) {
@@ -938,39 +1075,10 @@ function SecuritySettings() {
         </div>
       </Card>
 
-      {/* Cloud polish — the one setting that routes user content off-device. */}
-      <Card
-        variant="default"
-        padding="md"
-        className={allowCloudPolish ? 'border-amber-500/40' : ''}
-      >
-        <div className="space-y-3">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-start gap-2 min-w-0 flex-1">
-              <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
-              <div className="min-w-0">
-                <p className="text-sm font-medium text-iron-text">Allow cloud polishing (Claude / Copilot)</p>
-                <p className="text-xs text-iron-text-muted mt-0.5">
-                  Off by default. IronMic processes everything locally. Turning this on
-                  sends your transcript text to the authenticated Claude or Copilot CLI
-                  when you polish a note.
-                </p>
-              </div>
-            </div>
-            <Toggle checked={allowCloudPolish} onChange={handleCloudPolishToggle} />
-          </div>
-          {allowCloudPolish && (
-            <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300">
-              <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-              <span>
-                Cloud polish is enabled. Polish runs will use Claude or Copilot when authenticated;
-                otherwise they fall back to the local LLM. The polish toggle in Notes shows a "via Claude" /
-                "via Copilot" / "via local" badge so you can confirm where each polish ran.
-              </span>
-            </div>
-          )}
-        </div>
-      </Card>
+      {/* Cloud opt-ins for AI Assist (cloud polish, cloud Voice Chat) live
+          in Settings → AI Assist as of v1.8.x. Co-located with provider /
+          model selection so all "what does AI Assist talk to?" controls
+          are in one place. */}
 
       {/* Proxy Configuration */}
       <Card variant="default" padding="md">

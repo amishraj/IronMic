@@ -3,6 +3,7 @@ import { Mic, X } from 'lucide-react';
 import { useTtsStore } from '../../stores/useTtsStore';
 
 type Engine = 'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown';
+type Provider = 'copilot' | 'claude' | 'local' | null;
 
 export interface VoiceChatOverlayProps {
   micState: 'idle' | 'recording' | 'stopping';
@@ -12,6 +13,9 @@ export interface VoiceChatOverlayProps {
   committedText: string;        // committed user-turn-so-far (mirrors `input`)
   engine: Engine;
   lastAiReply: string | null;   // last assistant message content (for caption)
+  /** Active AI provider — surfaced as a "via …" badge so the user always sees
+   *  where each turn went, especially after opting into cloud Voice Chat. */
+  provider: Provider;
   onClose: () => void;
   onMicClick: () => void;       // toggle off (kept for parity with mic button)
 }
@@ -37,6 +41,7 @@ export function VoiceChatOverlay({
   committedText,
   engine,
   lastAiReply,
+  provider,
   onClose,
   onMicClick,
 }: VoiceChatOverlayProps) {
@@ -160,6 +165,21 @@ export function VoiceChatOverlay({
             </p>
           )}
         </div>
+
+        {/* Provider badge — surfaces "via Claude / Copilot / local" so the
+            user always sees where each turn was sent. Especially important
+            after opting into cloud Voice Chat. */}
+        {provider && (
+          <div className="mt-4 flex items-center justify-center gap-1.5">
+            <span className={`text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full border ${
+              provider === 'local'
+                ? 'border-iron-success/30 text-iron-success bg-iron-success/5'
+                : 'border-amber-500/30 text-amber-300 bg-amber-500/5'
+            }`}>
+              via {provider}
+            </span>
+          </div>
+        )}
 
         {/* Last AI reply caption — context for what's being spoken aloud. */}
         {lastAiReply && (

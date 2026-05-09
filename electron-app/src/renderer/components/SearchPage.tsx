@@ -1,7 +1,7 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { Search, Mic, Sparkles, StickyNote, Clock, MessageSquare, ArrowRight } from 'lucide-react';
 import { useEntryStore } from '../stores/useEntryStore';
-import { useAiChatStore, type AiSession } from '../stores/useAiChatStore';
+import { useAiChatStore, type AiSession, type AiSessionSearchHit } from '../stores/useAiChatStore';
 import { useNotesStore, type Note } from '../stores/useNotesStore';
 import { Card } from './ui';
 
@@ -23,7 +23,24 @@ export function SearchPage() {
 
   const entries = useEntryStore((s) => s.entries);
   const sessions = useAiChatStore((s) => s.sessions);
+  const searchSessions = useAiChatStore((s) => s.searchSessions);
   const notes = useNotesStore((s) => s.notes);
+
+  // AI session search runs against SQLite FTS5 (aiChatSearchSessions IPC) so
+  // sessions whose messages haven't been lazy-loaded into the renderer still
+  // turn up in results. Iterating session.messages here would silently miss
+  // most history once persistence is enabled.
+  const [aiHits, setAiHits] = useState<AiSessionSearchHit[]>([]);
+  useEffect(() => {
+    const q = query.trim();
+    if (!q) { setAiHits([]); return; }
+    let cancelled = false;
+    const handle = setTimeout(async () => {
+      const hits = await searchSessions(q, 50);
+      if (!cancelled) setAiHits(hits);
+    }, 200);
+    return () => { cancelled = true; clearTimeout(handle); };
+  }, [query, searchSessions]);
 
   const results = useMemo(() => {
     const q = query.toLowerCase().trim();
@@ -48,17 +65,39 @@ export function SearchPage() {
       }
     }
 
-    // Search AI sessions
+    // AI sessions: prefer FTS hits (which include sessions whose messages
+    // aren't yet lazy-loaded), augmented by a title-only match against the
+    // currently-loaded session list so renaming feels instant before the
+    // next FTS index sync.
+    const seenSessionIds = new Set<string>();
+    const sessionsById = new Map(sessions.map((s) => [s.id, s] as const));
+    for (const hit of aiHits) {
+      if (seenSessionIds.has(hit.session.id)) continue;
+      seenSessionIds.add(hit.session.id);
+      const fresh = sessionsById.get(hit.session.id) ?? hit.session;
+      if (fresh.isArchived) continue;
+      // Strip FTS5 mark tags for a plain-text preview.
+      const plainSnippet = hit.snippet.replace(/<\/?mark>/g, '').replace(/…/g, '...');
+      all.push({
+        type: 'ai-session',
+        id: fresh.id,
+        sessionId: fresh.id,
+        title: fresh.title,
+        preview: plainSnippet || fresh.lastMessagePreview || 'AI conversation',
+        time: fresh.updatedAt,
+      });
+    }
     for (const session of sessions) {
-      const allText = session.messages.map((m) => m.content).join(' ').toLowerCase();
-      if (allText.includes(q) || session.title.toLowerCase().includes(q)) {
-        const lastUserMsg = [...session.messages].reverse().find((m) => m.role === 'user');
+      if (seenSessionIds.has(session.id)) continue;
+      if (session.isArchived) continue;
+      if (session.title.toLowerCase().includes(q)) {
+        seenSessionIds.add(session.id);
         all.push({
           type: 'ai-session',
           id: session.id,
           sessionId: session.id,
           title: session.title,
-          preview: lastUserMsg?.content.slice(0, 120) || 'AI conversation',
+          preview: session.lastMessagePreview || 'AI conversation',
           time: session.updatedAt,
         });
       }
@@ -85,7 +124,7 @@ export function SearchPage() {
     // Sort by relevance (time descending)
     all.sort((a, b) => b.time - a.time);
     return all;
-  }, [query, entries, sessions, notes]);
+  }, [query, entries, sessions, notes, aiHits]);
 
   const filtered = activeFilter === 'all' ? results : results.filter((r) => r.type === activeFilter);
 

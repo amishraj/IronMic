@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -145,6 +145,10 @@ impl Database {
 
         if current_version < 8 {
             self.migrate_v8(&conn)?;
+        }
+
+        if current_version < 9 {
+            self.migrate_v9(&conn)?;
         }
 
         // Update version
@@ -617,6 +621,73 @@ impl Database {
         .map_err(|e| IronMicError::Storage(format!("Migration v8 indexes failed: {e}")))?;
 
         info!("Migration v8 applied: remote_segment_id + expression indexes");
+        Ok(())
+    }
+
+    /// Migration v9: Persistent AI chat sessions and messages, with FTS5 search
+    /// across message content. Mirrors the entries/entries_fts pattern. New
+    /// `voice_chat_allow_cloud` setting added (default off) so cloud Voice Chat
+    /// requires explicit user opt-in.
+    fn migrate_v9(&self, conn: &Connection) -> Result<(), IronMicError> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS ai_chat_sessions (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                provider TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_accessed_at TEXT NOT NULL,
+                last_message_preview TEXT,
+                is_pinned INTEGER NOT NULL DEFAULT 0,
+                is_archived INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_updated
+                ON ai_chat_sessions(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_ai_chat_sessions_pinned
+                ON ai_chat_sessions(is_pinned, updated_at);
+
+            CREATE TABLE IF NOT EXISTS ai_chat_messages (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES ai_chat_sessions(id) ON DELETE CASCADE,
+                role TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+                content TEXT NOT NULL,
+                provider TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_chat_messages_session
+                ON ai_chat_messages(session_id, created_at);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS ai_chat_messages_fts USING fts5(
+                content,
+                session_id UNINDEXED,
+                content='ai_chat_messages',
+                content_rowid='rowid'
+            );
+
+            CREATE TRIGGER IF NOT EXISTS ai_chat_messages_ai AFTER INSERT ON ai_chat_messages BEGIN
+                INSERT INTO ai_chat_messages_fts(rowid, content, session_id)
+                VALUES (new.rowid, new.content, new.session_id);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS ai_chat_messages_ad AFTER DELETE ON ai_chat_messages BEGIN
+                INSERT INTO ai_chat_messages_fts(ai_chat_messages_fts, rowid, content, session_id)
+                VALUES ('delete', old.rowid, old.content, old.session_id);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS ai_chat_messages_au AFTER UPDATE ON ai_chat_messages BEGIN
+                INSERT INTO ai_chat_messages_fts(ai_chat_messages_fts, rowid, content, session_id)
+                VALUES ('delete', old.rowid, old.content, old.session_id);
+                INSERT INTO ai_chat_messages_fts(rowid, content, session_id)
+                VALUES (new.rowid, new.content, new.session_id);
+            END;
+
+            INSERT OR IGNORE INTO settings (key, value) VALUES ('voice_chat_allow_cloud', 'false');
+            ",
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v9 failed: {e}")))?;
+
+        info!("Migration v9 applied: ai_chat_sessions + ai_chat_messages + FTS5");
         Ok(())
     }
 

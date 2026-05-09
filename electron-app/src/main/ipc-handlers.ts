@@ -120,6 +120,10 @@ const ALLOWED_SETTING_KEYS = new Set([
   // 'true' (default): final transcript is auto-pasted at the OS cursor.
   // 'false': transcript is copied to clipboard only — user pastes manually.
   'forge_auto_paste_enabled',
+  // Voice Chat cloud opt-in (v1.8.x). Default 'false'. When 'true' AND the
+  // selected provider is authenticated, the conversational loop may auto-send
+  // raw mic transcripts to Claude/Copilot. Otherwise Voice Chat is local-only.
+  'voice_chat_allow_cloud',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -625,7 +629,14 @@ If the text is too short or unclear, output: ["General"]`;
   ipcMain.handle('ai:get-auth-state', () => aiManager.getAuthState());
   ipcMain.handle('ai:refresh-auth', (_e, provider?: AIProvider) => aiManager.refreshAuth(provider));
   ipcMain.handle('ai:pick-provider', () => aiManager.pickProvider());
-  ipcMain.handle('ai:send-message', async (_e, prompt: string, provider: AIProvider, model?: string) => {
+  ipcMain.handle('ai:send-message', async (
+    _e,
+    prompt: string,
+    provider: AIProvider,
+    model?: string,
+    sessionId?: string | null,
+    priorMessages?: Array<{ role: string; content: string }>,
+  ) => {
     assertString(prompt, 'prompt');
     assertString(provider, 'provider');
     assertMaxLength(prompt, MAX_PROMPT_LENGTH, 'AI prompt');
@@ -636,8 +647,14 @@ If the text is too short or unclear, output: ["General"]`;
       assertString(model, 'model');
       assertMaxLength(model, 100, 'model');
     }
+    if (sessionId !== undefined && sessionId !== null) {
+      assertString(sessionId, 'sessionId');
+      assertMaxLength(sessionId, 100, 'sessionId');
+    }
+    // priorMessages is bounded by the renderer (last N up to MAX_HISTORY) so
+    // we don't enforce structure here beyond runtime tolerance.
     const window = BrowserWindow.getFocusedWindow();
-    return aiManager.sendMessage(prompt, provider, window, model || undefined);
+    return aiManager.sendMessage(prompt, provider, window, model || undefined, 'chat', sessionId ?? null, priorMessages);
   });
   ipcMain.handle('ai:get-models', async (_e, provider?: AIProvider) => {
     if (provider) return aiManager.getModels(provider);
@@ -650,7 +667,9 @@ If the text is too short or unclear, output: ["General"]`;
     return aiManager.refreshModels(provider, opts ?? {});
   });
   ipcMain.handle('ai:cancel', () => aiManager.cancel());
-  ipcMain.handle('ai:reset-session', () => aiManager.resetSession());
+  ipcMain.handle('ai:reset-session', (_e, sessionId?: string | null) =>
+    aiManager.resetSession(sessionId ?? null),
+  );
   ipcMain.handle('ai:local-model-status', () => aiManager.getLocalModelStatuses());
 
   // ── ML Features: Notifications ──
@@ -675,6 +694,36 @@ If the text is too short or unclear, output: ["General"]`;
   );
   ipcMain.handle(IPC_CHANNELS.NOTIFICATION_GET_UNREAD_COUNT, () => native.addon.getUnreadNotificationCount());
   ipcMain.handle(IPC_CHANNELS.NOTIFICATION_DELETE_OLD, (_e, days: number) => native.addon.deleteOldNotifications(days));
+
+  // ── AI Chat Persistence (v1.8.x) ──
+
+  ipcMain.handle('ironmic:ai-chat-create-session', (_e, id: string | null, title: string, provider: string | null, createdAt?: string, updatedAt?: string) =>
+    native.addon.aiChatCreateSession(id, title, provider, createdAt ?? null, updatedAt ?? null)
+  );
+  ipcMain.handle('ironmic:ai-chat-list-sessions', (_e, limit: number, offset: number, includeArchived: boolean) =>
+    native.addon.aiChatListSessions(limit, offset, includeArchived)
+  );
+  ipcMain.handle('ironmic:ai-chat-get-session', (_e, id: string) =>
+    native.addon.aiChatGetSession(id)
+  );
+  ipcMain.handle('ironmic:ai-chat-rename-session', (_e, id: string, title: string) =>
+    native.addon.aiChatRenameSession(id, title)
+  );
+  ipcMain.handle('ironmic:ai-chat-pin-session', (_e, id: string, pinned: boolean) =>
+    native.addon.aiChatPinSession(id, pinned)
+  );
+  ipcMain.handle('ironmic:ai-chat-archive-session', (_e, id: string, archived: boolean) =>
+    native.addon.aiChatArchiveSession(id, archived)
+  );
+  ipcMain.handle('ironmic:ai-chat-delete-session', (_e, id: string) =>
+    native.addon.aiChatDeleteSession(id)
+  );
+  ipcMain.handle('ironmic:ai-chat-append-message', (_e, sessionId: string, role: string, content: string, provider: string | null, id?: string, createdAt?: string) =>
+    native.addon.aiChatAppendMessage(sessionId, role, content, provider, id ?? null, createdAt ?? null)
+  );
+  ipcMain.handle('ironmic:ai-chat-search-sessions', (_e, query: string, limit: number) =>
+    native.addon.aiChatSearchSessions(query, limit)
+  );
 
   // ── ML Features: Action Log ──
 
