@@ -182,7 +182,8 @@ declare global {
       dictationStreamStop: () => Promise<{ text: string; chunkCount: number }>;
       onDictationStreamChunk: (cb: (p: { index: number; text: string; isFinal: boolean; source: 'notes' | 'forge' | 'ai-chat' }) => void) => () => void;
       onDictationStreamDraft: (cb: (p: { hypothesis: string; source: 'notes' | 'forge' | 'ai-chat' }) => void) => () => void;
-      onDictationStreamState: (cb: (s: { status: string; startedAt: number | null; chunkCount: number; source: 'notes' | 'forge' | 'ai-chat' }) => void) => () => void;
+      onDictationStreamState: (cb: (s: { status: string; startedAt: number | null; chunkCount: number; source: 'notes' | 'forge' | 'ai-chat'; engine?: 'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown' }) => void) => () => void;
+      onDictationStreamEndOfTurn: (cb: (p: { source: 'ai-chat'; text: string }) => void) => () => void;
       // Meeting Room (LAN multi-user)
       meetingRoomHostStart: (sessionId: string, hostName: string, templateId?: string | null) => Promise<any>;
       meetingRoomHostStop: () => Promise<any>;

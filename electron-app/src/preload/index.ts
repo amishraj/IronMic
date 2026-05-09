@@ -255,10 +255,19 @@ const api = {
     ipcRenderer.on('ironmic:dictation-stream-draft', handler);
     return () => ipcRenderer.removeListener('ironmic:dictation-stream-draft', handler);
   },
-  onDictationStreamState: (callback: (state: { status: string; startedAt: number | null; chunkCount: number; source: 'notes' | 'forge' | 'ai-chat' }) => void) => {
+  onDictationStreamState: (callback: (state: { status: string; startedAt: number | null; chunkCount: number; source: 'notes' | 'forge' | 'ai-chat'; engine?: 'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown' }) => void) => {
     const handler = (_e: any, s: any) => callback(s);
     ipcRenderer.on('ironmic:dictation-stream-state', handler);
     return () => ipcRenderer.removeListener('ironmic:dictation-stream-state', handler);
+  },
+  /** Voice Chat hands-free signal: fired when the streaming session detects
+   *  a silence-driven commit for an `ai-chat` source with non-empty text.
+   *  The renderer should auto-send the payload `text` (do NOT read React
+   *  state — chunk events are async and may not have flushed). */
+  onDictationStreamEndOfTurn: (callback: (payload: { source: 'ai-chat'; text: string }) => void) => {
+    const handler = (_e: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:dictation-stream-end-of-turn', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-end-of-turn', handler);
   },
   /** Notify the main-process LiveSummarizer that the user typed new notes.
    *  Fire-and-forget — the summarizer will re-read the persisted notes and
