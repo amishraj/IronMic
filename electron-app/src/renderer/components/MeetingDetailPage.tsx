@@ -1,12 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, Clock, Users, ChevronDown, ChevronRight, Pencil, Save, X, Loader2, RefreshCw, History, Mic, MicOff, Volume2, Pause, Users as UsersIcon } from 'lucide-react';
+import { ArrowLeft, Clock, Users, ChevronDown, ChevronRight, Pencil, Save, X, Loader2, RefreshCw, History, Mic, MicOff, Volume2, Pause, Play, Users as UsersIcon } from 'lucide-react';
 import { type Editor } from '@tiptap/react';
 import { MeetingTranscriptPanel, type TranscriptSegment } from './MeetingTranscriptPanel';
 import { MeetingNotesPanel } from './MeetingNotesPanel';
 import { MeetingRegenerateModal, type EditsDisposition } from './MeetingRegenerateModal';
 import { MeetingVersionsDrawer } from './MeetingVersionsDrawer';
 import { RichTextEditorShell } from './RichTextEditorShell';
-import { RawPolishedToggle } from './RawPolishedToggle';
 import { NotesCollaborateModal } from './NotesCollaborateModal';
 import type { MeetingTemplate, StructuredMeetingOutput } from '../services/tfjs/MeetingTemplateEngine';
 import {
@@ -57,10 +56,6 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
   const [regenerateOpen, setRegenerateOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [regenerating, setRegenerating] = useState(false);
-  /** Read-mode: which view is shown in the body — the polished AI notes
-   *  (default) or the raw transcript. Edit mode forces 'polished' since
-   *  the editor only operates on polished notes. */
-  const [displayMode, setDisplayMode] = useState<'raw' | 'polished'>('polished');
   const [collabOpen, setCollabOpen] = useState(false);
   /** Local dictate-append state — scoped to this editor instance, NOT
    *  global. Avoids the NoteEditor pattern of "fetch latest entry on
@@ -655,15 +650,6 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
             </>
           ) : (
             <>
-              {/* Raw/Polished — shown only in read mode. Edit operates on
-                  the polished notes, so we hide the toggle when editing
-                  to avoid implying you can switch what's in the editor. */}
-              {!isProcessing && !isEmpty && segments.length > 0 && (
-                <RawPolishedToggle
-                  displayMode={displayMode}
-                  onToggle={setDisplayMode}
-                />
-              )}
               <ReadAloudButton
                 getText={() => editing ? (editorRef.current?.getText() || '') : (plainSummary || '')}
                 ttsKey={notebookEntryIdForTools}
@@ -708,12 +694,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
                 Regenerate
               </button>
               <button
-                onClick={() => {
-                  // Forcing 'polished' on edit-entry — the editor only
-                  // operates on polished notes, and Raw is a read-only view.
-                  setDisplayMode('polished');
-                  setEditing(true);
-                }}
+                onClick={() => setEditing(true)}
                 disabled={isProcessing}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs text-iron-text-muted rounded-lg border border-iron-border hover:bg-iron-surface-hover transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                 title={isProcessing ? 'Notes are being generated — edit will be available shortly' : 'Edit notes'}
@@ -773,12 +754,6 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
                     }
                     className="flex flex-col bg-iron-surface min-h-[300px]"
                   />
-                </div>
-              ) : displayMode === 'raw' ? (
-                <div className="bg-iron-surface border border-iron-border rounded-lg px-4 py-3 text-sm text-iron-text leading-relaxed whitespace-pre-wrap max-h-[60vh] overflow-y-auto">
-                  {reconstructTranscript() || (
-                    <span className="text-iron-text-muted">No transcript captured.</span>
-                  )}
                 </div>
               ) : isProcessing ? (
                 <div className="flex items-center gap-2 text-sm text-amber-400 bg-amber-500/5 border border-amber-500/20 rounded-lg px-4 py-3">
@@ -926,7 +901,10 @@ function ReadAloudButton({
     }
   };
 
-  const Icon = isPlayingThis ? Pause : Volume2;
+  // Icon-only button. Speakerphone (Volume2) when idle; Pause while
+  // actively speaking; Play to resume from a paused stream. The tooltip
+  // carries the verb so the affordance is still discoverable on hover.
+  const Icon = isPlayingThis ? Pause : isPausedThis ? Play : Volume2;
   const title = isPlayingThis
     ? 'Pause'
     : isPausedThis
@@ -942,7 +920,8 @@ function ReadAloudButton({
       onClick={handleClick}
       disabled={disabled || isSynthThis}
       title={title}
-      className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-lg border transition-colors ${
+      aria-label={title}
+      className={`p-2 rounded-lg border transition-colors ${
         isPlayingThis || isPausedThis
           ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/30'
           : 'text-iron-text-muted border-iron-border hover:bg-iron-surface-hover'
@@ -953,9 +932,6 @@ function ReadAloudButton({
       ) : (
         <Icon className="w-3.5 h-3.5" />
       )}
-      <span className="hidden sm:inline">
-        {isPlayingThis ? 'Pause' : isPausedThis ? 'Resume' : 'Read aloud'}
-      </span>
     </button>
   );
 }
