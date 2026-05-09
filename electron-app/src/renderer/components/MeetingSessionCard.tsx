@@ -4,6 +4,7 @@ import { Card } from './ui';
 import { ShareMenu } from './ShareMenu';
 import { AddToNotebookMenu } from './AddToNotebookMenu';
 import { useMeetingStore } from '../stores/useMeetingStore';
+import { resolveMeetingTitle } from '../services/meetingTitle';
 
 interface MeetingSession {
   id: string;
@@ -38,17 +39,12 @@ export function MeetingSessionCard({ session, onDelete, onOpen }: Props) {
   // Try to parse structured output
   let structuredSections: Array<{ key: string; title: string; content: string }> | null = null;
   let processingState: string | null = null;
-  let customTitle: string | null = null;
-  let sequence: number | null = null;
+  let parsedStructured: any = null;
   if (session.structured_output) {
     try {
-      const parsed = JSON.parse(session.structured_output);
-      structuredSections = parsed.sections || null;
-      processingState = parsed.processingState ?? null;
-      customTitle = parsed.title ?? null;
-      if (typeof parsed.sequence === 'number' && parsed.sequence > 0) {
-        sequence = parsed.sequence;
-      }
+      parsedStructured = JSON.parse(session.structured_output);
+      structuredSections = parsedStructured.sections || null;
+      processingState = parsedStructured.processingState ?? null;
     } catch { /* fallback to summary */ }
   }
 
@@ -62,16 +58,7 @@ export function MeetingSessionCard({ session, onDelete, onOpen }: Props) {
   );
   const hasNotes = !isProcessing && !isEmpty && !isInsufficient && processingState === 'done' && hasSummary;
 
-  // Default title precedence (when the user hasn't set a custom title):
-  //   1. Sequential number ("Meeting #N") — stable, assigned at create time.
-  //   2. Detected meeting app (e.g. "Zoom Meeting") — for pre-sequence sessions.
-  //   3. Plain "Meeting" — last resort for older sessions missing both.
-  const defaultTitle = sequence != null
-    ? `Meeting #${sequence}`
-    : session.detected_app
-      ? `${session.detected_app.charAt(0).toUpperCase() + session.detected_app.slice(1)} Meeting`
-      : 'Meeting';
-  const titleText = customTitle && customTitle.trim().length > 0 ? customTitle : defaultTitle;
+  const titleText = resolveMeetingTitle(session, parsedStructured);
 
   return (
     <Card variant="default" padding="none" className="animate-fade-in">

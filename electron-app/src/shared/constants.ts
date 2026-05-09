@@ -118,6 +118,7 @@ export const IPC_CHANNELS = {
   TRANSCRIBE: 'ironmic:transcribe',
   POLISH_TEXT: 'ironmic:polish-text',
   POLISH_TEXT_DETAILED: 'ironmic:polish-text-detailed',
+  POLISH_TEXT_LOCAL: 'ironmic:polish-text-local',
 
   // Entries
   CREATE_ENTRY: 'ironmic:create-entry',

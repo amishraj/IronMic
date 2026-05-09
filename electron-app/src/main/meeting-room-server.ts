@@ -259,9 +259,14 @@ class MeetingRoomServerManager {
           }
         } catch { /* fall through with empty merged */ }
         if (title === null || title.length === 0) {
+          // Blank → "no authored title" — clear both so resolveMeetingTitle
+          // falls back to Meeting #N.
           delete merged.title;
+          delete (merged as any).titleSource;
         } else {
           merged.title = title;
+          // Host editing the title live is always user-authored.
+          (merged as any).titleSource = 'user';
         }
         native.setMeetingStructuredOutput(targetSessionId, JSON.stringify(merged));
       } catch (err) {

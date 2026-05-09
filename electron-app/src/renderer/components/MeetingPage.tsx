@@ -15,6 +15,8 @@ import { meetingDetector, type MeetingState, type MeetingResult } from '../servi
 import type { MeetingTemplate, StructuredMeetingOutput } from '../services/tfjs/MeetingTemplateEngine';
 import type { TranscriptSegment } from './MeetingTranscriptPanel';
 import { upsertMeetingNoteEntry } from '../services/notebooks';
+import { resolveMeetingTitle } from '../services/meetingTitle';
+import { generateMeetingTitle } from '../services/meeting/SummaryGenerator';
 import { useDictationStore } from '../stores/useDictationStore';
 import { useToastStore } from '../stores/useToastStore';
 
@@ -653,7 +655,10 @@ export function MeetingPage() {
             try { merged = JSON.parse(JSON.parse(rawForOverride)?.structured_output || '{}'); }
             catch { merged = {}; }
           }
-          if (hostTitleOverride && hostTitleOverride.length > 0) merged.title = hostTitleOverride;
+          if (hostTitleOverride && hostTitleOverride.length > 0) {
+            merged.title = hostTitleOverride;
+            merged.titleSource = 'user';
+          }
           if (hostSummaryOverride && hostSummaryOverride.trim().length > 0) {
             merged.plainSummary = hostSummaryOverride;
             merged.sections = [{ key: 'summary', title: 'Summary', content: hostSummaryOverride }];
@@ -696,17 +701,28 @@ export function MeetingPage() {
           let so: any = {};
           try { so = JSON.parse(latestSession.structured_output || '{}'); } catch {}
 
-          const title = so.title || `Meeting ${new Date().toLocaleString()}`;
           const plainText = (so.plainSummary || latestSession.summary || '').trim();
 
           if (plainText && so.processingState !== 'generating') {
+            // If no title is set (or only an AI-generated one was), try to
+            // produce a better one from the content. Never overwrite a
+            // user-authored title (titleSource === 'user').
+            if (!so.title || so.titleSource === 'ai') {
+              const aiTitle = await generateMeetingTitle(plainText);
+              if (aiTitle) {
+                so.title = aiTitle;
+                so.titleSource = 'ai';
+              }
+            }
+            const title = resolveMeetingTitle(latestSession, so);
+
             const entryId = await upsertMeetingNoteEntry({
               existingEntryId: so.notebookEntryId ?? null,
               sessionId,
               title,
               plainText,
             });
-            if (entryId !== so.notebookEntryId) {
+            if (entryId !== so.notebookEntryId || so.title) {
               await window.ironmic.meetingSetStructuredOutput(
                 sessionId,
                 JSON.stringify({ ...so, notebookEntryId: entryId }),
@@ -820,14 +836,17 @@ export function MeetingPage() {
   ) => {
     try {
       // Read the current structured_output so we preserve userNotes + any
-      // other keys (e.g. _recoveryTranscript) that might be there.
+      // other keys (e.g. _recoveryTranscript) that might be there. Also
+      // capture the session record itself so we can resolve the title (which
+      // needs detected_app for the fallback chain).
       let existing: any = {};
+      let liveSession: any = null;
       try {
         const raw = await window.ironmic.meetingGet(sessionId);
         if (raw) {
-          const session = JSON.parse(raw);
-          if (session?.structured_output) {
-            try { existing = JSON.parse(session.structured_output) || {}; }
+          liveSession = JSON.parse(raw);
+          if (liveSession?.structured_output) {
+            try { existing = JSON.parse(liveSession.structured_output) || {}; }
             catch { /* ignore */ }
           }
         }
@@ -881,12 +900,25 @@ export function MeetingPage() {
         if ((finalStructured as any)[k] === undefined) delete (finalStructured as any)[k];
       });
 
+      // Try AI title from content if no user-authored title exists.
+      const liveSummaryTrim = liveSummary.trim();
+      if (
+        liveSummaryTrim &&
+        (!(finalStructured as any).title || (finalStructured as any).titleSource === 'ai')
+      ) {
+        const aiTitle = await generateMeetingTitle(liveSummaryTrim);
+        if (aiTitle) {
+          (finalStructured as any).title = aiTitle;
+          (finalStructured as any).titleSource = 'ai';
+        }
+      }
+
       try {
         const entryId = await upsertMeetingNoteEntry({
           existingEntryId: (finalStructured as any).notebookEntryId ?? null,
           sessionId,
-          title: (finalStructured as any).title || `Meeting ${new Date().toLocaleString()}`,
-          plainText: liveSummary.trim(),
+          title: resolveMeetingTitle(liveSession, finalStructured as any),
+          plainText: liveSummaryTrim,
         });
         (finalStructured as any).notebookEntryId = entryId;
       } catch (err) {
@@ -944,11 +976,30 @@ export function MeetingPage() {
       // alongside regular notes (and by the AI assistant across one corpus).
       // Upsert by notebookEntryId so regenerations don't stack duplicates.
       try {
+        // Try AI-generated title from content if no user title is set.
+        if (
+          summaryForColumn.trim() &&
+          (!(structured as any).title || (structured as any).titleSource === 'ai')
+        ) {
+          const aiTitle = await generateMeetingTitle(summaryForColumn);
+          if (aiTitle) {
+            (structured as any).title = aiTitle;
+            (structured as any).titleSource = 'ai';
+          }
+        }
+
+        // Need detected_app for the title fallback chain.
+        let sessionForTitle: { detected_app?: string | null } | null = null;
+        try {
+          const raw = await window.ironmic.meetingGet(sessionId);
+          if (raw) sessionForTitle = JSON.parse(raw);
+        } catch { /* ignore */ }
+
         const existingNotebookEntryId = (structured as any).notebookEntryId ?? null;
         const entryId = await upsertMeetingNoteEntry({
           existingEntryId: existingNotebookEntryId,
           sessionId,
-          title: (structured as any).title || `Meeting ${new Date().toLocaleString()}`,
+          title: resolveMeetingTitle(sessionForTitle, structured as any),
           plainText: summaryForColumn,
         });
         (structured as any).notebookEntryId = entryId;

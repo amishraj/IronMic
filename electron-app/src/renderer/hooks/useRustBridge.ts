@@ -21,6 +21,7 @@ declare global {
         rawText: string,
         opts?: { requireModel?: boolean },
       ) => Promise<{ text: string; providerUsed: 'claude' | 'copilot' | 'local' }>;
+      polishTextLocal: (rawText: string, opts?: { requireModel?: boolean }) => Promise<string>;
       // Entries
       createEntry: (entry: NewEntry) => Promise<Entry>;
       getEntry: (id: string) => Promise<Entry | null>;

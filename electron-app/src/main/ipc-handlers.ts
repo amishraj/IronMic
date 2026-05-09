@@ -315,6 +315,26 @@ export function registerIpcHandlers(): void {
     opts?: { requireModel?: boolean },
   ) => dispatchPolish(rawText, !!opts?.requireModel));
 
+  // Strictly local-only polish. Used by callers (e.g. AI title generation)
+  // that must never route to a cloud provider regardless of the user's
+  // polish_allow_cloud setting. Returns only text to match POLISH_TEXT.
+  ipcMain.handle(IPC_CHANNELS.POLISH_TEXT_LOCAL, async (
+    _e,
+    rawText: string,
+    opts?: { requireModel?: boolean },
+  ) => {
+    const requireModel = !!opts?.requireModel;
+    try {
+      const result = await aiManager.polish(rawText, { allowCloud: false });
+      return result.text;
+    } catch (err: any) {
+      if (!requireModel && err?.message?.includes('Cleanup model not downloaded')) {
+        return rawText;
+      }
+      throw err;
+    }
+  });
+
   // ── Processing state tracking (for quit-confirmation) ──
   // Renderer fires this when it starts/stops LLM note generation so the main
   // process can intercept window close and warn about in-flight work.
@@ -1260,9 +1280,14 @@ If the text is too short or unclear, output: ["General"]`;
           }
         }
         if (safeTitle === null || safeTitle.length === 0) {
+          // Treat blank as "no authored title" — clear both fields so
+          // resolveMeetingTitle falls back to Meeting #N.
           delete merged.title;
+          delete (merged as any).titleSource;
         } else {
           merged.title = safeTitle.slice(0, 256);
+          // Live edit during recording is always user-authored.
+          (merged as any).titleSource = 'user';
         }
         native.setMeetingStructuredOutput(sessionId, JSON.stringify(merged));
       } catch (err) {
