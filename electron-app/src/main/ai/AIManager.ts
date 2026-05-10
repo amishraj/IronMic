@@ -40,6 +40,21 @@ function prettifyModelId(id: string): string {
 type CLIProvider = 'copilot' | 'claude';
 
 /**
+ * Map known-bogus model ids (typically left over in user settings from a
+ * past version where ClaudeAdapter listed wrong ids) to their correct
+ * canonical form. Cheap O(1) table — used in the hot resolveModel path.
+ *
+ * Today's only entry: the mis-ordered Haiku 3.5 dated id. Anthropic's
+ * dated id pattern is `claude-{version}-{family}-{YYYYMMDD}`, so Haiku
+ * 3.5 is `claude-3-5-haiku-20241022` — the previous list had
+ * `claude-haiku-3-5-20241022` which the Claude CLI rejects.
+ */
+function normalizeKnownBadModelId(id: string): string {
+  if (id === 'claude-haiku-3-5-20241022') return 'claude-3-5-haiku-20241022';
+  return id;
+}
+
+/**
  * Translate raw CLI stderr into a user-facing message when it looks like
  * the selected model is not available on the user's plan / policy. Returns
  * null if stderr doesn't match a known entitlement-error pattern, so callers
@@ -77,8 +92,13 @@ const MAX_HISTORY_MESSAGES = 20;
 /** Hard timeout for any single polish call (CLI or local). */
 const POLISH_TIMEOUT_MS = 5 * 60 * 1000;
 
-/** System prompt for the polish pass. Kept verbatim from CLAUDE.md so the
- *  behavior is consistent across local and CLI providers. */
+/**
+ * Plain-mode polish prompt — used when `polish_format_mode === 'plain'`.
+ *
+ * Historical CLEANUP_SYSTEM_PROMPT, preserved verbatim so users who turn
+ * off "Smart formatting" get exactly today's behavior. Plain mode keeps
+ * the original "no structure" instruction.
+ */
 const CLEANUP_PROMPT = `You are a text cleanup assistant. You receive raw speech-to-text transcriptions and produce clean, polished text.
 
 Rules:
@@ -92,6 +112,138 @@ Rules:
 - Do NOT add information that wasn't spoken
 - Do NOT summarize or shorten — keep the full content
 - Output ONLY the cleaned text, nothing else — no preamble, no explanation`;
+
+/**
+ * Local-mode polish prompt — for the small Phi-3-mini-Q2_K running via
+ * llmSubprocess. Tightly scoped: long instructions over-constrain a small
+ * model. Granola-style adaptive formatting: every note gets *some*
+ * structure (bold for key terms always; inline code for identifiers;
+ * bullets for enumerations) but the heading hierarchy scales with length
+ * — short notes get bold + bullets only, medium notes get H3, long notes
+ * get H2. No flat-paragraph-only fallback; even a 20-word capture
+ * deserves bolded subjects.
+ */
+const LOCAL_POLISH_PROMPT = `You are a professional formatter. Convert raw speech-to-text into clean, well-structured markdown. Every note gets some structure — even short ones.
+
+CLEANUP:
+- Fix grammar, spelling, punctuation
+- Remove fillers (um, uh, like, you know, basically, so, right)
+- Remove false starts and stutters
+- Preserve meaning, tone, vocabulary level, and technical terms exactly
+
+ALWAYS (regardless of length):
+- **Bold** key subjects: names, decisions, deadlines, owners, totals, deliverables
+- Use \`inline code\` for file names, function names, PR refs, commands
+- Use professional vocabulary: "blockers", "action items", "deliverables"
+
+ADAPT BY LENGTH:
+- Very short (<30 words, single thought) → one paragraph with **bold** key terms; no headings, no bullets unless explicitly enumerated
+- Short (30–80 words, single topic) → one or two paragraphs; bold key terms; bullets if items were listed
+- Medium (80–200 words, possibly multi-topic) → ### H3 sub-sections per topic + bullets where natural
+- Long (>200 words or many topics) → ## H2 per major section, with ### H3 sub-headings if needed
+
+LISTS: enumerated items ("first… second… also…") always become bullets, regardless of total length.
+
+NEVER:
+- Add information not in the transcript
+- Summarize or shorten — produce roughly the same length as the input
+- Add preamble or trailing commentary
+
+Output ONLY markdown. Examples:
+
+Input (short): "need to fix the bug in user.ts on line 42 then deploy by Friday"
+Output:
+Need to fix the bug in \`user.ts\` on line 42, then **deploy by Friday**.
+
+Input (enumerated): "first finish the auth flow second add tests third deploy by Friday"
+Output:
+- Finish the auth flow
+- Add tests
+- **Deploy by Friday**`;
+
+/**
+ * Cloud-mode polish prompt — for Claude / Copilot CLI. Larger models
+ * reward thoroughness and worked examples. Granola-style: every note
+ * gets *some* structure (bold + inline code at minimum); heading
+ * hierarchy scales with length. Allows tables and code fences
+ * (capabilities the local model handles less reliably).
+ */
+const CLOUD_POLISH_PROMPT = `You are a professional document formatter for technical and business contexts. You receive raw speech-to-text transcriptions and produce clean, well-structured markdown. Every note gets some structure — even short ones (Granola-style).
+
+# Cleanup
+- Fix grammar, spelling, punctuation
+- Remove fillers (um, uh, like, you know, basically, so, right)
+- Remove false starts, stutters, and repeated phrases
+- Preserve the speaker's meaning, tone, vocabulary level, and technical terms verbatim
+
+# Always — regardless of length
+- \`**bold**\` key subjects: names, decisions, deadlines, owners, totals, deliverables, action items
+- \`\\\`inline code\\\`\` for file names, function names, commands, package names, PR / ticket / JIRA refs
+- Use corporate/technical vocabulary when natural: "blockers" not "stuck stuff", "action items" not "todos", "deliverables", "stakeholders", "scope", "timeline"
+- Direct quotes → \`> blockquote\`
+- Code dictated → fenced \`\\\`\\\`\\\`code blocks\\\`\\\`\\\`\`
+
+# Heading hierarchy scales with length
+- **Very short (<30 words, single thought)** → one paragraph with bolded key terms; no headings
+- **Short (30–80 words, single topic)** → one or two paragraphs with bolded key terms; bullets ONLY if explicitly enumerated
+- **Medium (80–200 words, possibly multi-topic)** → \`### H3\` sub-sections per topic; paragraphs / bullets where natural
+- **Long (>200 words, multi-topic)** → \`## H2\` per major section, \`### H3\` for sub-sections inside
+
+Enumerated items ("first… second… also… and finally…") always become bullets, regardless of total length. Genuinely tabular data (rows of owner/item/date triples) → markdown table.
+
+# Hard rules
+- Do NOT add information not in the transcript
+- Do NOT summarize or shorten — produce roughly the same length as the input
+- Do NOT add preamble like "Here is the cleaned text:" or trailing commentary
+- Output ONLY markdown — no explanations, no notes about what you did
+
+# Examples
+
+Input (very short): "um so basically I need to fix the bug in user dot ts on line 42 then deploy by Friday"
+Output: I need to fix the bug in \`user.ts\` on line 42, then **deploy by Friday**.
+
+Input (short): "okay quick standup update finished the auth refactor today next up is the rate limiter for the API and I'm blocked on the staging credentials Alice still needs to send"
+Output:
+Finished the **auth refactor** today. Next up is the **rate limiter** for the API. **Blocked on staging credentials** — Alice still needs to send.
+
+Input (enumerated short): "first finish the auth flow second add tests third deploy by Friday"
+Output:
+- Finish the auth flow
+- Add tests
+- **Deploy by Friday**
+
+Input (medium, multi-topic): "okay so the plan is the migration we decided to use the staged rollout approach Alice owns the auth piece Bob owns the data piece both due Friday and we agreed not to touch billing this week also separately I want to mention the on-call rotation needs an extra person Carol volunteered for next month"
+Output:
+### Migration plan
+
+We decided to use the **staged rollout** approach.
+
+**Owners:**
+- **Alice** — auth piece, due **Friday**
+- **Bob** — data piece, due **Friday**
+
+**Decided:** no billing changes this week.
+
+### On-call rotation
+
+Need an extra person. **Carol** volunteered for next month.
+
+Input (technical): "the auth bug in login dot ts is using the old token format so we need to add the new validator and update the test in auth dot test dot ts"
+Output: The **auth bug** in \`login.ts\` is using the old token format. We need to add the new validator and update the test in \`auth.test.ts\`.`;
+
+/**
+ * Read `polish_format_mode` and pick the right system prompt for the path
+ * (local vs cloud). Missing setting defaults to 'rich' so Phase 4 doesn't
+ * depend on Phase 5's migration having materialized the setting yet.
+ */
+function selectPolishPrompt(target: 'local' | 'cloud'): string {
+  let mode: string | null = null;
+  try {
+    mode = native.getSetting('polish_format_mode');
+  } catch { /* setting absent → default to rich */ }
+  if (mode === 'plain') return CLEANUP_PROMPT;
+  return target === 'cloud' ? CLOUD_POLISH_PROMPT : LOCAL_POLISH_PROMPT;
+}
 
 export class AIManager {
   private copilot = new CopilotAdapter();
@@ -107,6 +259,12 @@ export class AIManager {
    */
   private cliTurnCounts: Record<string, number> = {};
   private activeProcess: ChildProcess | null = null;
+  /** Session id that owns `activeProcess`. Used by `resetSession` to scope
+   *  cancellation — a defensive context-clear on session A must NOT kill
+   *  an in-flight CLI request belonging to session B. Null when activeProcess
+   *  is from a non-chat path (polish, generate) or when no process is
+   *  running. */
+  private activeProcessSessionId: string | null = null;
 
   /**
    * Per-context conversation history for local LLM sessions.
@@ -191,9 +349,16 @@ export class AIManager {
    */
   resolveModel(provider: AIProvider, id: string | undefined | null): AIModel | undefined {
     if (!id) return undefined;
-    const cached = this.modelLookup[provider]?.get(id);
+    // Defensive: rewrite known-bogus saved ids to their correct form
+    // before lookup. Users who selected the old (mis-ordered) Haiku 3.5
+    // entry have `claude-haiku-3-5-20241022` persisted in their `ai_model`
+    // setting; the Claude CLI rejects that with "model may not exist or
+    // you may not have access to it". Normalize on read so they don't
+    // have to re-pick from the dropdown.
+    const normalized = normalizeKnownBadModelId(id);
+    const cached = this.modelLookup[provider]?.get(normalized);
     if (cached) return cached;
-    return this.synthesizeModel(provider, id);
+    return this.synthesizeModel(provider, normalized);
   }
 
   private synthesizeModel(provider: AIProvider, id: string): AIModel {
@@ -554,6 +719,7 @@ export class AIManager {
       try { proc.stdin?.end(); } catch { /* ignore */ }
 
       this.activeProcess = proc;
+      this.activeProcessSessionId = sessionId ?? null;
       let fullOutput = '';
       let stderrBuf = '';
 
@@ -581,11 +747,13 @@ export class AIManager {
 
       proc.on('error', (err) => {
         this.activeProcess = null;
+        this.activeProcessSessionId = null;
         reject(new Error(`Failed to start ${provider}: ${err.message}`));
       });
 
       proc.on('close', (code) => {
         this.activeProcess = null;
+        this.activeProcessSessionId = null;
 
         if (window && !window.isDestroyed()) {
           window.webContents.send('ai:turn-end', { provider });
@@ -638,16 +806,22 @@ export class AIManager {
       savedProvider = native.getSetting('ai_provider');
     } catch { /* ignore — settings unavailable */ }
 
+    // CLI binaries take a single prompt argument — no separate system-message
+    // channel — so we concatenate the system prompt inline before spawning.
+    // The system prompt depends on polish_format_mode and the path: cloud
+    // gets the richer prompt with worked examples; local gets the terse
+    // variant; plain mode falls back to the legacy CLEANUP_PROMPT.
+    const cloudPrompt = `${selectPolishPrompt('cloud')}\n\nInput transcript:\n${rawText}`;
     const claude = opts.allowCloud ? await this.checkAuth('claude') : null;
     if (claude?.authenticated) {
       const claudeModel = savedProvider === 'claude' ? savedModelId : null;
-      const text = await this.runCliOneShot('claude', rawText, claudeModel || undefined);
+      const text = await this.runCliOneShot('claude', cloudPrompt, claudeModel || undefined);
       return { text, providerUsed: 'claude' };
     }
     const copilot = opts.allowCloud ? await this.checkAuth('copilot') : null;
     if (copilot?.authenticated) {
       const copilotModel = savedProvider === 'copilot' ? savedModelId : null;
-      const text = await this.runCliOneShot('copilot', rawText, copilotModel || undefined);
+      const text = await this.runCliOneShot('copilot', cloudPrompt, copilotModel || undefined);
       return { text, providerUsed: 'copilot' };
     }
     const resolvedLocal = resolveActiveChatModel(native);
@@ -669,11 +843,13 @@ export class AIManager {
           modelPath: resolvedLocal.modelPath,
           modelType: resolvedLocal.modelType,
           messages: [
-            { role: 'system', content: CLEANUP_PROMPT },
+            { role: 'system', content: selectPolishPrompt('local') },
             { role: 'user', content: rawText },
           ],
           maxTokens: 2048,
-          temperature: 0.3,
+          // Lower temp for the rich-format prompt — small model needs the
+          // structure to stick. Plain mode keeps temp 0.3 (today's value).
+          temperature: 0.1,
         }),
         timeout,
       ]);
@@ -685,12 +861,118 @@ export class AIManager {
   }
 
   /**
-   * Spawn a CLI provider for a single polish turn. Isolated from the chat
-   * pipeline — no shared state, no event emissions, no continueSession.
+   * Generic LLM transport. Caller owns the system prompt — no cleanup prompt
+   * is layered on top. Used by SummaryGenerator, MeetingTemplateEngine,
+   * IntentClassifier, MeetingDetector, and any other non-polish completion.
+   *
+   * Provider routing matches `polish()` exactly:
+   *   - allowCloud && Claude authenticated → Claude
+   *   - allowCloud && Copilot authenticated → Copilot
+   *   - local chat model installed → local
+   *   - otherwise → throw
+   *
+   * Crucially separate from `sendMessage` and `polish` — never touches
+   * cliTurnCounts, never assigns activeProcess, never emits ai:turn-* events.
+   *
+   * Caller must clamp maxTokens / temperature before calling. The IPC
+   * handler enforces clamps and prompt-length validation; this method
+   * trusts its arguments because the IPC boundary is the security gate.
+   */
+  async generate(
+    systemPrompt: string,
+    userPrompt: string,
+    opts: { allowCloud: boolean; maxTokens: number; temperature: number },
+  ): Promise<{ text: string; providerUsed: AIProvider }> {
+    let savedModelId: string | null = null;
+    let savedProvider: string | null = null;
+    try {
+      savedModelId = native.getSetting('ai_model');
+      savedProvider = native.getSetting('ai_provider');
+    } catch { /* ignore */ }
+
+    const claude = opts.allowCloud ? await this.checkAuth('claude') : null;
+    if (claude?.authenticated) {
+      const claudeModel = savedProvider === 'claude' ? savedModelId : null;
+      const text = await this.runCliOneShotWithSystem(
+        'claude',
+        systemPrompt,
+        userPrompt,
+        claudeModel || undefined,
+      );
+      return { text, providerUsed: 'claude' };
+    }
+    const copilot = opts.allowCloud ? await this.checkAuth('copilot') : null;
+    if (copilot?.authenticated) {
+      const copilotModel = savedProvider === 'copilot' ? savedModelId : null;
+      const text = await this.runCliOneShotWithSystem(
+        'copilot',
+        systemPrompt,
+        userPrompt,
+        copilotModel || undefined,
+      );
+      return { text, providerUsed: 'copilot' };
+    }
+    const resolvedLocal = resolveActiveChatModel(native);
+    if (resolvedLocal) {
+      if (!llmSubprocess.isAvailable()) {
+        throw new Error(
+          'Local LLM binary (ironmic-llm) is missing. Rebuild with: ' +
+            'cargo build --release --bin ironmic-llm --features llm-bin',
+        );
+      }
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error(`Generate timed out after ${POLISH_TIMEOUT_MS / 1000}s`)),
+          POLISH_TIMEOUT_MS,
+        ),
+      );
+      const text = await Promise.race([
+        llmSubprocess.chatComplete({
+          modelPath: resolvedLocal.modelPath,
+          modelType: resolvedLocal.modelType,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          maxTokens: opts.maxTokens,
+          temperature: opts.temperature,
+        }),
+        timeout,
+      ]);
+      return { text, providerUsed: 'local' };
+    }
+    throw new Error(
+      'Cleanup model not downloaded. Import or download one in Settings to enable AI generation.',
+    );
+  }
+
+  /**
+   * runCliOneShot variant that takes an explicit system prompt and user input
+   * separately. The CLI binaries take a single prompt argument with no
+   * separate system-message channel, so we concatenate inline — same
+   * approach as the polish path, but without baking in the cleanup prompt.
+   */
+  private async runCliOneShotWithSystem(
+    provider: 'claude' | 'copilot',
+    systemPrompt: string,
+    userPrompt: string,
+    model?: string,
+  ): Promise<string> {
+    return this.runCliOneShot(
+      provider,
+      `${systemPrompt}\n\n${userPrompt}`,
+      model,
+    );
+  }
+
+  /**
+   * Spawn a CLI provider for a single one-shot turn. Caller passes a
+   * fully-built prompt string. Isolated from the chat pipeline — no
+   * shared state, no event emissions, no continueSession.
    */
   private async runCliOneShot(
     provider: 'claude' | 'copilot',
-    rawText: string,
+    prompt: string,
     model?: string,
   ): Promise<string> {
     const adapter = this.getCLIAdapter(provider);
@@ -702,10 +984,6 @@ export class AIManager {
       throw new Error(`${provider} CLI is not authenticated`);
     }
     const binary = auth.binaryPath!;
-    // The cleanup prompt is prepended to the raw transcript inline because
-    // the CLI binaries take a single positional/argument prompt — there's no
-    // separate system-message channel like chatComplete has.
-    const prompt = `${CLEANUP_PROMPT}\n\nInput transcript:\n${rawText}`;
     const resolvedModel = this.resolveModel(provider, model);
     const args = provider === 'copilot'
       ? this.copilot.buildArgsForBinary(binary, prompt, false, resolvedModel ?? model)
@@ -754,12 +1032,26 @@ export class AIManager {
     return this.local.getModelStatuses();
   }
 
-  /** Cancel the active process. */
-  cancel(): void {
-    if (this.activeProcess) {
-      this.activeProcess.kill('SIGTERM');
-      this.activeProcess = null;
-    }
+  /**
+   * Cancel the active process.
+   *
+   * If `sessionId` is provided, only kills the process when its sessionId
+   * matches — a session-scoped cancel must NOT touch a CLI request that
+   * belongs to a different session. (This is the bug behind first-message
+   * `claude exited with code null`: the renderer fires a defensive
+   * resetSession on every newly-created chat, which used to kill any
+   * concurrent in-flight request — most commonly the very first message
+   * the user just sent in that new chat.)
+   *
+   * Without a sessionId (the explicit user-cancel button + the wholesale
+   * "Clear all AI history" path), kills whatever's running.
+   */
+  cancel(sessionId?: string | null): void {
+    if (!this.activeProcess) return;
+    if (sessionId && this.activeProcessSessionId !== sessionId) return;
+    this.activeProcess.kill('SIGTERM');
+    this.activeProcess = null;
+    this.activeProcessSessionId = null;
   }
 
   /**
@@ -767,9 +1059,13 @@ export class AIManager {
    * across all providers (used by Settings → "Clear all AI history"). With a
    * `sessionId` clears only that one session's context — used by "New chat"
    * and by switching to a different persisted session.
+   *
+   * Cancellation is now session-scoped (see `cancel(sessionId)`) so a
+   * defensive reset on session A no longer kills an in-flight request on
+   * session B.
    */
   resetSession(sessionId?: string | null): void {
-    this.cancel();
+    this.cancel(sessionId ?? undefined);
     if (!sessionId) {
       this.cliTurnCounts = {};
       this.localHistories.clear();

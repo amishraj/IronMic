@@ -33,13 +33,8 @@
 
 import { useEffect, useRef, useState, useCallback, type ReactNode } from 'react';
 import { useEditor, EditorContent, BubbleMenu, type Editor } from '@tiptap/react';
-import StarterKit from '@tiptap/starter-kit';
 import Placeholder from '@tiptap/extension-placeholder';
-import Underline from '@tiptap/extension-underline';
-import TextAlign from '@tiptap/extension-text-align';
-import Highlight from '@tiptap/extension-highlight';
-import Link from '@tiptap/extension-link';
-import Typography from '@tiptap/extension-typography';
+import { buildSharedExtensions } from '../../shared/tiptapExtensions';
 import {
   Bold, Italic, Underline as UnderlineIcon, Strikethrough,
   Heading1, Heading2, Heading3, List, ListOrdered,
@@ -81,13 +76,11 @@ export function RichTextEditorShell({
 
   const editor = useEditor({
     extensions: [
-      StarterKit.configure({ heading: { levels: [1, 2, 3] } }),
+      // Shared structural extensions — same list used by main's @tiptap/html
+      // generateJSON so JSON round-trip is lossless.
+      ...buildSharedExtensions(),
+      // Editor-only presentation concern — not part of the shared list.
       Placeholder.configure({ placeholder }),
-      Underline,
-      TextAlign.configure({ types: ['heading', 'paragraph'] }),
-      Highlight.configure({ multicolor: false }),
-      Link.configure({ openOnClick: false, HTMLAttributes: { class: '' } }),
-      Typography,
     ],
     content: valueHtml,
     editable: !readOnly,

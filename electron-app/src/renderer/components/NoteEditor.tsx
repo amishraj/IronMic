@@ -108,8 +108,9 @@ export function NoteEditor() {
   }, [setNoteId]);
 
   // Append the most recent transcript when the dictation pipeline returns
-  // to idle. This is the existing "fetch latest entry on idle" behavior —
-  // unchanged by the shell refactor.
+  // to idle. Prefers the rich JSON projection (polishedTextJson) so headings,
+  // bold, lists, code, and tables from the LLM render with their formatting.
+  // Falls back to plain text for legacy entries / plain mode.
   useEffect(() => {
     const cleanup = window.ironmic.onPipelineStateChanged((state: string) => {
       if (state !== 'idle') return;
@@ -118,7 +119,26 @@ export function NoteEditor() {
           const entries = await window.ironmic.listEntries({ limit: 1, offset: 0, archived: false });
           const editor = editorRef.current;
           if (entries.length > 0 && entries[0].id !== currentEntryId.current && editor) {
-            const text = entries[0].polishedText || entries[0].rawTranscript;
+            const entry = entries[0];
+            const richJson = (entry as any).polishedTextJson;
+            if (richJson) {
+              try {
+                const doc = JSON.parse(richJson);
+                // The polish pipeline produces a full ProseMirror doc (root
+                // node type 'doc' with a content[] of block nodes). To append
+                // we want the block nodes themselves — passing the doc would
+                // try to nest a doc inside a doc.
+                const fragment = doc?.content && Array.isArray(doc.content)
+                  ? doc.content
+                  : doc;
+                editor.commands.insertContent(fragment);
+                return;
+              } catch (err) {
+                // Malformed JSON — fall through to plain text path.
+                console.warn('[NoteEditor] polishedTextJson parse failed, falling back to plain text:', err);
+              }
+            }
+            const text = entry.polishedText || entry.rawTranscript;
             editor.commands.insertContent(text + ' ');
           }
         } catch { /* ignore */ }

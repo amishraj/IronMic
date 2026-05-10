@@ -269,15 +269,19 @@ export const useEntryStore = create<EntryStore>((set, get) => ({
         return;
       }
 
-      // Single round-trip: write polishedText AND displayMode='polished' so
-      // Notes/Timeline see a consistent record after one event broadcast.
-      // IMPORTANT: do NOT include `polishedTextJson` here. Polish output is
-      // plaintext; if the user previously hand-edited the polished side and
-      // we wrote a JSON column, that rich state would be silently destroyed
-      // every time they re-polished. Omitting the field tells the napi layer
-      // to leave the column untouched (Option<String>::None → no SET clause).
+      // Single round-trip: write polishedText, polishedTextJson, AND
+      // displayMode='polished' so Notes/Timeline see a consistent record
+      // after one event broadcast. The new polish pipeline emits markdown,
+      // and polishTextDetailed returns BOTH the markdown-stripped plain
+      // projection (polished_text — used by FTS / TTS / clipboard) AND a
+      // sanitized ProseMirror JSON projection (polished_text_json — used
+      // by the editor to render headings / bold / lists / tables). Writing
+      // both atomically replaces any previous rich state with the freshly-
+      // polished version, which is the right behavior since the user
+      // explicitly asked to re-polish (re-polish IS the regenerate signal).
       const updated = await window.ironmic.updateEntry(id, {
         polishedText: polishedTrim,
+        polishedTextJson: result.jsonString || undefined,
         displayMode: 'polished',
       });
       if (updated) {

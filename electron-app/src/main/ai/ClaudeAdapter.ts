@@ -100,7 +100,15 @@ export class ClaudeAdapter implements ICLIAdapter {
     return [
       { id: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4', provider: 'claude', source: 'static', billing: 'paid', description: 'Best balance of speed and capability' },
       { id: 'claude-opus-4-20250514', label: 'Claude Opus 4', provider: 'claude', source: 'static', billing: 'paid', description: 'Most capable, slower' },
-      { id: 'claude-haiku-3-5-20241022', label: 'Claude Haiku 3.5', provider: 'claude', source: 'static', billing: 'paid', description: 'Fastest and most affordable' },
+      // Haiku model id format: Anthropic's dated ids use the pattern
+      // `claude-{version}-{family}-{YYYYMMDD}`, so Haiku 3.5 is
+      // `claude-3-5-haiku-20241022` — NOT `claude-haiku-3-5-20241022`
+      // (that bogus reordering was the source of the "selected model
+      // doesn't exist" CLI rejection). Listing the alias `claude-haiku-4-5`
+      // alongside so users can pick the newer fast model that matches
+      // the Sonnet 4 / Opus 4 generation above.
+      { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5', provider: 'claude', source: 'static', billing: 'paid', description: 'Fastest and most affordable' },
+      { id: 'claude-3-5-haiku-20241022', label: 'Claude Haiku 3.5', provider: 'claude', source: 'static', billing: 'paid', description: 'Previous-gen fast model' },
     ];
   }
 

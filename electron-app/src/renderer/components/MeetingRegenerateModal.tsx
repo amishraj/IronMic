@@ -43,7 +43,16 @@ export function MeetingRegenerateModal({
   onClose,
   onConfirm,
 }: Props) {
-  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(currentTemplate?.id ?? '');
+  // Pick the initial template:
+  //   1. The meeting's currently-applied template (if any) — preserves user intent
+  //   2. The Default template (builtin-auto) — the one users almost always want
+  //   3. The first template in the list (defensive fallback)
+  // We never start with "" (no template) because that path produces flat
+  // bullets and isn't a sensible default for the regenerate flow.
+  const defaultTemplate =
+    templates.find(t => t.id === 'builtin-auto') ?? templates[0] ?? null;
+  const initialId = currentTemplate?.id ?? defaultTemplate?.id ?? '';
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>(initialId);
   const [disposition, setDisposition] = useState<EditsDisposition>(
     hasUnsavedEdits ? 'save-to-history' : 'discard',
   );
@@ -102,7 +111,10 @@ export function MeetingRegenerateModal({
               onChange={(e) => setSelectedTemplateId(e.target.value)}
               className="w-full bg-iron-surface-hover border border-iron-border rounded-lg px-3 py-2 text-sm text-iron-text focus:outline-none focus:border-iron-accent/40"
             >
-              <option value="">No template (plain summary)</option>
+              {/* No "no template" option — every regenerate runs through a
+                  template so the output is always structured. Default
+                  (builtin-auto) is pre-selected by the initialId above
+                  when the meeting has no current template. */}
               {templates.map(t => (
                 <option key={t.id} value={t.id}>
                   {t.name}{t.is_builtin ? '' : ' (custom)'}

@@ -281,11 +281,20 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
       // view. This is the same record, so updating it here is a no-op write
       // if the text is identical.
       try {
+        // Sync the user-edited summary to the notebook entry. Polished side
+        // gets the user's edited markdown; raw side stays the original
+        // transcript pulled from the session record (so user edits to the
+        // summary don't overwrite the transcript on the raw side).
+        const sessionTranscript: string =
+          (typeof (session as any).full_transcript === 'string' && (session as any).full_transcript.trim())
+            ? (session as any).full_transcript
+            : finalPlain;
         const entryId = await upsertMeetingNoteEntry({
           existingEntryId: merged.notebookEntryId ?? null,
           sessionId: session.id,
           title: resolveMeetingTitle(session, merged),
-          plainText: finalPlain,
+          polishedMarkdown: finalPlain,
+          rawTranscript: sessionTranscript,
         });
         merged.notebookEntryId = entryId;
       } catch (err) {
@@ -404,8 +413,13 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
         titleSource: userAuthored ? 'user' : undefined,
         versions: carriedVersions,
         hasUserEdits: false,
-        // AI-generated output is always plain — clear any user-formatted HTML.
-        htmlContent: null,
+        // Preserve `fresh.htmlContent` — the SummaryGenerator now runs the
+        // LLM markdown through the sanitization pipeline (convertMarkdown)
+        // and returns the rich HTML alongside sections. Previously this
+        // line nulled htmlContent on the assumption that AI output is
+        // always plain; that was true before this change but is no longer
+        // — regen would otherwise destroy the formatting we just generated.
+        // (`...fresh` already carries `htmlContent`; not re-listed here.)
         // Carry forward the linked notebook entry id so regen updates in place.
         notebookEntryId: (existing as any)?.notebookEntryId,
       } as StructuredOutput;
@@ -426,12 +440,16 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
 
       // Upsert the Meeting Notes notebook entry for this session so the
       // regenerated summary is reflected in the unified notes corpus.
+      // The reconstructed transcript (used for the regen LLM call above)
+      // is the verbatim source — write it on the raw side. Polished side
+      // gets the freshly-regenerated structured summary.
       try {
         const entryId = await upsertMeetingNoteEntry({
           existingEntryId: (merged as any).notebookEntryId ?? null,
           sessionId: session.id,
           title: resolveMeetingTitle(session, merged as any),
-          plainText: summaryForColumn,
+          polishedMarkdown: summaryForColumn,
+          rawTranscript: transcript,
         });
         (merged as any).notebookEntryId = entryId;
       } catch (err) {

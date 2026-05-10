@@ -130,9 +130,32 @@ export async function addTextAsEntryToNotebook(params: {
     `${NOTEBOOK_TAG_PREFIX}${params.notebookId}`,
     `__status__:done`,
   ];
+
+  // The `plainText` arg is markdown for meeting exports (and arbitrary
+  // user content for other consumers). Run it through the same sanitization
+  // pipeline polish + auto-file uses so the resulting entry has both
+  // sides populated and DictatePage renders headings / bold / lists
+  // instead of the literal `## TL;DR` source.
+  const markdown = params.plainText;
+  let polishedPlain = markdown;
+  let polishedJson: string | undefined;
+  if (markdown.trim()) {
+    try {
+      const projections = await (window as any).ironmic?.convertMarkdown?.(markdown);
+      if (projections?.plainText) polishedPlain = projections.plainText;
+      if (projections?.jsonString) polishedJson = projections.jsonString;
+    } catch { /* fall through with raw markdown as the polished projection */ }
+  }
+
   const entry = await api.createEntry({
-    rawTranscript: params.plainText,
-    polishedText: undefined,
+    // Raw + polished both seeded from the input. Filed notes don't have a
+    // separate "raw" source (no transcript), so the markdown serves both
+    // sides; the polished side gets the rich JSON projection so the
+    // editor renders it formatted by default (display_mode defaults to
+    // 'polished' per the entries schema).
+    rawTranscript: markdown,
+    polishedText: polishedPlain,
+    polishedTextJson: polishedJson,
     durationSeconds: undefined,
     sourceApp: params.sourceApp ?? 'meeting-export',
     tags: JSON.stringify(tagsArr),
@@ -268,20 +291,60 @@ export async function syncMeetingEntryToSession(params: {
  *
  * Returns the entry id, which the caller should persist into the session's
  * structured_output.notebookEntryId so the next call can find it.
+ *
+ * Raw vs Polished mapping (matches the DictatePage Raw/Polished toggle):
+ *   - **raw**       → the full meeting transcript text (verbatim source)
+ *   - **polished**  → the AI-generated structured summary (markdown), with
+ *                     a `polished_text_json` projection from convertMarkdown
+ *                     so the editor renders it with headings/bold/lists
+ *                     instead of literal `## TL;DR` text.
+ *
+ * `displayMode` defaults to 'polished' on create — when the user opens a
+ * meeting from the Notes sidebar, they see the formatted summary first.
+ *
+ * Backwards compatibility: the legacy `plainText` field is still accepted
+ * (it was the markdown summary, written into rawTranscript). New callers
+ * should pass `polishedMarkdown` + `rawTranscript` explicitly.
  */
 export async function upsertMeetingNoteEntry(params: {
   existingEntryId?: string | null;
   sessionId: string;
   title: string;
-  plainText: string;
+  /** Markdown summary — goes on the polished side. Required for new callers. */
+  polishedMarkdown?: string;
+  /** Verbatim meeting transcript — goes on the raw side. Required for new callers. */
+  rawTranscript?: string;
+  /** Legacy: pre-rename callers passed the markdown summary here and it was
+   *  stored as rawTranscript. Treated as polishedMarkdown if the new fields
+   *  aren't set. */
+  plainText?: string;
 }): Promise<string> {
   const api = window.ironmic;
   await ensureMeetingNotesNotebook();
+
+  // Resolve raw + polished from explicit fields, falling back to the legacy
+  // plainText shape so older call sites keep working until they migrate.
+  const polishedSrc = params.polishedMarkdown ?? params.plainText ?? '';
+  const rawSrc = params.rawTranscript ?? params.plainText ?? '';
+
   // Defensive fallback only. Callers are now responsible for resolving the
   // display title via resolveMeetingTitle(); this branch fires only if a
   // caller still passes nothing — and we *never* want a date-stamped name
   // because that disagrees with the meeting card's own `Meeting #N` header.
   const title = params.title?.trim() || 'Meeting';
+
+  // Convert the markdown summary into the rich projections used by the
+  // editor. Falls through if the IPC isn't available; the editor will then
+  // render the markdown source as plain text (today's behavior).
+  let polishedPlain = polishedSrc;
+  let polishedJson: string | undefined;
+  if (polishedSrc.trim()) {
+    try {
+      const projections = await (window as any).ironmic?.convertMarkdown?.(polishedSrc);
+      if (projections?.plainText) polishedPlain = projections.plainText;
+      if (projections?.jsonString) polishedJson = projections.jsonString;
+    } catch { /* keep raw markdown as the polished plain projection */ }
+  }
 
   // Resolve the target entry. Order:
   //  1) caller-provided id (fast path, typical)
@@ -332,8 +395,16 @@ export async function upsertMeetingNoteEntry(params: {
   const tagsJson = JSON.stringify(tagsArr);
 
   if (targetId) {
+    // Regenerate / live-update path. We always overwrite both sides because
+    // this entry is a downstream snapshot of the meeting; the meeting itself
+    // is the source of truth and any user edits inside this notebook entry
+    // are explicitly designed to be transient (re-snapshotted on each
+    // regenerate). displayMode is left untouched on update so a user who
+    // flipped to raw and back stays where they were.
     await api.updateEntry(targetId, {
-      rawTranscript: params.plainText,
+      rawTranscript: rawSrc,
+      polishedText: polishedPlain,
+      polishedTextJson: polishedJson,
       tags: tagsJson,
     } as any);
     notifyEntriesChanged();
@@ -341,8 +412,15 @@ export async function upsertMeetingNoteEntry(params: {
   }
 
   const entry = await api.createEntry({
-    rawTranscript: params.plainText,
-    polishedText: undefined,
+    rawTranscript: rawSrc,
+    polishedText: polishedPlain,
+    polishedTextJson: polishedJson,
+    // displayMode is omitted — the DB default is 'polished' (see entries
+    // schema in rust-core/src/storage/db.rs), and DictatePage's
+    // effectiveMode helper falls through to 'raw' when polishedText is
+    // empty anyway. So users opening a meeting from the Notes sidebar
+    // see the formatted summary, while users opening an empty draft
+    // entry stay on the raw side until they click Polish.
     durationSeconds: undefined,
     sourceApp: 'meeting-auto',
     tags: tagsJson,

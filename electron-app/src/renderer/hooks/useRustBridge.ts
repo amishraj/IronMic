@@ -20,8 +20,40 @@ declare global {
       polishTextDetailed: (
         rawText: string,
         opts?: { requireModel?: boolean },
-      ) => Promise<{ text: string; providerUsed: 'claude' | 'copilot' | 'local' }>;
+      ) => Promise<{
+        markdown: string;
+        plainText: string;
+        html: string;
+        jsonString: string;
+        providerUsed: 'claude' | 'copilot' | 'local';
+        // Legacy field — equal to plainText. Kept for callers not yet
+        // migrated to the new projection fields.
+        text: string;
+      }>;
       polishTextLocal: (rawText: string, opts?: { requireModel?: boolean }) => Promise<string>;
+      // Generic LLM transport. Caller owns the system prompt — no cleanup
+      // prompt is layered on top. Use for non-polish completions (meeting
+      // summarization, template generation, intent fallback, etc.).
+      generateText: (
+        systemPrompt: string,
+        userPrompt: string,
+        opts?: { maxTokens?: number; temperature?: number; forceLocal?: boolean },
+      ) => Promise<{ text: string; providerUsed: 'claude' | 'copilot' | 'local' }>;
+      // Strictly local variant — never routes to cloud regardless of setting.
+      generateTextLocal: (
+        systemPrompt: string,
+        userPrompt: string,
+        opts?: { maxTokens?: number; temperature?: number },
+      ) => Promise<{ text: string; providerUsed: 'claude' | 'copilot' | 'local' }>;
+      // Markdown → projections. The only way for the renderer to access the
+      // sanitization pipeline. jsonString is JSON.stringify(ProseMirror JSON);
+      // caller JSON.parse before feeding the editor. html is sanitize-html-
+      // approved and safe to feed to dangerouslySetInnerHTML.
+      convertMarkdown: (md: string) => Promise<{
+        plainText: string;
+        html: string;
+        jsonString: string;
+      }>;
       // Entries
       createEntry: (entry: NewEntry) => Promise<Entry>;
       getEntry: (id: string) => Promise<Entry | null>;

@@ -119,6 +119,15 @@ export const IPC_CHANNELS = {
   POLISH_TEXT: 'ironmic:polish-text',
   POLISH_TEXT_DETAILED: 'ironmic:polish-text-detailed',
   POLISH_TEXT_LOCAL: 'ironmic:polish-text-local',
+  // Generic LLM transport (caller-supplied system prompt). Used by
+  // SummaryGenerator / MeetingTemplateEngine / IntentClassifier /
+  // MeetingDetector — NOT polish callers (they keep POLISH_TEXT_*).
+  // Live summary stays on its own llmSubprocess path for cancellation.
+  GENERATE_TEXT: 'ironmic:generate-text',
+  GENERATE_TEXT_LOCAL: 'ironmic:generate-text-local',
+  // Markdown → { plainText, html, jsonString } projections from the main-side
+  // sanitization pipeline. Renderer never imports the pipeline directly.
+  CONVERT_MARKDOWN: 'ironmic:convert-markdown',
 
   // Entries
   CREATE_ENTRY: 'ironmic:create-entry',

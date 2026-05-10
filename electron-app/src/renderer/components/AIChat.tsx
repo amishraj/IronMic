@@ -555,9 +555,13 @@ export function AIChat() {
     setActiveSession(id);
     setStreaming('');
     setError(null);
-    // Scoped reset: only clear the brand-new session's context. Other sessions
-    // keep their per-session context so resuming them retains continuity.
-    window.ironmic.aiResetSession(id);
+    // Note: NOT calling aiResetSession(id) here. A brand-new session id
+    // has no context in main to clear by definition, and the reset was
+    // racing with the user's first send-message — it would SIGTERM the
+    // freshly-spawned Claude/Copilot CLI process before any output came
+    // back, surfacing as "exited with code null". The aiManager's
+    // localHistories / cliTurnCounts are keyed by sessionId, so a new id
+    // simply has no entry to wipe.
   }, [createSession, setActiveSession, provider]);
 
   const noProvider = !provider;

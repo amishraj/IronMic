@@ -34,7 +34,13 @@ const CHUNK_CHAR_SIZE = 3_500;
 /** Guard: transcripts below this word count aren't worth summarising. */
 const MIN_WORDS_FOR_SUMMARY = 30;
 /** Echo rejection threshold — if output/input length > this, it's an echo. */
-const MAX_OUTPUT_TO_INPUT_RATIO = 0.8;
+// Bumped from 0.8 → 1.6 because a well-structured summary (TL;DR +
+// Decisions + Discussion + Action Items + Open Questions table) can
+// easily exceed the input length for short or condensed meetings.
+// Genuine transcript-echo failures sit at ~1.0x or higher *and* fail
+// the long-verbatim-span guard — both checks together still catch them
+// reliably without rejecting legitimate structured output.
+const MAX_OUTPUT_TO_INPUT_RATIO = 1.6;
 /** Longest verbatim span we'll tolerate from the input (words). */
 const MAX_VERBATIM_SPAN_WORDS = 20;
 
@@ -143,14 +149,29 @@ export async function generateMeetingSummary(
           templateName: template.name,
           processingState: 'done',
           generatedAt,
+          // Populate plainSummary from the LLM's raw markdown so the
+          // notebook auto-file path uses the actual produced text (with
+          // correct heading casing like "## TL;DR") instead of falling
+          // through to MeetingPage's section-reconstruction fallback,
+          // which lowercases section keys whose titles weren't in
+          // SECTION_TITLES. The fallback is still there as a safety net
+          // — this is the happy-path source of truth.
+          plainSummary: (structured as any).rawOutput ?? (structured as any).plainSummary,
         };
       }
     } else {
       const summary = await plainSummarize(inputForFinalPass);
       if (summary) {
+        // Plain path doesn't go through MeetingTemplateEngine, so we
+        // convert the markdown ourselves here for the htmlContent slot
+        // (gated by polish_format_mode — same gate as rich vs plain
+        // for templates). MeetingNotesPanel prefers htmlContent over
+        // sections when present.
+        const htmlContent = await maybeConvertMarkdown(summary);
         return {
           sections: [{ key: 'summary', title: 'Summary', content: summary }],
           plainSummary: summary,
+          htmlContent,
           processingState: 'done',
           generatedAt,
         };
@@ -254,9 +275,11 @@ async function runTemplateWithGuardrails(
   template: MeetingTemplate,
   input: string,
 ) {
-  // First attempt — honour the template's own prompt.
+  // Pass #1 — honour the template's own prompt with the strict echo guard.
+  let lastAttempt: Awaited<ReturnType<typeof runTemplate>> | null = null;
   try {
     const structured = await runTemplate(template, input);
+    lastAttempt = structured;
     if (structured && !isStructuredEcho(structured.rawOutput, input)) {
       return structured;
     }
@@ -264,7 +287,7 @@ async function runTemplateWithGuardrails(
     console.warn('[SummaryGenerator] template pass #1 failed:', err);
   }
 
-  // Retry with a harsher prefix instructing the model to compress and not echo.
+  // Pass #2 — retry with a harsher anti-echo prefix.
   const hardenedTemplate: MeetingTemplate = {
     ...template,
     llm_prompt:
@@ -276,6 +299,7 @@ async function runTemplateWithGuardrails(
   };
   try {
     const structured = await runTemplate(hardenedTemplate, input);
+    if (structured) lastAttempt = structured;
     if (structured && !isStructuredEcho(structured.rawOutput, input)) {
       return structured;
     }
@@ -283,10 +307,26 @@ async function runTemplateWithGuardrails(
     console.warn('[SummaryGenerator] template pass #2 failed:', err);
   }
 
+  // Pass #3 — last resort. The strict echo guard rejected both attempts,
+  // but they may still be VALID structured output that just happens to be
+  // longer than MAX_OUTPUT_TO_INPUT_RATIO would allow (common for short
+  // meetings where headings + bullets exceed transcript length). Accept
+  // the output if it has at least one ## heading or - bullet AND doesn't
+  // contain prompt leakage. Without this, users get "Summary unavailable"
+  // for perfectly good summaries.
+  if (lastAttempt && hasStructureWithoutPromptLeak(lastAttempt.rawOutput)) {
+    return lastAttempt;
+  }
+
   return null;
 }
 
 async function plainSummarize(input: string): Promise<string | null> {
+  // The "Free-form bullets (no template)" path. Produces flat bullets
+  // only — no headings, no tables. Users who want structured output pick
+  // the "Default" template instead (or any of the meeting-type-specific
+  // templates), which runs through MeetingTemplateEngine and produces
+  // the proper sectioned layout.
   const basePrompt =
     `You are a meeting-notes assistant. Produce clear, concise bullet points ` +
     `capturing key decisions, action items, and discussion topics from the ` +
@@ -327,6 +367,24 @@ async function plainSummarize(input: string): Promise<string | null> {
 // ──────────────────────────────────────────────────────────────────────────
 // Echo detection
 // ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Looser fallback validator used by runTemplateWithGuardrails's pass #3.
+ * Only rejects the obvious failure modes: empty output, prompt leakage,
+ * the transcript wrapper tags. Does NOT reject on length ratio — that's
+ * what isStructuredEcho is for, and the whole point of pass #3 is to
+ * accept output the strict guard rejected.
+ */
+function hasStructureWithoutPromptLeak(rawOutput: string): boolean {
+  const out = rawOutput.trim();
+  if (!out) return false;
+  if (out.includes('<transcript>') || out.includes('<segment>')) return false;
+  if (/IMPORTANT: The previous attempt failed/i.test(out)) return false;
+  if (/you are a (?:professional |meeting )?(?:meeting[- ])?notes?\s+(?:assistant|formatter)/i.test(out)) return false;
+  // Must have at least one heading (## ) or bullet (- ) so we know it's
+  // SOMETHING resembling structured notes, not a raw paragraph echo.
+  return /^##\s/m.test(out) || /^-\s/m.test(out);
+}
 
 function isStructuredEcho(rawOutput: string, input: string): boolean {
   const out = rawOutput.trim();
@@ -386,10 +444,38 @@ function cleanBulletList(raw: string, input: string): string | null {
 
 async function callPolish(prompt: string): Promise<string> {
   const ironmic = (window as any).ironmic;
-  if (!ironmic?.polishText) {
-    throw new Error('polishText IPC not available');
+  // Migrated from polishText (which layered the cleanup prompt on top of
+  // the caller's system prompt — the wrong contract for summarization).
+  // generateText is the dedicated transport for non-polish completions.
+  // Pass empty system + full prompt as user; Phase 5 splits the prompt
+  // properly into system/user when the new Auto-template prompt lands.
+  if (!ironmic?.generateText) {
+    throw new Error('generateText IPC not available');
   }
-  return await ironmic.polishText(prompt);
+  const { text } = await ironmic.generateText('', prompt, { maxTokens: 1024, temperature: 0.2 });
+  return text;
+}
+
+/**
+ * Convert markdown into sanitized HTML for `structured_output.htmlContent`,
+ * but only when `polish_format_mode === 'rich'`. Plain mode skips this so
+ * MeetingNotesPanel falls through to the section-block UI (today's behavior).
+ *
+ * Returns undefined on any error or in plain mode — caller should treat
+ * undefined as "no rich rendering available, use sections fallback".
+ */
+async function maybeConvertMarkdown(md: string): Promise<string | undefined> {
+  if (!md.trim()) return undefined;
+  const ironmic = (window as any).ironmic;
+  if (!ironmic?.convertMarkdown) return undefined;
+  try {
+    const mode = await ironmic.getSetting?.('polish_format_mode');
+    if (mode === 'plain') return undefined;
+    const projections = await ironmic.convertMarkdown(md);
+    return projections.html || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function wordCount(s: string): number {
@@ -452,9 +538,16 @@ export function restoreVersion(
  *  to title against, and `Meeting #N` is the better fallback. */
 const MIN_CHARS_FOR_AI_TITLE = 40;
 
-/** Soft clamp for the produced title. Anything longer than this is almost
- *  certainly the model failing to obey "3-7 words". */
-const MAX_TITLE_CHARS = 80;
+/** Hard char clamp — meeting cards and the detail header truncate at
+ *  ~40-45 chars on a normal viewport, so anything beyond that gets
+ *  clipped with an ellipsis. Tightened from 80 to keep titles glanceable. */
+const MAX_TITLE_CHARS = 45;
+
+/** Hard word clamp — even when the model produces something under 45
+ *  chars, we want it under N words for at-a-glance scanning. Phi-3 and
+ *  cloud models both ignore "3-5 words" instructions reliably enough
+ *  that a post-processing truncate is the right enforcement layer. */
+const MAX_TITLE_WORDS = 5;
 
 /**
  * Generate a short title from meeting content. Always runs through the
@@ -472,20 +565,30 @@ export async function generateMeetingTitle(
   if (text.length < MIN_CHARS_FOR_AI_TITLE) return null;
 
   const ironmic = (window as any).ironmic;
-  if (!ironmic?.polishTextLocal) return null;
+  if (!ironmic?.generateTextLocal) return null;
 
-  const prompt =
-    'Produce a 3–7 word, sentence-case title for the following meeting ' +
-    'content. Output the title only — no quotes, no trailing period, no ' +
-    'preamble. If content is too thin, output the single token NONE.\n\n' +
-    `Content: ${text}`;
+  // Title generation runs through the strictly-local generateText channel.
+  // Caller owns the system prompt; no cleanup-prompt layering.
+  //
+  // Word count: the prompt asks for 2-4 words but post-processing clamps
+  // to MAX_TITLE_WORDS regardless. Models routinely overshoot prose-style
+  // word-count instructions, so the clamp is the actual enforcement.
+  const systemPrompt =
+    'Produce a SHORT 2-4 word title (max 5 words) for the meeting content ' +
+    'the user provides. Sentence case. The title should be glanceable — ' +
+    'a noun phrase, not a sentence. Examples of GOOD titles: "Sprint planning", ' +
+    '"Q4 budget review", "Backend architecture sync". BAD (too long): "Speaker ' +
+    'praises Granola for fast meeting notes". Output the title only — no ' +
+    'quotes, no trailing period, no preamble. If content is too thin to title ' +
+    'meaningfully, output the single token NONE.';
 
   let raw: string;
   try {
-    // requireModel: true so a missing local cleanup model throws instead of
-    // returning the prompt unchanged (which would otherwise get clamped into
-    // a bogus title).
-    raw = await ironmic.polishTextLocal(prompt, { requireModel: true });
+    const result = await ironmic.generateTextLocal(systemPrompt, `Content: ${text}`, {
+      maxTokens: 32,
+      temperature: 0.2,
+    });
+    raw = result.text;
   } catch {
     return null;
   }
@@ -506,6 +609,18 @@ function sanitizeTitle(raw: string | null | undefined): string | null {
   t = t.replace(/[.!?,;:\-–—]+$/g, '').trim();
   if (!t) return null;
   if (t.toUpperCase() === 'NONE') return null;
+  // Word clamp first — keeps the truncation on a word boundary instead of
+  // mid-word. Splits on whitespace; punctuation stays attached to the
+  // preceding word so "Q4 budget review" stays 3 words, not 4.
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length > MAX_TITLE_WORDS) {
+    t = words.slice(0, MAX_TITLE_WORDS).join(' ');
+    // After truncating, drop any trailing punctuation again (if the cut
+    // word ended with a comma, etc.).
+    t = t.replace(/[.!?,;:\-–—]+$/g, '').trim();
+  }
+  // Char clamp as a defense-in-depth backstop for pathologically long
+  // single words (URLs, hashes). Word clamp handles 99% of cases.
   if (t.length > MAX_TITLE_CHARS) t = t.slice(0, MAX_TITLE_CHARS).trim();
   return t || null;
 }

@@ -228,11 +228,17 @@ export class MeetingDetector {
               .filter((l: string) => l.length > 0);
           }
         } else {
-          // No template — use generic summary prompt
+          // No template — use generic summary prompt via generateText
+          // (the dedicated non-polish transport; polishText baked in
+          // cleanup-prompt instructions that conflicted with summarization).
           const ironmic = (window as any).ironmic;
-          if (ironmic?.polishText) {
-            const summaryPrompt = `Summarize this meeting transcript. List key decisions and action items.\n\n${fullTranscript}`;
-            const result = await ironmic.polishText(summaryPrompt);
+          if (ironmic?.generateText) {
+            const systemPrompt = 'Summarize the meeting transcript the user provides. List key decisions and action items.';
+            const generated = await ironmic.generateText(systemPrompt, fullTranscript, {
+              maxTokens: 1024,
+              temperature: 0.2,
+            });
+            const result = generated.text;
             summary = result;
 
             const actionMatch = result.match(/action\s*items?:?\s*([\s\S]*?)(?:$|\n\n)/i);

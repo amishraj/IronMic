@@ -96,7 +96,7 @@ export function SettingsPanel() {
 // ═══════════════════════════════════════════
 
 function GeneralSettings() {
-  const { hotkey, llmCleanupEnabled, theme, setHotkey, setLlmCleanup, setTheme } =
+  const { hotkey, llmCleanupEnabled, polishFormatMode, theme, setHotkey, setLlmCleanup, setPolishFormatMode, setTheme } =
     useSettingsStore();
   // `hotkey` / `setHotkey` retained for backward compat with older settings
   // payloads; the dictation gesture itself is now hardcoded in
@@ -116,6 +116,17 @@ function GeneralSettings() {
         title="LLM Text Cleanup"
         description="Polish transcriptions with a local LLM"
         control={<Toggle checked={llmCleanupEnabled} onChange={setLlmCleanup} />}
+      />
+
+      <SettingRow
+        title="Smart formatting"
+        description="Polished notes and meeting summaries are formatted with headings, lists, and bold. Turn off for flat-text output."
+        control={
+          <Toggle
+            checked={polishFormatMode === 'rich'}
+            onChange={(checked) => setPolishFormatMode(checked ? 'rich' : 'plain')}
+          />
+        }
       />
 
       <div className="space-y-1.5">
@@ -636,11 +647,12 @@ function AIAssistSettings() {
                   <div className="flex items-start gap-2 min-w-0 flex-1">
                     <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
                     <div className="min-w-0">
-                      <p className="text-sm font-medium text-iron-text">Allow cloud polishing (Claude / Copilot)</p>
+                      <p className="text-sm font-medium text-iron-text">Use cloud AI when authenticated (Claude / Copilot)</p>
                       <p className="text-xs text-iron-text-muted mt-0.5">
                         Off by default. IronMic processes everything locally. Turning this on
-                        sends your transcript text to the authenticated Claude or Copilot CLI
-                        when you polish a note.
+                        routes polish, meeting summarization, and other AI tasks through the
+                        authenticated Claude or Copilot CLI. Live meeting summaries always
+                        stay local regardless of this setting.
                       </p>
                     </div>
                   </div>

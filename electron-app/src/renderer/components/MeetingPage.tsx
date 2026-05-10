@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User, Share2, PanelRightOpen, PanelRightClose } from 'lucide-react';
+import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User, Share2, PanelRightOpen, PanelRightClose, Eye, EyeOff } from 'lucide-react';
 import { Card, Badge, Button } from './ui';
 import { MeetingSessionCard } from './MeetingSessionCard';
 import { MeetingTemplateEditor } from './MeetingTemplateEditor';
@@ -48,9 +48,102 @@ export function MeetingPage() {
 
   const [meetingState, setMeetingState] = useState<MeetingState>('idle');
   const [selectedTemplate, setSelectedTemplate] = useState<MeetingTemplate | null>(null);
+  // Whether the user has explicitly clicked a template since this component
+  // mounted. Once true, the default-template effect stops overriding their
+  // pick — clicking a template button is a user choice that beats any
+  // global default.
+  const userOverrodeTemplateRef = useRef(false);
+  // Declared early so the meetings-list UX state below (which references it
+  // in openDetail / scroll-restore effect / etc.) can resolve at module
+  // init time. Originally lived further down with the granola state.
+  const [detailSessionId, setDetailSessionId] = useState<string | null>(null);
+
+  // ── Meetings list UX state ──
+  /** Scroll-position preservation across detail open → back. The list
+   *  unmounts when detailSessionId is set, so we capture scrollTop before
+   *  navigating in and restore it once the list remounts. */
+  const listScrollRef = useRef<HTMLDivElement | null>(null);
+  const savedScrollYRef = useRef<number>(0);
+
+  /** Whether to show meetings that captured no audio (processingState
+   *  'empty'). Persisted in localStorage so the user's choice survives
+   *  reload. Default false — they're noise on a busy list. */
+  const SHOW_EMPTY_KEY = 'ironmic-meetings-show-empty';
+  const [showEmptyMeetings, setShowEmptyMeetings] = useState<boolean>(() => {
+    try { return localStorage.getItem(SHOW_EMPTY_KEY) === 'true'; }
+    catch { return false; }
+  });
+  const toggleShowEmpty = useCallback((next: boolean) => {
+    setShowEmptyMeetings(next);
+    try { localStorage.setItem(SHOW_EMPTY_KEY, String(next)); } catch { /* ignore */ }
+  }, []);
+
+  /** Multi-select state for bulk delete. Click a card's mic icon to enter
+   *  selection mode; the icon becomes a checkbox and subsequent card
+   *  clicks toggle selection instead of opening detail. The floating
+   *  action bar at the bottom gives Delete + Cancel. */
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const selectionMode = selectedIds.size > 0;
+  const toggleSelection = useCallback((id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
+
+  /** Open a meeting's detail view, capturing the current scroll position
+   *  first so the back-nav useLayoutEffect can restore it. Bypassed when
+   *  selectionMode is on (in which case the card click toggles selection
+   *  instead of navigating). */
+  const openDetail = useCallback((id: string) => {
+    if (listScrollRef.current) {
+      savedScrollYRef.current = listScrollRef.current.scrollTop;
+    }
+    setDetailSessionId(id);
+  }, []);
+
+  /** Restore scroll position whenever we transition from "in detail view"
+   *  back to the list. useLayoutEffect (not useEffect) so the scroll set
+   *  happens BEFORE the browser paints — otherwise the user briefly sees
+   *  the list scrolled to top. */
+  useEffect(() => {
+    if (detailSessionId !== null) return;
+    const el = listScrollRef.current;
+    if (!el) return;
+    // setTimeout 0 lets layout settle first (sessions list re-renders may
+    // run after this effect; restoring before the children mount would
+    // clamp scrollTop to 0). One frame is enough on every machine I tested.
+    const t = setTimeout(() => {
+      if (listScrollRef.current) listScrollRef.current.scrollTop = savedScrollYRef.current;
+    }, 0);
+    return () => clearTimeout(t);
+  }, [detailSessionId]);
+
+  /** Bulk delete confirmed selected meetings. Uses the existing
+   *  deleteSession action so each delete triggers the same downstream
+   *  cleanup (transcript_segments cascade, notebook entry orphaning, etc.)
+   *  as a single delete via the per-card trash button. */
+  const deleteSelected = useCallback(async () => {
+    if (selectedIds.size === 0) return;
+    const count = selectedIds.size;
+    const ok = window.confirm(
+      `Delete ${count} meeting${count === 1 ? '' : 's'}?\n\n` +
+        `This will permanently remove the selected meetings, their transcripts, and notes. This cannot be undone.`,
+    );
+    if (!ok) return;
+    for (const id of Array.from(selectedIds)) {
+      try { await deleteSession(id); }
+      catch (err) { console.warn(`[MeetingPage] bulk delete failed for ${id}:`, err); }
+    }
+    clearSelection();
+  }, [selectedIds, clearSelection]);
   const [showEditor, setShowEditor] = useState(false);
   const [durationMs, setDurationMs] = useState(0);
-  const [detailSessionId, setDetailSessionId] = useState<string | null>(null);
+  // (detailSessionId moved up above so the meetings-list UX hooks can
+  //  reference it before it would otherwise be declared.)
 
   // Granola mode — current notes (session ID lives in Zustand to survive tab switches)
   const [granolaStructuredOutput, setGranolaStructuredOutput] = useState<StructuredMeetingOutput | null>(null);
@@ -334,6 +427,28 @@ export function MeetingPage() {
       })
       .catch(() => {});
   }, [setRoomMode]);
+
+  // ── Resolve the user's `meeting_default_template` setting to an actual
+  // template object once templates have loaded. Without this, every meeting
+  // started without an explicit template click runs the no-template path
+  // (plainSummarize → flat bullets), and the new "Auto" template seeded by
+  // migration v10 never actually runs. The userOverrodeTemplateRef guard
+  // ensures a click in the template picker is sticky for the session.
+  useEffect(() => {
+    if (userOverrodeTemplateRef.current) return;
+    if (!templates || templates.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const id = await window.ironmic.getSetting('meeting_default_template');
+        if (cancelled) return;
+        if (!id) return;
+        const match = templates.find((t: MeetingTemplate) => t.id === id);
+        if (match) setSelectedTemplate(match);
+      } catch { /* setting unavailable → keep null */ }
+    })();
+    return () => { cancelled = true; };
+  }, [templates]);
 
   // ── Legacy ambient meeting detector + startup recovery ──
   useEffect(() => {
@@ -681,10 +796,17 @@ export function MeetingPage() {
           await finalizeInsufficient(sessionId, 'empty');
         } else if (liveInsufficient && (!liveSummary || !liveSummary.trim())) {
           await finalizeInsufficient(sessionId, 'insufficient');
-        } else if (liveSummary && liveSummary.trim().length > 0) {
-          await finalizeWithLiveSummary(sessionId, liveSummary, template);
         } else {
-          await generateStructuredNotes(sessionId, fullTranscript, durationSec, template);
+          // Always run the structured pass through a template — never the
+          // flat-bullets plainSummarize path. If `template` is null (rare:
+          // first-launch race before the meeting_default_template effect
+          // resolves, or a meeting started during template loading), fall
+          // back to the Default builtin so the output is still structured.
+          // The live summary is just the in-flight ticker; the final
+          // summary is the template-driven structured one.
+          const effectiveTemplate =
+            template ?? templates.find((t: MeetingTemplate) => t.id === 'builtin-auto') ?? templates[0] ?? null;
+          await generateStructuredNotes(sessionId, fullTranscript, durationSec, effectiveTemplate as MeetingTemplate | null);
         }
         await loadSessions();
       }
@@ -716,11 +838,28 @@ export function MeetingPage() {
             }
             const title = resolveMeetingTitle(latestSession, so);
 
+            // Pull the full transcript from the session record (the same
+            // record we just re-read). `fullTranscript` from the outer
+            // try block is out of scope here — finally has its own scope
+            // and `let` declared inside try doesn't escape.
+            const sessionTranscript: string =
+              (typeof latestSession?.full_transcript === 'string' && latestSession.full_transcript.trim())
+                ? latestSession.full_transcript
+                : plainText;
             const entryId = await upsertMeetingNoteEntry({
               existingEntryId: so.notebookEntryId ?? null,
               sessionId,
               title,
-              plainText,
+              // Polished side: the markdown summary. upsertMeetingNoteEntry
+              // runs convertMarkdown internally so the editor gets the rich
+              // JSON projection and renders headings/bold/lists rather than
+              // showing literal `## TL;DR` source.
+              polishedMarkdown: plainText,
+              // Raw side: the full meeting transcript. Falls back to the
+              // markdown summary if for some reason the transcript isn't
+              // available — better to have something than nothing on the
+              // raw side.
+              rawTranscript: sessionTranscript,
             });
             if (entryId !== so.notebookEntryId || so.title) {
               await window.ironmic.meetingSetStructuredOutput(
@@ -885,11 +1024,24 @@ export function MeetingPage() {
         }
       }
 
+      // Even on the live-summary path (no template), run the markdown
+      // pipeline so the bullets render with bold/code/links instead of
+      // plaintext. Failure is non-fatal — falls back to text-only display.
+      let liveHtmlContent: string | null = null;
+      try {
+        const projections = await (window as any).ironmic?.convertMarkdown?.(liveSummary.trim());
+        if (projections?.html) liveHtmlContent = projections.html;
+      } catch { /* ignore */ }
+
       const finalStructured = {
         ...existing,
         processingState: 'done',
         sections,
         plainSummary: liveSummary.trim(),
+        // htmlContent populated from the live-bullets markdown so the
+        // detail page + notes panel render formatting (bold names,
+        // inline code refs, etc.) instead of flat text.
+        ...(liveHtmlContent ? { htmlContent: liveHtmlContent } : {}),
         // Strip recovery keys — no longer needed
         _recoveryTranscript: undefined,
         _recoveryTemplateId: undefined,
@@ -914,11 +1066,21 @@ export function MeetingPage() {
       }
 
       try {
+        // Live-summary path: polished side is the bullet summary, raw side
+        // is the full meeting transcript pulled from the session record.
+        // Falls back to the summary if the transcript wasn't persisted
+        // (older sessions, certain failure modes) — at least the polished
+        // view stays correct.
+        const liveTranscript: string =
+          (typeof liveSession?.full_transcript === 'string' && liveSession.full_transcript.trim())
+            ? liveSession.full_transcript
+            : liveSummaryTrim;
         const entryId = await upsertMeetingNoteEntry({
           existingEntryId: (finalStructured as any).notebookEntryId ?? null,
           sessionId,
           title: resolveMeetingTitle(liveSession, finalStructured as any),
-          plainText: liveSummaryTrim,
+          polishedMarkdown: liveSummaryTrim,
+          rawTranscript: liveTranscript,
         });
         (finalStructured as any).notebookEntryId = entryId;
       } catch (err) {
@@ -1000,7 +1162,11 @@ export function MeetingPage() {
           existingEntryId: existingNotebookEntryId,
           sessionId,
           title: resolveMeetingTitle(sessionForTitle, structured as any),
-          plainText: summaryForColumn,
+          // Polished side: structured markdown summary (rendered as rich
+          // content in the editor via convertMarkdown). Raw side: the
+          // verbatim transcript that was just summarized.
+          polishedMarkdown: summaryForColumn,
+          rawTranscript: transcript,
         });
         (structured as any).notebookEntryId = entryId;
       } catch (err) {
@@ -1123,7 +1289,13 @@ export function MeetingPage() {
     return (
       <MeetingDetailPage
         sessionId={detailSessionId}
-        onBack={() => setDetailSessionId(null)}
+        onBack={() => {
+          // Closing the detail re-mounts the list. The useLayoutEffect
+          // tied to detailSessionId restores the scroll position from
+          // savedScrollYRef so the user lands on the same card they
+          // opened, not at the top of the list.
+          setDetailSessionId(null);
+        }}
         onUpdated={loadSessions}
       />
     );
@@ -1392,7 +1564,7 @@ export function MeetingPage() {
 
   // ── Default single-column layout (idle / legacy recording) ──
   return (
-    <div className="h-full overflow-y-auto">
+    <div className="h-full overflow-y-auto" ref={listScrollRef}>
       <div className="max-w-lg mx-auto space-y-6 px-4 py-6">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-iron-text">Meetings</h2>
@@ -1593,23 +1765,18 @@ export function MeetingPage() {
             <MeetingTemplateEditor onSave={handleSaveTemplate} onCancel={() => setShowEditor(false)} />
           )}
 
+          {/* No "Generic / no template" button — every meeting runs through
+              a template so the output is always structured. The Default
+              template (builtin-auto) is auto-selected on mount via the
+              meeting_default_template setting effect. */}
           <div className="grid grid-cols-2 gap-2">
-            <button
-              onClick={() => setSelectedTemplate(null)}
-              className={`text-left px-3 py-2.5 rounded-xl text-xs transition-all border ${
-                !selectedTemplate
-                  ? 'bg-iron-accent/10 text-iron-accent-light border-iron-accent/20'
-                  : 'bg-iron-surface text-iron-text-muted border-iron-border hover:border-iron-border-hover'
-              }`}
-            >
-              <span className="font-medium">Generic</span>
-              <span className="block text-[10px] mt-0.5 opacity-70">Free-form summary</span>
-            </button>
-
             {templates.map(t => (
               <button
                 key={t.id}
-                onClick={() => setSelectedTemplate(t as MeetingTemplate)}
+                onClick={() => {
+                  userOverrodeTemplateRef.current = true;
+                  setSelectedTemplate(t as MeetingTemplate);
+                }}
                 className={`text-left px-3 py-2.5 rounded-xl text-xs transition-all border ${
                   selectedTemplate?.id === t.id
                     ? 'bg-iron-accent/10 text-iron-accent-light border-iron-accent/20'
@@ -1695,21 +1862,182 @@ export function MeetingPage() {
         </Card>
       )}
 
-      {/* Meeting history */}
-      {sessions.length > 0 && (
-        <div className="space-y-2">
-          <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">History</p>
-          {sessions.map(s => (
-            <MeetingSessionCard
-              key={s.id}
-              session={s}
-              onDelete={deleteSession}
-              onOpen={() => setDetailSessionId(s.id)}
-            />
-          ))}
+      {/* Meeting history — grouped by date bucket (Today / Yesterday /
+          This week / Last week / This month / Earlier) for at-a-glance
+          orientation on long lists. groupSessionsByDate sorts each bucket
+          newest-first internally and returns buckets in chronological
+          order so the most recent group is at the top. */}
+      {sessions.length > 0 && (() => {
+        // Filter out empty meetings (processingState === 'empty') unless
+        // the user has opted to show them. Done at MeetingPage level so
+        // grouping reflects only what's actually rendered (buckets that
+        // become empty after filtering disappear, no confusing headers).
+        const filtered = showEmptyMeetings
+          ? sessions
+          : sessions.filter((s) => !isSessionEmpty(s));
+        const hiddenCount = sessions.length - filtered.length;
+        const grouped = groupSessionsByDate(filtered);
+        return (
+          <div className="space-y-3">
+            {/* Header row: filter toggle (icon-only, neat) + hidden-count chip */}
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">History</p>
+              <button
+                onClick={() => toggleShowEmpty(!showEmptyMeetings)}
+                title={showEmptyMeetings ? 'Hide meetings with no audio captured' : 'Show meetings with no audio captured'}
+                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] transition-colors ${
+                  showEmptyMeetings
+                    ? 'bg-iron-surface text-iron-text border border-iron-border'
+                    : 'bg-iron-surface/60 text-iron-text-muted border border-iron-border/60 hover:text-iron-text'
+                }`}
+              >
+                {showEmptyMeetings ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
+                <span>{showEmptyMeetings ? 'Show empty' : 'Hide empty'}</span>
+                {hiddenCount > 0 && !showEmptyMeetings && (
+                  <span className="ml-0.5 px-1 rounded bg-iron-accent/10 text-iron-accent-light">{hiddenCount}</span>
+                )}
+              </button>
+            </div>
+            {grouped.length > 0 ? (
+              <div className="space-y-5">
+                {grouped.map(([label, group]) => (
+                  <div key={label} className="space-y-2">
+                    <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">{label}</p>
+                    {group.map(s => (
+                      <MeetingSessionCard
+                        key={s.id}
+                        session={s}
+                        onDelete={deleteSession}
+                        onOpen={openDetail}
+                        selectionMode={selectionMode}
+                        selected={selectedIds.has(s.id)}
+                        onToggleSelect={toggleSelection}
+                      />
+                    ))}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="text-xs text-iron-text-muted italic px-1 py-2">
+                {hiddenCount > 0
+                  ? `${hiddenCount} meeting${hiddenCount === 1 ? '' : 's'} with no audio hidden — toggle "Show empty" above to see ${hiddenCount === 1 ? 'it' : 'them'}.`
+                  : 'No meetings yet.'}
+              </p>
+            )}
+          </div>
+        );
+      })()}
+
+      {/* Floating bulk-action bar — visible only in selection mode. Sits
+          above the page bottom so it doesn't shift the list layout. */}
+      {selectionMode && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2.5 rounded-xl shadow-depth-lg bg-iron-surface border border-iron-border animate-slide-up">
+          <span className="text-xs text-iron-text font-medium">
+            {selectedIds.size} selected
+          </span>
+          <button
+            onClick={clearSelection}
+            className="px-3 py-1.5 rounded-lg text-xs text-iron-text-muted hover:text-iron-text hover:bg-iron-surface-hover transition-colors"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={deleteSelected}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium text-red-300 bg-red-500/10 border border-red-500/20 hover:bg-red-500/20 transition-colors"
+          >
+            <Trash2 className="w-3.5 h-3.5" />
+            Delete {selectedIds.size}
+          </button>
         </div>
       )}
       </div>
     </div>
   );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// "No audio captured" detection — used by the empty-meetings filter
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * True when the session never captured speech worth summarizing — its
+ * structured_output.processingState is 'empty'. The card UI also shows
+ * an "Insufficient" badge for meetings where some audio was captured but
+ * not enough to summarize; we treat those as keepers (the user might
+ * still want their raw transcript), so only 'empty' is filtered.
+ */
+function isSessionEmpty(session: { structured_output?: string }): boolean {
+  if (!session.structured_output) return false;
+  try {
+    const parsed = JSON.parse(session.structured_output);
+    return parsed?.processingState === 'empty';
+  } catch {
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Date-bucket grouping for the meeting history list
+// ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * Bucket meeting sessions by their `started_at` date relative to "now":
+ *   Today / Yesterday / This week (older than yesterday, within the
+ *   current Sun-Sat week) / Last week / This month / Earlier.
+ *
+ * Returns an array of [bucketLabel, sessions[]] pairs in display order
+ * (most recent bucket first). Each bucket's sessions are sorted
+ * newest-first internally. Buckets that end up empty are omitted so we
+ * don't render a header with no cards beneath it.
+ *
+ * Why this lives here and not in a util module: only this list view
+ * cares about it, and the bucket boundaries (calendar day vs ISO week)
+ * are coupled to the user-visible labels — moving them to a generic
+ * helper would force the labels into a separate i18n surface for no
+ * benefit while the rest of the app uses raw timestamps.
+ */
+function groupSessionsByDate<T extends { started_at: string }>(
+  sessions: readonly T[],
+): Array<[string, T[]]> {
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfYesterday = startOfToday - 24 * 60 * 60 * 1000;
+  // Start of this calendar week (Sunday). Day-of-week 0 = Sun.
+  const startOfThisWeek = startOfToday - now.getDay() * 24 * 60 * 60 * 1000;
+  const startOfLastWeek = startOfThisWeek - 7 * 24 * 60 * 60 * 1000;
+  const startOfThisMonth = new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+
+  const buckets: Record<string, T[]> = {
+    Today: [],
+    Yesterday: [],
+    'This week': [],
+    'Last week': [],
+    'This month': [],
+    Earlier: [],
+  };
+
+  for (const s of sessions) {
+    const t = Date.parse(s.started_at);
+    if (Number.isNaN(t)) {
+      buckets.Earlier.push(s);
+      continue;
+    }
+    if (t >= startOfToday) buckets.Today.push(s);
+    else if (t >= startOfYesterday) buckets.Yesterday.push(s);
+    else if (t >= startOfThisWeek) buckets['This week'].push(s);
+    else if (t >= startOfLastWeek) buckets['Last week'].push(s);
+    else if (t >= startOfThisMonth) buckets['This month'].push(s);
+    else buckets.Earlier.push(s);
+  }
+
+  // Sort each bucket newest-first, then drop empty ones.
+  const order = ['Today', 'Yesterday', 'This week', 'Last week', 'This month', 'Earlier'];
+  return order
+    .map<[string, T[]]>((label) => {
+      const arr = buckets[label].slice().sort(
+        (a, b) => Date.parse(b.started_at) - Date.parse(a.started_at),
+      );
+      return [label, arr];
+    })
+    .filter(([, arr]) => arr.length > 0);
 }

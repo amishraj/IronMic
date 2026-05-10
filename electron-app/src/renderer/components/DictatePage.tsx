@@ -22,13 +22,8 @@
 
 import { useEffect, useRef, useCallback, useState } from 'react';
 import { useEditor, EditorContent } from '@tiptap/react';
-import StarterKit from '@tiptap/starter-kit';
 import Placeholder from '@tiptap/extension-placeholder';
-import Underline from '@tiptap/extension-underline';
-import TextAlign from '@tiptap/extension-text-align';
-import Highlight from '@tiptap/extension-highlight';
-import Link from '@tiptap/extension-link';
-import Typography from '@tiptap/extension-typography';
+import { buildSharedExtensions } from '../../shared/tiptapExtensions';
 import {
   Bold, Italic, Underline as UnderlineIcon, Strikethrough,
   Heading1, Heading2, Heading3, List, ListOrdered,
@@ -393,13 +388,16 @@ export function DictatePage() {
 
   const editor = useEditor({
     extensions: [
-      StarterKit.configure({ heading: { levels: [1, 2, 3] } }),
+      // Shared structural extensions — same set the polish-pipeline's
+      // @tiptap/html generateJSON uses in main, so the JSON it produces
+      // round-trips losslessly into THIS editor (Table + TaskList + the
+      // standard StarterKit extensions). Drift here would corrupt rich
+      // polish output silently.
+      ...buildSharedExtensions(),
+      // Page-specific extras: placeholder + the live-dictation overlay
+      // (DraftHypothesisExtension paints the in-flight Moonshine
+      // hypothesis) and the read-back highlighter.
       Placeholder.configure({ placeholder: 'Click Dictate and start speaking — words appear here live. Or type directly.' }),
-      Underline,
-      TextAlign.configure({ types: ['heading', 'paragraph'] }),
-      Highlight.configure({ multicolor: false }),
-      Link.configure({ openOnClick: false, HTMLAttributes: { class: '' } }),
-      Typography,
       DraftHypothesisExtension,
       TtsHighlightExtension,
     ],
@@ -1940,9 +1938,15 @@ export function DictatePage() {
         <ToolbarBtn onClick={setLink} active={editor.isActive('link')} icon={<LinkIcon className="w-3.5 h-3.5" />} title="Link" />
       </div>
 
-      {/* Editor */}
-      <div className={`flex-1 overflow-y-auto relative${status === 'recording' && draftHypothesis ? ' has-draft-hypothesis' : ''}`}>
-        <EditorContent editor={editor} />
+      {/* Editor — outer wrapper is `relative` and non-scrolling so the polish
+          overlay's `absolute inset-0` covers the full viewport regardless of
+          how tall the editor's content is. Previously the overlay was inside
+          the scroll container; `inset-0` then resolved to the scroll content
+          area, which left the lower portion of the editor uncovered. */}
+      <div className="flex-1 relative overflow-hidden">
+        <div className={`absolute inset-0 overflow-y-auto${status === 'recording' && draftHypothesis ? ' has-draft-hypothesis' : ''}`}>
+          <EditorContent editor={editor} />
+        </div>
         {isPolishing && (
           <div
             className="absolute inset-0 bg-iron-bg/70 backdrop-blur-[2px] flex items-center justify-center z-10 pointer-events-auto"

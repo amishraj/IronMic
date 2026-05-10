@@ -161,13 +161,21 @@ async function handleRecordingAction(
         return;
       }
 
-      // LLM cleanup
+      // LLM cleanup. Use the detailed variant so we get the rich projection
+      // (jsonString) for polished_text_json alongside the plain projection
+      // for polished_text. Both columns are written atomically below; the
+      // NoteEditor's "fetch latest entry on idle" listener depends on the
+      // jsonString being present BEFORE pipeline-state-changed 'idle' fires
+      // (it uses the rich fragment for append-into-open-note).
       const cleanupEnabled = await api.getSetting('llm_cleanup_enabled');
       let polishedText: string | null = null;
+      let polishedTextJson: string | null = null;
 
       if (cleanupEnabled === 'true' && rawTranscript.trim()) {
         try {
-          polishedText = await api.polishText(rawTranscript);
+          const detailed = await (window as any).ironmic.polishTextDetailed(rawTranscript);
+          polishedText = detailed.plainText;
+          polishedTextJson = detailed.jsonString;
         } catch {
           // LLM polish is optional — continue without it
         }
@@ -202,12 +210,16 @@ async function handleRecordingAction(
         if (sessionId) resolvedSourceApp = `ai-chat:${sessionId}`;
       }
 
-      // Save entry
+      // Save entry. We MUST await this before the 'idle' state transition at
+      // the bottom of this handler — the NoteEditor's pipeline-state listener
+      // races against the DB write and reads polished_text_json non-null
+      // depends on this entry being persisted first.
       let savedEntryId: string | null = null;
       try {
         const saved = await api.createEntry({
           rawTranscript,
           polishedText: polishedText ?? undefined,
+          polishedTextJson: polishedTextJson ?? undefined,
           durationSeconds: undefined,
           sourceApp: resolvedSourceApp ?? undefined,
         } as any);

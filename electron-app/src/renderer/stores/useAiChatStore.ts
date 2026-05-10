@@ -261,9 +261,18 @@ export const useAiChatStore = create<AiChatStore>((set, get) => ({
     const sessions = [session, ...get().sessions];
     set({ sessions, activeSessionId: id });
 
-    // Persist asynchronously through the per-session queue. The new session
-    // also gets a scoped context reset so any stale local context for this
-    // freshly-minted id (impossible in practice but cheap) is cleared.
+    // Persist asynchronously through the per-session queue.
+    //
+    // Used to enqueue a defensive `aiResetSession(id)` here too
+    // ("impossible in practice but cheap"). It wasn't cheap — it was the
+    // root cause of "claude exited with code null" on the first message
+    // of every new chat. The reset fires `aiManager.cancel()` on whatever
+    // CLI process is currently active, and there's a window where the
+    // user's first send has already spawned the Claude/Copilot process
+    // but the reset hasn't run yet. The queue then runs the reset and
+    // SIGTERMs the spawn before any output arrives. A brand-new session
+    // id has no context to clear by definition, so the enqueue was pure
+    // overhead with a sharp edge — removed.
     enqueue(id, async () => {
       const a = api();
       if (!a?.aiChatCreateSession) return;
@@ -272,10 +281,6 @@ export const useAiChatStore = create<AiChatStore>((set, get) => ({
       } catch (err) {
         console.error('[ai-chat] createSession persist failed:', err);
       }
-    });
-    enqueue(id, async () => {
-      const a = api();
-      try { await a?.aiResetSession?.(id); } catch { /* ignore */ }
     });
     return id;
   },

@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 9;
+const SCHEMA_VERSION: u32 = 11;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -149,6 +149,14 @@ impl Database {
 
         if current_version < 9 {
             self.migrate_v9(&conn)?;
+        }
+
+        if current_version < 10 {
+            self.migrate_v10(&conn)?;
+        }
+
+        if current_version < 11 {
+            self.migrate_v11(&conn)?;
         }
 
         // Update version
@@ -691,6 +699,133 @@ impl Database {
         Ok(())
     }
 
+    /// Migration v10: Intelligent polish + meeting summary formatting.
+    ///
+    /// Schema-content only — no column changes. Three things happen:
+    ///   1. Seed the new "Auto" builtin template (`builtin-auto`).
+    ///   2. Equality-guarded UPDATE on each of the 5 v4 builtin templates'
+    ///      `llm_prompt` content. The guard preserves user customizations
+    ///      (if/when the UI permits editing builtin prompts) by only
+    ///      writing when the current value matches the v4 baseline byte-
+    ///      for-byte.
+    ///   3. Default-flip: set `meeting_default_template = 'builtin-auto'`
+    ///      for users where it's still the v4 default empty string.
+    ///   4. Seed `polish_format_mode = 'rich'` for users where the setting
+    ///      isn't yet present.
+    ///
+    /// Existing installs migrate to the upgraded prompts atomically here.
+    /// Fresh installs get the same prompts via `seed_builtin_templates`,
+    /// which is updated to seed v10 prompts directly (the new Auto plus
+    /// the upgraded 5 — see below).
+    fn migrate_v10(&self, conn: &Connection) -> Result<(), IronMicError> {
+        use crate::llm::v4_template_prompts as t;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // 1. Seed the new "Auto" template. Idempotent on builtin-auto id.
+        conn.execute(
+            "INSERT OR IGNORE INTO meeting_templates
+                (id, name, meeting_type, sections, llm_prompt, display_layout, is_builtin, created_at, updated_at)
+             VALUES ('builtin-auto', ?1, ?2, ?3, ?4, ?5, 1, ?6, ?6)",
+            rusqlite::params![
+                t::AUTO_TEMPLATE_NAME,
+                t::AUTO_TEMPLATE_TYPE,
+                t::AUTO_TEMPLATE_SECTIONS,
+                t::AUTO_TEMPLATE_PROMPT,
+                t::AUTO_TEMPLATE_LAYOUT,
+                now,
+            ],
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v10 seed Auto failed: {e}")))?;
+
+        // 2. Upgrade the 5 existing builtin templates' prompts.
+        // Conditional UPDATE — fires only when current llm_prompt matches
+        // the v4 baseline (byte-equal). Preserves user customizations.
+        let upgrades: [(&str, &str, &str); 5] = [
+            ("builtin-standup",  t::V4_STANDUP_PROMPT,   t::V10_STANDUP_PROMPT),
+            ("builtin-1on1",     t::V4_1ON1_PROMPT,      t::V10_1ON1_PROMPT),
+            ("builtin-discovery", t::V4_DISCOVERY_PROMPT, t::V10_DISCOVERY_PROMPT),
+            ("builtin-team-sync", t::V4_TEAM_SYNC_PROMPT, t::V10_TEAM_SYNC_PROMPT),
+            ("builtin-retro",    t::V4_RETRO_PROMPT,     t::V10_RETRO_PROMPT),
+        ];
+        for (id, expected, replacement) in upgrades.iter() {
+            conn.execute(
+                "UPDATE meeting_templates
+                 SET llm_prompt = ?2, updated_at = ?3
+                 WHERE id = ?1 AND llm_prompt = ?4",
+                rusqlite::params![id, replacement, now, expected],
+            )
+            .map_err(|e| IronMicError::Storage(format!("Migration v10 upgrade {id} failed: {e}")))?;
+        }
+
+        // 3. Default-flip meeting_default_template only when still empty.
+        // Preserves any user-set choice (including legacy template IDs).
+        conn.execute(
+            "UPDATE settings SET value = 'builtin-auto'
+             WHERE key = 'meeting_default_template' AND value = ''",
+            [],
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v10 default flip failed: {e}")))?;
+
+        // 4. Seed polish_format_mode = 'rich' (idempotent).
+        conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value)
+             VALUES ('polish_format_mode', 'rich')",
+            [],
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v10 settings seed failed: {e}")))?;
+
+        info!("Migration v10 applied: Auto template seeded, 5 builtin prompts upgraded, polish_format_mode default seeded");
+        Ok(())
+    }
+
+    /// Migration v11: simplify the Default (formerly "Auto") template.
+    ///
+    /// The v10 prompt asked the local Phi-3-mini-Q2_K to (a) classify the
+    /// meeting type into one of 8 categories and (b) emit a layout from a
+    /// per-category spec. Too much instruction-following for the small
+    /// model — it routinely returned the `[INSUFFICIENT_CONTENT]` escape
+    /// hatch on perfectly good transcripts. v11 replaces that with a
+    /// single fixed structured layout (TL;DR / Decisions / Discussion /
+    /// Action Items / Open Questions) that both local and cloud models
+    /// follow reliably, and renames the user-facing label from
+    /// "Auto (smart format)" → "Default".
+    ///
+    /// Equality guards on the v10 baseline preserve any user-customized
+    /// builtin-auto rows (if/when the UI ever permits editing builtin
+    /// templates).
+    fn migrate_v11(&self, conn: &Connection) -> Result<(), IronMicError> {
+        use crate::llm::v4_template_prompts as t;
+        let now = chrono::Utc::now().to_rfc3339();
+
+        // Update name + prompt + sections + layout in a single statement
+        // so a partial v10 row (e.g. user customized only the prompt)
+        // doesn't get split between v10/v11 shapes.
+        conn.execute(
+            "UPDATE meeting_templates
+             SET name = ?1,
+                 llm_prompt = ?2,
+                 sections = ?3,
+                 display_layout = ?4,
+                 updated_at = ?5
+             WHERE id = 'builtin-auto'
+               AND name = ?6
+               AND llm_prompt = ?7",
+            rusqlite::params![
+                t::AUTO_TEMPLATE_NAME,           // ?1 — new name "Default"
+                t::AUTO_TEMPLATE_PROMPT,         // ?2 — new simplified prompt
+                t::AUTO_TEMPLATE_SECTIONS,       // ?3 — new sections list
+                t::AUTO_TEMPLATE_LAYOUT,         // ?4 — new layout
+                now,                             // ?5 — updated_at
+                t::V10_AUTO_TEMPLATE_NAME,       // ?6 — equality guard (name)
+                t::V10_AUTO_TEMPLATE_PROMPT,     // ?7 — equality guard (prompt)
+            ],
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v11 update Default template failed: {e}")))?;
+
+        info!("Migration v11 applied: Default template prompt simplified, name updated");
+        Ok(())
+    }
+
     fn seed_builtin_templates(&self, conn: &Connection) -> Result<(), IronMicError> {
         let now = chrono::Utc::now().to_rfc3339();
         let templates = vec![
@@ -800,6 +935,196 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn migration_v10_seeds_auto_template_and_upgrades_builtins() {
+        use crate::llm::v4_template_prompts as t;
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // builtin-auto exists with the new prompt + sections.
+        let auto_prompt: String = conn
+            .query_row(
+                "SELECT llm_prompt FROM meeting_templates WHERE id='builtin-auto'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_prompt, t::AUTO_TEMPLATE_PROMPT);
+
+        let auto_sections: String = conn
+            .query_row(
+                "SELECT sections FROM meeting_templates WHERE id='builtin-auto'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(auto_sections, t::AUTO_TEMPLATE_SECTIONS);
+
+        // Each existing builtin was upgraded from V4 baseline to V10.
+        // (Fresh-install path: v4 seeds V4, then v10 UPDATEs to V10.)
+        for (id, expected) in [
+            ("builtin-standup", t::V10_STANDUP_PROMPT),
+            ("builtin-1on1", t::V10_1ON1_PROMPT),
+            ("builtin-discovery", t::V10_DISCOVERY_PROMPT),
+            ("builtin-team-sync", t::V10_TEAM_SYNC_PROMPT),
+            ("builtin-retro", t::V10_RETRO_PROMPT),
+        ] {
+            let prompt: String = conn
+                .query_row(
+                    "SELECT llm_prompt FROM meeting_templates WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|e| panic!("failed to read {id}: {e}"));
+            assert_eq!(prompt, expected, "template {id} not upgraded to V10");
+        }
+
+        // meeting_default_template flipped from '' to 'builtin-auto' on
+        // the fresh install.
+        let default_template: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='meeting_default_template'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(default_template, "builtin-auto");
+
+        // polish_format_mode seeded.
+        let mode: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='polish_format_mode'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mode, "rich");
+    }
+
+    #[test]
+    fn migration_v10_preserves_user_customized_templates() {
+        // Simulate an existing install where the user customized a builtin
+        // template's prompt before v10 ran. The equality guard should NOT
+        // overwrite their customization.
+        use crate::llm::v4_template_prompts as t;
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // Replace standup prompt with a user-edited version (matches neither V4 nor V10).
+        const USER_PROMPT: &str = "USER CUSTOM standup prompt — do not overwrite";
+        conn.execute(
+            "UPDATE meeting_templates SET llm_prompt = ?1 WHERE id = 'builtin-standup'",
+            [USER_PROMPT],
+        )
+        .unwrap();
+
+        // Re-run the v10 migration. (open_in_memory already ran it once;
+        // call directly to simulate re-application as if a cold-resume hit
+        // the migration again — defensive idempotency check.)
+        db.migrate_v10(&conn).unwrap();
+
+        // User customization preserved — equality guard prevents overwrite.
+        let prompt: String = conn
+            .query_row(
+                "SELECT llm_prompt FROM meeting_templates WHERE id='builtin-standup'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompt, USER_PROMPT);
+
+        // Other builtins still got the V10 upgrade — only the modified one was protected.
+        let one_on_one: String = conn
+            .query_row(
+                "SELECT llm_prompt FROM meeting_templates WHERE id='builtin-1on1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(one_on_one, t::V10_1ON1_PROMPT);
+    }
+
+    #[test]
+    fn migration_v11_renames_auto_to_default_and_simplifies_prompt() {
+        use crate::llm::v4_template_prompts as t;
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // After fresh install (which runs through v11), the Default template
+        // exists with the simplified prompt + the new label.
+        let (name, prompt, sections, layout): (String, String, String, String) = conn
+            .query_row(
+                "SELECT name, llm_prompt, sections, display_layout FROM meeting_templates WHERE id='builtin-auto'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(name, t::AUTO_TEMPLATE_NAME);
+        assert_eq!(name, "Default");
+        assert_eq!(prompt, t::AUTO_TEMPLATE_PROMPT);
+        assert_eq!(sections, t::AUTO_TEMPLATE_SECTIONS);
+        assert_eq!(layout, t::AUTO_TEMPLATE_LAYOUT);
+        // The new prompt removes the [INSUFFICIENT_CONTENT] escape hatch.
+        assert!(!prompt.contains("INSUFFICIENT_CONTENT"));
+    }
+
+    #[test]
+    fn migration_v11_preserves_user_customized_auto_template() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // Simulate a user who customized the auto template post-v10.
+        const USER_PROMPT: &str = "USER CUSTOMIZED auto prompt — do not overwrite";
+        const USER_NAME: &str = "My Custom Auto";
+        conn.execute(
+            "UPDATE meeting_templates
+             SET name = ?1, llm_prompt = ?2
+             WHERE id = 'builtin-auto'",
+            [USER_NAME, USER_PROMPT],
+        )
+        .unwrap();
+
+        // Re-run v11 — it should be a no-op for this row because the
+        // equality guard requires the v10 baseline name AND prompt.
+        db.migrate_v11(&conn).unwrap();
+
+        let (name, prompt): (String, String) = conn
+            .query_row(
+                "SELECT name, llm_prompt FROM meeting_templates WHERE id='builtin-auto'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(name, USER_NAME);
+        assert_eq!(prompt, USER_PROMPT);
+    }
+
+    #[test]
+    fn migration_v10_preserves_user_default_template_choice() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // Simulate user picking a non-empty default before v10.
+        conn.execute(
+            "UPDATE settings SET value = 'builtin-retro' WHERE key = 'meeting_default_template'",
+            [],
+        )
+        .unwrap();
+
+        // Re-run v10.
+        db.migrate_v10(&conn).unwrap();
+
+        // User's choice preserved — only empty values get flipped to builtin-auto.
+        let chosen: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE key='meeting_default_template'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(chosen, "builtin-retro");
     }
 
     #[test]

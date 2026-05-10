@@ -270,15 +270,19 @@ export class IntentClassifier {
 
   private async classifyWithLLM(transcript: string): Promise<ClassifiedIntent | null> {
     const ironmic = (window as any).ironmic;
-    if (!ironmic?.polishText) return null;
+    if (!ironmic?.generateText) return null;
 
     try {
-      const prompt = `Classify this voice command into one of these intents: ${INTENTS.join(', ')}.
-Return ONLY a JSON object: {"intent": "...", "entities": {}}
+      const systemPrompt = `Classify the voice command into one of these intents: ${INTENTS.join(', ')}.
+Return ONLY a JSON object: {"intent": "...", "entities": {}}`;
 
-Voice command: "${transcript}"`;
-
-      const response = await ironmic.polishText(prompt);
+      // Migrated from polishText (which baked in the cleanup prompt — wrong
+      // for classification). generateText is the generic LLM transport.
+      const result = await ironmic.generateText(systemPrompt, `Voice command: "${transcript}"`, {
+        maxTokens: 128,
+        temperature: 0.1,
+      });
+      const response = result.text;
       // Try to parse JSON from response
       const jsonMatch = response.match(/\{[\s\S]*\}/);
       if (jsonMatch) {

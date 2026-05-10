@@ -15,9 +15,16 @@ const api = {
   transcribe: (audioBuffer: Buffer) => ipcRenderer.invoke('ironmic:transcribe', audioBuffer),
   polishText: (rawText: string, opts?: { requireModel?: boolean }) =>
     ipcRenderer.invoke('ironmic:polish-text', rawText, opts),
-  // Detailed variant for the toggle-driven polish UI: returns
-  // { text, providerUsed } so the UI can render a "via Claude/Copilot/local"
-  // badge after a successful polish. Existing callers stay on polishText.
+  // Detailed variant for the toggle-driven polish UI: returns the full
+  // projection set so callers that persist entries can store both
+  // polished_text (plain) and polished_text_json (rich) atomically.
+  //
+  //   - markdown:    raw LLM output (verbatim, for export / round-trip)
+  //   - plainText:   markdown stripped (FTS / TTS / clipboard / exports)
+  //   - html:        sanitize-html-approved (safe for dangerouslySetInnerHTML)
+  //   - jsonString:  JSON.stringify of ProseMirror JSON (parse for setContent)
+  //   - providerUsed: 'claude' | 'copilot' | 'local' for the "via X" badge
+  //   - text:        legacy field equal to plainText, kept for back-compat
   polishTextDetailed: (rawText: string, opts?: { requireModel?: boolean }) =>
     ipcRenderer.invoke('ironmic:polish-text-detailed', rawText, opts),
   // Strictly local-only polish — bypasses polish_allow_cloud. For callers
@@ -25,6 +32,33 @@ const api = {
   // generation) regardless of the user's polish setting.
   polishTextLocal: (rawText: string, opts?: { requireModel?: boolean }) =>
     ipcRenderer.invoke('ironmic:polish-text-local', rawText, opts),
+  // Generic LLM transport. Caller owns the system prompt (no cleanup prompt
+  // is layered on top). Use this for meeting summarization, template
+  // generation, intent classification fallback, meeting detection — anything
+  // that ISN'T a polish pass. Returns { text, providerUsed }.
+  // opts: maxTokens (clamped 1..4096), temperature (clamped 0..1), forceLocal.
+  generateText: (
+    systemPrompt: string,
+    userPrompt: string,
+    opts?: { maxTokens?: number; temperature?: number; forceLocal?: boolean },
+  ) => ipcRenderer.invoke('ironmic:generate-text', systemPrompt, userPrompt, opts),
+  // Same as generateText but with forceLocal pinned on. For callers (e.g.
+  // AI title generation) that must never touch cloud regardless of user setting.
+  generateTextLocal: (
+    systemPrompt: string,
+    userPrompt: string,
+    opts?: { maxTokens?: number; temperature?: number },
+  ) => ipcRenderer.invoke('ironmic:generate-text-local', systemPrompt, userPrompt, opts),
+  // Markdown → { plainText, html, jsonString } projections from the main-side
+  // sanitization pipeline. Renderer never imports the pipeline directly.
+  // jsonString is JSON.stringify(ProseMirror JSON) — caller does JSON.parse
+  // when feeding the editor.
+  convertMarkdown: (md: string) =>
+    ipcRenderer.invoke('ironmic:convert-markdown', md) as Promise<{
+      plainText: string;
+      html: string;
+      jsonString: string;
+    }>,
 
   // Entries
   createEntry: (entry: any) => ipcRenderer.invoke('ironmic:create-entry', entry),

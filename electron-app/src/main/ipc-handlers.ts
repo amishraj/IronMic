@@ -25,6 +25,7 @@ import { checkBlackHoleInstalled, installBlackHole, openAudioMidiSetup, broadcas
 import { audioStream } from './audio-stream-manager';
 import { debugLog, invalidateDebugLogCache } from './debug-log';
 import { computeRmsPcm16 } from './transcribe-clean';
+import { markdownToProjections } from './utils/markdownPipeline';
 import { execFile } from 'child_process';
 import {
   enterForgeMode,
@@ -89,7 +90,14 @@ const ALLOWED_SETTING_KEYS = new Set([
   // Polish provider preference. 'true' enables cloud polish via authenticated
   // Claude/Copilot CLIs; default 'false' keeps polish strictly on-device.
   // The renderer Settings panel surfaces this with a privacy warning + confirm.
+  // Note: this setting now also gates non-polish AI tasks (meeting summaries,
+  // template generation, intent classification, meeting detection) via
+  // generateText. Settings UI copy reflects the broader scope.
   'polish_allow_cloud',
+  // Format mode for polished output and meeting summaries. 'rich' (default)
+  // produces structured markdown rendered as TipTap content; 'plain' falls
+  // back to the legacy flat-text behavior. Seeded by migration v10.
+  'polish_format_mode',
   // Developer features escape hatch. 'true' surfaces legacy/experimental
   // controls (e.g. Solo meeting mode). Default 'false'.
   'dev_features_enabled',
@@ -295,29 +303,75 @@ export function registerIpcHandlers(): void {
     }
   };
 
-  // Backward-compat: existing callers (useRecordingStore, useNotesStore,
-  // SummaryGenerator, MeetingDetector, MeetingTemplateEngine, IntentClassifier)
-  // expect a string return. Don't change that — return only result.text here.
+  // Backward-compat: existing callers (Forge polish, useNotesStore, the
+  // local Notes "Polish now" button) expect a string return. Phase 1
+  // migrated SummaryGenerator / MeetingTemplateEngine / IntentClassifier /
+  // MeetingDetector to generateText. The remaining string consumers want
+  // the plainText projection — once Phase 4's prompts emit markdown,
+  // returning result.text directly would leak `## headings` and `**bold**`
+  // syntax into clipboards / Forge pastes / plain-text fields.
   ipcMain.handle(IPC_CHANNELS.POLISH_TEXT, async (
     _e,
     rawText: string,
     opts?: { requireModel?: boolean },
   ) => {
     const result = await dispatchPolish(rawText, !!opts?.requireModel);
-    return result.text;
+    try {
+      return markdownToProjections(result.text).plainText;
+    } catch {
+      // Pipeline failure → fall back to verbatim text (matches old behavior).
+      return result.text;
+    }
   });
 
-  // New channel for the toggle-driven polish flow that wants to know which
-  // provider produced the output (for the "via X" badge next to the toggle).
+  // New channel for the toggle-driven polish flow.
+  //
+  // Returns the full projection set so callers that persist entries can
+  // store both polished_text (plain) and polished_text_json (rich).
+  // Renderer-facing contract is strings only — `jsonString` not `json`.
+  // The markdown projection is the LLM output; cloud + local converge on
+  // markdown going forward (Phase 4 lands the prompts that exploit this).
   ipcMain.handle(IPC_CHANNELS.POLISH_TEXT_DETAILED, async (
     _e,
     rawText: string,
     opts?: { requireModel?: boolean },
-  ) => dispatchPolish(rawText, !!opts?.requireModel));
+  ) => {
+    const result = await dispatchPolish(rawText, !!opts?.requireModel);
+    // The polish pass already returns text. In Phase 4 the prompt instructs
+    // the model to emit markdown; today's prompt instructs plain text. Either
+    // way, we run the result through the markdown pipeline so callers always
+    // get all three projections — plain markdown becomes a single-paragraph
+    // ProseMirror doc (no harm), formatted markdown becomes structured.
+    let projections;
+    try {
+      projections = markdownToProjections(result.text);
+    } catch {
+      // If the pipeline somehow fails (e.g. malformed LLM output), fall back
+      // to the raw text in all three slots so callers don't crash.
+      projections = {
+        plainText: result.text,
+        html: '',
+        json: { type: 'doc', content: [] },
+      };
+    }
+    return {
+      // markdown is the verbatim LLM output (stable contract for callers
+      // that want it for export / round-trip).
+      markdown: result.text,
+      plainText: projections.plainText,
+      html: projections.html,
+      jsonString: JSON.stringify(projections.json),
+      providerUsed: result.providerUsed,
+      // Back-compat: keep `text` so existing callers reading `.text` still work
+      // until they migrate. Equal to `plainText` to avoid markdown bleed.
+      text: projections.plainText,
+    };
+  });
 
   // Strictly local-only polish. Used by callers (e.g. AI title generation)
   // that must never route to a cloud provider regardless of the user's
-  // polish_allow_cloud setting. Returns only text to match POLISH_TEXT.
+  // polish_allow_cloud setting. Returns only the plainText projection to
+  // match POLISH_TEXT and preserve "string consumers never see markdown".
   ipcMain.handle(IPC_CHANNELS.POLISH_TEXT_LOCAL, async (
     _e,
     rawText: string,
@@ -326,13 +380,99 @@ export function registerIpcHandlers(): void {
     const requireModel = !!opts?.requireModel;
     try {
       const result = await aiManager.polish(rawText, { allowCloud: false });
-      return result.text;
+      try {
+        return markdownToProjections(result.text).plainText;
+      } catch {
+        return result.text;
+      }
     } catch (err: any) {
       if (!requireModel && err?.message?.includes('Cleanup model not downloaded')) {
         return rawText;
       }
       throw err;
     }
+  });
+
+  // ── Generic LLM transport (caller owns the system prompt) ──
+  // Used by SummaryGenerator, MeetingTemplateEngine, IntentClassifier,
+  // MeetingDetector, etc. — anything that needs an LLM completion that ISN'T
+  // a polish pass. Live summary stays on its own llmSubprocess path because
+  // it needs abort-signal cancellation that this wrapper doesn't provide.
+  //
+  // Renderer-supplied opts can only NARROW permissions:
+  //   - forceLocal: true → bypass cloud regardless of polish_allow_cloud
+  //   - maxTokens, temperature → clamped here, never trusted verbatim
+  // Cloud allowance always read from main-process settings, never opts.
+  const clamp = (n: number, lo: number, hi: number) =>
+    Math.max(lo, Math.min(hi, n));
+  const dispatchGenerate = async (
+    systemPrompt: string,
+    userPrompt: string,
+    opts: { forceLocal?: boolean; maxTokens?: number; temperature?: number } | undefined,
+  ): Promise<{ text: string; providerUsed: AIProvider }> => {
+    if (typeof systemPrompt !== 'string' || typeof userPrompt !== 'string') {
+      throw new Error('generateText requires string system and user prompts');
+    }
+    if (systemPrompt.length + userPrompt.length > MAX_PROMPT_LENGTH) {
+      throw new Error(
+        `generateText prompts too long: ${systemPrompt.length + userPrompt.length} chars (max ${MAX_PROMPT_LENGTH})`,
+      );
+    }
+    const maxTokens = clamp(Number(opts?.maxTokens ?? 1024), 1, 4096);
+    const temperature = clamp(Number(opts?.temperature ?? 0.2), 0, 1);
+    let allowCloud = false;
+    if (!opts?.forceLocal) {
+      try {
+        allowCloud = native.getSetting('polish_allow_cloud') === 'true';
+      } catch { /* setting absent → default false */ }
+    }
+    return aiManager.generate(systemPrompt, userPrompt, { allowCloud, maxTokens, temperature });
+  };
+
+  ipcMain.handle(IPC_CHANNELS.GENERATE_TEXT, async (
+    _e,
+    systemPrompt: string,
+    userPrompt: string,
+    opts?: { forceLocal?: boolean; maxTokens?: number; temperature?: number },
+  ) => {
+    const result = await dispatchGenerate(systemPrompt, userPrompt, opts);
+    return { text: result.text, providerUsed: result.providerUsed };
+  });
+
+  // Strictly local generic transport. Same shape as GENERATE_TEXT but with
+  // forceLocal pinned on, for callers (e.g. AI title generation) that must
+  // never touch cloud regardless of user setting.
+  ipcMain.handle(IPC_CHANNELS.GENERATE_TEXT_LOCAL, async (
+    _e,
+    systemPrompt: string,
+    userPrompt: string,
+    opts?: { maxTokens?: number; temperature?: number },
+  ) => {
+    const result = await dispatchGenerate(systemPrompt, userPrompt, {
+      ...opts,
+      forceLocal: true,
+    });
+    return { text: result.text, providerUsed: result.providerUsed };
+  });
+
+  // Markdown → { plainText, html, jsonString } projections.
+  // Renderer never imports the pipeline directly — it goes through this IPC
+  // so sanitize-html and Marked's HTML-dropping tokenizer run in main, where
+  // they can be audited as a single security-relevant codepath. Renderer
+  // consumes the strings: html for `dangerouslySetInnerHTML`, jsonString
+  // for `editor.commands.setContent(JSON.parse(jsonString))`.
+  ipcMain.handle(IPC_CHANNELS.CONVERT_MARKDOWN, async (_e, md: string) => {
+    if (typeof md !== 'string') {
+      throw new Error('convertMarkdown requires a string input');
+    }
+    if (md.length > MAX_PROMPT_LENGTH) {
+      throw new Error(`convertMarkdown markdown too long: ${md.length} chars (max ${MAX_PROMPT_LENGTH})`);
+    }
+    const { plainText, html, json } = markdownToProjections(md);
+    // Crossing the IPC boundary: object → string. Renderer types declare
+    // jsonString, never object — see the `convertMarkdown` typing in the
+    // global Window.ironmic interface.
+    return { plainText, html, jsonString: JSON.stringify(json) };
   });
 
   // ── Processing state tracking (for quit-confirmation) ──

@@ -109,6 +109,17 @@ export function VoiceChatOverlay({
 
   const showManualFallbackBanner = engine !== 'moonshine-session' && engine !== 'unknown';
 
+  // What text to show prominently as "the AI is talking":
+  //   - while THINKING (streaming tokens are arriving) → show the live stream
+  //     so the user sees words appear as the model produces them
+  //   - while SPEAKING (TTS playing the completed response) → show the same
+  //     full text the TTS is reading, so the user can read along
+  //   - otherwise → no live text panel (last reply still shown as caption)
+  const liveAiText =
+    phase === 'thinking' && streaming ? streaming
+    : phase === 'speaking' ? (lastAiReply ?? streaming)
+    : '';
+
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center bg-iron-bg/90 backdrop-blur-sm">
       <button
@@ -120,7 +131,7 @@ export function VoiceChatOverlay({
         <X className="w-4 h-4" />
       </button>
 
-      <div className="w-full max-w-md mx-auto px-6 flex flex-col items-center">
+      <div className="w-full max-w-2xl mx-auto px-6 flex flex-col items-center">
         {/* Phase pill */}
         <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-iron-surface border border-iron-border">
           <span className="relative flex h-2 w-2">
@@ -181,11 +192,40 @@ export function VoiceChatOverlay({
           </div>
         )}
 
-        {/* Last AI reply caption — context for what's being spoken aloud. */}
-        {lastAiReply && (
+        {/* Live AI panel — prominent during thinking/speaking so the user
+            reads the assistant's words AS they're produced (thinking) and
+            AS they're spoken (speaking). Replaces the previous small grey
+            line-clamped caption that read like an afterthought. */}
+        {liveAiText && (phase === 'thinking' || phase === 'speaking') && (
+          <div className="mt-6 w-full">
+            <div className="flex items-center gap-2 mb-1.5 justify-center">
+              <span className="text-[10px] uppercase tracking-wider text-iron-text-muted">
+                {phase === 'thinking' ? 'AI is thinking…' : 'AI is speaking…'}
+              </span>
+              {phase === 'thinking' && (
+                <span className="inline-flex w-1 h-1 rounded-full bg-iron-accent animate-pulse" />
+              )}
+            </div>
+            <div className="max-h-[40vh] overflow-y-auto rounded-xl bg-iron-surface/80 border border-iron-border px-5 py-4">
+              <p className="text-base leading-relaxed text-iron-text whitespace-pre-wrap">
+                {liveAiText}
+                {phase === 'thinking' && (
+                  // Visible blinking caret so the panel feels alive while the
+                  // model is still emitting tokens. Disappears once we flip
+                  // into the speaking phase (TTS reading the full text).
+                  <span className="inline-block w-[2px] h-4 ml-0.5 align-middle bg-iron-accent-light animate-pulse" />
+                )}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {/* Last reply caption — only shown when the AI is idle/listening so
+            the user has visual context for what was last said aloud. During
+            thinking/speaking the live panel above takes over. */}
+        {lastAiReply && phase !== 'thinking' && phase !== 'speaking' && (
           <p className="mt-6 text-xs text-iron-text-muted text-center max-w-prose line-clamp-3">
-            {phase === 'speaking' || phase === 'thinking' ? '' : 'Last reply: '}
-            {phase === 'thinking' && streaming ? streaming : lastAiReply}
+            Last reply: {lastAiReply}
           </p>
         )}
 

@@ -26,25 +26,46 @@ export interface StructuredMeetingOutput {
   templateName: string;
   sections: StructuredSection[];
   rawOutput: string;
+  /** Sanitized HTML from the markdown pipeline. Populated in 'rich' mode
+   *  via convertMarkdown; absent in plain mode so MeetingNotesPanel falls
+   *  through to the section-block UI. */
+  htmlContent?: string;
 }
 
-/** Human-readable section titles */
+/** Human-readable section titles. Keys must cover every section id used by
+ *  any seeded template — when a key is missing, parseSections falls back
+ *  to the raw lowercase key as the title, which then gets serialized into
+ *  the auto-filed notebook entry as `## tldr` instead of `## TL;DR`. */
 const SECTION_TITLES: Record<string, string> = {
+  // Default (builtin-auto) template keys
+  tldr: 'TL;DR',
+  discussion: 'Discussion',
+  // Standup
   completed: 'Completed',
   in_progress: 'In Progress',
   blockers: 'Blockers',
+  // 1-on-1
   discussion_points: 'Discussion Points',
   action_items: 'Action Items',
   feedback: 'Feedback',
+  follow_ups: 'Follow-ups',
+  // Discovery
   pain_points: 'Pain Points',
   requirements: 'Requirements',
   next_steps: 'Next Steps',
   budget_timeline: 'Budget & Timeline',
+  // Team sync
   updates: 'Updates',
   decisions: 'Decisions',
   open_questions: 'Open Questions',
+  // Retro
   went_well: 'Went Well',
   improve: 'Needs Improvement',
+  // Planning
+  scope: 'Scope',
+  milestones: 'Milestones',
+  owners: 'Owners',
+  risks: 'Risks',
 };
 
 /**
@@ -57,12 +78,26 @@ export async function generateStructuredNotes(
   // Substitute transcript into the template's LLM prompt
   const prompt = template.llm_prompt.replace(/\{transcript\}/g, transcript);
 
-  // Call the LLM via the existing polishText IPC
+  // Call the LLM via the generic generateText IPC. polishText layered the
+  // cleanup system prompt on top, which conflicted with the template's own
+  // instructions — generateText is the dedicated path for non-polish
+  // completions. Pass empty system + full prompt as user; Phase 5 splits
+  // out the system/user properly when the new Auto-template prompt lands.
   const ironmic = window.ironmic;
   let rawOutput: string;
 
-  if (ironmic?.polishText && transcript.length > 20) {
-    rawOutput = await ironmic.polishText(prompt);
+  if (ironmic?.generateText && transcript.length > 20) {
+    try {
+      const result = await ironmic.generateText('', prompt, {
+        maxTokens: 1024,
+        temperature: 0.1,
+      });
+      rawOutput = result.text;
+    } catch {
+      // No model available — graceful no-op fallback (matches old polishText
+      // behavior where missing cleanup model returned input unchanged).
+      rawOutput = transcript;
+    }
   } else {
     // No LLM available — return the raw transcript organized by template
     rawOutput = transcript;
@@ -72,11 +107,30 @@ export async function generateStructuredNotes(
   const sectionKeys: string[] = JSON.parse(template.sections);
   const sections = parseSections(rawOutput, sectionKeys);
 
+  // Convert the markdown LLM output into rich projections so MeetingNotesPanel's
+  // htmlContent path lights up automatically. Plain mode skips this — sections
+  // alone preserve today's behavior. We respect polish_format_mode here even
+  // for meeting summaries because the same Settings toggle covers both surfaces.
+  let htmlContent: string | undefined;
+  let formatMode: string | null = null;
+  try {
+    formatMode = await ironmic?.getSetting?.('polish_format_mode');
+  } catch { /* ignore */ }
+  if (formatMode !== 'plain' && ironmic?.convertMarkdown && rawOutput.trim()) {
+    try {
+      const projections = await ironmic.convertMarkdown(rawOutput);
+      htmlContent = projections.html || undefined;
+    } catch {
+      // Pipeline error — fall through; downstream will render section blocks.
+    }
+  }
+
   return {
     templateId: template.id,
     templateName: template.name,
     sections,
     rawOutput,
+    htmlContent,
   };
 }
 
