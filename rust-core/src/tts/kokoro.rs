@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "tts"))]
 use std::os::windows::process::CommandExt;
 
 use tracing::{info, warn};
@@ -11,7 +11,7 @@ use tracing::{info, warn};
 /// Windows process-creation flag that suppresses the console window normally
 /// allocated for a console-subsystem child spawned by a GUI parent. Without
 /// it, every espeak-ng invocation flashes a black CMD window on screen.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "tts"))]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use crate::error::IronMicError;
