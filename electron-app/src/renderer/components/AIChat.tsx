@@ -337,12 +337,12 @@ export function AIChat() {
           if (intentJson) {
             const intent = JSON.parse(intentJson);
             filters = intent?.filters ?? {};
+            console.log('[Search] intent classified:', intent);
+          } else {
+            console.warn('[Search] ragClassifyIntent is missing — addon may be stale (restart npm run dev).');
           }
         } catch (intentErr) {
-          // Intent classification is best-effort. Falling through with
-          // empty filters means we get unfiltered retrieval + the
-          // recent-activity fallback in the Rust path.
-          console.warn('[AIChat] intent classification failed (using empty filters):', intentErr);
+          console.warn('[Search] intent classification failed (using empty filters):', intentErr);
         }
         const opts = {
           model_version: 'bge-small-en-v1.5',
@@ -350,14 +350,12 @@ export function AIChat() {
           filters,
           skip_archived: true,
         };
+        console.log('[Search] calling ragRetrieveHybrid with:', { query: text, opts });
         // Hard 12-second timeout. The retrieval call CAN take a while
         // when the IndexerService is mid-meeting-chunk (Rust addon
         // serializes SQL through one mutex). The Rust side will still
         // finish eventually, but blocking the user-visible send for
-        // longer than that is unacceptable. We fall back to sending
-        // without retrieved context — the assistant just answers from
-        // its general knowledge for this turn. Next turn will likely
-        // succeed once the indexer releases the mutex.
+        // longer than that is unacceptable.
         const retrievalPromise: Promise<string | null> = (window as any).ironmic.ragRetrieveHybrid
           ? (window as any).ironmic.ragRetrieveHybrid(text, new Uint8Array(), JSON.stringify(opts))
           : Promise.resolve(null);
@@ -366,19 +364,47 @@ export function AIChat() {
         if (json) {
           const parsed = JSON.parse(json);
           const hits: Array<{ label: string; text: string }> = parsed?.hits ?? [];
+          console.log(`[Search] retrieval returned ${hits.length} hits (fts: ${parsed?.fts_count ?? 0}, vector: ${parsed?.vector_count ?? 0})`);
           if (hits.length > 0) {
             const block = hits
               .map((h, i) => `[${i + 1}] ${h.label}\n${h.text}`)
               .join('\n\n');
             contextBlocks.push(`[Retrieved from your IronMic — ${hits.length} sources]\n${block}`);
+          } else {
+            // Zero hits even after fallback means the chunks table is
+            // empty (indexer hasn't run yet, or genuinely no content
+            // matches the filter). Fall back AGAIN — this time by
+            // dropping the filters entirely and pulling the user's most
+            // recent N raw entries directly. This guarantees the model
+            // gets SOMETHING to work with on first-use.
+            try {
+              const recentEntries = await (window as any).ironmic.listEntries?.({
+                limit: k,
+                offset: 0,
+                archived: false,
+              });
+              if (Array.isArray(recentEntries) && recentEntries.length > 0) {
+                const block = recentEntries
+                  .map((e: any, i: number) => {
+                    const body = (e.polishedText || e.rawTranscript || '').slice(0, 1200);
+                    const date = e.createdAt ? new Date(e.createdAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '';
+                    return `[${i + 1}] Dictation ${date}\n${body}`;
+                  })
+                  .join('\n\n');
+                contextBlocks.push(`[Your most recent dictations — fallback context, index may still be building]\n${block}`);
+                console.log(`[Search] fell back to ${recentEntries.length} most-recent entries directly`);
+              } else {
+                console.warn('[Search] zero hits AND no recent entries — the user genuinely has no indexable content yet.');
+              }
+            } catch (fallbackErr) {
+              console.warn('[Search] last-resort entry fallback failed:', fallbackErr);
+            }
           }
         } else {
-          console.warn('[AIChat] retrieval timed out or returned empty — sending without retrieved context.');
+          console.warn('[Search] retrieval timed out — sending without retrieved context.');
         }
       } catch (err) {
-        // Retrieval failure should never block the send. Log and continue
-        // with just attached/no context.
-        console.warn('[AIChat] retrieval failed (continuing without retrieved context):', err);
+        console.warn('[Search] retrieval failed (continuing without retrieved context):', err);
       }
     }
     if (contextBlocks.length > 0) {
