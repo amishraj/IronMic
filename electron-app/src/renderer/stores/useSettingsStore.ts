@@ -8,6 +8,10 @@ interface SettingsStore {
    *  using the legacy CLEANUP_SYSTEM_PROMPT. */
   polishFormatMode: 'rich' | 'plain';
   aiEnabled: boolean;
+  /** Whether the Ask page (Knowledge Q&A) is visible in the sidebar. Mirrors
+   *  `knowledge_qa_enabled` from settings — when false the sidebar entry
+   *  hides exactly like `aiEnabled` hides the AI Assistant entry. */
+  knowledgeQaEnabled: boolean;
   defaultView: 'timeline' | 'editor';
   theme: 'system' | 'light' | 'dark';
   loaded: boolean;
@@ -17,6 +21,7 @@ interface SettingsStore {
   setLlmCleanup: (enabled: boolean) => Promise<void>;
   setPolishFormatMode: (mode: 'rich' | 'plain') => Promise<void>;
   setAiEnabled: (enabled: boolean) => Promise<void>;
+  setKnowledgeQaEnabled: (enabled: boolean) => Promise<void>;
   setDefaultView: (view: 'timeline' | 'editor') => Promise<void>;
   setTheme: (theme: 'system' | 'light' | 'dark') => Promise<void>;
 }
@@ -26,19 +31,21 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
   llmCleanupEnabled: true,
   polishFormatMode: 'rich',
   aiEnabled: true,
+  knowledgeQaEnabled: true,
   defaultView: 'timeline',
   theme: 'system',
   loaded: false,
 
   loadSettings: async () => {
     const api = window.ironmic;
-    const [hotkey, cleanup, formatMode, ai, view, theme] = await Promise.all([
+    const [hotkey, cleanup, formatMode, ai, view, theme, kq] = await Promise.all([
       api.getSetting('hotkey_record'),
       api.getSetting('llm_cleanup_enabled'),
       api.getSetting('polish_format_mode'),
       api.getSetting('ai_enabled'),
       api.getSetting('default_view'),
       api.getSetting('theme'),
+      api.getSetting('knowledge_qa_enabled'),
     ]);
 
     const resolvedTheme = (theme as 'system' | 'light' | 'dark') || 'system';
@@ -51,6 +58,7 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
       // migrates) also resolves to 'rich' so the feature is on day one.
       polishFormatMode: formatMode === 'plain' ? 'plain' : 'rich',
       aiEnabled: ai !== 'false', // on by default
+      knowledgeQaEnabled: kq !== 'false', // on by default
       defaultView: (view as 'timeline' | 'editor') || 'timeline',
       theme: resolvedTheme,
       loaded: true,
@@ -76,6 +84,11 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
   setAiEnabled: async (enabled) => {
     await window.ironmic.setSetting('ai_enabled', String(enabled));
     set({ aiEnabled: enabled });
+  },
+
+  setKnowledgeQaEnabled: async (enabled) => {
+    await window.ironmic.setSetting('knowledge_qa_enabled', String(enabled));
+    set({ knowledgeQaEnabled: enabled });
   },
 
   setDefaultView: async (view) => {

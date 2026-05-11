@@ -190,6 +190,14 @@ function AIAssistSettings() {
   // panel so all "what does AI Assist talk to?" controls live together.
   const [allowCloudPolish, setAllowCloudPolish] = useState(false);
   const [allowCloudVoiceChat, setAllowCloudVoiceChat] = useState(false);
+  // Knowledge Q&A — Ask page settings. The cloud toggle is forward-looking:
+  // manual-attach in AIChat is governed by the user's explicit provider
+  // pick, but the future automatic-retrieval path (RAG retrieves chunks the
+  // user didn't hand-pick) needs an explicit opt-in. Surfacing it now so the
+  // posture is consistent with polish_allow_cloud / voice_chat_allow_cloud.
+  const [knowledgeQaEnabled, setKnowledgeQaEnabled] = useState(true);
+  const [knowledgeQaAllowCloud, setKnowledgeQaAllowCloud] = useState(false);
+  const [indexStats, setIndexStats] = useState<{ total: number; indexed: number; byType: Record<string, number> } | null>(null);
   const [pendingFocusKey, setPendingFocusKey] = useState<string | null>(null);
   const polishToggleRef = useRef<HTMLDivElement | null>(null);
   const voiceChatToggleRef = useRef<HTMLDivElement | null>(null);
@@ -265,6 +273,67 @@ function AIAssistSettings() {
     if (localModelStatus) setLocalModels(localModelStatus);
     setAllowCloudPolish(polishCloud === 'true');
     setAllowCloudVoiceChat(voiceChatCloud === 'true');
+
+    // Knowledge Q&A settings + index stats. Failures are silent — these
+    // settings have safe defaults and the stats card just won't render.
+    try {
+      const [kqEnabled, kqCloud] = await Promise.all([
+        api.getSetting('knowledge_qa_enabled'),
+        api.getSetting('knowledge_qa_allow_cloud'),
+      ]);
+      setKnowledgeQaEnabled(kqEnabled !== 'false'); // default ON
+      setKnowledgeQaAllowCloud(kqCloud === 'true'); // default OFF
+    } catch { /* keep defaults */ }
+    try {
+      const statsJson = await api.ragGetIndexStats?.();
+      if (statsJson) {
+        const parsed = JSON.parse(statsJson);
+        setIndexStats({
+          total: parsed.total_chunks ?? 0,
+          indexed: parsed.indexed_chunks ?? 0,
+          byType: parsed.by_source_type ?? {},
+        });
+      }
+    } catch { /* index card hidden when stats unavailable */ }
+  }
+
+  async function handleKnowledgeQaEnabledToggle(next: boolean) {
+    setKnowledgeQaEnabled(next);
+    await window.ironmic.setSetting('knowledge_qa_enabled', String(next));
+  }
+
+  async function handleKnowledgeQaCloudToggle(next: boolean) {
+    if (next) {
+      const ok = window.confirm(
+        'Allow cloud Knowledge Q&A?\n\n' +
+        'When enabled, the Ask page can send retrieved excerpts of your notes, ' +
+        'dictations, and meetings to the authenticated Claude or Copilot CLI for ' +
+        'higher-quality answers.\n\n' +
+        'This is for the automatic-retrieval Q&A path. Manually attaching content ' +
+        'in AI Chat already goes to whatever provider you have selected — that path ' +
+        'is consent-by-action and is not gated by this toggle.\n\n' +
+        'You can turn this off again at any time.',
+      );
+      if (!ok) return;
+    }
+    setKnowledgeQaAllowCloud(next);
+    await window.ironmic.setSetting('knowledge_qa_allow_cloud', String(next));
+  }
+
+  async function handleRebuildIndex() {
+    const ok = window.confirm(
+      'Rebuild the Knowledge Q&A index?\n\n' +
+      'This deletes every chunk and embedding, then re-chunks every entry, ' +
+      'meeting, and note on next Ask page visit. Your underlying content is ' +
+      'untouched. Useful if retrieval feels stale or you upgraded the embedding model.',
+    );
+    if (!ok) return;
+    try {
+      await window.ironmic.ragRebuildIndex?.();
+      setIndexStats({ total: 0, indexed: 0, byType: {} });
+    } catch (err) {
+      console.error('[settings] rebuild index failed:', err);
+    }
   }
 
   /** Confirm before turning ON either cloud opt-in — they route user content
@@ -706,6 +775,91 @@ function AIAssistSettings() {
               </div>
             </Card>
           </div>
+
+          {/* ── Knowledge Q&A (Ask page) ────────────────────────────────── */}
+          <Card variant="default" padding="md">
+            <div className="space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2 min-w-0 flex-1">
+                  <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-iron-text">Knowledge Q&A (Ask page)</p>
+                    <p className="text-xs text-iron-text-muted mt-0.5">
+                      Lets the Ask page search your notes, dictations, and meetings and answer
+                      with citations. Turn off to hide the Ask page from the sidebar. Manually
+                      attaching content in AI Chat is not affected by this toggle.
+                    </p>
+                  </div>
+                </div>
+                <Toggle checked={knowledgeQaEnabled} onChange={handleKnowledgeQaEnabledToggle} />
+              </div>
+            </div>
+          </Card>
+
+          <Card
+            variant="default"
+            padding="md"
+            className={knowledgeQaAllowCloud ? 'border-amber-500/40' : ''}
+          >
+            <div className="space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2 min-w-0 flex-1">
+                  <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-iron-text">Allow cloud Knowledge Q&A (Claude / Copilot)</p>
+                    <p className="text-xs text-iron-text-muted mt-0.5">
+                      Off by default. The Ask page auto-retrieves chunks of your content and sends
+                      them to your selected provider — turn this on to let those automatically-
+                      retrieved excerpts go to Claude or Copilot. Manual AI Chat attachments are
+                      not gated by this; that's explicit consent by the user's pick.
+                    </p>
+                  </div>
+                </div>
+                <Toggle checked={knowledgeQaAllowCloud} onChange={handleKnowledgeQaCloudToggle} />
+              </div>
+              {knowledgeQaAllowCloud && (
+                <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300">
+                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                  <span>
+                    Cloud Knowledge Q&A is enabled. The Ask page can route retrieved excerpts of
+                    your local content to Claude or Copilot when those providers are selected.
+                  </span>
+                </div>
+              )}
+            </div>
+          </Card>
+
+          {indexStats && (
+            <Card variant="default" padding="md">
+              <div className="space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2 min-w-0 flex-1">
+                    <Info className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-iron-text">Index status</p>
+                      <p className="text-xs text-iron-text-muted mt-0.5">
+                        <strong className="text-iron-text-secondary">{indexStats.total.toLocaleString()}</strong>{' '}
+                        chunks indexed
+                        {Object.keys(indexStats.byType).length > 0 && (
+                          <>
+                            {' '}({Object.entries(indexStats.byType).map(([k, v]) => `${v} ${k}`).join(', ')})
+                          </>
+                        )}.
+                        Rebuilding starts from zero on next Ask page visit; safe to do if retrieval
+                        feels stale.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleRebuildIndex}
+                    className="text-xs px-3 py-1.5 rounded-lg border border-iron-border text-iron-text-secondary hover:bg-iron-surface-hover transition-colors flex-shrink-0"
+                  >
+                    Rebuild
+                  </button>
+                </div>
+              </div>
+            </Card>
+          )}
 
           {/* Info card — contextual per provider */}
           <Card variant="default" padding="md">

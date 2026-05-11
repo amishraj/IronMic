@@ -123,6 +123,20 @@ export function AIChat() {
   const session = activeSession();
   const messages = session?.messages ?? [];
 
+  // Clear local streaming/loading state whenever the active session id
+  // changes. Without this, a partial response that was accumulating in
+  // chat A's `streaming` buffer would stay rendered as part of chat B's
+  // view after the user switched chats. The AIManager has already
+  // emitted/will continue to emit ai:output events tagged with A's id,
+  // but the global onAiOutput handler above filters those out. Here we
+  // also drop whatever buffer was already accumulated locally so the
+  // new chat starts visually clean.
+  const activeSessionId = useAiChatStore((s) => s.activeSessionId);
+  useEffect(() => {
+    setStreaming('');
+    setLoading(false);
+  }, [activeSessionId]);
+
   // Load auth & auto-create session on mount
   useEffect(() => {
     loadAuth();
@@ -150,14 +164,26 @@ export function AIChat() {
     })();
   }, []);
 
-  // Listen for streaming output
+  // Listen for streaming output. EVERY event from AIManager now carries a
+  // sessionId; we discard tokens whose session isn't the currently-active
+  // one so a long-running response from chat A doesn't bleed into chat B
+  // after the user switches. Reading activeSessionId from the store at
+  // event time (not as a closed-over value) so a session switch mid-render
+  // doesn't leave the handler comparing against stale state.
   useEffect(() => {
     const cleanupOutput = window.ironmic.onAiOutput((data: any) => {
-      if (data.type === 'text' && data.content) {
-        setStreaming((prev) => prev + data.content);
+      if (data.type !== 'text' || !data.content) return;
+      const currentSession = useAiChatStore.getState().activeSessionId;
+      if (data.sessionId && currentSession && data.sessionId !== currentSession) {
+        return; // Token belongs to a different chat — drop it.
       }
+      setStreaming((prev) => prev + data.content);
     });
-    const cleanupEnd = window.ironmic.onAiTurnEnd(() => {
+    const cleanupEnd = window.ironmic.onAiTurnEnd((data: any) => {
+      const currentSession = useAiChatStore.getState().activeSessionId;
+      if (data?.sessionId && currentSession && data.sessionId !== currentSession) {
+        return; // End event for a different chat — ignore.
+      }
       setStreaming('');
       setLoading(false);
     });

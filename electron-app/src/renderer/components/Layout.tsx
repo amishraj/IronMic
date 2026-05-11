@@ -68,7 +68,7 @@ export function Layout() {
   // recording does — without this, the icon stays idle/grey while the user
   // is dictating because useRecordingStore is the legacy non-streaming pipe.
   const dictationStatus = useDictationStore(s => s.status);
-  const { loadSettings, aiEnabled } = useSettingsStore();
+  const { loadSettings, aiEnabled, knowledgeQaEnabled } = useSettingsStore();
   const { refresh } = useEntryStore();
   const pageRef = useRef(page);
   pageRef.current = page;
@@ -182,7 +182,8 @@ export function Layout() {
 
   useEffect(() => {
     if (!aiEnabled && page === 'ai') setPage('home');
-  }, [aiEnabled, page]);
+    if (!knowledgeQaEnabled && page === 'ask') setPage('home');
+  }, [aiEnabled, knowledgeQaEnabled, page]);
 
   // Show a toast when dictation completes on a page that doesn't display the result inline
   useEffect(() => {
@@ -286,7 +287,11 @@ export function Layout() {
     setPage(target as Page);
   }, []);
 
-  const coreItems = NAV_ITEMS.filter((n) => n.section === 'core' && (n.id !== 'ai' || aiEnabled));
+  const coreItems = NAV_ITEMS.filter((n) =>
+    n.section === 'core'
+    && (n.id !== 'ai' || aiEnabled)
+    && (n.id !== 'ask' || knowledgeQaEnabled),
+  );
   const toolItems = NAV_ITEMS.filter((n) => n.section === 'tools');
   const systemItems = NAV_ITEMS.filter((n) => n.section === 'system');
 

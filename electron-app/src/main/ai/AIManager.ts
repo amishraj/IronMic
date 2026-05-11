@@ -525,7 +525,7 @@ export class AIManager {
   ): Promise<string> {
     const scopedKey = this.contextKeyFor(contextKey, sessionId);
     if (provider === 'local') {
-      return this.sendLocalMessage(prompt, window, model, scopedKey, priorMessages, systemPromptOverride);
+      return this.sendLocalMessage(prompt, window, model, scopedKey, priorMessages, systemPromptOverride, sessionId);
     }
     return this.sendCLIMessage(prompt, provider, window, model, sessionId, priorMessages);
   }
@@ -540,6 +540,11 @@ export class AIManager {
     contextKey = 'chat',
     priorMessages?: ReadonlyArray<{ role: string; content: string }>,
     systemPromptOverride?: string,
+    // Stamped onto every ai:output / ai:turn-* event so the renderer can
+    // discard tokens from a request whose owner-session is no longer the
+    // visible one (prevents "answer from chat A leaking into chat B"
+    // when the user starts a new chat mid-stream).
+    sessionId?: string | null,
   ): Promise<string> {
     // Resolve the model ID to a LOCAL model. The renderer may pass a stale
     // model ID here — most commonly when the user previously chose a cloud
@@ -604,7 +609,7 @@ export class AIManager {
     ];
 
     if (window && !window.isDestroyed()) {
-      window.webContents.send('ai:turn-start', { provider: 'local' });
+      window.webContents.send('ai:turn-start', { provider: 'local', sessionId });
     }
 
     try {
@@ -622,13 +627,14 @@ export class AIManager {
               provider: 'local',
               type: 'text',
               content: token,
+              sessionId,
             });
           }
         },
       );
 
       if (window && !window.isDestroyed()) {
-        window.webContents.send('ai:turn-end', { provider: 'local' });
+        window.webContents.send('ai:turn-end', { provider: 'local', sessionId });
       }
 
       this.getLocalHistory(contextKey).push({ role: 'assistant', content: result });
@@ -641,8 +647,9 @@ export class AIManager {
           provider: 'local',
           type: 'error',
           content: errorMsg,
+          sessionId,
         });
-        window.webContents.send('ai:turn-end', { provider: 'local' });
+        window.webContents.send('ai:turn-end', { provider: 'local', sessionId });
       }
 
       this.getLocalHistory(contextKey).pop();
@@ -708,9 +715,11 @@ export class AIManager {
     }
 
     return new Promise((resolve, reject) => {
-      // Notify UI that turn started
+      // Notify UI that turn started. sessionId stamped here lets the
+      // renderer filter so a stream that arrives after the user has
+      // switched to a different chat doesn't bleed into it.
       if (window && !window.isDestroyed()) {
-        window.webContents.send('ai:turn-start', { provider });
+        window.webContents.send('ai:turn-start', { provider, sessionId });
       }
 
       const scopedEnv = getScopedSpawnEnv(provider);
@@ -742,6 +751,7 @@ export class AIManager {
           const parsed = adapter.parseOutput(text);
           window.webContents.send('ai:output', {
             provider,
+            sessionId,
             ...parsed,
           });
         }
@@ -766,7 +776,7 @@ export class AIManager {
         this.activeProcessSessionId = null;
 
         if (window && !window.isDestroyed()) {
-          window.webContents.send('ai:turn-end', { provider });
+          window.webContents.send('ai:turn-end', { provider, sessionId });
         }
 
         if (code === 0) {

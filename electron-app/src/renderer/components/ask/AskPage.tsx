@@ -37,6 +37,11 @@ type Phase = 'idle' | 'retrieving' | 'retrieved' | 'streaming' | 'done' | 'error
 
 interface AskState {
   phase: Phase;
+  /** Synthetic id passed to AIManager so the renderer can filter ai:output
+   *  events. Different from `requestId` (which scopes the knowledge:ask-event
+   *  stream). The same value is what gets stamped on every `ai:output`
+   *  payload for this turn — we drop tokens whose sessionId doesn't match. */
+  askSessionId: string | null;
   /** What the user asked — frozen at send time so the input box is free
    *  to be re-typed mid-stream. */
   query: string;
@@ -60,6 +65,7 @@ interface AskState {
 
 const initialState: AskState = {
   phase: 'idle',
+  askSessionId: null,
   query: '',
   answer: '',
   sources: [],
@@ -176,11 +182,14 @@ export function AskPage() {
     });
 
     // Token text from AIManager streams on the existing `ai:output` channel.
+    // We filter on `askSessionId` so a stream from a stale request (or from
+    // AIChat if it ever co-rendered) can't bleed into the current answer.
     const offTokens = (window as any).ironmic.onAiOutput?.((data: any) => {
-      if (stateRef.current.phase !== 'streaming' && stateRef.current.phase !== 'retrieved') return;
-      if (data?.type === 'text' && typeof data.content === 'string') {
-        setState((s) => ({ ...s, answer: s.answer + data.content }));
-      }
+      const cur = stateRef.current;
+      if (cur.phase !== 'streaming' && cur.phase !== 'retrieved') return;
+      if (data?.type !== 'text' || typeof data.content !== 'string') return;
+      if (data.sessionId && cur.askSessionId && data.sessionId !== cur.askSessionId) return;
+      setState((s) => ({ ...s, answer: s.answer + data.content }));
     });
 
     return () => {
@@ -205,9 +214,11 @@ export function AskPage() {
     }
 
     setInput('');
+    const askSessionId = `ask-${Date.now()}`;
     setState({
       ...initialState,
       query,
+      askSessionId,
       phase: 'retrieving',
     });
 
@@ -218,15 +229,15 @@ export function AskPage() {
 
     try {
       const result = await (window as any).ironmic.knowledgeAskStart(query, {
-        // No sessionId — Ask is single-shot, not a multi-turn chat. Each
-        // submission is its own ephemeral interaction. (To persist Q&A turns
-        // into ai_chat_sessions with kind='knowledge', wire a sessionId here
-        // and write the user/assistant exchange on done — a separate UX
-        // decision.)
-        sessionId: `ask-${Date.now()}`,
-        // Use an empty embedding for FTS5-only retrieval. When Slice B
-        // (BGE embedder via ONNX Runtime Web) lands, replace this with the
-        // embedder output — the orchestrator handles either shape.
+        // Ask is single-shot — each submission is its own ephemeral
+        // interaction. We pass `askSessionId` so AIManager stamps every
+        // ai:output / ai:turn-* event with it; the onAiOutput handler
+        // filters on this value to discard tokens from stale or
+        // cross-page requests.
+        sessionId: askSessionId,
+        // Empty embedding ⇒ FTS5-only retrieval. When Slice B lands
+        // (BGE embedder via ONNX Runtime Web), pass the embedder output
+        // here — the orchestrator handles either shape.
         queryEmbedding: new Uint8Array(),
       });
       // Persist the active requestId for event correlation.

@@ -132,6 +132,37 @@ const ALLOWED_SETTING_KEYS = new Set([
   // selected provider is authenticated, the conversational loop may auto-send
   // raw mic transcripts to Claude/Copilot. Otherwise Voice Chat is local-only.
   'voice_chat_allow_cloud',
+  // ── Knowledge Q&A (v13 / RAG layer) ──
+  // knowledge_qa_enabled         — master toggle for the Ask page.
+  // knowledge_qa_allow_cloud     — separate cloud opt-in for Q&A (intended
+  //                                for the future automatic-retrieval gate;
+  //                                manual attachment in AIChat doesn't use it).
+  // knowledge_qa_default_provider— 'auto' | 'local' | 'claude' | 'copilot'.
+  //                                Overrides ai_provider for Ask only.
+  // embedding_active_model       — embedding model id. Drives query-time
+  //                                filtering of chunk_embeddings rows so
+  //                                multiple models can coexist during a
+  //                                lazy re-embedding migration.
+  // rag_chunk_size_tokens        — target chunk size for the chunker.
+  // rag_chunk_overlap_tokens     — overlap between adjacent chunks.
+  // rag_contextual_prefix_enabled — best-effort doc-context prefix
+  //                                injection at embed time.
+  // rag_topic_k_local            — retrieval k for local-LLM route.
+  // rag_topic_k_cloud            — retrieval k for cloud route (larger).
+  // notes_migrated_to_sqlite     — one-shot flag flipped by useNotesStore's
+  //                                renderer-side migration after a successful
+  //                                localStorage → SQLite import. Renderer
+  //                                checks this on each boot to skip re-runs.
+  'knowledge_qa_enabled',
+  'knowledge_qa_allow_cloud',
+  'knowledge_qa_default_provider',
+  'embedding_active_model',
+  'rag_chunk_size_tokens',
+  'rag_chunk_overlap_tokens',
+  'rag_contextual_prefix_enabled',
+  'rag_topic_k_local',
+  'rag_topic_k_cloud',
+  'notes_migrated_to_sqlite',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
