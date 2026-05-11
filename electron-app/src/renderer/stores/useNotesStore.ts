@@ -277,11 +277,53 @@ async function migrateLocalStorageIfNeeded(): Promise<void> {
     createdAt: nb.createdAt ? new Date(nb.createdAt).toISOString() : new Date().toISOString(),
   }));
 
+  // Defense in depth: if any of the addon hooks we depend on are missing
+  // (e.g. the user is running with an older Rust binary that pre-dates v13),
+  // we must NOT clear localStorage or set the migrated flag. A stub or absent
+  // function returning 0 / undefined would otherwise look like "successful
+  // import of zero rows" and silently wipe the user's data on the way out.
+  if (
+    typeof ipc.userNotesBulkImport !== 'function' ||
+    typeof ipc.userNotesList !== 'function'
+  ) {
+    console.warn('[useNotesStore] Native addon lacks user_notes API — skipping migration; legacy data preserved.');
+    return;
+  }
+
   try {
     await ipc.userNotesBulkImport(JSON.stringify({ notes, notebooks }));
+
+    // Round-trip verification: read back the SQLite note count and make sure
+    // it covers what we attempted to import. The bulk_import N-API returns the
+    // attempt count (not the insert count, since it uses INSERT OR IGNORE), so
+    // we can't trust its return value alone — we have to query.
+    let persistedCount = 0;
+    try {
+      const rows = await ipc.userNotesList({ limit: 99999, offset: 0 });
+      persistedCount = Array.isArray(rows) ? rows.length : 0;
+    } catch (verifyErr) {
+      console.error('[useNotesStore] Post-import verification failed:', verifyErr);
+      useToastStore.getState().show({
+        type: 'error',
+        message: 'Note migration could not be verified — keeping your localStorage copy and will retry on next launch.',
+        durationMs: 8000,
+      });
+      return;
+    }
+
+    if (notes.length > 0 && persistedCount < notes.length) {
+      console.error(`[useNotesStore] Post-import note count (${persistedCount}) is below expected (${notes.length}) — refusing to clear localStorage.`);
+      useToastStore.getState().show({
+        type: 'error',
+        message: `Note migration looks incomplete (${persistedCount} of ${notes.length} found in SQLite). Keeping your localStorage copy and will retry on next launch.`,
+        durationMs: 10000,
+      });
+      return;
+    }
+
     await ipc.setSetting?.(MIGRATED_FLAG, 'true');
-    // Only clear localStorage after the flag flip lands so a mid-flight crash
-    // can be retried safely on next boot.
+    // Only clear localStorage after the flag flip lands AND we've verified the
+    // SQLite copy is at least as large as the source.
     try {
       localStorage.removeItem(NOTES_KEY_LEGACY);
       localStorage.removeItem(NOTEBOOKS_KEY_LEGACY);
@@ -326,10 +368,59 @@ export const useNotesStore = create<NotesStore>((set, get) => ({
     await migrateLocalStorageIfNeeded();
 
     const ipc = api();
+
+    // Helper: read the legacy localStorage payload directly. Used as a last-
+    // resort fallback whenever the SQLite path is unavailable — typically
+    // "user is running with a pre-v13 Rust addon" — so the UI still shows
+    // their notes (read-only-effective: edits will still attempt to persist,
+    // but the optimistic cache keeps them visible regardless).
+    const loadLegacy = (): { notes: Note[]; notebooks: Notebook[] } => {
+      try {
+        const rawNotes = JSON.parse(localStorage.getItem(NOTES_KEY_LEGACY) || '[]');
+        const rawBooks = JSON.parse(localStorage.getItem(NOTEBOOKS_KEY_LEGACY) || '[]');
+        const notes: Note[] = (Array.isArray(rawNotes) ? rawNotes : []).map((n: any) => ({
+          id: n.id,
+          title: n.title ?? '',
+          content: n.content ?? '',
+          polishedContent: n.polishedContent ?? null,
+          displayMode: n.displayMode === 'polished' ? 'polished' : 'raw',
+          notebookId: n.notebookId ?? null,
+          tags: Array.isArray(n.tags) ? n.tags : [],
+          isPinned: !!n.isPinned,
+          createdAt: typeof n.createdAt === 'number' ? n.createdAt : Date.parse(n.createdAt) || Date.now(),
+          updatedAt: typeof n.updatedAt === 'number' ? n.updatedAt : Date.parse(n.updatedAt) || Date.now(),
+        }));
+        const notebooks: Notebook[] = (Array.isArray(rawBooks) ? rawBooks : []).map((nb: any) => ({
+          id: nb.id,
+          name: nb.name,
+          color: nb.color ?? '#6366F1',
+          createdAt: typeof nb.createdAt === 'number' ? nb.createdAt : Date.parse(nb.createdAt) || Date.now(),
+        }));
+        return { notes, notebooks };
+      } catch {
+        return { notes: [], notebooks: [] };
+      }
+    };
+
+    // No native API at all (test mode / broken bridge) — read legacy directly.
     if (!ipc) {
-      // No native API (test mode, broken bridge). Mark hydrated so the UI
-      // doesn't hang on a perpetual skeleton.
-      set({ hydrated: true });
+      const legacy = loadLegacy();
+      set({ ...legacy, hydrated: true });
+      return;
+    }
+
+    // Addon present but lacking the new methods (older binary). Same fallback.
+    if (typeof ipc.userNotesList !== 'function') {
+      console.warn('[useNotesStore] Native addon lacks userNotesList — falling back to localStorage. Rebuild the Rust addon to enable SQLite-backed notes.');
+      const legacy = loadLegacy();
+      set({ ...legacy, hydrated: true });
+      if (legacy.notes.length > 0) {
+        useToastStore.getState().show({
+          type: 'info',
+          message: 'Reading notes from legacy storage — rebuild the Rust addon to enable the new SQLite-backed Notes layer.',
+          durationMs: 8000,
+        });
+      }
       return;
     }
 
@@ -340,21 +431,30 @@ export const useNotesStore = create<NotesStore>((set, get) => ({
       ]);
       const notes: Note[] = (rawNotes ?? []).map(dbToNote);
       const notebooks: Notebook[] = (rawBooks ?? []).map(dbToNotebook);
-      set({
-        notes,
-        notebooks,
-        hydrated: true,
-      });
+
+      // If SQLite came back empty AND legacy localStorage still has data, fall
+      // back to legacy so the user sees their notes. This covers the window
+      // where migration was prevented (e.g. by the bulk_import stub guard) but
+      // hydrate doesn't know that — without this, the picker would be empty.
+      if (notes.length === 0 && notebooks.length === 0) {
+        const legacy = loadLegacy();
+        if (legacy.notes.length > 0 || legacy.notebooks.length > 0) {
+          console.warn('[useNotesStore] SQLite empty but legacy localStorage has data — surfacing legacy until migration completes.');
+          set({ ...legacy, hydrated: true });
+          return;
+        }
+      }
+
+      set({ notes, notebooks, hydrated: true });
     } catch (err) {
       console.error('[useNotesStore] hydration failed:', err);
+      const legacy = loadLegacy();
       useToastStore.getState().show({
         type: 'error',
-        message: 'Failed to load notes from local storage. Some features may be limited until reload.',
-        durationMs: 6000,
+        message: 'Failed to load notes from SQLite — showing legacy copy. Edits may not persist until next launch.',
+        durationMs: 8000,
       });
-      // Still flip `hydrated` so the UI proceeds; the cache will simply be
-      // empty until the user reloads or recreates notes.
-      set({ hydrated: true });
+      set({ ...legacy, hydrated: true });
     }
   },
 
