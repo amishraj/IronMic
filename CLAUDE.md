@@ -384,6 +384,38 @@ endMeetingSession(id, speakerCount, summary, actionItems, duration, entryIds): v
 getMeetingSession(id): string // JSON or "null"
 listMeetingSessions(limit, offset): string // JSON
 deleteMeetingSession(id): void
+
+// --- RAG: Indexing (v1.8.0) ---
+ragChunkEntry(entryId: string): Promise<number>
+ragChunkMeeting(meetingId: string): Promise<number>
+ragChunkUserNote(noteId: string): Promise<number>
+ragGetUnembeddedChunks(limit: number, modelVersion: string): Promise<string>   // JSON [{chunk_id, text, context_prefix}]
+ragStoreChunkEmbeddings(itemsBuffer: Buffer, modelVersion: string): Promise<number>
+ragSetActiveModel(modelVersion: string): Promise<void>
+ragGetIndexStats(): Promise<string>    // JSON {active_model, total_chunks, indexed_chunks, by_source_type, last_indexed_at}
+ragDeleteChunksForSource(sourceType: string, sourceId: string): Promise<number>
+ragRebuildIndex(): Promise<void>
+
+// --- RAG: Retrieval (v1.8.0) ---
+// Note: queryEmbedding is passed FROM the renderer (BgeEmbedder); Rust never embeds.
+ragClassifyIntent(query: string): Promise<string>  // JSON IntentResult
+ragRetrieveHybrid(
+  query: string,
+  queryEmbedding: Buffer,              // 384 * 4 bytes (Float32); empty = FTS5-only fallback
+  optionsJson: string                  // {modelVersion, filters, k, sourceTypes}
+): Promise<string>                     // JSON {intent, filters, hits: [{chunk_id, source_type, source_id, score, text, citation}]}
+
+// --- User Notes (v1.8.0 — replaces localStorage useNotesStore) ---
+userNotesBulkImport(notesJson: string, notebooksJson: string): Promise<number>
+userNotesCreate(note: NewUserNote): Promise<UserNote>
+userNotesGet(id: string): Promise<UserNote | null>
+userNotesUpdate(id: string, updates: PartialUserNote): Promise<UserNote>
+userNotesDelete(id: string): Promise<void>
+userNotesList(opts: { notebookId?: string; search?: string; limit: number; offset: number }): Promise<UserNote[]>
+userNotebooksCreate(notebook: NewUserNotebook): Promise<UserNotebook>
+userNotebooksRename(id: string, name: string): Promise<void>
+userNotebooksDelete(id: string): Promise<void>
+userNotebooksList(): Promise<UserNotebook[]>
 ```
 
 ---
@@ -568,7 +600,11 @@ These are hard architectural constraints, not policies:
 
 6. **Reproducible builds.** CI builds are deterministic and verifiable. Users can build from source.
 
-**One explicit, opt-in exception: cloud polishing.** The `polish_allow_cloud` setting (default `false`, surfaced in Settings → Security & Privacy with a warning callout and a confirmation dialog) lets users route the *polish* pass through an authenticated Claude or Copilot CLI for higher-quality cleanups. When it is on AND a cloud CLI is authenticated, transcript text is sent to that CLI; the toggle in Notes/Timeline shows a "via Claude" / "via Copilot" / "via local" badge so the user always sees where each polish ran. Authentication of a cloud provider does NOT auto-enable this setting — the user must consciously turn it on. With the default off, polish stays strictly on-device. No other feature uses cloud APIs.
+**Two explicit, opt-in cloud exceptions:**
+
+1. **`polish_allow_cloud`** (default `false`) — routes the *polish* pass through Claude or Copilot CLI. Notes/Timeline show a "via Claude" / "via Copilot" / "via local" badge. Auth alone does not enable this.
+
+2. **`knowledge_qa_allow_cloud`** (default `false`) — routes *Knowledge Q&A* answers through the selected cloud provider. This is independent of `polish_allow_cloud`; enabling polish does not enable knowledge Q&A cloud access. The setting is surfaced in Settings → Security & Privacy with the same warning pattern. When off and the user selects a cloud provider for Q&A, IronMic falls back to the local LLM if available, or surfaces a "no provider available" error with a deeplink to Settings.
 
 ---
 
@@ -736,21 +772,35 @@ Renderer Thread                    ML Web Worker (CPU)
                                                           ActionRouter
 ```
 
-### SQLite Schema v3 Tables
+### SQLite Schema — Current Tables
 
-| Table | Feature | Purpose |
-|-------|---------|---------|
-| `vad_training_samples` | VAD | MFCC features for on-device model fine-tuning |
-| `intent_training_samples` | Intent | Classification logs + corrections |
-| `voice_routing_log` | Routing | Route decisions for ML training |
-| `meeting_sessions` | Meeting | Session metadata, summary, action items |
-| `notifications` | Notifications | In-app notification CRUD |
-| `notification_interactions` | Notifications | User engagement tracking for ML |
-| `action_log` | Workflows | Action type + temporal metadata (no content) |
-| `workflows` | Workflows | Discovered patterns |
-| `embeddings` | Search | 512-dim Float32 vectors as BLOB |
-| `ml_model_weights` | Shared | Serialized TF.js model weights |
-| `tfjs_model_metadata` | Shared | Model version tracking |
+| Table | Added | Purpose |
+|-------|-------|---------|
+| `entries` | v1.0 | Dictation entry CRUD |
+| `entries_fts` | v1.0 | FTS5 virtual table over entries |
+| `dictionary` | v1.0 | Custom dictionary words |
+| `settings` | v1.0 | Key-value settings store |
+| `meeting_sessions` | v1.1 | Meeting session metadata, summary, action items |
+| `transcript_segments` | v1.1 | Speaker-labeled transcript segments per meeting |
+| `vad_training_samples` | v1.1 | MFCC features for on-device VAD fine-tuning |
+| `intent_training_samples` | v1.1 | Classification logs + corrections |
+| `voice_routing_log` | v1.1 | Route decisions for ML training |
+| `notifications` | v1.1 | In-app notification CRUD |
+| `notification_interactions` | v1.1 | User engagement tracking for ML |
+| `action_log` | v1.1 | Action type + temporal metadata (no content) |
+| `workflows` | v1.1 | Discovered workflow patterns |
+| `embeddings` | v1.1 | Legacy 512-dim USE vectors (whole-document level) |
+| `ml_model_weights` | v1.1 | Serialized TF.js model weights |
+| `tfjs_model_metadata` | v1.1 | Model version tracking |
+| `ai_chat_sessions` | v1.5 | AI chat session headers |
+| `ai_chat_messages` | v1.5 | Chat message bodies |
+| `ai_chat_messages_fts` | v1.5 | FTS5 virtual table over chat messages |
+| `chunks` | v1.8 | Chunked retrievable units for RAG (entry / meeting / user_note) |
+| `chunks_fts` | v1.8 | FTS5 virtual table over chunks |
+| `chunk_embeddings` | v1.8 | Per-chunk Float32 embeddings keyed by (chunk_id, model_version) |
+| `user_notes` | v1.8 | User-authored notes (migrated from localStorage) |
+| `user_notes_fts` | v1.8 | FTS5 virtual table over user notes |
+| `user_notebooks` | v1.8 | Note notebook groupings |
 
 ### ML Settings (all in `settings` table)
 
@@ -792,6 +842,95 @@ Renderer Thread                    ML Web Worker (CPU)
 - Action log records action types only, never user content
 - All learned data in local SQLite, deletable per-feature
 - `blockAllNetworkRequests()` unchanged — no new network access
+
+---
+
+## RAG Layer (v1.8.0)
+
+### Architecture
+
+Retrieval lives in Rust (`rust-core/src/rag/`). Embedding inference runs in the renderer ML Worker and results are passed across the IPC boundary as a `Buffer` — Rust never loads an ONNX model itself.
+
+```
+Renderer                                    Rust Core
+┌──────────────────────────┐               ┌──────────────────────────┐
+│  AI Assistant / Ask        │               │  rag/retrieval.rs         │
+│  knowledgeAskStart()       │  N-API        │   ├─ intent.rs             │
+│  onKnowledgeAskEvent()     │ ◀──────────▶ │   ├─ hybrid_search.rs      │
+│  QuickSearch + SearchPage  │               │   └─ vector.rs (SIMD cos.) │
+└──────────────────────────┘               │                            │
+                                           │  rag/chunker.rs             │
+ML Worker (renderer)                       │   ├─ chunk_entry            │
+┌──────────────────────────┐               │   ├─ chunk_meeting          │
+│  BgeEmbedder (ONNX)        │               │   └─ chunk_user_note       │
+│  384-dim Float32 output    │               │                            │
+│  L2-normalized             │               │  storage/                  │
+└──────────────────────────┘               │   ├─ chunks.rs              │
+                                           │   ├─ chunk_embeddings.rs    │
+main process                               │   └─ user_notes.rs          │
+┌──────────────────────────┐               └──────────────────────────┘
+│  IndexerService.ts         │
+│  QAOrchestrator.ts         │
+│  promptBuilder.ts          │
+└──────────────────────────┘
+```
+
+### Chunking strategy
+
+| Source | Chunker | Chunk size | Extra fields |
+|--------|---------|------------|--------------|
+| Entries | `chunk_entry` — walk ProseMirror JSON (h1/h2/h3 boundaries), accumulate ~400 tokens | ~400 tok, ~50 overlap | `heading_path` |
+| Meetings | `chunk_meeting` — group consecutive same-speaker `transcript_segments` | ~400 tok, ~50 overlap | `start_ms`, `end_ms`, `speaker_label` |
+| Structured output sections | One chunk per section (`completed`, `blockers`, etc.) | Whole section | `source_type = 'meeting_segment'` |
+| User notes | `chunk_user_note` — plaintext 400-token windows | ~400 tok, no overlap | `heading_path[0] = title` |
+
+### Retrieval pipeline (per query)
+
+1. **Intent classification** (`rag::intent`) — regex + chrono date parser → `Temporal | Topic | SingleDoc | CrossDoc` + extracted filters.
+2. **SQL pre-filter** — date range, `is_archived = 0`, source type filter.
+3. **FTS5 path** — `chunks_fts MATCH ?` → top-30 with bm25.
+4. **Vector path** — load filtered `chunk_embeddings` → flat SIMD dot product against caller-supplied query embedding → top-30.
+5. **RRF merge** (k=60) → top-10 chunks returned as `hits`.
+
+### Incremental indexing
+
+`IndexerService` (main process singleton) owns a priority queue:
+- **App load** — `kickOnce()` from `Layout.tsx`; skips if already indexed.
+- **Entry / meeting / note CRUD** — IPC handlers call `scheduleUserNoteChunkRefresh` / `scheduleMeetingChunkRefresh` / `scheduleEntryChunkRefresh` via `queueMicrotask` (fire-and-forget, non-blocking).
+- **Rebuild** — `ragRebuildIndex()` wipes `chunks` + `chunk_embeddings`, then `kickOnce({ force: true })` re-chunks everything from scratch.
+
+### Settings keys (v1.8.0)
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `knowledge_qa_enabled` | `'true'` | Master toggle |
+| `knowledge_qa_allow_cloud` | `'false'` | Cloud Q&A opt-in (independent of `polish_allow_cloud`) |
+| `knowledge_qa_default_provider` | `'auto'` | `auto` / `local` / `claude` / `copilot` |
+| `embedding_active_model` | `'bge-small-en-v1.5'` | Drives query filter and indexer target |
+| `rag_chunk_size_tokens` | `'400'` | Tunable chunk target |
+| `rag_chunk_overlap_tokens` | `'50'` | Overlap between consecutive chunks |
+| `rag_contextual_prefix_enabled` | `'true'` | Best-effort one-sentence doc context prepended at embed time |
+| `rag_topic_k_local` | `'8'` | Top-k for local provider |
+| `rag_topic_k_cloud` | `'30'` | Top-k for cloud provider |
+| `notes_migrated_to_sqlite` | `'false'→'true'` | One-shot localStorage→SQLite migration guard |
+
+### New files (v1.8.0)
+
+| File | Purpose |
+|------|---------|
+| `rust-core/src/rag/mod.rs` | Module root |
+| `rust-core/src/rag/chunker.rs` | Chunking for entries, meetings, user notes |
+| `rust-core/src/rag/intent.rs` | Rule-based intent + date-filter extraction |
+| `rust-core/src/rag/hybrid_search.rs` | SQL pre-filter → FTS5 + vector → RRF |
+| `rust-core/src/rag/vector.rs` | Flat SIMD cosine via `wide` crate |
+| `rust-core/src/rag/prompts.rs` | System prompt templates per intent |
+| `rust-core/src/storage/chunks.rs` | Chunks + chunk_embeddings CRUD |
+| `rust-core/src/storage/user_notes.rs` | User notes + notebooks CRUD + FTS5 |
+| `electron-app/src/main/rag/IndexerService.ts` | Priority-queue background indexer singleton |
+| `electron-app/src/main/rag/QAOrchestrator.ts` | Query → retrieval → provider routing → streaming |
+| `electron-app/src/main/rag/promptBuilder.ts` | Per-route prompt assembly (local / Claude / Copilot) |
+| `electron-app/src/renderer/components/QuickSearch.tsx` | App-bar quick search with portal-based popover |
+| `electron-app/src/renderer/utils/searchNormalize.ts` | NFKD normalization + AND-token matching |
 
 ---
 

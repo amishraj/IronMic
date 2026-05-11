@@ -26,6 +26,19 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 
 ## Features
 
+### Knowledge Q&A — RAG over your meetings & notes <sup>NEW in 1.8.0</sup>
+- **Ask questions in plain language** — "What did we decide about the auth flow?" / "Summarize my meetings from last week" / "What did Sarah say in Tuesday's standup?" — IronMic retrieves the relevant context from your meetings, notes, and dictation entries and answers with citations.
+- **Hybrid FTS5 + vector retrieval** — Full-text search and semantic similarity run together; Reciprocal Rank Fusion merges the result lists for the best of both.
+- **Intent classification** — Queries are automatically routed: temporal (date-scoped), topic (hybrid search), single-doc (speaker/title filter), or cross-doc (map-reduce).
+- **Incremental indexing** — Every new note, meeting, or dictation entry is chunked and embedded in the background the moment it's saved. No manual rebuild needed for day-to-day use. The Knowledge Q&A index is rebuilt automatically on app load if it doesn't exist yet.
+- **Citations** — Answers include `[1]`, `[2]` markers that resolve to the exact meeting segment or note chunk, with a timestamp deep-link for meetings.
+- **Privacy gate** — `knowledge_qa_allow_cloud` (default **off**, independent of the polish gate) must be explicitly enabled before any retrieved context is sent to a cloud provider.
+
+### QuickSearch <sup>NEW in 1.8.0</sup>
+- **Always-accessible search** — A search icon in the app bar expands into a live input that returns up to 5 results in a popover, without leaving the current page.
+- **Smart normalization** — Punctuation-agnostic AND-token matching: `high leverage` matches `High-Leverage`. NFKD decomposition + diacritic stripping means accented characters never break a search.
+- **Keyboard nav** — ↑ ↓ to move, Enter to open, Esc to close. "See all results" seeds the full Search page with the current query.
+
 ### Core Dictation
 - **Voice-to-clipboard** — Press a global hotkey, speak, press again. Polished text lands in your clipboard, ready to paste anywhere.
 - **Voice-to-note** — Dictate directly into a rich text editor (TipTap/ProseMirror) with formatting, headings, lists, code blocks, and more.
@@ -33,12 +46,13 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 - **LLM text cleanup with smart formatting** <sup>NEW in 1.7.5</sup> — Polished output is now structured markdown that adapts to content shape: short notes stay clean paragraphs with **bold** for key terms (Granola-style), longer notes get H2/H3 sections, lists get bullets, file names get `inline code`, and tables for genuinely tabular data. Both local (Phi-3) and cloud (Claude / Copilot) paths produce structured output; cloud gets a richer prompt with worked examples for higher quality. Settings → "Smart formatting" toggles back to flat text if preferred.
 - **Custom dictionary** — Add domain-specific terms, names, and jargon to improve transcription accuracy.
 
-### Meeting Notes <sup>NEW in 1.7.5</sup>
+### Meeting Notes
 - **Structured summaries on every meeting** — Default template emits `## Attendees` + `## Overview` + `## Discussion` (with `### H3` per topic) + `## Decisions` (each prefixed `**Decided:**`) + `## Action Items` (markdown table with Owner / Item / Due) + `## Open Questions`. Sections are emitted only when they have content.
-- **Action items extraction emphasized** — The summarizer is explicitly tuned to surface action items ("usually the most valuable thing that comes out of a meeting") with concrete pattern hints. Rendered as a proper markdown table.
-- **Attendees pulled from the session roster** — Host + every joiner from the historical `participants` list is surfaced under the Attendees heading. The summarizer prepends a metadata block to the transcript so the LLM sources accurate names instead of guessing.
-- **Per-meeting-type templates** — Five built-in alternatives (Standup / 1-on-1 / Discovery / Team Sync / Retrospective) for users who want forced layouts. Each produces richer markdown than before — bold for names/decisions/deadlines, inline code for technical refs, action items as tables.
-- **Meeting list grouped by date** — Today / Yesterday / This week / Last week / This month / Earlier. Hide-empty toggle filters out short captures with no audio. Multi-select via mic icon click for bulk delete. Scroll position preserved across detail open + back.
+- **Action items extraction emphasized** — The summarizer is explicitly tuned to surface action items with concrete pattern hints. Rendered as a proper markdown table.
+- **Attendees pulled from the session roster** — Host + every joiner is surfaced under Attendees. The summarizer prepends a metadata block so the LLM sources accurate names instead of guessing.
+- **Per-meeting-type templates** — Five built-in alternatives (Standup / 1-on-1 / Discovery / Team Sync / Retrospective) for users who want forced layouts.
+- **Meeting list grouped by date** — Today / Yesterday / This week / Last week / This month / Earlier. Hide-empty iOS-style toggle. Multi-select via mic icon click for bulk delete. Scroll position preserved across detail open + back. <sup>UX improved in 1.8.0</sup>
+- **Host/Join mode switch** — Left-aligned compact pill with high contrast in both light and dark mode. Display name lives in a slim header pill instead of a full-width field. <sup>NEW in 1.8.0</sup>
 
 ### Text-to-Speech Read-Back
 - **Kokoro 82M TTS** — Hear your dictations read back through a local neural voice engine.
@@ -48,10 +62,11 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 - **Auto read-back** — Optionally read text aloud automatically after dictation completes.
 
 ### AI Assistant
+- **Knowledge Q&A** — Ask questions about your meetings and notes; get cited answers backed by hybrid retrieval. <sup>NEW in 1.8.0</sup>
 - **Built-in AI chat** — Wrapper around GitHub Copilot CLI and Claude Code CLI.
-- **Context-aware** — Ask questions, refine text, brainstorm — powered by your existing AI subscriptions.
+- **Attach context** — Attach notes, dictations, or meetings to any chat turn; content is loaded from SQLite at send time.
 - **Streaming responses** — Real-time token-by-token output.
-- **Privacy-first** — The AI feature is off by default. When enabled, it uses your own CLI tools and credentials.
+- **Privacy-first** — AI features are off by default. When enabled, they use your own CLI tools and credentials. Knowledge Q&A has its own separate cloud-opt-in gate (`knowledge_qa_allow_cloud`, default off).
 
 ### On-Device Machine Learning <sup>NEW in 1.1.0</sup>
 
@@ -69,6 +84,8 @@ IronMic includes 5 TensorFlow.js-powered ML features that learn from your usage 
 > All ML models are under 50MB total. All training data stays in SQLite on your machine. Toggle each feature independently in **Settings > Voice AI**.
 
 ### Organization & Search
+- **QuickSearch** — Permanent search icon in the app bar; instant 5-result popover with smart normalization. <sup>NEW in 1.8.0</sup>
+- **Full Search page** — Unified results across dictation entries, notes, meetings, AI sessions, and notebooks. System tags stripped from chips and titles. Meetings deep-link directly into the detail view.
 - **Timeline view** — Scrollable card feed of all dictations, newest first.
 - **Full-text search** — Instant search across all transcriptions (SQLite FTS5).
 - **Semantic search** — AI-powered meaning-based search across all content (TF.js Universal Sentence Encoder).
@@ -109,8 +126,10 @@ Electron UI ← IPC (contextBridge) → Rust Core (napi-rs)
   │   ├── Intent classifier              ├── Kokoro ONNX (text-to-speech)
   │   ├── Semantic search (USE)          ├── Audio playback (cpal)
   │   ├── Notification ranker            ├── SQLite (storage + FTS5)
-  │   └── Workflow predictor             └── Clipboard (arboard)
-  └── Web Audio API (AudioWorklet)
+  │   └── Workflow predictor             ├── RAG engine (chunks + FTS5/vector)
+  ├── Web Audio API (AudioWorklet)       └── Clipboard (arboard)
+  ├── IndexerService (bg chunking)
+  └── QuickSearch + SearchPage
 ```
 
 | Layer | Tech | Purpose |
@@ -123,7 +142,8 @@ Electron UI ← IPC (contextBridge) → Rust Core (napi-rs)
 | LLM | llama-cpp-rs (llama.cpp) | Local text cleanup |
 | TTS | ort (ONNX Runtime) + Kokoro 82M | Local neural text-to-speech |
 | ML | TensorFlow.js (Web Worker) | VAD, intent, search, notifications, workflows |
-| Storage | rusqlite (SQLite + FTS5) | Entries, settings, ML data, embeddings |
+| RAG | Rust `rag/` module | Chunking, hybrid FTS5+vector retrieval, intent routing, citations |
+| Storage | rusqlite (SQLite + FTS5) | Entries, settings, ML data, embeddings, chunks |
 | Clipboard | arboard | Cross-platform clipboard |
 
 ---
