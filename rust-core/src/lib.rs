@@ -905,17 +905,50 @@ mod napi_exports {
     /// distinction is documented in `UserNoteStore::bulk_import`).
     #[napi]
     pub fn user_notes_bulk_import(payload_json: String) -> napi::Result<u32> {
+        // Plain-Rust intermediates so serde can derive Deserialize without
+        // touching the `#[napi(object)]` types (those don't derive Deserialize
+        // and adding it would risk confusing napi's macro). Field shapes
+        // match what the renderer JSON-encodes in useNotesStore.ts.
+        #[derive(serde::Deserialize)]
+        struct PayloadNote {
+            id: Option<String>,
+            #[serde(default)]
+            title: Option<String>,
+            #[serde(default)]
+            content: Option<String>,
+            #[serde(default, rename = "polishedContent")]
+            polished_content: Option<String>,
+            #[serde(default, rename = "displayMode")]
+            display_mode: Option<String>,
+            #[serde(default, rename = "notebookId")]
+            notebook_id: Option<String>,
+            #[serde(default)]
+            tags: Option<String>,
+            #[serde(default, rename = "isPinned")]
+            is_pinned: Option<bool>,
+            #[serde(default, rename = "createdAt")]
+            created_at: Option<String>,
+            #[serde(default, rename = "updatedAt")]
+            updated_at: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct PayloadNotebook {
+            id: String,
+            name: String,
+            color: String,
+            #[serde(rename = "createdAt")]
+            created_at: String,
+        }
         #[derive(serde::Deserialize)]
         struct Payload {
-            notes: Vec<JsNewUserNote>,
-            notebooks: Vec<JsUserNotebook>,
+            notes: Vec<PayloadNote>,
+            notebooks: Vec<PayloadNotebook>,
         }
+
         let payload: Payload = serde_json::from_str(&payload_json).map_err(|e| {
             napi::Error::from_reason(format!("Invalid bulk import payload JSON: {e}"))
         })?;
 
-        // Hand-translate JsUserNotebook -> UserNotebook since we don't impl From
-        // for it (the other direction was enough).
         let books: Vec<UserNotebook> = payload
             .notebooks
             .into_iter()
@@ -926,7 +959,22 @@ mod napi_exports {
                 created_at: nb.created_at,
             })
             .collect();
-        let notes: Vec<NewUserNote> = payload.notes.into_iter().map(Into::into).collect();
+        let notes: Vec<NewUserNote> = payload
+            .notes
+            .into_iter()
+            .map(|n| NewUserNote {
+                id: n.id,
+                title: n.title,
+                content: n.content,
+                polished_content: n.polished_content,
+                display_mode: n.display_mode,
+                notebook_id: n.notebook_id,
+                tags: n.tags,
+                is_pinned: n.is_pinned,
+                created_at: n.created_at,
+                updated_at: n.updated_at,
+            })
+            .collect();
 
         let store = UserNoteStore::new(DATABASE.clone());
         store.bulk_import(notes, books).map_err(Into::into)
@@ -1012,14 +1060,19 @@ mod napi_exports {
     /// All integers are little-endian. Mirrors the equivalent format that
     /// `getAllEmbeddingsWithData` produces in the other direction so the
     /// renderer can reuse one shared (de)serializer.
+    //
+    // Note: this module imports `napi::bindgen_prelude::*`, which brings
+    // `napi::Result<T>` into scope under the bare name `Result`. We
+    // fully-qualify `std::result::Result` here so `?` and `Err("...".into())`
+    // don't try to land in `napi::Error`.
     fn parse_packed_chunk_embeddings(
         bytes: &[u8],
-    ) -> Result<Vec<(String, Vec<u8>)>, String> {
+    ) -> std::result::Result<Vec<(String, Vec<u8>)>, String> {
         if bytes.len() < 4 {
             return Err("buffer too short for count header".into());
         }
         let mut off = 0usize;
-        let read_u32 = |b: &[u8], off: &mut usize| -> Result<u32, String> {
+        let read_u32 = |b: &[u8], off: &mut usize| -> std::result::Result<u32, String> {
             if b.len() < *off + 4 {
                 return Err("truncated u32".into());
             }
