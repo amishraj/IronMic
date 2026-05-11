@@ -105,6 +105,28 @@ export function AIChat() {
     loadAuth();
   }, []);
 
+  // Preload entries and meetings so the attach-context picker is populated
+  // the moment the user opens it, instead of showing an empty list while
+  // async stores back-fill. NotePickerModal also lazy-loads as a fallback;
+  // this just races ahead so the common case is "already there." Cheap —
+  // each load is a single paginated SQLite read.
+  useEffect(() => {
+    void (async () => {
+      try {
+        const { useEntryStore } = await import('../stores/useEntryStore');
+        const { useMeetingStore } = await import('../stores/useMeetingStore');
+        if (useEntryStore.getState().entries.length === 0) {
+          await useEntryStore.getState().loadEntries({ limit: 50, offset: 0 } as any);
+        }
+        if (useMeetingStore.getState().sessions.length === 0) {
+          await useMeetingStore.getState().loadSessions();
+        }
+      } catch (err) {
+        console.warn('[AIChat] Picker preload failed (non-fatal):', err);
+      }
+    })();
+  }, []);
+
   // Listen for streaming output
   useEffect(() => {
     const cleanupOutput = window.ironmic.onAiOutput((data: any) => {
@@ -180,37 +202,14 @@ export function AIChat() {
       sessionId = createSession(provider);
     }
 
-    // ── Effective provider, gated for the attached-notes case ──
-    //
-    // Until the full Knowledge Q&A pipeline lands (Slices B/D/E/F), the
-    // attach-note button still routes through the regular `aiSendMessage`
-    // path. But that path historically shipped the entire note body to
-    // whatever provider was selected — including cloud CLIs — with no
-    // user-visible privacy opt-in. The `knowledge_qa_allow_cloud` setting
-    // (introduced in migration v10) closes this leak: if the user has
-    // attached notes AND a cloud provider is selected, we require the
-    // explicit Q&A cloud opt-in. When the gate is off we silently fall
-    // back to local and show a small note in the assistant message.
-    //
-    // Plain chat (no attached notes) is unaffected — that's covered by the
-    // existing `voice_chat_allow_cloud` gating for the voice path and the
-    // user's `ai_provider` selection generally.
-    let effectiveProvider: AIProvider = provider;
-    let cloudGateApplied = false;
-    if (attachedNotes.length > 0 && (provider === 'claude' || provider === 'copilot')) {
-      try {
-        const gate = await window.ironmic.getSetting('knowledge_qa_allow_cloud');
-        if (gate !== 'true') {
-          effectiveProvider = 'local';
-          cloudGateApplied = true;
-        }
-      } catch {
-        // If the setting read fails we default to the safer choice — local —
-        // since we can't confirm the user opted in to cloud Q&A.
-        effectiveProvider = 'local';
-        cloudGateApplied = true;
-      }
-    }
+    // Manually attaching items via the picker IS the user's consent for
+    // their content to go to the currently-selected provider. We DON'T gate
+    // here — gating belongs on the future automatic-retrieval path (RAG),
+    // not on an explicit user action. The user picked items, the user picked
+    // the provider; honor both. The earlier reroute-to-local behavior
+    // created a "context doesn't work" UX hole when the user's cloud
+    // provider was the entire point of attaching.
+    const effectiveProvider: AIProvider = provider;
 
     // Build prompt with attached items as context. Picker emits prefixed ids
     // for dictations and meetings; we label the block accordingly so the LLM
@@ -218,6 +217,12 @@ export function AIChat() {
     // a polished meeting summary). The block format is otherwise identical
     // to keep prompt diffs minimal.
     let fullPrompt = text;
+    // We also keep a human-readable summary of what was attached and prepend
+    // it to the *stored* user message so the chat history makes it obvious
+    // which turns included context. Cheap UX win — without it the user sees
+    // their question and a response and has no signal that their attachment
+    // actually got through.
+    let visibleContent = text;
     if (attachedNotes.length > 0) {
       const context = attachedNotes.map((n) => {
         const kindLabel = n.id.startsWith('dictation:')
@@ -228,13 +233,24 @@ export function AIChat() {
         return `[${kindLabel}: ${n.title || 'Untitled'}]\n${n.content}`;
       }).join('\n\n');
       fullPrompt = `Context from my IronMic:\n\n${context}\n\n---\n\n${text}`;
+
+      const labels = attachedNotes.map((n) => {
+        const kindIcon = n.id.startsWith('dictation:')
+          ? '🎙️'
+          : n.id.startsWith('meeting:')
+            ? '👥'
+            : '📝';
+        return `${kindIcon} ${n.title || 'Untitled'}`;
+      }).join('   ');
+      visibleContent = `📎 Context attached: ${labels}\n\n${text}`;
+
       setAttachedNotes([]); // Clear after sending
     }
 
     const userMsg: ChatMessage = {
       id: Date.now().toString(),
       role: 'user',
-      content: text,
+      content: visibleContent,
       timestamp: Date.now(),
     };
 
@@ -277,20 +293,6 @@ export function AIChat() {
             .map((m) => ({ role: m.role, content: m.content }))
         : undefined;
       const response = await window.ironmic.aiSendMessage(fullPrompt, effectiveProvider, modelId, sessionId, priorMessages);
-
-      // When the cloud gate forced a fallback to local, surface that to the
-      // user as a small system message before the assistant turn so they
-      // know why their selected provider didn't run. The setting deep-link
-      // lets them flip the gate without hunting through preferences.
-      if (cloudGateApplied) {
-        const gateMsg: ChatMessage = {
-          id: (Date.now() - 1).toString(),
-          role: 'system',
-          content: `Attached notes were processed locally because Cloud Q&A is off. Enable it in Settings → Privacy if you want to send note context to your cloud provider.`,
-          timestamp: Date.now(),
-        };
-        addMessage(sessionId, gateMsg);
-      }
 
       const assistantMsg: ChatMessage = {
         id: (Date.now() + 1).toString(),

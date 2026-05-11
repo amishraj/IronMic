@@ -223,18 +223,6 @@ export function NotePickerModal({ open, onClose, onSelect, selectedIds }: NotePi
     ).slice(0, 30);
   }, [query, allItems]);
 
-  // Notebooks tab grouping (only notes have notebook membership).
-  const notebookNotes = useMemo(() => {
-    const map: Record<string, PickerItem[]> = { uncategorized: [] };
-    for (const nb of notebooks) map[nb.id] = [];
-    for (const it of noteItems) {
-      const key = it.notebookId || 'uncategorized';
-      if (!map[key]) map[key] = [];
-      map[key].push(it);
-    }
-    return map;
-  }, [noteItems, notebooks]);
-
   if (!open) return null;
 
   return (
@@ -293,38 +281,10 @@ export function NotePickerModal({ open, onClose, onSelect, selectedIds }: NotePi
             ) : (
               <ItemList items={searchResults} notebooks={notebooks} selectedIds={selectedIds} onSelect={(it) => onSelect(itemToNote(it))} />
             )
+          ) : baseItems.length === 0 ? (
+            <EmptyState message={emptyMessage(activeTab)} />
           ) : (
-            <>
-              {baseItems.length === 0 ? (
-                <EmptyState message={emptyMessage(activeTab)} />
-              ) : (
-                <ItemList items={baseItems} notebooks={notebooks} selectedIds={selectedIds} onSelect={(it) => onSelect(itemToNote(it))} />
-              )}
-
-              {/* Notebooks grouping is a Notes-only affordance. We surface it
-                  *under* the flat list on the Notes tab when there are notebooks
-                  defined, instead of behind its own tab — keeps the picker
-                  flatter and avoids a fourth top-level concept. */}
-              {activeTab === 'notes' && notebooks.length > 0 && (
-                <div className="mt-4 pt-3 border-t border-iron-border space-y-3">
-                  <p className="text-[10px] uppercase tracking-wide text-iron-text-muted px-2">Notebooks</p>
-                  {notebooks.map((nb) => {
-                    const inBook = notebookNotes[nb.id] || [];
-                    if (inBook.length === 0) return null;
-                    return (
-                      <div key={nb.id}>
-                        <div className="flex items-center gap-2 px-2 py-1.5">
-                          <div className="w-3 h-3 rounded" style={{ backgroundColor: nb.color }} />
-                          <span className="text-[11px] font-semibold text-iron-text-secondary">{nb.name}</span>
-                          <span className="text-[10px] text-iron-text-muted">{inBook.length}</span>
-                        </div>
-                        <ItemList items={inBook} notebooks={notebooks} selectedIds={selectedIds} onSelect={(it) => onSelect(itemToNote(it))} />
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </>
+            <ItemList items={baseItems} notebooks={notebooks} selectedIds={selectedIds} onSelect={(it) => onSelect(itemToNote(it))} />
           )}
         </div>
       </div>
