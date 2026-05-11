@@ -72,6 +72,29 @@ const api = {
   deleteEntriesOlderThan: (days: number) => ipcRenderer.invoke('ironmic:delete-entries-older-than', days),
   runAutoCleanup: () => ipcRenderer.invoke('ironmic:run-auto-cleanup'),
 
+  // ── Knowledge Q&A — orchestrator API for the Ask page ──
+  knowledgeAskStart: (query: string, options: any) =>
+    ipcRenderer.invoke('ironmic:knowledge-ask-start', query, options),
+  knowledgeAskCancel: () => ipcRenderer.invoke('ironmic:knowledge-ask-cancel'),
+  /** Subscribe to phase events (retrieving / retrieved / route-resolved /
+   *  streaming / done / error). Returns an unsubscribe function. The
+   *  streaming token text itself rides the existing onAiOutput channel —
+   *  this event stream is for phase + sources + final-state notifications. */
+  onKnowledgeAskEvent: (callback: (evt: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('ironmic:knowledge-ask-event', handler);
+    return () => ipcRenderer.removeListener('ironmic:knowledge-ask-event', handler);
+  },
+  /** Index admin — called by IndexerService on app boot to backfill chunks
+   *  for content created before v13, and from Settings for manual rebuild. */
+  ragIndexBackfill: (sourceType: string, batchSize: number) =>
+    ipcRenderer.invoke('ironmic:rag-index-backfill', sourceType, batchSize),
+  ragGetIndexStats: () => ipcRenderer.invoke('ironmic:rag-get-index-stats'),
+  ragRebuildIndex: () => ipcRenderer.invoke('ironmic:rag-rebuild-index'),
+  ragChunkEntry: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-entry', id),
+  ragChunkMeeting: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-meeting', id),
+  ragChunkUserNote: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-user-note', id),
+
   // ── User Notes (Slice 0 of Knowledge Q&A — SQLite-backed, replaces localStorage) ──
   // The renderer-side useNotesStore wraps these with an optimistic in-memory cache
   // + per-id serial write queue so the public store interface stays synchronous.

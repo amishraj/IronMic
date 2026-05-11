@@ -515,10 +515,17 @@ export class AIManager {
     contextKey = 'chat',
     sessionId?: string | null,
     priorMessages?: ReadonlyArray<{ role: string; content: string }>,
+    // Optional override of the system prompt for the local-LLM path. Cloud
+    // CLIs don't have a real "system" channel — the orchestrator bakes any
+    // system instructions into the prompt before calling sendMessage, so
+    // this parameter is local-only. When unset the local path keeps the
+    // hardcoded generic "helpful assistant" system message so existing chat
+    // behavior is unchanged.
+    systemPromptOverride?: string,
   ): Promise<string> {
     const scopedKey = this.contextKeyFor(contextKey, sessionId);
     if (provider === 'local') {
-      return this.sendLocalMessage(prompt, window, model, scopedKey, priorMessages);
+      return this.sendLocalMessage(prompt, window, model, scopedKey, priorMessages, systemPromptOverride);
     }
     return this.sendCLIMessage(prompt, provider, window, model, sessionId, priorMessages);
   }
@@ -532,6 +539,7 @@ export class AIManager {
     model?: string,
     contextKey = 'chat',
     priorMessages?: ReadonlyArray<{ role: string; content: string }>,
+    systemPromptOverride?: string,
   ): Promise<string> {
     // Resolve the model ID to a LOCAL model. The renderer may pass a stale
     // model ID here — most commonly when the user previously chose a cloud
@@ -588,8 +596,10 @@ export class AIManager {
       localHistory.splice(0, localHistory.length - MAX_HISTORY_MESSAGES);
     }
 
+    const systemContent = systemPromptOverride
+      || 'You are a helpful AI assistant running locally on the user\'s device. Be concise and helpful.';
     const messages = [
-      { role: 'system', content: 'You are a helpful AI assistant running locally on the user\'s device. Be concise and helpful.' },
+      { role: 'system', content: systemContent },
       ...localHistory,
     ];
 

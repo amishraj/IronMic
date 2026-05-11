@@ -14,5 +14,7 @@
 //! dependency tree small and matches the offline-only promise.
 
 pub mod chunker;
+pub mod hybrid_search;
 pub mod intent;
 pub mod prompts;
+pub mod vector;

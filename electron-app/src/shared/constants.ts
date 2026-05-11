@@ -377,6 +377,20 @@ export const IPC_CHANNELS = {
   // error) so main can clear `dictationOwner` and accept the next hotkey.
   FORGE_DICTATION_COMPLETE: 'ironmic:forge-dictation-complete',
 
+  // ── Knowledge Q&A (Ask page + retrieval pipeline) ──
+  /** Start an ask request; orchestrator emits KNOWLEDGE_ASK_EVENT updates
+   *  asynchronously with the requestId we return here. */
+  KNOWLEDGE_ASK_START: 'ironmic:knowledge-ask-start',
+  /** Cancel the active ask request (single-active-request design). */
+  KNOWLEDGE_ASK_CANCEL: 'ironmic:knowledge-ask-cancel',
+  /** main → renderer push for each phase: retrieving / retrieved / route-resolved
+   *  / streaming / done / error. Renderer correlates by requestId. */
+  KNOWLEDGE_ASK_EVENT: 'ironmic:knowledge-ask-event',
+  /** Index / re-index operations (background indexer admin). */
+  RAG_INDEX_BACKFILL: 'ironmic:rag-index-backfill',
+  RAG_GET_INDEX_STATS: 'ironmic:rag-get-index-stats',
+  RAG_REBUILD_INDEX: 'ironmic:rag-rebuild-index',
+
   // ── User Notes (Slice 0 of Knowledge Q&A — replaces localStorage-backed notes) ──
   USER_NOTES_CREATE: 'ironmic:user-notes-create',
   USER_NOTES_GET: 'ironmic:user-notes-get',

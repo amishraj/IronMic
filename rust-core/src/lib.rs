@@ -1210,6 +1210,208 @@ mod napi_exports {
             .map_err(|e| napi::Error::from_reason(format!("Failed to serialize intent: {e}")))
     }
 
+    /// Chunk a single entry and persist its chunks. Returns the number of
+    /// chunks written. Idempotent — calls `replace_for_source` which
+    /// atomically swaps any prior chunks for this source. Used by the
+    /// renderer-side IndexerService both on demand and during the initial
+    /// "backfill everything" pass for users coming over from pre-v13.
+    #[napi]
+    pub fn rag_chunk_entry(entry_id: String) -> napi::Result<u32> {
+        let store = EntryStore::new(DATABASE.clone());
+        let Some(entry) = store.get(&entry_id).map_err(napi::Error::from)? else {
+            return Ok(0);
+        };
+        // Use the polished text as the canonical body when present (it's
+        // cleaner — Whisper artifacts removed); fall back to raw transcript.
+        let opts = crate::rag::chunker::ChunkOptions::default();
+        let new_chunks = crate::rag::chunker::chunk_entry(
+            &entry.id,
+            entry.polished_text_json.as_deref(),
+            entry.raw_transcript_json.as_deref(),
+            entry.polished_text.as_deref(),
+            &entry.raw_transcript,
+            &opts,
+        );
+        let chunk_store = crate::storage::chunks::ChunkStore::new(DATABASE.clone());
+        chunk_store
+            .replace_for_source(
+                crate::storage::chunks::source_types::ENTRY,
+                &entry.id,
+                new_chunks,
+            )
+            .map(|v| v.len() as u32)
+            .map_err(Into::into)
+    }
+
+    /// Chunk a single user note.
+    #[napi]
+    pub fn rag_chunk_user_note(note_id: String) -> napi::Result<u32> {
+        let store = UserNoteStore::new(DATABASE.clone());
+        let Some(note) = store.get(&note_id).map_err(napi::Error::from)? else {
+            return Ok(0);
+        };
+        // Polished_content overrides raw content when display_mode='polished'
+        // — same precedence the editor uses.
+        let body = if note.display_mode == "polished" && note.polished_content.is_some() {
+            note.polished_content.unwrap()
+        } else {
+            note.content
+        };
+        let opts = crate::rag::chunker::ChunkOptions::default();
+        let new_chunks = crate::rag::chunker::chunk_user_note(&note.id, &note.title, &body, &opts);
+        let chunk_store = crate::storage::chunks::ChunkStore::new(DATABASE.clone());
+        chunk_store
+            .replace_for_source(
+                crate::storage::chunks::source_types::USER_NOTE,
+                &note.id,
+                new_chunks,
+            )
+            .map(|v| v.len() as u32)
+            .map_err(Into::into)
+    }
+
+    /// Chunk a meeting. Uses transcript_segments when present (speaker-turn
+    /// grouped); falls back to full_transcript sliding-window otherwise.
+    /// Also chunks each structured_output section if present, so the picker
+    /// and retrieval can surface "blockers section of Tuesday standup"
+    /// independently from the rest of the meeting.
+    #[napi]
+    pub fn rag_chunk_meeting(meeting_id: String) -> napi::Result<u32> {
+        // The meetings + transcript_segments stores are method-impls on
+        // Database, not separate store structs. Call directly.
+        let Some(meeting) = DATABASE.get_meeting_session(&meeting_id).map_err(napi::Error::from)? else {
+            return Ok(0);
+        };
+
+        let segments = DATABASE
+            .list_transcript_segments(&meeting_id)
+            .map_err(napi::Error::from)?;
+
+        // MeetingSession doesn't carry full_transcript in its struct (it's
+        // schema-only since v5), so we fetch it directly when segments are
+        // empty. Keeps MeetingSession lean for the hot meeting-list path.
+        let full_transcript: Option<String> = {
+            let conn = DATABASE.conn();
+            conn.query_row(
+                "SELECT full_transcript FROM meeting_sessions WHERE id = ?1",
+                [&meeting.id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+        };
+
+        let opts = crate::rag::chunker::ChunkOptions::default();
+        let new_chunks: Vec<crate::storage::chunks::NewChunk> = if !segments.is_empty() {
+            let typed_segments: Vec<crate::rag::chunker::MeetingSegment> = segments
+                .into_iter()
+                .map(|s| crate::rag::chunker::MeetingSegment {
+                    id: s.id,
+                    start_ms: s.start_ms,
+                    end_ms: s.end_ms,
+                    speaker_label: s.speaker_label,
+                    text: s.text,
+                })
+                .collect();
+            crate::rag::chunker::chunk_meeting_from_segments(&meeting.id, &typed_segments, &opts)
+        } else if let Some(ref ft) = full_transcript {
+            crate::rag::chunker::chunk_meeting_from_full_transcript(&meeting.id, ft, &opts)
+        } else {
+            Vec::new()
+        };
+
+        let chunk_store = crate::storage::chunks::ChunkStore::new(DATABASE.clone());
+        // Replace under both source_types so transcript-based AND
+        // full_transcript-fallback rewrites don't leave duplicates. The
+        // chunker tags the source_type correctly above; we just need to
+        // wipe any prior chunks under both buckets first.
+        let _ = chunk_store.delete_for_source(crate::storage::chunks::source_types::MEETING, &meeting.id);
+        let _ = chunk_store.delete_for_source(crate::storage::chunks::source_types::MEETING_SEGMENT, &meeting.id);
+        // Use the first chunk's source_type to drive the replace_for_source key.
+        let key = new_chunks
+            .first()
+            .map(|c| c.source_type.clone())
+            .unwrap_or_else(|| crate::storage::chunks::source_types::MEETING.to_string());
+        chunk_store
+            .replace_for_source(&key, &meeting.id, new_chunks)
+            .map(|v| v.len() as u32)
+            .map_err(Into::into)
+    }
+
+    /// Bulk-list source ids that have content but no chunks yet, scoped by
+    /// source_type. Used by IndexerService's initial backfill to find work
+    /// without a full table scan + per-id LEFT JOIN round-trip from JS.
+    /// Returns JSON `[{ "id": "...", "source_type": "..." }, ...]` capped at `limit`.
+    #[napi]
+    pub fn rag_list_unchunked_sources(source_type: String, limit: u32) -> napi::Result<String> {
+        let conn = DATABASE.conn();
+        let sql = match source_type.as_str() {
+            "entry" => "SELECT e.id FROM entries e \
+                        LEFT JOIN chunks c ON c.source_id = e.id AND c.source_type = 'entry' \
+                        WHERE c.id IS NULL AND e.is_archived = 0 \
+                        ORDER BY e.created_at DESC LIMIT ?1",
+            "user_note" => "SELECT u.id FROM user_notes u \
+                            LEFT JOIN chunks c ON c.source_id = u.id AND c.source_type = 'user_note' \
+                            WHERE c.id IS NULL \
+                            ORDER BY u.updated_at DESC LIMIT ?1",
+            "meeting" => "SELECT m.id FROM meeting_sessions m \
+                          LEFT JOIN chunks c ON c.source_id = m.id AND c.source_type IN ('meeting','meeting_segment') \
+                          WHERE c.id IS NULL AND m.ended_at IS NOT NULL \
+                          ORDER BY m.started_at DESC LIMIT ?1",
+            other => {
+                return Err(napi::Error::from_reason(format!(
+                    "Unknown source_type for unchunked listing: {other}"
+                )));
+            }
+        };
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to prepare unchunked query: {e}")))?;
+        let rows = stmt
+            .query_map([limit], |row| row.get::<_, String>(0))
+            .map_err(|e| napi::Error::from_reason(format!("Failed to query unchunked: {e}")))?;
+        let ids: Vec<String> = rows.flatten().collect();
+        serde_json::to_string(&ids)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to serialize unchunked ids: {e}")))
+    }
+
+    /// Hybrid retrieval entry point. Takes the user's query, an optional
+    /// pre-computed query embedding (Buffer of `dim * 4` LE Float32 bytes,
+    /// or empty for FTS5-only mode), and a JSON options blob:
+    ///
+    /// ```json
+    /// {
+    ///   "model_version": "bge-small-en-v1.5",
+    ///   "k": 10,
+    ///   "filters": { /* IntentFilters from rag_classify_intent or hand-built */ },
+    ///   "skip_archived": true
+    /// }
+    /// ```
+    ///
+    /// Returns JSON `RetrievalResult` with the top-`k` fused hits, each
+    /// carrying enough metadata for the citation chip + sources panel +
+    /// deeplink without further round-trips. Designed to never panic — a
+    /// malformed embedding or bad FTS5 expression degrades to an empty
+    /// result set, never a renderer-visible error.
+    #[napi]
+    pub fn rag_retrieve_hybrid(
+        query: String,
+        query_embedding: NapiBuffer,
+        options_json: String,
+    ) -> napi::Result<String> {
+        let opts: crate::rag::hybrid_search::RetrieveOptions = serde_json::from_str(&options_json)
+            .map_err(|e| napi::Error::from_reason(format!("Invalid retrieve options JSON: {e}")))?;
+        let result = crate::rag::hybrid_search::retrieve(
+            &DATABASE,
+            &query,
+            query_embedding.as_ref(),
+            &opts,
+        )
+        .map_err(napi::Error::from)?;
+        serde_json::to_string(&result)
+            .map_err(|e| napi::Error::from_reason(format!("Failed to serialize retrieval result: {e}")))
+    }
+
     // ── Dictionary N-API exports ──
 
     #[napi]

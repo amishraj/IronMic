@@ -190,6 +190,22 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     userNotebooksRename: () => {},
     userNotebooksDelete: () => {},
     userNotebooksList: () => [],
+    // Knowledge Q&A / RAG stubs — graceful fallback when the addon is older
+    // than v13 / hasn't been rebuilt. Renderer code already null-checks
+    // these via optional chaining; stubs return shapes the orchestrator
+    // can handle ("no chunks indexed yet, no hits, no work to do").
+    ragChunkEntry: () => 0,
+    ragChunkUserNote: () => 0,
+    ragChunkMeeting: () => 0,
+    ragListUnchunkedSources: () => '[]',
+    ragClassifyIntent: () => JSON.stringify({ intent: 'Topic', filters: {}, scope_label: 'All time' }),
+    ragRetrieveHybrid: () => JSON.stringify({ hits: [], fts_count: 0, vector_count: 0, vector_used: false }),
+    ragGetIndexStats: () => JSON.stringify({ active_model: 'bge-small-en-v1.5', total_chunks: 0, indexed_chunks: 0, by_source_type: {} }),
+    ragDeleteChunksForSource: () => 0,
+    ragRebuildIndex: () => 0,
+    ragSetActiveModel: () => {},
+    ragGetUnembeddedChunks: () => '[]',
+    ragStoreChunkEmbeddings: () => 0,
   };
 }
 

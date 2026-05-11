@@ -9,6 +9,7 @@ import { RecordingIndicator } from './RecordingIndicator';
 import { Timeline } from './Timeline';
 import { SettingsPanel } from './SettingsPanel';
 import { AIChat } from './AIChat';
+import { AskPage } from './ask/AskPage';
 import { SearchPage } from './SearchPage';
 import { WelcomePage } from './WelcomePage';
 import { ListenPage } from './ListenPage';
@@ -31,7 +32,7 @@ import micRecording from '../assets/mic-recording.png';
 import micProcessing from '../assets/mic-processing.png';
 import micSuccess from '../assets/mic-success.png';
 
-type Page = 'home' | 'main' | 'ai' | 'dictate' | 'listen' | 'search' | 'analytics' | 'meetings' | 'settings';
+type Page = 'home' | 'main' | 'ai' | 'ask' | 'dictate' | 'listen' | 'search' | 'analytics' | 'meetings' | 'settings';
 
 interface NavItem {
   id: Page;
@@ -44,6 +45,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'home', label: 'Home', icon: Home, section: 'core' },
   { id: 'main', label: 'Timeline', icon: List, section: 'core' },
   { id: 'ai', label: 'AI Assistant', icon: Sparkles, section: 'core' },
+  { id: 'ask', label: 'Ask', icon: Search, section: 'core' },
   { id: 'dictate', label: 'Notes', icon: StickyNote, section: 'tools' },
   { id: 'listen', label: 'Listen', icon: Volume2, section: 'tools' },
   { id: 'search', label: 'Search', icon: Search, section: 'tools' },
@@ -400,6 +402,11 @@ export function Layout() {
             </ErrorBoundary>
           )}
           {page === 'ai' && <AIChat />}
+          {page === 'ask' && (
+            <ErrorBoundary label="Ask">
+              <AskPage />
+            </ErrorBoundary>
+          )}
           {page === 'dictate' && (
             <ErrorBoundary label="Notes">
               <DictatePage />

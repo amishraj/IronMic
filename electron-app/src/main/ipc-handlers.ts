@@ -536,6 +536,48 @@ export function registerIpcHandlers(): void {
   );
   ipcMain.handle(IPC_CHANNELS.USER_NOTEBOOKS_LIST, () => native.addon.userNotebooksList());
 
+  // Knowledge Q&A (Ask page). The orchestrator owns the full flow —
+  // intent classification → hybrid retrieval → prompt assembly →
+  // AIManager dispatch — and emits phase events back to the renderer.
+  // Single-active-request semantics; a new start cancels any prior.
+  ipcMain.handle(IPC_CHANNELS.KNOWLEDGE_ASK_START, async (e, query: string, options: any) => {
+    const { knowledgeAsk } = await import('./rag/QAOrchestrator');
+    const win = BrowserWindow.fromWebContents(e.sender);
+    return knowledgeAsk(query, options, win);
+  });
+  ipcMain.handle(IPC_CHANNELS.KNOWLEDGE_ASK_CANCEL, async () => {
+    const { cancelKnowledgeAsk } = await import('./rag/QAOrchestrator');
+    cancelKnowledgeAsk();
+  });
+  // Background indexer admin. Used by Settings → Knowledge Q&A controls
+  // and by the renderer-side IndexerService when it runs the initial
+  // backfill pass after a v13 install. Each chunk_* call is idempotent.
+  ipcMain.handle(IPC_CHANNELS.RAG_INDEX_BACKFILL, async (_e, sourceType: string, batchSize: number) => {
+    const limit = Math.min(Math.max(batchSize || 25, 1), 100);
+    const idsJson = native.addon.ragListUnchunkedSources?.(sourceType, limit);
+    if (!idsJson) return 0;
+    const ids: string[] = JSON.parse(idsJson);
+    let total = 0;
+    for (const id of ids) {
+      try {
+        if (sourceType === 'entry') total += native.addon.ragChunkEntry?.(id) ?? 0;
+        else if (sourceType === 'user_note') total += native.addon.ragChunkUserNote?.(id) ?? 0;
+        else if (sourceType === 'meeting') total += native.addon.ragChunkMeeting?.(id) ?? 0;
+      } catch (err) {
+        console.warn(`[rag] backfill chunk failed for ${sourceType} ${id}:`, err);
+      }
+    }
+    return total;
+  });
+  ipcMain.handle(IPC_CHANNELS.RAG_GET_INDEX_STATS, () => native.addon.ragGetIndexStats?.());
+  ipcMain.handle(IPC_CHANNELS.RAG_REBUILD_INDEX, () => native.addon.ragRebuildIndex?.());
+  // Direct single-source chunking — used by IndexerService.markDirty when a
+  // freshly-created entry/meeting/note needs chunks before the next backfill
+  // sweep. Each is idempotent (replace_for_source semantics in Rust).
+  ipcMain.handle('ironmic:rag-chunk-entry', (_e, id: string) => native.addon.ragChunkEntry?.(id));
+  ipcMain.handle('ironmic:rag-chunk-meeting', (_e, id: string) => native.addon.ragChunkMeeting?.(id));
+  ipcMain.handle('ironmic:rag-chunk-user-note', (_e, id: string) => native.addon.ragChunkUserNote?.(id));
+
   // Dictionary. After a mutation, broadcast `dictionary-changed` so any
   // renderer/main caches re-fetch their term list (used by transcript
   // post-correction). The Rust addon already pushes the change into the
