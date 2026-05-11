@@ -46,7 +46,13 @@ export function NotePickerModal({ open, onClose, onSelect, selectedIds }: NotePi
   if (!open) return null;
 
   return (
-    <Modal onClose={onClose} title="Add Note as Context">
+    // NotePickerModal already early-returns null when its `open` is false, so
+    // by the time we render the inner Modal `open` is unconditionally true.
+    // Omitting this prop made the underlying Modal silently return null
+    // (its body has its own `if (!open) return null` gate at Modal.tsx:25),
+    // which manifested as "the attach-note button does nothing" — the button
+    // toggled showNotePicker correctly but the Modal never mounted.
+    <Modal open onClose={onClose} title="Add Note as Context">
       <div className="w-[480px] max-h-[60vh] flex flex-col">
         {/* Search */}
         <div className="px-4 pt-3 pb-2">
