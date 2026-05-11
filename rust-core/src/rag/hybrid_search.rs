@@ -164,6 +164,42 @@ pub fn retrieve(
     let fts_count = fts_hits.len() as u32;
     let vector_count = vec_hits.len() as u32;
 
+    // ── 2.5 Recent-activity fallback ──────────────────────────────────────
+    //
+    // When both FTS5 and the vector path come up empty — typical for casual
+    // natural-language queries that have nothing distinctive to anchor on
+    // ("what did I do?", "summarize my notes"), or temporal queries where
+    // the keyword "yesterday" doesn't literally appear in any chunk — we
+    // fall back to "most recent chunks within the filter window". Better
+    // than handing the model a context-less prompt. The retrieved chunks
+    // are still scoped by `opts.filters.date_from / date_to / source_types`
+    // when present (so "yesterday" + temporal intent + Temporal date filter
+    // still narrows to actual yesterday content).
+    if fts_hits.is_empty() && vec_hits.is_empty() {
+        let recent_sql = build_recent_fallback_sql(&opts.filters, opts.skip_archived);
+        if let Ok(mut stmt) = conn.prepare(&recent_sql) {
+            // Single bound param: the LIMIT. Rust string-formatted the WHERE
+            // clause; user input doesn't reach the SQL bytes (filters come
+            // from intent classifier output, escaped where needed).
+            let rows = stmt.query_map([opts.k as i64], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            });
+            if let Ok(rows) = rows {
+                for r in rows.flatten() {
+                    // Synthesize a low-but-positive score so RRF still merges
+                    // these in rank order behind any (zero) real hits.
+                    let (id, created_at) = r;
+                    // Score = inverse of position in ORDER BY, normalized down
+                    // so a real FTS hit on a future query always outranks
+                    // a fallback chunk. Using created_at as a tie-breaker
+                    // happens implicitly via the SQL ORDER BY.
+                    let _ = created_at;
+                    fts_hits.push((id, 0.001));
+                }
+            }
+        }
+    }
+
     // ── 3. RRF merge ──────────────────────────────────────────────────────
     // score(chunk) = Σ over paths of 1 / (K + rank_in_path).
     // Unrepresented in a path contributes 0.
@@ -194,10 +230,44 @@ pub fn retrieve(
     })
 }
 
+/// Common English stopwords that should be stripped from FTS5 queries.
+/// These are conversational noise — "what did I X" / "tell me about Y" —
+/// not signal. Keeping them in the query (combined with the old implicit
+/// AND join) was the dominant reason retrieval returned 0 hits for
+/// natural-language questions: every chunk that didn't happen to contain
+/// "what" AND "did" AND "I" was rejected.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "do", "does", "did", "doing", "have", "has", "had", "having",
+    "i", "me", "my", "mine", "we", "us", "our", "you", "your", "yours",
+    "he", "she", "it", "they", "them", "their",
+    "this", "that", "these", "those",
+    "what", "when", "where", "who", "whom", "which", "why", "how",
+    "and", "or", "but", "if", "then", "else", "of", "in", "on", "at",
+    "to", "from", "by", "for", "with", "about", "as", "than",
+    "can", "could", "would", "should", "will", "shall", "may", "might",
+    "tell", "show", "give", "find", "search", "look", "say", "said",
+    "please", "thanks", "hi", "hello",
+];
+
+fn is_stopword(token: &str) -> bool {
+    STOPWORDS.binary_search(&token).is_ok()
+        // Linear fallback if STOPWORDS isn't sorted (it isn't — we keep it
+        // readable rather than alphabetic). Cheap enough at ~70 items.
+        || STOPWORDS.iter().any(|w| *w == token)
+}
+
 /// FTS5 syntax requires a `MATCH` clause that's valid. User input goes
 /// straight into the param so we sanitize by stripping quote chars and
-/// double-quoting each whitespace token. The result is a phrase-or-tokens
-/// match — robust to common punctuation in chat-style queries.
+/// double-quoting each whitespace token. The result is an OR-joined
+/// tokens match with stopwords removed and a prefix-wildcard on the
+/// last real keyword — robust to chat-style natural-language queries.
+///
+/// We switched from implicit AND to explicit OR after observing that
+/// "what did I dictate yesterday" produced zero FTS5 matches because no
+/// chunk contained ALL of those words. With OR + stopword strip, that
+/// query effectively becomes `"dictate" OR "yesterday*"` which actually
+/// hits dictation chunks containing either term.
 fn sanitize_fts_query(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -208,22 +278,27 @@ fn sanitize_fts_query(raw: &str) -> String {
         .chars()
         .map(|c| if c == '"' || c == '\'' { ' ' } else { c })
         .collect();
-    let tokens: Vec<String> = cleaned
+    // Lowercase + filter stopwords + double-quote so FTS5 treats each as
+    // a literal term. Drop tokens shorter than 2 chars (typo noise).
+    let mut tokens: Vec<String> = cleaned
         .split_whitespace()
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .map(|t| t.trim_end_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|t| !t.is_empty() && t.len() >= 2 && !is_stopword(t))
+        .map(|t| format!("\"{t}\""))
         .collect();
     if tokens.is_empty() {
+        // After stopword strip we have nothing left — happens for queries
+        // like "what did I do?". Caller's recent-activity fallback handles
+        // this case: empty FTS query ⇒ empty FTS path ⇒ fallback engages.
         return String::new();
     }
-    // Tokens combined with implicit AND. Add a trailing prefix-wildcard on
-    // the last token so partial typing ("auth" matches "authentication")
-    // still hits — matches the keyword-search expectation most users have.
+    // Prefix-wildcard the last real keyword so partial typing ("auth"
+    // matches "authentication") and trailing-noun typos still hit.
     let last = tokens.last().cloned().unwrap();
-    let mut prefix = tokens.clone();
-    prefix.pop();
-    prefix.push(format!("{}*", last.trim_matches('"')));
-    prefix.join(" ")
+    let last_inner = last.trim_matches('"').to_string();
+    *tokens.last_mut().unwrap() = format!("{}*", last_inner);
+    // Explicit OR join — see the doc comment for why.
+    tokens.join(" OR ")
 }
 
 /// FTS5 candidate SQL. Joins `chunks` for metadata + filters, scores by
@@ -290,6 +365,55 @@ fn build_fts_sql(filters: &IntentFilters, skip_archived: bool) -> String {
         "SELECT c.id, bm25(chunks_fts) FROM chunks c \
          JOIN chunks_fts ON chunks_fts.rowid = c.rowid \
          WHERE {} ORDER BY bm25(chunks_fts) ASC LIMIT ?2",
+        where_clauses.join(" AND ")
+    )
+}
+
+/// Recent-activity fallback SQL. Used when keyword + vector both return
+/// no hits — gives the LLM SOMETHING current to ground on instead of a
+/// bare prompt. Returns (chunk_id, source_created_at) ordered most-recent
+/// first, scoped by the same date / source_type / archive filters as the
+/// real retrieval paths so a Temporal intent ("yesterday") still gets
+/// yesterday-only content even when no chunk text literally says
+/// "yesterday".
+fn build_recent_fallback_sql(filters: &IntentFilters, skip_archived: bool) -> String {
+    let mut where_clauses: Vec<String> = vec!["1=1".to_string()];
+    let coalesced_created = "COALESCE(\
+        (SELECT e.created_at FROM entries e WHERE e.id = c.source_id),\
+        (SELECT m.started_at FROM meeting_sessions m WHERE m.id = c.source_id),\
+        (SELECT u.created_at FROM user_notes u WHERE u.id = c.source_id)\
+     )";
+
+    if let Some(ref types) = filters.source_types {
+        if !types.is_empty() {
+            let in_list = types.iter()
+                .map(|t| format!("'{}'", t.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(",");
+            where_clauses.push(format!("c.source_type IN ({in_list})"));
+        }
+    }
+    if let Some(ref from) = filters.date_from {
+        where_clauses.push(format!("{coalesced_created} >= '{}'", from.replace('\'', "''")));
+    }
+    if let Some(ref to) = filters.date_to {
+        where_clauses.push(format!("{coalesced_created} <= '{}'", to.replace('\'', "''")));
+    }
+    if let Some(ref speaker) = filters.speaker {
+        where_clauses.push(format!("c.speaker_label = '{}'", speaker.replace('\'', "''")));
+    }
+    if skip_archived {
+        where_clauses.push(
+            "NOT EXISTS (SELECT 1 FROM entries e WHERE e.id = c.source_id AND e.is_archived = 1)".to_string()
+        );
+    }
+
+    format!(
+        "SELECT c.id, {coalesced_created} AS created \
+         FROM chunks c \
+         WHERE {} \
+         ORDER BY created DESC NULLS LAST \
+         LIMIT ?1",
         where_clauses.join(" AND ")
     )
 }
@@ -594,18 +718,35 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_fts_query_handles_punctuation() {
+    fn sanitize_fts_query_strips_stopwords_and_uses_or() {
+        // Single keyword: prefix-wildcard, no OR separator needed.
         assert_eq!(sanitize_fts_query("auth"), "auth*");
-        assert_eq!(sanitize_fts_query("\"foo\" bar"), "\"foo\" bar*");
+        // Stopwords ("what", "did", "i") get dropped; "dictate" and
+        // "yesterday" survive; OR joins them. "yesterday" is last so it
+        // gets the prefix wildcard.
+        let q = sanitize_fts_query("what did I dictate yesterday");
+        assert!(q.contains("dictate"), "expected 'dictate' in: {q}");
+        assert!(q.contains("yesterday"), "expected 'yesterday' in: {q}");
+        assert!(q.contains(" OR "), "expected OR-joined query, got: {q}");
+        // All-stopword input collapses to empty so the recent-activity
+        // fallback engages downstream.
+        assert_eq!(sanitize_fts_query("what did I do?"), "");
+        // Pure whitespace stays empty.
         assert_eq!(sanitize_fts_query("   "), "");
-        // Common chat punctuation should survive sanitation.
-        let q = sanitize_fts_query("what about Q3 migration?");
-        assert!(q.contains("\"what\""));
-        assert!(q.ends_with("migration?*") || q.ends_with("\"migration?\"*") || q.contains("migration"));
+        // Short tokens (< 2 chars) get filtered as typo noise.
+        let q2 = sanitize_fts_query("a b authentication");
+        assert!(q2.contains("authentication"));
+        assert!(!q2.contains("\"a\""));
+        assert!(!q2.contains("\"b\""));
     }
 
     #[test]
-    fn empty_query_returns_empty_result_not_error() {
+    fn empty_query_falls_back_to_recent_activity_not_error() {
+        // Contract change: an effectively-empty query (whitespace, or only
+        // stopwords) used to return zero hits. With the recent-activity
+        // fallback it now surfaces the user's most recent content —
+        // strictly better UX for chat-style natural-language queries that
+        // don't have keyword anchors. Empty corpus would still return zero.
         let db = setup();
         seed_user_note(&db, "n1", "Test");
         seed_chunks(&db, "n1", vec!["hello world"]);
@@ -616,8 +757,26 @@ mod tests {
             skip_archived: true,
         };
         let result = retrieve(&db, "   ", &[], &opts).unwrap();
-        assert_eq!(result.hits.len(), 0);
+        // Hits come from the fallback path, NOT the FTS path.
         assert_eq!(result.fts_count, 0);
+        assert_eq!(result.vector_count, 0);
+        assert!(result.hits.len() >= 1, "fallback should surface recent content");
+    }
+
+    #[test]
+    fn empty_corpus_returns_zero_hits() {
+        // The fallback can only surface content that actually exists. With
+        // no seeded chunks the result is still empty — the orchestrator's
+        // "no context found" branch is what handles this UX-side.
+        let db = setup();
+        let opts = RetrieveOptions {
+            model_version: "bge-small-en-v1.5".into(),
+            k: 10,
+            filters: IntentFilters::default(),
+            skip_archived: true,
+        };
+        let result = retrieve(&db, "anything", &[], &opts).unwrap();
+        assert_eq!(result.hits.len(), 0);
     }
 
     #[test]
@@ -671,6 +830,33 @@ mod tests {
         };
         let result = retrieve(&db, "alpha", &[], &opts).unwrap();
         assert!(result.hits.iter().any(|h| h.label.starts_with("Note: Project X")));
+    }
+
+    #[test]
+    fn fallback_returns_recent_chunks_when_keyword_misses() {
+        // Seed two notes with non-overlapping content, then query for
+        // something that doesn't literally appear in either. With the
+        // old AND-join + no fallback we'd return zero hits; now the
+        // recent-activity fallback should surface both notes ordered
+        // by their parent's created_at descending.
+        let db = setup();
+        seed_user_note(&db, "n1", "Lunch");
+        seed_chunks(&db, "n1", vec!["tacos and pizza"]);
+        seed_user_note(&db, "n2", "Coffee");
+        seed_chunks(&db, "n2", vec!["espresso double shot"]);
+
+        let opts = RetrieveOptions {
+            model_version: "bge-small-en-v1.5".into(),
+            k: 10,
+            filters: IntentFilters::default(),
+            skip_archived: true,
+        };
+        // "yesterday" is a stopword-free keyword that won't match either
+        // chunk literally — the fallback should still surface them.
+        let result = retrieve(&db, "yesterday", &[], &opts).unwrap();
+        assert!(result.hits.len() >= 1,
+                "expected fallback to surface at least one chunk when keyword misses, got {}",
+                result.hits.len());
     }
 
     #[test]

@@ -326,10 +326,28 @@ export function AIChat() {
       setSendPhase('retrieving');
       try {
         const k = (provider === 'local') ? 6 : 12;
+        // Classify intent first so temporal queries ("yesterday", "last
+        // week") and single-doc queries ("what did Sarah say") get their
+        // metadata filters applied. Without this, every query was a bare
+        // FTS5 keyword scan and a phrase like "yesterday" — which doesn't
+        // appear in any chunk text — returned zero hits.
+        let filters: any = {};
+        try {
+          const intentJson = await (window as any).ironmic.ragClassifyIntent?.(text);
+          if (intentJson) {
+            const intent = JSON.parse(intentJson);
+            filters = intent?.filters ?? {};
+          }
+        } catch (intentErr) {
+          // Intent classification is best-effort. Falling through with
+          // empty filters means we get unfiltered retrieval + the
+          // recent-activity fallback in the Rust path.
+          console.warn('[AIChat] intent classification failed (using empty filters):', intentErr);
+        }
         const opts = {
           model_version: 'bge-small-en-v1.5',
           k,
-          filters: {},
+          filters,
           skip_archived: true,
         };
         // Hard 12-second timeout. The retrieval call CAN take a while
