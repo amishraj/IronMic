@@ -94,6 +94,18 @@ const api = {
   ragChunkEntry: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-entry', id),
   ragChunkMeeting: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-meeting', id),
   ragChunkUserNote: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-user-note', id),
+  /** Classify a free-text query into a Knowledge Q&A intent (Temporal /
+   *  SingleDoc / CrossDoc / Topic) with date / speaker / source-type filters
+   *  pre-computed. Returns a JSON string. Used by AI Chat's Search-mode
+   *  toggle to scope retrieval (e.g. "yesterday" ⇒ date_from/date_to). */
+  ragClassifyIntent: (query: string) => ipcRenderer.invoke('ironmic:rag-classify-intent', query),
+  /** Hybrid FTS5 + (optional) vector retrieval over the indexed chunks.
+   *  queryEmbedding is the BgeEmbedder output as Uint8Array, or an empty
+   *  buffer for FTS5-only mode. optionsJson encodes {model_version, k,
+   *  filters, skip_archived}. Returns a JSON string with the top-k hits
+   *  ready for citation rendering. */
+  ragRetrieveHybrid: (query: string, queryEmbedding: Uint8Array, optionsJson: string) =>
+    ipcRenderer.invoke('ironmic:rag-retrieve-hybrid', query, queryEmbedding, optionsJson),
 
   // ── User Notes (Slice 0 of Knowledge Q&A — SQLite-backed, replaces localStorage) ──
   // The renderer-side useNotesStore wraps these with an optimistic in-memory cache

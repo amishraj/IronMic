@@ -608,6 +608,20 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('ironmic:rag-chunk-entry', (_e, id: string) => native.addon.ragChunkEntry?.(id));
   ipcMain.handle('ironmic:rag-chunk-meeting', (_e, id: string) => native.addon.ragChunkMeeting?.(id));
   ipcMain.handle('ironmic:rag-chunk-user-note', (_e, id: string) => native.addon.ragChunkUserNote?.(id));
+  // Direct retrieval / intent classification, exposed for the AI Chat
+  // Search-mode toggle. The original design routed everything through
+  // knowledge:ask-start (QAOrchestrator), but merging Ask into AI Chat
+  // means the renderer now constructs prompts itself and just needs
+  // primitive retrieval + intent ops. queryEmbedding is a Uint8Array from
+  // the renderer; electron's IPC serializer carries it through verbatim,
+  // and the Rust N-API receives it as a Buffer.
+  ipcMain.handle('ironmic:rag-classify-intent', (_e, query: string) => native.addon.ragClassifyIntent?.(query));
+  ipcMain.handle('ironmic:rag-retrieve-hybrid', (_e, query: string, queryEmbedding: Uint8Array, optionsJson: string) => {
+    // Convert Uint8Array to Buffer for the N-API call. Empty buffer is fine
+    // (FTS5-only retrieval); Rust skips the vector path when len == 0.
+    const buf = Buffer.from(queryEmbedding ?? new Uint8Array());
+    return native.addon.ragRetrieveHybrid?.(query, buf, optionsJson);
+  });
 
   // Dictionary. After a mutation, broadcast `dictionary-changed` so any
   // renderer/main caches re-fetch their term list (used by transcript
