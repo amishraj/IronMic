@@ -1686,16 +1686,15 @@ export function MeetingPage() {
       {/* Setup: template picker + audio device (when idle) */}
       {!isActive && (
         <div className="space-y-3">
-          {/* Mode selector — segmented switch, centered. The wrapper is a
-              flex row so the segmented pill is centered no matter the
-              parent width; the pill itself doesn't stretch (no `w-full`)
-              so it sits at its natural intrinsic width and looks tidy
-              instead of being smeared across the whole column. */}
-          <div className="flex justify-center">
+          {/* Mode selector — left-aligned compact pill segmented control.
+              Track uses a neutral tint so the active pill (white/semi-white)
+              pops clearly in both light and dark mode. */}
+          <div>
+            <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider mb-2">Mode</p>
             <div
               role="radiogroup"
               aria-label="Meeting mode"
-              className="inline-flex items-center p-0.5 rounded-full bg-iron-surface/60 border border-iron-border"
+              className="inline-flex items-center gap-0.5 p-0.5 rounded-full border border-iron-border bg-black/[0.06] dark:bg-white/[0.08]"
             >
               {[
                 { key: 'host', label: 'Host', icon: <Wifi className="w-3.5 h-3.5" /> },
@@ -1703,32 +1702,29 @@ export function MeetingPage() {
                 ...(devFeaturesEnabled
                   ? [{ key: 'solo', label: 'Solo', icon: <Mic className="w-3.5 h-3.5" /> }]
                   : []),
-              ].map((opt) => {
-                const active = roomMode === opt.key;
-                return (
-                  <button
-                    key={opt.key}
-                    type="button"
-                    role="radio"
-                    aria-checked={active}
-                    onClick={() => { setRoomMode(opt.key as any); setRoomError(null); }}
-                    className={`flex items-center justify-center gap-1.5 min-w-[88px] px-4 py-1.5 rounded-full text-xs font-medium transition-all ${
-                      active
-                        ? 'bg-iron-surface text-iron-text shadow-sm'
-                        : 'text-iron-text-muted hover:text-iron-text'
-                    }`}
-                  >
-                    {opt.icon}
-                    <span>{opt.label}</span>
-                  </button>
-                );
-              })}
+              ].map((opt) => (
+                <button
+                  key={opt.key}
+                  type="button"
+                  role="radio"
+                  aria-checked={roomMode === opt.key}
+                  onClick={() => { setRoomMode(opt.key as any); setRoomError(null); }}
+                  className={`flex items-center gap-1.5 px-4 py-1.5 rounded-full text-xs font-medium transition-all select-none ${
+                    roomMode === opt.key
+                      ? 'bg-white dark:bg-white/20 text-iron-text dark:text-white shadow-sm'
+                      : 'text-iron-text-muted hover:text-iron-text'
+                  }`}
+                >
+                  {opt.icon}
+                  <span>{opt.label}</span>
+                </button>
+              ))}
             </div>
           </div>
 
           {/* Join form: IP:Port + Room code, or paste invite */}
           {roomMode === 'participant' && (
-            <div className="space-y-2 border border-iron-border rounded-xl p-3 bg-iron-surface/50">
+            <div className="space-y-2 border border-iron-border rounded-xl p-3 bg-iron-surface/50 mt-1">
               <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">Room invite</p>
               <input
                 type="text"
@@ -1790,7 +1786,7 @@ export function MeetingPage() {
             </div>
           )}
 
-          <div className="flex items-center justify-between">
+          <div className="flex items-center justify-between mt-3">
             <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">Meeting Templates</p>
             <button
               onClick={() => setShowEditor(!showEditor)}
