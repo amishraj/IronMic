@@ -214,15 +214,13 @@ export function AIChat() {
     // Build prompt with attached items as context. Picker emits prefixed ids
     // for dictations and meetings; we label the block accordingly so the LLM
     // knows what kind of source it's reading (raw dictation may be rough vs.
-    // a polished meeting summary). The block format is otherwise identical
-    // to keep prompt diffs minimal.
+    // a polished meeting summary). The stored user message stays as the bare
+    // typed text — the pill row above the input already shows what's
+    // attached, so duplicating that info inside the chat bubble would be
+    // redundant clutter. Attached pills also persist across turns by design
+    // (no setAttachedNotes([])) so the filter-bar visual is the single
+    // source of truth for "what does the AI know about right now?".
     let fullPrompt = text;
-    // We also keep a human-readable summary of what was attached and prepend
-    // it to the *stored* user message so the chat history makes it obvious
-    // which turns included context. Cheap UX win — without it the user sees
-    // their question and a response and has no signal that their attachment
-    // actually got through.
-    let visibleContent = text;
     if (attachedNotes.length > 0) {
       const context = attachedNotes.map((n) => {
         const kindLabel = n.id.startsWith('dictation:')
@@ -233,30 +231,12 @@ export function AIChat() {
         return `[${kindLabel}: ${n.title || 'Untitled'}]\n${n.content}`;
       }).join('\n\n');
       fullPrompt = `Context from my IronMic:\n\n${context}\n\n---\n\n${text}`;
-
-      const labels = attachedNotes.map((n) => {
-        const kindIcon = n.id.startsWith('dictation:')
-          ? '🎙️'
-          : n.id.startsWith('meeting:')
-            ? '👥'
-            : '📝';
-        return `${kindIcon} ${n.title || 'Untitled'}`;
-      }).join('   ');
-      visibleContent = `📎 Context attached: ${labels}\n\n${text}`;
-
-      // Note: we intentionally do NOT clear `attachedNotes` after send.
-      // Attached items behave like *filter pills* — once added they stay
-      // pinned across turns so the user can build up a multi-source context
-      // (e.g. attach Tuesday's standup + the auth-migration meeting, ask a
-      // question, refine with follow-ups, then attach Wednesday's standup
-      // and keep going). The user explicitly removes pills with the × on
-      // each chip or "Clear all" at the row end.
     }
 
     const userMsg: ChatMessage = {
       id: Date.now().toString(),
       role: 'user',
-      content: visibleContent,
+      content: text,
       timestamp: Date.now(),
     };
 
