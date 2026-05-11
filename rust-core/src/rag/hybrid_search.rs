@@ -320,28 +320,38 @@ fn build_fts_sql(filters: &IntentFilters, skip_archived: bool) -> String {
         }
     }
 
-    // Date range — applied against the parent source row's created_at via
-    // CASE on source_type. We can't index this cleanly without expression
-    // indexes; the FTS5 MATCH prefilters enough that the per-row JOIN is fine.
-    if let Some(ref from) = filters.date_from {
-        where_clauses.push(format!(
-            "COALESCE(\
+    // Date range — applied against EITHER created_at OR updated_at on the
+    // parent source row. A note created May 9 but edited May 10 should
+    // show up in a "yesterday" query for May 10: matching only on
+    // created_at would miss it. Conversely, a note created May 10 but
+    // never re-edited should match a May 10 query via created_at. The
+    // OR makes the filter inclusive in both directions.
+    //
+    // Meetings only have started_at; user_notes carries both. The
+    // sub-SELECT pattern compiles to the same indexed lookup as a single
+    // COALESCE — SQLite re-runs it but the FTS5 MATCH prefilters enough
+    // that the per-row JOIN cost is amortized.
+    let date_in_range = |bound: &str, op: &str| -> String {
+        format!(
+            "(COALESCE(\
                 (SELECT e.created_at FROM entries e WHERE e.id = c.source_id),\
                 (SELECT m.started_at FROM meeting_sessions m WHERE m.id = c.source_id),\
                 (SELECT u.created_at FROM user_notes u WHERE u.id = c.source_id)\
-             ) >= '{}'",
-            from.replace('\'', "''")
-        ));
+             ) {op} '{bound}' \
+             OR COALESCE(\
+                (SELECT e.updated_at FROM entries e WHERE e.id = c.source_id),\
+                (SELECT m.ended_at FROM meeting_sessions m WHERE m.id = c.source_id),\
+                (SELECT u.updated_at FROM user_notes u WHERE u.id = c.source_id)\
+             ) {op} '{bound}')",
+            bound = bound.replace('\'', "''"),
+            op = op,
+        )
+    };
+    if let Some(ref from) = filters.date_from {
+        where_clauses.push(date_in_range(from, ">="));
     }
     if let Some(ref to) = filters.date_to {
-        where_clauses.push(format!(
-            "COALESCE(\
-                (SELECT e.created_at FROM entries e WHERE e.id = c.source_id),\
-                (SELECT m.started_at FROM meeting_sessions m WHERE m.id = c.source_id),\
-                (SELECT u.created_at FROM user_notes u WHERE u.id = c.source_id)\
-             ) <= '{}'",
-            to.replace('\'', "''")
-        ));
+        where_clauses.push(date_in_range(to, "<="));
     }
 
     // Speaker filter (meetings only).
@@ -378,11 +388,31 @@ fn build_fts_sql(filters: &IntentFilters, skip_archived: bool) -> String {
 /// "yesterday".
 fn build_recent_fallback_sql(filters: &IntentFilters, skip_archived: bool) -> String {
     let mut where_clauses: Vec<String> = vec!["1=1".to_string()];
-    let coalesced_created = "COALESCE(\
-        (SELECT e.created_at FROM entries e WHERE e.id = c.source_id),\
-        (SELECT m.started_at FROM meeting_sessions m WHERE m.id = c.source_id),\
-        (SELECT u.created_at FROM user_notes u WHERE u.id = c.source_id)\
+    // For the "ORDER BY recency" we use MAX(created_at, updated_at) so a
+    // note edited today appears before one created today but unedited
+    // since. For the date-range filter we use OR over both, same as the
+    // FTS / vector paths — see build_fts_sql for the rationale.
+    let coalesced_max = "COALESCE(\
+        (SELECT MAX(e.created_at, e.updated_at) FROM entries e WHERE e.id = c.source_id),\
+        (SELECT MAX(m.started_at, COALESCE(m.ended_at, m.started_at)) FROM meeting_sessions m WHERE m.id = c.source_id),\
+        (SELECT MAX(u.created_at, u.updated_at) FROM user_notes u WHERE u.id = c.source_id)\
      )";
+    let date_in_range = |bound: &str, op: &str| -> String {
+        format!(
+            "(COALESCE(\
+                (SELECT e.created_at FROM entries e WHERE e.id = c.source_id),\
+                (SELECT m.started_at FROM meeting_sessions m WHERE m.id = c.source_id),\
+                (SELECT u.created_at FROM user_notes u WHERE u.id = c.source_id)\
+             ) {op} '{bound}' \
+             OR COALESCE(\
+                (SELECT e.updated_at FROM entries e WHERE e.id = c.source_id),\
+                (SELECT m.ended_at FROM meeting_sessions m WHERE m.id = c.source_id),\
+                (SELECT u.updated_at FROM user_notes u WHERE u.id = c.source_id)\
+             ) {op} '{bound}')",
+            bound = bound.replace('\'', "''"),
+            op = op,
+        )
+    };
 
     if let Some(ref types) = filters.source_types {
         if !types.is_empty() {
@@ -394,10 +424,10 @@ fn build_recent_fallback_sql(filters: &IntentFilters, skip_archived: bool) -> St
         }
     }
     if let Some(ref from) = filters.date_from {
-        where_clauses.push(format!("{coalesced_created} >= '{}'", from.replace('\'', "''")));
+        where_clauses.push(date_in_range(from, ">="));
     }
     if let Some(ref to) = filters.date_to {
-        where_clauses.push(format!("{coalesced_created} <= '{}'", to.replace('\'', "''")));
+        where_clauses.push(date_in_range(to, "<="));
     }
     if let Some(ref speaker) = filters.speaker {
         where_clauses.push(format!("c.speaker_label = '{}'", speaker.replace('\'', "''")));
@@ -409,10 +439,10 @@ fn build_recent_fallback_sql(filters: &IntentFilters, skip_archived: bool) -> St
     }
 
     format!(
-        "SELECT c.id, {coalesced_created} AS created \
+        "SELECT c.id, {coalesced_max} AS most_recent \
          FROM chunks c \
          WHERE {} \
-         ORDER BY created DESC NULLS LAST \
+         ORDER BY most_recent DESC NULLS LAST \
          LIMIT ?1",
         where_clauses.join(" AND ")
     )
@@ -436,25 +466,29 @@ fn build_vector_candidate_sql(filters: &IntentFilters, skip_archived: bool) -> S
             where_clauses.push(format!("c.source_type IN ({in_list})"));
         }
     }
-    if let Some(ref from) = filters.date_from {
-        where_clauses.push(format!(
-            "COALESCE(\
+    // Same created_at-OR-updated_at expansion as the FTS5 path — see
+    // build_fts_sql for the rationale.
+    let date_in_range = |bound: &str, op: &str| -> String {
+        format!(
+            "(COALESCE(\
                 (SELECT e.created_at FROM entries e WHERE e.id = c.source_id),\
                 (SELECT m.started_at FROM meeting_sessions m WHERE m.id = c.source_id),\
                 (SELECT u.created_at FROM user_notes u WHERE u.id = c.source_id)\
-             ) >= '{}'",
-            from.replace('\'', "''")
-        ));
+             ) {op} '{bound}' \
+             OR COALESCE(\
+                (SELECT e.updated_at FROM entries e WHERE e.id = c.source_id),\
+                (SELECT m.ended_at FROM meeting_sessions m WHERE m.id = c.source_id),\
+                (SELECT u.updated_at FROM user_notes u WHERE u.id = c.source_id)\
+             ) {op} '{bound}')",
+            bound = bound.replace('\'', "''"),
+            op = op,
+        )
+    };
+    if let Some(ref from) = filters.date_from {
+        where_clauses.push(date_in_range(from, ">="));
     }
     if let Some(ref to) = filters.date_to {
-        where_clauses.push(format!(
-            "COALESCE(\
-                (SELECT e.created_at FROM entries e WHERE e.id = c.source_id),\
-                (SELECT m.started_at FROM meeting_sessions m WHERE m.id = c.source_id),\
-                (SELECT u.created_at FROM user_notes u WHERE u.id = c.source_id)\
-             ) <= '{}'",
-            to.replace('\'', "''")
-        ));
+        where_clauses.push(date_in_range(to, "<="));
     }
     if let Some(ref speaker) = filters.speaker {
         where_clauses.push(format!(

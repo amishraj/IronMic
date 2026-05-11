@@ -1508,6 +1508,31 @@ export function DictatePage() {
     } catch { /* best effort */ }
   }, []);
 
+  /** Auto-persist the default emoji as soon as we have an entry to attach
+   *  it to. Without this, a freshly-created note shows the randomly-picked
+   *  emoji in the editor but the underlying entry's `tags` never gets the
+   *  `__emoji__:` row — so the sidebar (which reads from tags) renders no
+   *  emoji until the user manually changes it. We only write when the
+   *  entry has NO existing emoji tag, so this never clobbers a user-set
+   *  emoji or one carried in from a collab peer. */
+  useEffect(() => {
+    if (!entryId || !noteEmoji) return;
+    void (async () => {
+      try {
+        const fresh = await window.ironmic.getEntry(entryId);
+        if (!fresh) return;
+        const existing = parseEmojiTag((fresh as any).tags);
+        if (existing && existing.length > 0) return; // already has one — don't overwrite
+        const parsed: string[] = JSON.parse((fresh as any).tags || '[]');
+        // Defensive: filter any prior empty/malformed emoji tag.
+        const filtered = parsed.filter((s: string) => !s.startsWith(EMOJI_TAG_PREFIX));
+        filtered.push(`${EMOJI_TAG_PREFIX}${noteEmoji}`);
+        await window.ironmic.updateEntry(entryId, { tags: JSON.stringify(filtered) } as any);
+        try { window.dispatchEvent(new CustomEvent('ironmic:entries-changed')); } catch { /* noop */ }
+      } catch { /* best effort — sidebar will just keep showing no emoji */ }
+    })();
+  }, [entryId, noteEmoji]);
+
   /** Swap the editor + store onto a specific entry, running all the
    *  bookkeeping (counts, status, emoji, draft, store mirror, edit-rev
    *  reset). Used by both the sidebar click path AND the join-collab path

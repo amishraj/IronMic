@@ -313,11 +313,12 @@ export function AIChat() {
     const contextBlocks: string[] = [];
     if (attachedNotes.length > 0) {
       const block = attachedNotes.map((n) => {
-        const kindLabel = n.id.startsWith('dictation:')
-          ? 'Dictation'
-          : n.id.startsWith('meeting:')
-            ? 'Meeting'
-            : 'Note';
+        // Internal id prefix is 'dictation:' for legacy reasons but the
+        // user calls these "Notes". Labeling the prompt block "Note" here
+        // matches the picker UI and the user's mental model.
+        const kindLabel = n.id.startsWith('meeting:')
+          ? 'Meeting'
+          : 'Note';
         return `[${kindLabel}: ${n.title || 'Untitled'}]\n${n.content}`;
       }).join('\n\n');
       contextBlocks.push(`[Pinned context — items you attached]\n${block}`);
@@ -1023,7 +1024,7 @@ export function AIChat() {
                   <span
                     key={n.id}
                     className={`group inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full border max-w-[200px] ${palette}`}
-                    title={`${kind === 'note' ? 'Note' : kind === 'dictation' ? 'Dictation' : 'Meeting'}: ${n.title || 'Untitled'}`}
+                    title={`${kind === 'meeting' ? 'Meeting' : 'Note'}: ${n.title || 'Untitled'}`}
                   >
                     <Icon className="w-3 h-3 flex-shrink-0" />
                     <span className="truncate">{n.title || 'Untitled'}</span>

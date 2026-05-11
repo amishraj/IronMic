@@ -516,13 +516,50 @@ export function registerIpcHandlers(): void {
   // Expose the counter so index.ts can read it in the before-close hook.
   (global as any).__ironmicActiveGeneratingCount = () => activeNotesGeneratingCount;
 
-  // Entries
-  ipcMain.handle(IPC_CHANNELS.CREATE_ENTRY, (_e, entry) => native.createEntry(entry));
+  // Entries. CREATE / UPDATE both schedule a chunk refresh so RAG retrieval
+  // sees freshly-edited content on the next Search query — without this,
+  // the chunks table held content from the previous edit and queries like
+  // "what's in my note about X" would miss X if X was added recently.
+  // Fire-and-forget (the chunk op runs in Rust under the SQLite mutex) so
+  // we don't block the user-visible save. DELETE cascades to remove old
+  // chunks for the dropped source.
+  const scheduleChunkRefresh = (id: string) => {
+    queueMicrotask(() => {
+      try {
+        native.addon.ragChunkEntry?.(id);
+      } catch (err) {
+        console.warn(`[ipc] chunk refresh for entry ${id} failed:`, err);
+      }
+    });
+  };
+  ipcMain.handle(IPC_CHANNELS.CREATE_ENTRY, (_e, entry) => {
+    const created = native.createEntry(entry);
+    if (created?.id) scheduleChunkRefresh(created.id);
+    return created;
+  });
   ipcMain.handle(IPC_CHANNELS.GET_ENTRY, (_e, id: string) => native.getEntry(id));
-  ipcMain.handle(IPC_CHANNELS.UPDATE_ENTRY, (_e, id: string, updates) =>
-    native.updateEntry(id, updates)
-  );
-  ipcMain.handle(IPC_CHANNELS.DELETE_ENTRY, (_e, id: string) => native.deleteEntry(id));
+  ipcMain.handle(IPC_CHANNELS.UPDATE_ENTRY, (_e, id: string, updates) => {
+    const updated = native.updateEntry(id, updates);
+    // Only re-chunk when the body or polished text changed — tag / pin /
+    // archive flips don't affect chunk content and would just waste work.
+    const bodyChanged =
+      updates?.rawTranscript !== undefined
+      || updates?.polishedText !== undefined
+      || updates?.rawTranscriptJson !== undefined
+      || updates?.polishedTextJson !== undefined;
+    if (bodyChanged) scheduleChunkRefresh(id);
+    return updated;
+  });
+  ipcMain.handle(IPC_CHANNELS.DELETE_ENTRY, (_e, id: string) => {
+    // Drop the entry's chunks first so a delete followed immediately by a
+    // search doesn't surface ghost chunks for the just-removed entry.
+    try {
+      native.addon.ragDeleteChunksForSource?.('entry', id);
+    } catch (err) {
+      console.warn(`[ipc] chunk delete for entry ${id} failed:`, err);
+    }
+    return native.deleteEntry(id);
+  });
   ipcMain.handle('ironmic:tag-untagged-entries', (_e, sourceApp: string) =>
     native.addon.tagUntaggedEntries(sourceApp)
   );

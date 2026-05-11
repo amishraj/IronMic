@@ -308,12 +308,22 @@ export function NotePickerModal({ open, onClose, onSelect, selectedNotes, onDese
           </div>
         </div>
 
-        {/* Tabs */}
+        {/* Tabs — the user's mental model is "Notes" (whatever I created
+            via the Notes page) and "Meetings". The `entries` table is
+            where Notes-page content lives, so it's labeled "Notes" here.
+            The separate `user_notes` SQLite table is hidden unless the
+            user actually has rows there (rare today; reserved for a
+            future second-class manual-notes feature). This collapses the
+            picker to two intuitive tabs instead of three confusingly-
+            overlapping ones. */}
         <div className="flex items-center gap-1 px-4 pb-2">
           {([
             { id: 'recent', label: 'Recent', count: allItems.length },
-            { id: 'notes', label: 'Notes', count: noteItems.length },
-            { id: 'dictations', label: 'Dictations', count: entryItems.length },
+            { id: 'dictations', label: 'Notes', count: entryItems.length },
+            // user_notes-backed tab — surfaced only when non-empty.
+            ...(noteItems.length > 0
+              ? [{ id: 'notes' as const, label: 'Notebooks', count: noteItems.length }]
+              : []),
             { id: 'meetings', label: 'Meetings', count: meetingItems.length },
           ] as const).map(({ id, label, count }) => (
             <button
@@ -361,22 +371,27 @@ export function NotePickerModal({ open, onClose, onSelect, selectedNotes, onDese
 function emptyMessage(tab: 'recent' | 'notes' | 'dictations' | 'meetings'): string {
   switch (tab) {
     case 'notes':
-      return 'No notes yet. Create one from the Notes page to attach it as context.';
+      return 'No notebooks yet. Create one from the Notes page to attach it as context.';
     case 'dictations':
-      return 'No dictations yet. Open the Dictate page and record something to attach it.';
+      return 'No notes yet. Open the Notes page and write or dictate something to attach it.';
     case 'meetings':
       return 'No meetings yet. Start a Granola-mode recording from the Meetings page.';
     default:
-      return 'Nothing to attach yet. Dictate, take a note, or record a meeting first.';
+      return 'Nothing to attach yet. Create a note or record a meeting first.';
   }
 }
 
 function KindBadge({ kind }: { kind: Kind }) {
+  // Internal kind value is 'dictation' for legacy reasons (the entries
+  // table started life as the dictation timeline), but the user-facing
+  // label is "Note" — that's what users call this content. Keeping the
+  // kind name unchanged avoids ripple changes to prefixed-id parsers in
+  // AIChat ("dictation:<id>" prefix continues to work).
   if (kind === 'dictation') {
     return (
       <span className="inline-flex items-center gap-0.5 text-[9px] px-1.5 py-0.5 rounded bg-iron-accent/10 text-iron-accent-light">
         <Mic className="w-2.5 h-2.5" />
-        Dictation
+        Note
       </span>
     );
   }
