@@ -45,7 +45,14 @@ const NAV_ITEMS: NavItem[] = [
   { id: 'home', label: 'Home', icon: Home, section: 'core' },
   { id: 'main', label: 'Timeline', icon: List, section: 'core' },
   { id: 'ai', label: 'AI Assistant', icon: Sparkles, section: 'core' },
-  { id: 'ask', label: 'Ask', icon: Search, section: 'core' },
+  // The standalone Ask page was folded into AI Assistant as a
+  // "Search my IronMic" toggle in the input row — one chat surface that
+  // can either be conversational with manual attachments OR ask-style
+  // with auto-retrieval, depending on whether the toggle is on. The Ask
+  // route is left in the codebase (Layout still renders <AskPage> if
+  // `page === 'ask'`) so deeplinks and any internal navigation continue
+  // to work, but it's no longer in the primary sidebar.
+  // { id: 'ask', label: 'Ask', icon: Search, section: 'core' },
   { id: 'dictate', label: 'Notes', icon: StickyNote, section: 'tools' },
   { id: 'listen', label: 'Listen', icon: Volume2, section: 'tools' },
   { id: 'search', label: 'Search', icon: Search, section: 'tools' },

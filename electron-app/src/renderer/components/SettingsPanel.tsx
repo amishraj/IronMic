@@ -776,56 +776,24 @@ function AIAssistSettings() {
             </Card>
           </div>
 
-          {/* ── Knowledge Q&A (Ask page) ────────────────────────────────── */}
+          {/* ── Search my IronMic (in AI Assistant) ────────────────────── */}
           <Card variant="default" padding="md">
             <div className="space-y-3">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-start gap-2 min-w-0 flex-1">
                   <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
                   <div className="min-w-0">
-                    <p className="text-sm font-medium text-iron-text">Knowledge Q&A (Ask page)</p>
+                    <p className="text-sm font-medium text-iron-text">Search my IronMic (in AI Assistant)</p>
                     <p className="text-xs text-iron-text-muted mt-0.5">
-                      Lets the Ask page search your notes, dictations, and meetings and answer
-                      with citations. Turn off to hide the Ask page from the sidebar. Manually
-                      attaching content in AI Chat is not affected by this toggle.
+                      Surfaces a "Search my IronMic" button in the AI Assistant input row.
+                      When toggled on per-chat, each send first retrieves the most relevant
+                      chunks from your notes, dictations, and meetings, and injects them as
+                      context. Turn this master setting off to hide the button entirely.
                     </p>
                   </div>
                 </div>
                 <Toggle checked={knowledgeQaEnabled} onChange={handleKnowledgeQaEnabledToggle} />
               </div>
-            </div>
-          </Card>
-
-          <Card
-            variant="default"
-            padding="md"
-            className={knowledgeQaAllowCloud ? 'border-amber-500/40' : ''}
-          >
-            <div className="space-y-3">
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-start gap-2 min-w-0 flex-1">
-                  <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium text-iron-text">Allow cloud Knowledge Q&A (Claude / Copilot)</p>
-                    <p className="text-xs text-iron-text-muted mt-0.5">
-                      Off by default. The Ask page auto-retrieves chunks of your content and sends
-                      them to your selected provider — turn this on to let those automatically-
-                      retrieved excerpts go to Claude or Copilot. Manual AI Chat attachments are
-                      not gated by this; that's explicit consent by the user's pick.
-                    </p>
-                  </div>
-                </div>
-                <Toggle checked={knowledgeQaAllowCloud} onChange={handleKnowledgeQaCloudToggle} />
-              </div>
-              {knowledgeQaAllowCloud && (
-                <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300">
-                  <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
-                  <span>
-                    Cloud Knowledge Q&A is enabled. The Ask page can route retrieved excerpts of
-                    your local content to Claude or Copilot when those providers are selected.
-                  </span>
-                </div>
-              )}
             </div>
           </Card>
 

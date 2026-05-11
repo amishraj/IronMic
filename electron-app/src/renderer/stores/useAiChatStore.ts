@@ -52,6 +52,12 @@ interface AiChatStore {
    *  If this graduates to a sync-eligible feature later it can move into the
    *  table behind a small migration. */
   attachedContextBySession: Record<string, Note[]>;
+  /** Per-session "search my IronMic" toggle state. When true, every send
+   *  in that chat runs retrieval first and injects the top-k chunks as
+   *  context — same prompt-shape as a manual attach, but synthesized
+   *  per-turn from the user's query. Persisted in the same localStorage
+   *  key family as the attached pills. */
+  searchModeBySession: Record<string, boolean>;
 
   // Getters
   activeSession: () => AiSession | null;
@@ -77,6 +83,9 @@ interface AiChatStore {
   addAttachment: (sessionId: string, note: Note) => void;
   removeAttachment: (sessionId: string, noteId: string) => void;
   clearAttachments: (sessionId: string) => void;
+
+  // Search-mode actions
+  setSearchMode: (sessionId: string, enabled: boolean) => void;
 
   /** Background LLM-inferred chat title. Fires once per session after the
    *  first complete user→assistant exchange — calls the local LLM (cheap,
@@ -104,6 +113,28 @@ function deriveTitle(messages: ChatMessage[]): string {
 
 // ── Attached context persistence (localStorage) ────────────────────────────
 const ATTACHED_KEY = 'ironmic-ai-attached-context';
+const SEARCH_MODE_KEY = 'ironmic-ai-search-mode';
+
+function loadSearchModeMap(): Record<string, boolean> {
+  if (typeof localStorage === 'undefined') return {};
+  try {
+    const raw = localStorage.getItem(SEARCH_MODE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return {};
+    const out: Record<string, boolean> = {};
+    for (const [k, v] of Object.entries(parsed)) {
+      if (typeof v === 'boolean') out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+function saveSearchModeMap(map: Record<string, boolean>) {
+  if (typeof localStorage === 'undefined') return;
+  try { localStorage.setItem(SEARCH_MODE_KEY, JSON.stringify(map)); } catch { /* noop */ }
+}
 
 function loadAttachedContextMap(): Record<string, Note[]> {
   if (typeof localStorage === 'undefined') return {};
@@ -298,6 +329,7 @@ export const useAiChatStore = create<AiChatStore>((set, get) => ({
   hydrationError: null,
   closedForWrites: new Set(),
   attachedContextBySession: loadAttachedContextMap(),
+  searchModeBySession: loadSearchModeMap(),
 
   activeSession: () => {
     const { sessions, activeSessionId } = get();
@@ -468,12 +500,19 @@ export const useAiChatStore = create<AiChatStore>((set, get) => ({
     const closedForWrites = new Set(get().closedForWrites);
     closedForWrites.add(id);
 
-    // Drop the deleted session's attachments from the map so localStorage
-    // doesn't accrete ghost entries for chats the user has thrown away.
-    const { [id]: _drop, ...remainingAttached } = get().attachedContextBySession;
+    // Drop the deleted session's attachments + search-mode flag from the
+    // maps so localStorage doesn't accrete ghost entries for chats the user
+    // has thrown away.
+    const { [id]: _dropAttached, ...remainingAttached } = get().attachedContextBySession;
     saveAttachedContextMap(remainingAttached);
+    const { [id]: _dropSearch, ...remainingSearch } = get().searchModeBySession;
+    saveSearchModeMap(remainingSearch);
 
-    set({ sessions, activeSessionId, closedForWrites, attachedContextBySession: remainingAttached });
+    set({
+      sessions, activeSessionId, closedForWrites,
+      attachedContextBySession: remainingAttached,
+      searchModeBySession: remainingSearch,
+    });
 
     // Tombstone runs at the tail of the queue — prior writes drain in order.
     enqueue(id, async () => {
@@ -571,6 +610,12 @@ export const useAiChatStore = create<AiChatStore>((set, get) => ({
 
   clearAttachments: (sessionId) => {
     get().setAttachedContext(sessionId, []);
+  },
+
+  setSearchMode: (sessionId, enabled) => {
+    const map = { ...get().searchModeBySession, [sessionId]: enabled };
+    saveSearchModeMap(map);
+    set({ searchModeBySession: map });
   },
 
   // ── Title inference ─────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Bot, Send, Mic, Square, RefreshCw, Sparkles, AlertCircle, Plus, MessageSquare, X, Volume2, Pause, BookOpen, StickyNote, MessageCircle } from 'lucide-react';
 import { useAiChatStore, type ChatMessage, type AIProvider } from '../stores/useAiChatStore';
+import { useSettingsStore } from '../stores/useSettingsStore';
 import { useSettingsIntentStore } from '../stores/useSettingsIntentStore';
 import { useTtsStore } from '../stores/useTtsStore';
 import { NotePickerModal } from './NotePickerModal';
@@ -54,6 +55,23 @@ export function AIChat() {
     const id = s.activeSessionId;
     return id ? (s.attachedContextBySession[id] ?? []) : [];
   });
+
+  // Search-mode toggle ("🔍 Search my IronMic"): when on, every send first
+  // runs retrieval over the user's full corpus and injects the top-k chunks
+  // as context — same prompt shape as a manual attach, but synthesized from
+  // the user's query per-turn. Per-session, persisted to localStorage so
+  // toggling once sticks for that conversation.
+  const searchModeEnabled = useAiChatStore((s) => {
+    const id = s.activeSessionId;
+    return id ? !!s.searchModeBySession[id] : false;
+  });
+  /** Master enable for the entire "Search my IronMic" feature. Drives the
+   *  visibility of the toggle button; users can also flip the per-chat
+   *  toggle off independently. */
+  const knowledgeQaEnabled = useSettingsStore((s) => s.knowledgeQaEnabled);
+  /** "What's happening right now" indicator beneath the input. Updated by
+   *  sendText as it walks through retrieval → LLM dispatch → streaming. */
+  const [sendPhase, setSendPhase] = useState<'idle' | 'retrieving' | 'sending' | 'streaming'>('idle');
 
   /** Make sure we have a session id before recording an attach action.
    *  First-time attach creates the session so attachment intent survives
@@ -135,6 +153,7 @@ export function AIChat() {
   useEffect(() => {
     setStreaming('');
     setLoading(false);
+    setSendPhase('idle');
   }, [activeSessionId]);
 
   // Load auth & auto-create session on mount
@@ -147,6 +166,11 @@ export function AIChat() {
   // async stores back-fill. NotePickerModal also lazy-loads as a fallback;
   // this just races ahead so the common case is "already there." Cheap —
   // each load is a single paginated SQLite read.
+  //
+  // Also kicks the RAG IndexerService backfill in the same effect — without
+  // it the "Search my IronMic" toggle would have nothing to retrieve from
+  // until the user visits the (now-hidden) Ask page. Idempotent and runs
+  // once per session.
   useEffect(() => {
     void (async () => {
       try {
@@ -160,6 +184,12 @@ export function AIChat() {
         }
       } catch (err) {
         console.warn('[AIChat] Picker preload failed (non-fatal):', err);
+      }
+      try {
+        const { indexerService } = await import('../services/rag/IndexerService');
+        await indexerService.kickOnce();
+      } catch (err) {
+        console.warn('[AIChat] Indexer kick failed (non-fatal):', err);
       }
     })();
   }, []);
@@ -177,6 +207,10 @@ export function AIChat() {
       if (data.sessionId && currentSession && data.sessionId !== currentSession) {
         return; // Token belongs to a different chat — drop it.
       }
+      // First token in = we're actively streaming. Flip the phase indicator
+      // so the user sees "Composing answer…" instead of "Sending to Claude…"
+      // and knows tokens are actually arriving (not just queued).
+      setSendPhase((p) => (p === 'streaming' ? p : 'streaming'));
       setStreaming((prev) => prev + data.content);
     });
     const cleanupEnd = window.ironmic.onAiTurnEnd((data: any) => {
@@ -269,9 +303,16 @@ export function AIChat() {
     // redundant clutter. Attached pills also persist across turns by design
     // (no setAttachedNotes([])) so the filter-bar visual is the single
     // source of truth for "what does the AI know about right now?".
+    //
+    // Search-mode adds a SECOND context block: when the toggle is on we
+    // run retrieval over the full corpus on the current query, take top-N
+    // chunks, and append them as `[Retrieved: …]` entries to the same
+    // context block. Manual attachments win for accuracy (user explicitly
+    // picked them); retrieved chunks are best-effort augmentation.
     let fullPrompt = text;
+    const contextBlocks: string[] = [];
     if (attachedNotes.length > 0) {
-      const context = attachedNotes.map((n) => {
+      const block = attachedNotes.map((n) => {
         const kindLabel = n.id.startsWith('dictation:')
           ? 'Dictation'
           : n.id.startsWith('meeting:')
@@ -279,8 +320,39 @@ export function AIChat() {
             : 'Note';
         return `[${kindLabel}: ${n.title || 'Untitled'}]\n${n.content}`;
       }).join('\n\n');
-      fullPrompt = `Context from my IronMic:\n\n${context}\n\n---\n\n${text}`;
+      contextBlocks.push(`[Pinned context — items you attached]\n${block}`);
     }
+    if (searchModeEnabled) {
+      setSendPhase('retrieving');
+      try {
+        const k = (provider === 'local') ? 6 : 12;
+        const opts = {
+          model_version: 'bge-small-en-v1.5',
+          k,
+          filters: {},
+          skip_archived: true,
+        };
+        const json = await (window as any).ironmic.ragRetrieveHybrid?.(text, new Uint8Array(), JSON.stringify(opts));
+        if (json) {
+          const parsed = JSON.parse(json);
+          const hits: Array<{ label: string; text: string }> = parsed?.hits ?? [];
+          if (hits.length > 0) {
+            const block = hits
+              .map((h, i) => `[${i + 1}] ${h.label}\n${h.text}`)
+              .join('\n\n');
+            contextBlocks.push(`[Retrieved from your IronMic — ${hits.length} sources]\n${block}`);
+          }
+        }
+      } catch (err) {
+        // Retrieval failure should never block the send. Log and continue
+        // with just attached/no context.
+        console.warn('[AIChat] retrieval failed (continuing without retrieved context):', err);
+      }
+    }
+    if (contextBlocks.length > 0) {
+      fullPrompt = `${contextBlocks.join('\n\n---\n\n')}\n\n---\n\n${text}`;
+    }
+    setSendPhase('sending');
 
     const userMsg: ChatMessage = {
       id: Date.now().toString(),
@@ -391,13 +463,14 @@ export function AIChat() {
     } finally {
       setLoading(false);
       setStreaming('');
+      setSendPhase('idle');
     }
     // `attachedNotes` MUST be in this dep list: without it the closure freezes
     // to whatever value `attachedNotes` had when sendText was last rebuilt,
     // so the very first send after attaching reads `[]` and the context
     // silently vanishes. (Turn 2 looked like it worked because the loading
     // toggle from turn 1 re-created the callback with the fresh state.)
-  }, [loading, provider, attachedNotes, addMessage, createSession, startAiDictation]);
+  }, [loading, provider, attachedNotes, searchModeEnabled, addMessage, createSession, startAiDictation]);
 
   // Keep a ref to the latest sendText so the long-lived dictation listener
   // (mounted once with [] deps) can call it without re-binding on every change.
@@ -823,7 +896,20 @@ export function AIChat() {
                 <span className="w-1.5 h-1.5 rounded-full bg-iron-accent animate-bounce" style={{ animationDelay: '150ms' }} />
                 <span className="w-1.5 h-1.5 rounded-full bg-iron-accent animate-bounce" style={{ animationDelay: '300ms' }} />
               </div>
-              <span className="text-xs">Thinking...</span>
+              {/* Phase-aware status. Cloud CLIs take ~5–10s to cold-start
+                  before the first token arrives — without this the user has
+                  no signal anything is happening. Reading the active phase
+                  here lets us say "Searching your knowledge…" while the
+                  retrieval call is in flight and "Sending to {provider}…"
+                  while waiting on the LLM. Once streaming, the streaming
+                  bubble above takes over and this whole block hides. */}
+              <span className="text-xs">
+                {sendPhase === 'retrieving'
+                  ? 'Searching your knowledge…'
+                  : sendPhase === 'sending'
+                    ? `Sending to ${provider === 'claude' ? 'Claude' : provider === 'copilot' ? 'Copilot' : 'local model'}…`
+                    : 'Thinking…'}
+              </span>
             </div>
           )}
 
@@ -945,6 +1031,34 @@ export function AIChat() {
             >
               <BookOpen className="w-4 h-4" />
             </button>
+
+            {/* Search-my-IronMic toggle. When ON, every send first runs
+                retrieval over the user's full corpus (notes + dictations +
+                meetings via FTS5) and injects the top-k chunks as context.
+                Auto-curation rather than manual attach — same UX intent as
+                ChatGPT's "Search the web" button. Per-session, persisted.
+                A small indicator next to the icon makes the state visible
+                even when toggled idle. Hidden entirely when the user has
+                disabled Knowledge Q&A in Settings. */}
+            {knowledgeQaEnabled && (
+              <button
+                onClick={() => {
+                  const id = ensureSession();
+                  useAiChatStore.getState().setSearchMode(id, !searchModeEnabled);
+                }}
+                className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all flex-shrink-0 ${
+                  searchModeEnabled
+                    ? 'bg-iron-accent/15 text-iron-accent-light shadow-glow'
+                    : 'bg-iron-surface-hover text-iron-text-muted hover:text-iron-text-secondary'
+                }`}
+                title={searchModeEnabled
+                  ? 'Search my IronMic is ON — each send will retrieve and inject the most relevant chunks from your full corpus before asking the model.'
+                  : 'Search my IronMic — turn on to have the AI auto-pull context from your notes, dictations, and meetings on every send.'}
+                aria-pressed={searchModeEnabled}
+              >
+                <Sparkles className="w-4 h-4" />
+              </button>
+            )}
 
             {/*
               Text input + inline grey-draft overlay.
