@@ -244,7 +244,13 @@ export function AIChat() {
       }).join('   ');
       visibleContent = `📎 Context attached: ${labels}\n\n${text}`;
 
-      setAttachedNotes([]); // Clear after sending
+      // Note: we intentionally do NOT clear `attachedNotes` after send.
+      // Attached items behave like *filter pills* — once added they stay
+      // pinned across turns so the user can build up a multi-source context
+      // (e.g. attach Tuesday's standup + the auth-migration meeting, ask a
+      // question, refine with follow-ups, then attach Wednesday's standup
+      // and keep going). The user explicitly removes pills with the × on
+      // each chip or "Clear all" at the row end.
     }
 
     const userMsg: ChatMessage = {
@@ -357,7 +363,12 @@ export function AIChat() {
       setLoading(false);
       setStreaming('');
     }
-  }, [loading, provider, addMessage, createSession, startAiDictation]);
+    // `attachedNotes` MUST be in this dep list: without it the closure freezes
+    // to whatever value `attachedNotes` had when sendText was last rebuilt,
+    // so the very first send after attaching reads `[]` and the context
+    // silently vanishes. (Turn 2 looked like it worked because the loading
+    // toggle from turn 1 re-created the callback with the fresh state.)
+  }, [loading, provider, attachedNotes, addMessage, createSession, startAiDictation]);
 
   // Keep a ref to the latest sendText so the long-lived dictation listener
   // (mounted once with [] deps) can call it without re-binding on every change.
@@ -812,14 +823,18 @@ export function AIChat() {
             </div>
           )}
 
-          {/* Attached context preview — notes, dictations, and meetings all
-              land here as Note-shaped objects. The picker prefixes synthetic
-              ids with `dictation:` / `meeting:` (plain ids = notes), which we
-              decode here to render the right icon + color so the user can
-              tell at a glance what each chip represents. */}
+          {/* Attached-context pills — persistent across turns until the user
+              clears them. Each turn re-sends the full context block as part
+              of the current message, so the LLM always has the canonical
+              source text in hand. The pill row is meant to read like a
+              filter bar in a search UI: "what does the AI know about right
+              now?" The kind icon + color makes the source type unmistakable
+              at a glance even with many pills attached. */}
           {attachedNotes.length > 0 && (
-            <div className="flex items-center gap-1.5 mb-2 flex-wrap">
-              <span className="text-[10px] text-iron-text-muted">Context:</span>
+            <div className="flex items-center gap-1.5 mb-2 flex-wrap rounded-lg bg-iron-bg/40 border border-iron-border px-2 py-1.5">
+              <span className="text-[10px] uppercase tracking-wide text-iron-text-muted">
+                Context · {attachedNotes.length}
+              </span>
               {attachedNotes.map((n) => {
                 const kind: 'note' | 'dictation' | 'meeting' = n.id.startsWith('dictation:')
                   ? 'dictation'
@@ -827,28 +842,36 @@ export function AIChat() {
                     ? 'meeting'
                     : 'note';
                 const palette =
-                  kind === 'dictation' ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/20'
-                  : kind === 'meeting'  ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                  : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/15';
+                  kind === 'dictation' ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/25'
+                  : kind === 'meeting'  ? 'bg-amber-500/15 text-amber-400 border-amber-500/25'
+                  : 'bg-emerald-500/15 text-emerald-400 border-emerald-500/25';
                 const Icon = kind === 'dictation' ? Mic : kind === 'meeting' ? MessageSquare : StickyNote;
                 return (
                   <span
                     key={n.id}
-                    className={`inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full border ${palette}`}
+                    className={`group inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded-full border max-w-[200px] ${palette}`}
                     title={`${kind === 'note' ? 'Note' : kind === 'dictation' ? 'Dictation' : 'Meeting'}: ${n.title || 'Untitled'}`}
                   >
-                    <Icon className="w-2.5 h-2.5" />
-                    {n.title || 'Untitled'}
+                    <Icon className="w-3 h-3 flex-shrink-0" />
+                    <span className="truncate">{n.title || 'Untitled'}</span>
                     <button
                       onClick={() => setAttachedNotes((prev) => prev.filter((x) => x.id !== n.id))}
-                      className="ml-0.5 hover:text-iron-danger"
+                      className="ml-0.5 opacity-60 hover:opacity-100 hover:text-iron-danger flex-shrink-0"
                       aria-label={`Detach ${n.title || 'item'}`}
                     >
-                      <X className="w-2.5 h-2.5" />
+                      <X className="w-3 h-3" />
                     </button>
                   </span>
                 );
               })}
+              {attachedNotes.length > 1 && (
+                <button
+                  onClick={() => setAttachedNotes([])}
+                  className="ml-auto text-[10px] text-iron-text-muted hover:text-iron-danger underline-offset-2 hover:underline"
+                >
+                  Clear all
+                </button>
+              )}
             </div>
           )}
 
