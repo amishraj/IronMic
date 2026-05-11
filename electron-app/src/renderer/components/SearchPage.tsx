@@ -1,11 +1,15 @@
 import { useState, useMemo, useEffect } from 'react';
-import { Search, Mic, Sparkles, StickyNote, Clock, MessageSquare, ArrowRight } from 'lucide-react';
+import { Search, Mic, Sparkles, StickyNote, Users, ArrowRight } from 'lucide-react';
 import { useEntryStore } from '../stores/useEntryStore';
-import { useAiChatStore, type AiSession, type AiSessionSearchHit } from '../stores/useAiChatStore';
-import { useNotesStore, type Note } from '../stores/useNotesStore';
+import { useAiChatStore, type AiSessionSearchHit } from '../stores/useAiChatStore';
+import { useNotesStore } from '../stores/useNotesStore';
+import { useMeetingStore } from '../stores/useMeetingStore';
+import { resolveMeetingTitle } from '../services/meetingTitle';
+import { parseTags, parseTitleTag } from '../types';
+import { tokenizeQuery, matchesNormalized, normalizeForSearch } from '../utils/searchNormalize';
 import { Card } from './ui';
 
-type ResultType = 'dictation' | 'ai-session' | 'note';
+type ResultType = 'dictation' | 'ai-session' | 'note' | 'meeting';
 
 interface SearchResult {
   type: ResultType;
@@ -21,10 +25,43 @@ export function SearchPage() {
   const [query, setQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState<ResultType | 'all'>('all');
 
+  // Accept a seed query from the top-bar QuickSearch popover so "See all
+  // results" lands on the full page with the query already populated.
+  // QuickSearch dispatches the seed *just before* navigating, and SearchPage
+  // mounts immediately after — both happen inside the same tick. Reading a
+  // one-shot value from sessionStorage avoids the ordering race that
+  // event-only delivery would introduce.
+  useEffect(() => {
+    try {
+      const seed = window.sessionStorage.getItem('ironmic:search-seed');
+      if (seed) {
+        setQuery(seed);
+        window.sessionStorage.removeItem('ironmic:search-seed');
+      }
+    } catch { /* ignore (private mode etc.) */ }
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (typeof detail === 'string') setQuery(detail);
+    };
+    window.addEventListener('ironmic:search-seed', handler);
+    return () => window.removeEventListener('ironmic:search-seed', handler);
+  }, []);
+
   const entries = useEntryStore((s) => s.entries);
   const sessions = useAiChatStore((s) => s.sessions);
   const searchSessions = useAiChatStore((s) => s.searchSessions);
   const notes = useNotesStore((s) => s.notes);
+  const meetingSessions = useMeetingStore((s) => s.sessions);
+  const loadMeetingSessions = useMeetingStore((s) => s.loadSessions);
+
+  // Make sure the meeting list is loaded once when the user lands on the
+  // search page — otherwise users who never opened Meetings this session
+  // would see zero meeting results.
+  useEffect(() => {
+    if (meetingSessions.length === 0) {
+      void loadMeetingSessions().catch(() => { /* ignore */ });
+    }
+  }, [meetingSessions.length, loadMeetingSessions]);
 
   // AI session search runs against SQLite FTS5 (aiChatSearchSessions IPC) so
   // sessions whose messages haven't been lazy-loaded into the renderer still
@@ -43,32 +80,57 @@ export function SearchPage() {
   }, [query, searchSessions]);
 
   const results = useMemo(() => {
-    const q = query.toLowerCase().trim();
-    if (!q) return [];
+    // tokens === [] when the box is empty; bail out cheap.
+    const tokens = tokenizeQuery(query);
+    if (tokens.length === 0) return [];
+
+    // Section-body sub-matcher for meeting previews: returns the first
+    // section whose normalized body contains every token, so the preview
+    // is a snippet from the matching section instead of the first one.
+    const sectionMatchesAllTokens = (body: string) => {
+      const n = normalizeForSearch(body);
+      for (const t of tokens) if (!n.includes(t)) return false;
+      return true;
+    };
 
     const all: SearchResult[] = [];
 
-    // Search dictation entries (non-AI ones)
+    // Search dictation/note entries (non-AI ones). We label these as "Note"
+    // in the UI now — the user-facing language is consolidated post-Slice 0.
+    // entry.tags is a JSON-encoded string that mixes user-visible chips with
+    // internal __title__: / __notebook__: / __status__: / __emoji__: rows.
+    // parseTags() strips the internal prefixes so we never (a) match on them
+    // when the user types e.g. "status" and (b) render them as visible chips.
     for (const entry of entries) {
       const isAi = entry.sourceApp?.startsWith('ai-chat');
       if (isAi) continue; // AI entries are covered by session search
 
       const text = entry.polishedText || entry.rawTranscript;
-      if (text.toLowerCase().includes(q) || entry.rawTranscript.toLowerCase().includes(q)) {
+      const visibleTags = parseTags(entry.tags);
+      const titleFromTag = parseTitleTag(entry.tags);
+      const haystack = normalizeForSearch(
+        `${titleFromTag ?? ''} ${text} ${entry.rawTranscript} ${visibleTags.join(' ')}`,
+      );
+      if (matchesNormalized(haystack, tokens)) {
+        const title = (titleFromTag && titleFromTag.trim())
+          || text.split(/\n/).find((l) => l.trim().length > 0)?.slice(0, 60)
+          || 'Untitled note';
         all.push({
           type: 'dictation',
           id: entry.id,
-          title: 'Dictation',
-          preview: text.slice(0, 120),
-          time: new Date(entry.createdAt).getTime(),
+          title,
+          preview: text.slice(0, 160).replace(/\n+/g, ' '),
+          time: new Date(entry.updatedAt || entry.createdAt).getTime(),
+          tags: visibleTags,
         });
       }
     }
 
     // AI sessions: prefer FTS hits (which include sessions whose messages
-    // aren't yet lazy-loaded), augmented by a title-only match against the
+    // aren't yet lazy-loaded), augmented by a title match against the
     // currently-loaded session list so renaming feels instant before the
-    // next FTS index sync.
+    // next FTS index sync. The FTS engine ALREADY tokenizes/normalizes its
+    // way, so we don't double-filter aiHits — we trust the backend hit.
     const seenSessionIds = new Set<string>();
     const sessionsById = new Map(sessions.map((s) => [s.id, s] as const));
     for (const hit of aiHits) {
@@ -90,7 +152,7 @@ export function SearchPage() {
     for (const session of sessions) {
       if (seenSessionIds.has(session.id)) continue;
       if (session.isArchived) continue;
-      if (session.title.toLowerCase().includes(q)) {
+      if (matchesNormalized(normalizeForSearch(session.title), tokens)) {
         seenSessionIds.add(session.id);
         all.push({
           type: 'ai-session',
@@ -103,28 +165,62 @@ export function SearchPage() {
       }
     }
 
-    // Search notes
+    // Search notebook notes
     for (const note of notes) {
-      if (
-        note.title.toLowerCase().includes(q) ||
-        note.content.toLowerCase().includes(q) ||
-        note.tags.some((t) => t.toLowerCase().includes(q))
-      ) {
+      const haystack = normalizeForSearch(
+        `${note.title} ${note.content} ${note.tags.join(' ')}`,
+      );
+      if (matchesNormalized(haystack, tokens)) {
         all.push({
           type: 'note',
           id: note.id,
           title: note.title || 'Untitled',
-          preview: note.content.slice(0, 120).replace(/\n/g, ' ') || 'Empty note',
+          preview: note.content.slice(0, 160).replace(/\n/g, ' ') || 'Empty note',
           time: note.updatedAt,
           tags: note.tags,
         });
       }
     }
 
-    // Sort by relevance (time descending)
+    // Search meetings: title (resolved from structured_output), summary,
+    // action items, and detected app all become haystack.
+    for (const session of meetingSessions) {
+      let parsed: any = null;
+      if (session.structured_output) {
+        try { parsed = JSON.parse(session.structured_output); } catch { /* ignore */ }
+      }
+      const title = resolveMeetingTitle(session as any, parsed);
+      const summary = session.summary || '';
+      const actions = session.action_items || '';
+      const detected = session.detected_app || '';
+      const sectionBodies: string[] = [];
+      if (parsed?.sections && Array.isArray(parsed.sections)) {
+        for (const sec of parsed.sections) {
+          if (sec && typeof sec.content === 'string') sectionBodies.push(sec.content);
+        }
+      }
+      const haystack = normalizeForSearch(
+        `${title} ${summary} ${actions} ${detected} ${sectionBodies.join(' ')}`,
+      );
+      if (matchesNormalized(haystack, tokens)) {
+        const previewSource = sectionBodies.find(sectionMatchesAllTokens)
+          || summary
+          || sectionBodies[0]
+          || 'Meeting';
+        all.push({
+          type: 'meeting',
+          id: session.id,
+          title,
+          preview: previewSource.slice(0, 160).replace(/\n+/g, ' '),
+          time: new Date(session.ended_at || session.started_at).getTime(),
+        });
+      }
+    }
+
+    // Sort by recency (descending)
     all.sort((a, b) => b.time - a.time);
     return all;
-  }, [query, entries, sessions, notes, aiHits]);
+  }, [query, entries, sessions, notes, meetingSessions, aiHits]);
 
   const filtered = activeFilter === 'all' ? results : results.filter((r) => r.type === activeFilter);
 
@@ -133,17 +229,33 @@ export function SearchPage() {
     dictation: results.filter((r) => r.type === 'dictation').length,
     'ai-session': results.filter((r) => r.type === 'ai-session').length,
     note: results.filter((r) => r.type === 'note').length,
+    meeting: results.filter((r) => r.type === 'meeting').length,
   }), [results]);
 
   const handleNavigate = (result: SearchResult) => {
+    // For each result type we (1) flip the app to the right page and then
+    // (2) tell that page to open the specific item. Reverse order matters:
+    // if we dispatch open-X before navigate, the target page might not be
+    // mounted yet to receive the event. setTimeout(0) lets the page mount
+    // before we ask it to focus a specific row.
     if (result.type === 'ai-session' && result.sessionId) {
-      window.dispatchEvent(new CustomEvent('ironmic:open-ai-session', { detail: result.sessionId }));
       window.dispatchEvent(new CustomEvent('ironmic:navigate', { detail: 'ai' }));
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('ironmic:open-ai-session', { detail: result.sessionId }));
+      }, 0);
     } else if (result.type === 'note') {
       useNotesStore.getState().setActiveNote(result.id);
       window.dispatchEvent(new CustomEvent('ironmic:navigate', { detail: 'notes' }));
     } else if (result.type === 'dictation') {
-      window.dispatchEvent(new CustomEvent('ironmic:navigate', { detail: 'main' }));
+      window.dispatchEvent(new CustomEvent('ironmic:navigate', { detail: 'dictate' }));
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('ironmic:open-entry', { detail: result.id }));
+      }, 0);
+    } else if (result.type === 'meeting') {
+      window.dispatchEvent(new CustomEvent('ironmic:navigate', { detail: 'meetings' }));
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('ironmic:open-meeting', { detail: result.id }));
+      }, 0);
     }
   };
 
@@ -151,18 +263,21 @@ export function SearchPage() {
     dictation: Mic,
     'ai-session': Sparkles,
     note: StickyNote,
+    meeting: Users,
   };
 
   const typeColors: Record<ResultType, string> = {
     dictation: 'text-iron-accent-light bg-iron-accent/10',
     'ai-session': 'text-purple-400 bg-purple-500/10',
     note: 'text-emerald-400 bg-emerald-500/10',
+    meeting: 'text-sky-400 bg-sky-500/10',
   };
 
   const typeLabels: Record<ResultType, string> = {
-    dictation: 'Dictation',
+    dictation: 'Note',
     'ai-session': 'AI Chat',
-    note: 'Note',
+    note: 'Notebook',
+    meeting: 'Meeting',
   };
 
   return (
@@ -175,7 +290,7 @@ export function SearchPage() {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search across dictations, AI conversations, and notes..."
+              placeholder="Search across notes, meetings, AI conversations, and notebooks..."
               className="w-full text-base bg-iron-surface border border-iron-border rounded-2xl pl-12 pr-4 py-3.5 text-iron-text placeholder:text-iron-text-muted focus:outline-none focus:border-iron-accent/50 focus:shadow-glow transition-all"
               autoFocus
             />
@@ -184,7 +299,7 @@ export function SearchPage() {
           {/* Filter tabs */}
           {query.trim() && (
             <div className="flex items-center gap-1.5 mt-3">
-              {(['all', 'dictation', 'ai-session', 'note'] as const).map((filter) => (
+              {(['all', 'dictation', 'meeting', 'ai-session', 'note'] as const).map((filter) => (
                 <button
                   key={filter}
                   onClick={() => setActiveFilter(filter)}
@@ -214,7 +329,7 @@ export function SearchPage() {
               </div>
               <p className="text-sm font-medium text-iron-text">Search Everything</p>
               <p className="text-xs text-iron-text-muted mt-1 max-w-[280px]">
-                Search across all your dictations, AI conversations, and notes in one place.
+                Search across your notes, meetings, AI conversations, and notebooks in one place.
               </p>
             </div>
           )}

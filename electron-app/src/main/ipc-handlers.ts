@@ -163,6 +163,10 @@ const ALLOWED_SETTING_KEYS = new Set([
   'rag_topic_k_local',
   'rag_topic_k_cloud',
   'notes_migrated_to_sqlite',
+  // One-shot UI dismissal flags. These are renderer-driven booleans that
+  // suppress an onboarding banner / prompt once the user has acknowledged it.
+  // 'true' = dismissed.
+  'gpu_prompt_dismissed',
 ]);
 
 function assertString(val: unknown, name: string): asserts val is string {
@@ -579,14 +583,51 @@ export function registerIpcHandlers(): void {
   // User notes (Slice 0 — replaces localStorage-backed useNotesStore). All
   // routes are simple addon pass-throughs; the optimistic-cache + queued-write
   // semantic lives renderer-side so the UI stays synchronous.
-  ipcMain.handle(IPC_CHANNELS.USER_NOTES_CREATE, (_e, note) => native.addon.userNotesCreate(note));
+  //
+  // RAG: every mutation schedules a chunk refresh so Knowledge Q&A retrieval
+  // sees the latest content on the next Search query. Fire-and-forget — the
+  // chunker runs under the same SQLite mutex but in a separate microtask so
+  // it doesn't block the user-visible save. DELETE drops the source's chunks
+  // up front so a delete-then-search doesn't surface ghost rows.
+  const scheduleUserNoteChunkRefresh = (id: string) => {
+    queueMicrotask(() => {
+      try {
+        native.addon.ragChunkUserNote?.(id);
+      } catch (err) {
+        console.warn(`[ipc] chunk refresh for user_note ${id} failed:`, err);
+      }
+    });
+  };
+  ipcMain.handle(IPC_CHANNELS.USER_NOTES_CREATE, (_e, note) => {
+    const created = native.addon.userNotesCreate(note);
+    try {
+      const parsed = typeof created === 'string' ? JSON.parse(created) : created;
+      if (parsed?.id) scheduleUserNoteChunkRefresh(parsed.id);
+    } catch { /* ignore parse errors — best-effort */ }
+    return created;
+  });
   ipcMain.handle(IPC_CHANNELS.USER_NOTES_GET, (_e, id: string) => native.addon.userNotesGet(id));
-  ipcMain.handle(IPC_CHANNELS.USER_NOTES_UPDATE, (_e, id: string, updates: any) =>
-    native.addon.userNotesUpdate(id, updates)
-  );
-  ipcMain.handle(IPC_CHANNELS.USER_NOTES_DELETE, (_e, id: string) =>
-    native.addon.userNotesDelete(id)
-  );
+  ipcMain.handle(IPC_CHANNELS.USER_NOTES_UPDATE, (_e, id: string, updates: any) => {
+    const updated = native.addon.userNotesUpdate(id, updates);
+    // Re-chunk only when content-bearing fields changed. Title / pin / tags
+    // toggles don't move retrieval; skip them so rapid typing doesn't queue
+    // a chunker call on every keystroke (the renderer's per-id write queue
+    // already coalesces fast, but this is belt-and-suspenders).
+    const bodyChanged =
+      updates?.title !== undefined
+      || updates?.content !== undefined
+      || updates?.polishedContent !== undefined;
+    if (bodyChanged) scheduleUserNoteChunkRefresh(id);
+    return updated;
+  });
+  ipcMain.handle(IPC_CHANNELS.USER_NOTES_DELETE, (_e, id: string) => {
+    try {
+      native.addon.ragDeleteChunksForSource?.('user_note', id);
+    } catch (err) {
+      console.warn(`[ipc] chunk delete for user_note ${id} failed:`, err);
+    }
+    return native.addon.userNotesDelete(id);
+  });
   ipcMain.handle(IPC_CHANNELS.USER_NOTES_LIST, (_e, opts: any) =>
     native.addon.userNotesList(opts)
   );
@@ -1105,12 +1146,35 @@ If the text is too short or unclear, output: ["General"]`;
   // ── ML Features: Meeting Sessions ──
 
   ipcMain.handle(IPC_CHANNELS.MEETING_CREATE, () => native.addon.createMeetingSession());
-  ipcMain.handle(IPC_CHANNELS.MEETING_END, (_e, id: string, speakers: number, summary?: string, items?: string, duration?: number, entryIds?: string) =>
-    native.addon.endMeetingSession(id, speakers, summary ?? null, items ?? null, duration ?? 0, entryIds ?? null)
-  );
+  // RAG: re-chunk on every mutation that changes meeting content. MEETING_END
+  // seals the summary + transcript; MEETING_SET_STRUCTURED_OUTPUT lands the
+  // generated notes (rerun on every regenerate); MEETING_SET_TITLE updates the
+  // citation label. Fire-and-forget — chunker runs in a microtask so it
+  // doesn't block the user-visible save.
+  const scheduleMeetingChunkRefresh = (id: string) => {
+    queueMicrotask(() => {
+      try {
+        native.addon.ragChunkMeeting?.(id);
+      } catch (err) {
+        console.warn(`[ipc] chunk refresh for meeting ${id} failed:`, err);
+      }
+    });
+  };
+  ipcMain.handle(IPC_CHANNELS.MEETING_END, (_e, id: string, speakers: number, summary?: string, items?: string, duration?: number, entryIds?: string) => {
+    const r = native.addon.endMeetingSession(id, speakers, summary ?? null, items ?? null, duration ?? 0, entryIds ?? null);
+    scheduleMeetingChunkRefresh(id);
+    return r;
+  });
   ipcMain.handle(IPC_CHANNELS.MEETING_GET, (_e, id: string) => native.addon.getMeetingSession(id));
   ipcMain.handle(IPC_CHANNELS.MEETING_LIST, (_e, limit: number, offset: number) => native.addon.listMeetingSessions(limit, offset));
-  ipcMain.handle(IPC_CHANNELS.MEETING_DELETE, (_e, id: string) => native.addon.deleteMeetingSession(id));
+  ipcMain.handle(IPC_CHANNELS.MEETING_DELETE, (_e, id: string) => {
+    try {
+      native.addon.ragDeleteChunksForSource?.('meeting', id);
+    } catch (err) {
+      console.warn(`[ipc] chunk delete for meeting ${id} failed:`, err);
+    }
+    return native.addon.deleteMeetingSession(id);
+  });
   ipcMain.handle(IPC_CHANNELS.MEETING_GET_PARTICIPANTS, (_e, id: string) =>
     native.getMeetingParticipants(id),
   );
@@ -1319,7 +1383,12 @@ If the text is too short or unclear, output: ["General"]`;
     return native.createMeetingSessionWithTemplate(templateId ?? undefined, detectedApp ?? undefined);
   });
   ipcMain.handle(IPC_CHANNELS.MEETING_SET_STRUCTURED_OUTPUT, (_event, id: string, structuredOutput: string) => {
-    return native.setMeetingStructuredOutput(id, structuredOutput);
+    const r = native.setMeetingStructuredOutput(id, structuredOutput);
+    // Structured output carries the AI-generated sections that drive most
+    // Knowledge Q&A meeting hits; re-chunk so the next retrieval reflects
+    // the new content (e.g. after a "Regenerate notes" run).
+    scheduleMeetingChunkRefresh(id);
+    return r;
   });
 
   // ── Meeting Recording (Granola-style chunk loop) ──
@@ -1586,6 +1655,12 @@ If the text is too short or unclear, output: ["General"]`;
         console.warn('[ipc] MEETING_SET_TITLE solo persist failed:', err);
       }
     }
+    // Title is the most visible citation label in RAG results — re-chunk so
+    // the next retrieval shows the updated label. Both paths (host server
+    // broadcast and solo direct write) bottom out at structured_output, but
+    // the host path bypasses MEETING_SET_STRUCTURED_OUTPUT's hook, so we
+    // schedule here unconditionally.
+    scheduleMeetingChunkRefresh(sessionId);
     return { ok: true };
   });
 

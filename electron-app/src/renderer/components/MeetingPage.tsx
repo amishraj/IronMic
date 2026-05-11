@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User, Share2, PanelRightOpen, PanelRightClose, Eye, EyeOff } from 'lucide-react';
+import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User, Share2, PanelRightOpen, PanelRightClose } from 'lucide-react';
 import { Card, Badge, Button } from './ui';
 import { MeetingSessionCard } from './MeetingSessionCard';
 import { MeetingTemplateEditor } from './MeetingTemplateEditor';
@@ -473,6 +473,23 @@ export function MeetingPage() {
 
     return () => { unsub(); };
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Listen for cross-component requests to open a specific meeting detail
+  // (fired by SearchPage when the user clicks a meeting search result).
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      const targetId = typeof detail === 'string'
+        ? detail
+        : detail && typeof detail === 'object' && typeof (detail as any).id === 'string'
+        ? (detail as any).id
+        : null;
+      if (!targetId) return;
+      setDetailSessionId(targetId);
+    };
+    window.addEventListener('ironmic:open-meeting', handler);
+    return () => window.removeEventListener('ironmic:open-meeting', handler);
   }, []);
 
   // Live duration counter (Granola mode).
@@ -1570,8 +1587,32 @@ export function MeetingPage() {
   return (
     <div className="h-full overflow-y-auto" ref={listScrollRef}>
       <div className="max-w-lg mx-auto space-y-6 px-4 py-6">
-      <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold text-iron-text">Meetings</h2>
+      {/* Page header — big branded title on the left, display-name editor
+          on the right (it rarely changes, so an inline pill saves vertical
+          space vs. a labeled input below). Hidden in Solo mode where the
+          name isn't broadcast to anyone. */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 rounded-xl bg-iron-accent/10 flex items-center justify-center">
+            <Users className="w-5 h-5 text-iron-accent-light" />
+          </div>
+          <h2 className="text-2xl font-semibold text-iron-text tracking-tight">Meetings</h2>
+        </div>
+        {roomMode !== 'solo' && (
+          <div className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-iron-border bg-iron-surface focus-within:border-iron-accent/40 transition-colors">
+            <User className="w-3.5 h-3.5 text-iron-text-muted shrink-0" />
+            <input
+              type="text"
+              value={roomDisplayName}
+              onChange={(e) => setRoomDisplayName(e.target.value)}
+              placeholder="Your name"
+              maxLength={64}
+              aria-label="Your display name"
+              title="Your display name (shown to other participants)"
+              className="bg-transparent text-sm text-iron-text placeholder:text-iron-text-muted focus:outline-none w-[140px]"
+            />
+          </div>
+        )}
       </div>
 
       {/* Detection banner */}
@@ -1645,50 +1686,45 @@ export function MeetingPage() {
       {/* Setup: template picker + audio device (when idle) */}
       {!isActive && (
         <div className="space-y-3">
-          {/* Mode selector: Host a Room / Join a Room (+ Solo when dev features enabled) */}
-          <div>
-            <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider mb-2">Mode</p>
-            <div className={`grid gap-2 ${devFeaturesEnabled ? 'grid-cols-3' : 'grid-cols-2'}`}>
+          {/* Mode selector — segmented switch, centered. The wrapper is a
+              flex row so the segmented pill is centered no matter the
+              parent width; the pill itself doesn't stretch (no `w-full`)
+              so it sits at its natural intrinsic width and looks tidy
+              instead of being smeared across the whole column. */}
+          <div className="flex justify-center">
+            <div
+              role="radiogroup"
+              aria-label="Meeting mode"
+              className="inline-flex items-center p-0.5 rounded-full bg-iron-surface/60 border border-iron-border"
+            >
               {[
-                { key: 'host', label: 'Host Room', icon: <Wifi className="w-3.5 h-3.5" /> },
-                { key: 'participant', label: 'Join Room', icon: <LogIn className="w-3.5 h-3.5" /> },
+                { key: 'host', label: 'Host', icon: <Wifi className="w-3.5 h-3.5" /> },
+                { key: 'participant', label: 'Join', icon: <LogIn className="w-3.5 h-3.5" /> },
                 ...(devFeaturesEnabled
                   ? [{ key: 'solo', label: 'Solo', icon: <Mic className="w-3.5 h-3.5" /> }]
                   : []),
-              ].map(opt => (
-                <button
-                  key={opt.key}
-                  onClick={() => { setRoomMode(opt.key as any); setRoomError(null); }}
-                  className={`flex items-center justify-center gap-1.5 px-2 py-2 rounded-lg border text-xs transition-colors ${
-                    roomMode === opt.key
-                      ? 'bg-iron-accent/10 text-iron-accent-light border-iron-accent/20'
-                      : 'bg-iron-surface text-iron-text-muted border-iron-border hover:border-iron-border-hover'
-                  }`}
-                >
-                  {opt.icon}
-                  <span className="font-medium">{opt.label}</span>
-                </button>
-              ))}
+              ].map((opt) => {
+                const active = roomMode === opt.key;
+                return (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => { setRoomMode(opt.key as any); setRoomError(null); }}
+                    className={`flex items-center justify-center gap-1.5 min-w-[88px] px-4 py-1.5 rounded-full text-xs font-medium transition-all ${
+                      active
+                        ? 'bg-iron-surface text-iron-text shadow-sm'
+                        : 'text-iron-text-muted hover:text-iron-text'
+                    }`}
+                  >
+                    {opt.icon}
+                    <span>{opt.label}</span>
+                  </button>
+                );
+              })}
             </div>
           </div>
-
-          {/* Display name (only needed for room modes) */}
-          {roomMode !== 'solo' && (
-            <div>
-              <label className="flex items-center gap-1.5 text-[11px] text-iron-text-muted uppercase tracking-wider mb-1">
-                <User className="w-3 h-3" />
-                Your display name
-              </label>
-              <input
-                type="text"
-                value={roomDisplayName}
-                onChange={(e) => setRoomDisplayName(e.target.value)}
-                placeholder="e.g. Alex"
-                maxLength={64}
-                className="w-full px-3 py-2 text-sm bg-iron-surface text-iron-text rounded-lg border border-iron-border focus:outline-none focus:border-iron-accent/40"
-              />
-            </div>
-          )}
 
           {/* Join form: IP:Port + Room code, or paste invite */}
           {roomMode === 'participant' && (
@@ -1883,23 +1919,47 @@ export function MeetingPage() {
         const grouped = groupSessionsByDate(filtered);
         return (
           <div className="space-y-3">
-            {/* Header row: filter toggle (icon-only, neat) + hidden-count chip */}
-            <div className="flex items-center justify-between">
-              <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">History</p>
+            {/* Empty-meeting filter — settings-style toggle. The label
+                describes the SETTING ("Show empty meetings"), the switch
+                state describes the VALUE (on = shown, off = hidden). This
+                avoids the imperative-vs-status confusion of the prior
+                segmented control while staying compact. When OFF, the
+                hidden-count badge sits next to the label so users can see
+                what they're missing. */}
+            <div className="flex items-center justify-end">
               <button
+                type="button"
+                role="switch"
+                aria-checked={showEmptyMeetings}
                 onClick={() => toggleShowEmpty(!showEmptyMeetings)}
-                title={showEmptyMeetings ? 'Hide meetings with no audio captured' : 'Show meetings with no audio captured'}
-                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[10px] transition-colors ${
-                  showEmptyMeetings
-                    ? 'bg-iron-surface text-iron-text border border-iron-border'
-                    : 'bg-iron-surface/60 text-iron-text-muted border border-iron-border/60 hover:text-iron-text'
-                }`}
+                title={showEmptyMeetings
+                  ? 'Hide meetings with no audio captured'
+                  : 'Show meetings with no audio captured'}
+                className="flex items-center gap-2 group select-none"
               >
-                {showEmptyMeetings ? <Eye className="w-3 h-3" /> : <EyeOff className="w-3 h-3" />}
-                <span>{showEmptyMeetings ? 'Show empty' : 'Hide empty'}</span>
-                {hiddenCount > 0 && !showEmptyMeetings && (
-                  <span className="ml-0.5 px-1 rounded bg-iron-accent/10 text-iron-accent-light">{hiddenCount}</span>
+                <span className="text-[11px] text-iron-text-muted group-hover:text-iron-text transition-colors">
+                  Show empty meetings
+                </span>
+                {!showEmptyMeetings && hiddenCount > 0 && (
+                  <span className="px-1.5 py-0.5 rounded-full text-[9px] font-medium bg-iron-accent/10 text-iron-accent-light">
+                    {hiddenCount} hidden
+                  </span>
                 )}
+                {/* iOS-style track + thumb. Tailwind-only — no extra CSS.
+                    The track recolors on state; the thumb slides 14px
+                    (track width 32px - thumb width 14px - 2px padding × 2). */}
+                <span
+                  className={`relative inline-flex h-4 w-7 items-center rounded-full transition-colors ${
+                    showEmptyMeetings ? 'bg-iron-accent' : 'bg-iron-border'
+                  }`}
+                  aria-hidden="true"
+                >
+                  <span
+                    className={`inline-block h-3 w-3 transform rounded-full bg-white shadow-sm transition-transform ${
+                      showEmptyMeetings ? 'translate-x-3.5' : 'translate-x-0.5'
+                    }`}
+                  />
+                </span>
               </button>
             </div>
             {grouped.length > 0 ? (
@@ -1924,7 +1984,7 @@ export function MeetingPage() {
             ) : (
               <p className="text-xs text-iron-text-muted italic px-1 py-2">
                 {hiddenCount > 0
-                  ? `${hiddenCount} meeting${hiddenCount === 1 ? '' : 's'} with no audio hidden — toggle "Show empty" above to see ${hiddenCount === 1 ? 'it' : 'them'}.`
+                  ? `${hiddenCount} meeting${hiddenCount === 1 ? '' : 's'} with no audio hidden — switch to "Show all" above to see ${hiddenCount === 1 ? 'it' : 'them'}.`
                   : 'No meetings yet.'}
               </p>
             )}

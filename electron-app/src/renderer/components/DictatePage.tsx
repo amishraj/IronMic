@@ -1595,6 +1595,36 @@ export function DictatePage() {
     loadEntryIntoEditor(entry);
   }, [editor, status, toast, loadEntryIntoEditor]);
 
+  // ── Open-by-id from external navigation ──
+  // SearchPage and citation deep-links dispatch `ironmic:open-entry`
+  // with the entry id when the user clicks a Note result. We fetch the
+  // entry through getEntry (covers the case where the entry isn't in the
+  // current entries page) and route through the same loadEntryIntoEditor
+  // path the sidebar click uses — same dictation-state guard, same
+  // store-mirror bookkeeping, same toast UX.
+  useEffect(() => {
+    const handler = async (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      const targetId =
+        typeof detail === 'string'
+          ? detail
+          : detail && typeof detail === 'object' && typeof (detail as any).id === 'string'
+            ? (detail as any).id
+            : null;
+      if (!targetId || !editor) return;
+      try {
+        // Try the in-memory cache first, then fall back to a Rust fetch.
+        // useEntryStore.getEntryById handles the order internally.
+        const entry = await useEntryStore.getState().getEntryById(targetId);
+        if (entry) handleSelectEntry(entry);
+      } catch (err) {
+        console.warn('[DictatePage] open-entry failed:', err);
+      }
+    };
+    window.addEventListener('ironmic:open-entry', handler);
+    return () => window.removeEventListener('ironmic:open-entry', handler);
+  }, [editor, handleSelectEntry]);
+
   // ── Refresh the sidebar when meaningful things happen ──
   // (a) dictation finished (status went idle with an entry present), or
   // (b) the active notebook changed (a note was reclassified).

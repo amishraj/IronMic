@@ -323,14 +323,26 @@ function AIAssistSettings() {
   async function handleRebuildIndex() {
     const ok = window.confirm(
       'Rebuild the Knowledge Q&A index?\n\n' +
-      'This deletes every chunk and embedding, then re-chunks every entry, ' +
-      'meeting, and note on next Ask page visit. Your underlying content is ' +
-      'untouched. Useful if retrieval feels stale or you upgraded the embedding model.',
+      'This deletes every chunk and embedding, then immediately re-chunks ' +
+      'every entry, meeting, and note in the background. Your underlying ' +
+      'content is untouched. Useful if retrieval feels stale or you upgraded ' +
+      'the embedding model.',
     );
     if (!ok) return;
     try {
+      // Wipe the existing chunks/embeddings table first.
       await window.ironmic.ragRebuildIndex?.();
       setIndexStats({ total: 0, indexed: 0, byType: {} });
+      // Then immediately kick the renderer-side indexer with `force` so the
+      // user doesn't have to navigate to any page for the rebuild to start.
+      // Indexer batches yield to retrieval queries, so this is safe to fire
+      // and let run in the background.
+      try {
+        const { indexerService } = await import('../services/rag/IndexerService');
+        void indexerService.kickOnce({ force: true });
+      } catch (err) {
+        console.warn('[settings] indexer kick after rebuild failed (non-fatal):', err);
+      }
     } catch (err) {
       console.error('[settings] rebuild index failed:', err);
     }

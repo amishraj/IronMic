@@ -167,10 +167,9 @@ export function AIChat() {
   // this just races ahead so the common case is "already there." Cheap —
   // each load is a single paginated SQLite read.
   //
-  // Also kicks the RAG IndexerService backfill in the same effect — without
-  // it the "Search my IronMic" toggle would have nothing to retrieve from
-  // until the user visits the (now-hidden) Ask page. Idempotent and runs
-  // once per session.
+  // Note: the RAG IndexerService is now kicked from Layout on app boot
+  // (gated by `knowledge_qa_enabled`), so we don't need a duplicate kick
+  // here — kickOnce is idempotent within a session anyway.
   useEffect(() => {
     void (async () => {
       try {
@@ -184,12 +183,6 @@ export function AIChat() {
         }
       } catch (err) {
         console.warn('[AIChat] Picker preload failed (non-fatal):', err);
-      }
-      try {
-        const { indexerService } = await import('../services/rag/IndexerService');
-        await indexerService.kickOnce();
-      } catch (err) {
-        console.warn('[AIChat] Indexer kick failed (non-fatal):', err);
       }
     })();
   }, []);

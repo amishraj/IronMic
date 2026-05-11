@@ -6,6 +6,7 @@ import {
   Hammer,
 } from 'lucide-react';
 import { RecordingIndicator } from './RecordingIndicator';
+import { QuickSearch } from './QuickSearch';
 import { Timeline } from './Timeline';
 import { SettingsPanel } from './SettingsPanel';
 import { AIChat } from './AIChat';
@@ -136,6 +137,26 @@ export function Layout() {
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
 
+  // On startup: kick the RAG indexer so the chunks table is populated even
+  // before the user opens the AI Assistant. Knowledge Q&A folded into AIChat,
+  // so the previous "build on Ask page mount" trigger never fired for users
+  // who never visited that route. Now: every app boot drains unchunked
+  // sources in the background (idempotent — kickOnce no-ops if there's
+  // nothing to do, batches yield to retrieval queries so search stays fast).
+  // Gated by the master toggle so users with Knowledge Q&A turned off don't
+  // pay the indexing cost.
+  useEffect(() => {
+    if (!knowledgeQaEnabled) return;
+    void (async () => {
+      try {
+        const { indexerService } = await import('../services/rag/IndexerService');
+        await indexerService.kickOnce();
+      } catch (err) {
+        console.warn('[startup] RAG indexer kick failed (non-fatal):', err);
+      }
+    })();
+  }, [knowledgeQaEnabled]);
+
   // On startup: sync Rust recording state — if Rust thinks it's recording but JS is idle, force-reset
   useEffect(() => {
     (async () => {
@@ -239,7 +260,7 @@ export function Layout() {
   useEffect(() => {
     const handler = (e: Event) => {
       const target = (e as CustomEvent).detail as string;
-      if (['home', 'main', 'ai', 'dictate', 'listen', 'search', 'analytics', 'meetings', 'settings'].includes(target)) {
+      if (['home', 'main', 'ai', 'ask', 'dictate', 'listen', 'search', 'analytics', 'meetings', 'settings'].includes(target)) {
         setPage(target as Page);
       }
     };
@@ -374,6 +395,9 @@ export function Layout() {
         >
           <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
             <RecordingIndicator />
+          </div>
+          <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <QuickSearch />
           </div>
         </div>
 
