@@ -599,6 +599,59 @@ fn hydrate_hits(conn: &rusqlite::Connection, merged: &[(String, f64)]) -> Result
 /// Build a human-readable label for a citation chip. Source-type aware so
 /// each kind reads naturally — meeting cites show date + time + speaker;
 /// notes show "Note: <title> › <heading>"; entries show "Dictation <date>".
+/// Format an RFC3339 string as "Tue May 5" — falls back to a literal label
+/// if parsing fails so we never produce an empty date.
+fn short_date_from_rfc(s: Option<&str>, fallback: &str) -> String {
+    s.and_then(|raw| chrono::DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.format("%a %b %-d").to_string())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Parse a user-tags JSON array and pull out a `__notebook__:<id>`
+/// row's id portion. Returns None if there's no notebook tag. Used in
+/// the entry label to surface "in notebook X".
+fn parse_notebook_id_from_tags(tags_json: Option<&str>) -> Option<String> {
+    let raw = tags_json?;
+    let parsed: Vec<String> = serde_json::from_str(raw).ok()?;
+    for t in parsed {
+        if let Some(rest) = t.strip_prefix("__notebook__:") {
+            if !rest.is_empty() && rest != "default" {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parse a user-tags JSON array and pull out a `__title__:<name>`
+/// row. Entries store their user-facing title in tags rather than a
+/// dedicated column.
+fn parse_title_from_tags(tags_json: Option<&str>) -> Option<String> {
+    let raw = tags_json?;
+    let parsed: Vec<String> = serde_json::from_str(raw).ok()?;
+    for t in parsed {
+        if let Some(rest) = t.strip_prefix("__title__:") {
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Build the citation label for one retrieved chunk. The label is the
+/// human-readable string the LLM sees in the prompt's `[1] <label> —
+/// <text>` block AND what the renderer's Sources panel displays.
+///
+/// Each source-type variant surfaces the metadata the model needs to
+/// reason about WHEN and WHERE this chunk came from:
+///   - entry: title (from tags) · created date · "edited <date>" iff updated_at differs · notebook
+///   - meeting: weekday + date · duration · speaker count · in-meeting timestamp + speaker
+///   - user_note: title · heading breadcrumb · "edited <date>" iff updated_at differs
+///
+/// Anything not present in the source row is silently omitted (no empty
+/// "Edited" stubs). The label is bounded to a sensible width so a long
+/// notebook title or heading path doesn't blow up the prompt-context block.
 fn build_label(
     conn: &rusqlite::Connection,
     source_type: &str,
@@ -610,62 +663,111 @@ fn build_label(
     use crate::storage::chunks::source_types as st;
     match source_type {
         s if s == st::MEETING || s == st::MEETING_SEGMENT => {
-            // Get meeting started_at for the date stamp.
-            let started_at: Option<String> = conn
+            // Get meeting metadata: started_at, ended_at, speaker_count.
+            // duration is computed locally if the addon hasn't backfilled
+            // `total_duration_seconds` for older sessions.
+            let row: Option<(Option<String>, Option<String>, Option<i64>)> = conn
                 .query_row(
-                    "SELECT started_at FROM meeting_sessions WHERE id = ?1",
+                    "SELECT started_at, ended_at, speaker_count FROM meeting_sessions WHERE id = ?1",
                     [source_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0).ok(), row.get(1).ok(), row.get(2).ok().flatten())),
                 )
                 .ok();
-            let date_part = started_at
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.format("%a %b %-d").to_string())
-                .unwrap_or_else(|| "Meeting".to_string());
+            let (started_at, ended_at, speaker_count) = row.unwrap_or((None, None, None));
+            let date_part = short_date_from_rfc(started_at.as_deref(), "Meeting");
+            // Total meeting duration (rough — "53m") if we can compute it.
+            let duration_part = match (started_at.as_deref(), ended_at.as_deref()) {
+                (Some(s), Some(e)) => {
+                    let start = chrono::DateTime::parse_from_rfc3339(s).ok();
+                    let end = chrono::DateTime::parse_from_rfc3339(e).ok();
+                    match (start, end) {
+                        (Some(s), Some(e)) => {
+                            let secs = (e - s).num_seconds().max(0);
+                            if secs >= 60 { format!(" · {}m", secs / 60) } else { String::new() }
+                        }
+                        _ => String::new(),
+                    }
+                }
+                _ => String::new(),
+            };
+            let speakers_part = speaker_count
+                .filter(|n| *n > 0)
+                .map(|n| format!(" · {n} speakers"))
+                .unwrap_or_default();
+            // In-meeting timestamp + speaker for the specific chunk.
             let time_part = start_ms
                 .map(|ms| format!(" — {}m{:02}s", ms / 60_000, (ms % 60_000) / 1000))
                 .unwrap_or_default();
             let speaker_part = speaker_label
                 .map(|s| format!(" · {s}"))
                 .unwrap_or_default();
-            format!("{date_part}{time_part}{speaker_part}")
+            format!("Meeting {date_part}{duration_part}{speakers_part}{time_part}{speaker_part}")
         }
         s if s == st::USER_NOTE => {
-            let title: Option<String> = conn
+            // user_notes-table content: title, created_at, updated_at.
+            let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
                 .query_row(
-                    "SELECT title FROM user_notes WHERE id = ?1",
+                    "SELECT title, created_at, updated_at FROM user_notes WHERE id = ?1",
                     [source_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0).ok().flatten(), row.get(1).ok(), row.get(2).ok().flatten())),
                 )
                 .ok();
+            let (title, created_at, updated_at) = row.unwrap_or((None, None, None));
             let title = title.unwrap_or_else(|| "Note".to_string());
-            // Parse heading_path JSON if present and skip the first element (which is the title itself).
             let heading_tail = heading_path
                 .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
                 .map(|v| v.into_iter().skip(1).collect::<Vec<_>>().join(" › "))
                 .filter(|s| !s.is_empty())
                 .map(|s| format!(" › {s}"))
                 .unwrap_or_default();
-            format!("Note: {title}{heading_tail}")
+            // "edited" stamp only surfaces when updated_at differs from
+            // created_at meaningfully (>= 60s gap). For un-edited notes
+            // the bare created date is enough.
+            let edited_part = edited_marker(created_at.as_deref(), updated_at.as_deref());
+            format!("Note: {title}{heading_tail}{edited_part}")
         }
         s if s == st::ENTRY => {
-            let created_at: Option<String> = conn
+            // entries-table content (DictatePage notes): we surface
+            // (a) the user-set title from tags (entries don't have a dedicated
+            //     column for this — title lives in tags as __title__:)
+            // (b) the source date — created_at
+            // (c) an "edited <date>" marker if updated_at differs
+            // (d) the parent notebook id from tags (rendered as #nb so the
+            //     model knows the org context)
+            let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
                 .query_row(
-                    "SELECT created_at FROM entries WHERE id = ?1",
+                    "SELECT created_at, updated_at, tags FROM entries WHERE id = ?1",
                     [source_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0).ok(), row.get(1).ok().flatten(), row.get(2).ok().flatten())),
                 )
                 .ok();
-            let date_part = created_at
-                .as_deref()
-                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.format("%a %b %-d").to_string())
-                .unwrap_or_else(|| "Dictation".to_string());
-            format!("Dictation {date_part}")
+            let (created_at, updated_at, tags_json) = row.unwrap_or((None, None, None));
+            let date_part = short_date_from_rfc(created_at.as_deref(), "Note");
+            let title_part = parse_title_from_tags(tags_json.as_deref())
+                .filter(|t| !t.is_empty())
+                .map(|t| format!(": {t}"))
+                .unwrap_or_default();
+            let edited_part = edited_marker(created_at.as_deref(), updated_at.as_deref());
+            let notebook_part = parse_notebook_id_from_tags(tags_json.as_deref())
+                .map(|nb| format!(" · in {nb}"))
+                .unwrap_or_default();
+            format!("Note{title_part} · {date_part}{edited_part}{notebook_part}")
         }
         _ => "Source".to_string(),
     }
+}
+
+/// Produce " · edited <date>" iff updated_at is meaningfully later than
+/// created_at (>= 60 seconds gap, to ignore the same-transaction write).
+/// Returns empty string when not surfaced.
+fn edited_marker(created: Option<&str>, updated: Option<&str>) -> String {
+    let (Some(c), Some(u)) = (created, updated) else { return String::new(); };
+    let c_dt = chrono::DateTime::parse_from_rfc3339(c).ok();
+    let u_dt = chrono::DateTime::parse_from_rfc3339(u).ok();
+    let (Some(c_dt), Some(u_dt)) = (c_dt, u_dt) else { return String::new(); };
+    let gap = (u_dt - c_dt).num_seconds();
+    if gap < 60 { return String::new(); }
+    format!(" · edited {}", u_dt.format("%a %b %-d"))
 }
 
 /// Deeplinks use the `ironmic://` scheme registered by the main process so
