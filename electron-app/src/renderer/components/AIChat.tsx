@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Bot, Send, Mic, Square, RefreshCw, Sparkles, AlertCircle, Plus, MessageSquare, X, Volume2, Pause, BookOpen, StickyNote, MessageCircle } from 'lucide-react';
-import { useAiChatStore, type ChatMessage, type AIProvider } from '../stores/useAiChatStore';
+import { useAiChatStore, type ChatMessage, type AIProvider, type DispatchSendArgs } from '../stores/useAiChatStore';
 import { useSettingsStore } from '../stores/useSettingsStore';
 import { useSettingsIntentStore } from '../stores/useSettingsIntentStore';
 import { useTtsStore } from '../stores/useTtsStore';
@@ -18,31 +18,44 @@ interface AuthStatus {
 }
 
 export function AIChat() {
-  const [input, setInput] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [streaming, setStreaming] = useState('');
   const [provider, setProvider] = useState<AIProvider | null>(null);
   const [authState, setAuthState] = useState<{ copilot: AuthStatus; claude: AuthStatus; local: AuthStatus } | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [showNotePicker, setShowNotePicker] = useState(false);
   const [conversational, setConversational] = useState(false);
   const conversationalRef = useRef(false);
   conversationalRef.current = conversational;
 
+  // `mountedRef` is referenced by the `onAssistantText` callback that
+  // `dispatchSend` invokes on the success path. The callback may run AFTER
+  // this component has unmounted (the user navigated away mid-send and the
+  // request kept running inside the store closure). The callback body MUST
+  // short-circuit on `!mountedRef.current` before touching any local-state
+  // setter (setMicState, etc.), AND on `!conversationalRef.current` so a
+  // user who toggled conversational mode off mid-send doesn't get
+  // unexpected TTS playback.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
   // Refs synced each render so the dictation listener (mounted with [] deps)
   // and other long-lived callbacks read fresh values without re-binding.
   // Avoids stale-closure bugs in the end-of-turn auto-send path.
-  const loadingRef = useRef(false);
   const providerRef = useRef<AIProvider | null>(null);
   const autoSendingRef = useRef(false);
-  const sendTextRef = useRef<((text: string) => Promise<string | null>) | null>(null);
+  // `sendTextRef` is now fire-and-forget (no Promise<string | null> return).
+  // The lifecycle owner is `dispatchSend` in the store; this ref only
+  // exposes the dispatch entry point to long-lived listeners that need
+  // a stable reference across re-renders.
+  const sendTextRef = useRef<((text: string) => void) | null>(null);
   const engineRef = useRef<'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown'>('unknown');
   const micStateRef = useRef<'idle' | 'recording' | 'stopping'>('idle');
   // Engine surfaces in the conversational banner so the user knows when
   // hands-free auto-send is unavailable (Whisper / chunked-Moonshine fallback).
   const [engine, setEngine] = useState<'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown'>('unknown');
 
-  const { activeSession, createSession, setActiveSession, addMessage } =
+  const { activeSession, createSession, setActiveSession } =
     useAiChatStore();
 
   // Attached-context pills are now per-session and persisted to localStorage
@@ -69,21 +82,105 @@ export function AIChat() {
    *  visibility of the toggle button; users can also flip the per-chat
    *  toggle off independently. */
   const knowledgeQaEnabled = useSettingsStore((s) => s.knowledgeQaEnabled);
-  /** "What's happening right now" indicator beneath the input. Updated by
-   *  sendText as it walks through retrieval → LLM dispatch → streaming. */
-  const [sendPhase, setSendPhase] = useState<'idle' | 'retrieving' | 'sending' | 'streaming'>('idle');
+  /** "What's happening right now" indicator beneath the input. Owned by
+   *  `dispatchSend` (store) as it walks through retrieval → LLM dispatch
+   *  → streaming. Survives navigation because it's per-session in the
+   *  store rather than a component-local useState. */
+  const sendPhase = useAiChatStore((s) => {
+    const id = s.activeSessionId;
+    return id ? (s.sendPhaseBySession[id] ?? 'idle') : 'idle';
+  });
+  /** Streaming token buffer per active session. Tokens are appended by the
+   *  Layout-level `onAiOutput` subscription (so they accumulate while the
+   *  user is on another tab), and cleared atomically with the
+   *  assistant-message commit inside `dispatchSend`. */
+  const streaming = useAiChatStore((s) => {
+    const id = s.activeSessionId;
+    return id ? (s.streamingBySession[id] ?? '') : '';
+  });
+  /** Source of truth for the disabled / "Stop" state of the send button
+   *  and the early-return guard inside `dispatchSend`. Replaces the
+   *  former component-local `loading` useState so a mid-send navigate
+   *  doesn't reset it to false on remount. */
+  const inFlight = useAiChatStore((s) => {
+    const id = s.activeSessionId;
+    return id ? !!s.inFlightBySession[id] : false;
+  });
+  // Keep the old local-name `loading` so existing render code reads the
+  // same flag without thousands of touch-ups; same value, different source.
+  const loading = inFlight;
+  /** Most recent failure for the retry card. Survives navigation. */
+  const lastError = useAiChatStore((s) => {
+    const id = s.activeSessionId;
+    return id ? (s.lastErrorBySession[id] ?? null) : null;
+  });
+  /** Draft text for the active session, or `pendingDraft` when no session
+   *  exists yet. Survives navigation so a half-typed prompt isn't lost. */
+  const input = useAiChatStore((s) => {
+    const id = s.activeSessionId;
+    return id ? (s.draftBySession[id] ?? '') : s.pendingDraft;
+  });
+  /** Setter mirroring the previous local `setInput`. Writes to
+   *  `draftBySession[activeSessionId]` or `pendingDraft` when no session
+   *  exists. Accepts either a string or a (prev) => next updater so the
+   *  existing dictation-chunk-append callsites work unchanged. */
+  const setInput = useCallback((next: string | ((prev: string) => string)) => {
+    const store = useAiChatStore.getState();
+    const id = store.activeSessionId;
+    const prev = id ? (store.draftBySession[id] ?? '') : store.pendingDraft;
+    const value = typeof next === 'function' ? next(prev) : next;
+    store.setDraft(id, value);
+  }, []);
+
+  /** Stable read of "is the active session's request currently in flight?"
+   *  for use from long-lived listeners ([]-deps useEffects) that can't
+   *  close over the reactive `inFlight` selector value. Reading via
+   *  `getState()` at call time is the same pattern already used for
+   *  `activeSessionId` elsewhere in this component. */
+  const isCurrentSessionInFlight = useCallback((): boolean => {
+    const store = useAiChatStore.getState();
+    const id = store.activeSessionId;
+    return id ? !!store.inFlightBySession[id] : false;
+  }, []);
+
+  /** Bridge for the prior component-local `setError(msg)` callsites. Routes
+   *  the message into the per-session error card. `null` clears. */
+  const setError = useCallback((msg: string | null) => {
+    const id = useAiChatStore.getState().activeSessionId;
+    if (!id) return; // No active session — nowhere to show the error.
+    useAiChatStore.getState().setLastError(
+      id,
+      msg == null ? null : { message: msg, replay: null },
+    );
+  }, []);
+
+  /** Bridge for the prior component-local `setStreaming('')` callsites
+   *  (cleanup paths during cancel / mode-toggle / new-chat). */
+  const setStreaming = useCallback((_text: string) => {
+    // Only the empty-string clear path is exercised from outside dispatchSend.
+    const id = useAiChatStore.getState().activeSessionId;
+    if (id) useAiChatStore.getState().clearStreaming(id);
+  }, []);
+
+  /** Bridge for the prior component-local `setLoading(false)` callsites
+   *  (cancel-on-toggle, voice-chat tear-down). Only the false branch is
+   *  exercised from outside dispatchSend. */
+  const setLoading = useCallback((flag: boolean) => {
+    const id = useAiChatStore.getState().activeSessionId;
+    if (id) useAiChatStore.getState().setInFlight(id, flag);
+  }, []);
 
   /** Make sure we have a session id before recording an attach action.
    *  First-time attach creates the session so attachment intent survives
    *  reloads even if the user never hits send. The created session
    *  appears in the history drawer as a "New Chat" until the title
-   *  inference (after the first assistant reply) renames it. */
+   *  inference (after the first assistant reply) renames it.
+   *
+   *  Promotes `pendingDraft` into `draftBySession[newId]` so a half-typed
+   *  prompt isn't orphaned when the session is created by an attach /
+   *  search-mode side effect. */
   const ensureSession = useCallback((): string => {
-    let id = useAiChatStore.getState().activeSessionId;
-    if (!id) {
-      id = useAiChatStore.getState().createSession(provider ?? null);
-    }
-    return id;
+    return useAiChatStore.getState().ensureAiSessionForDraft(provider ?? null);
   }, [provider]);
 
   /** Live read of `voice_chat_allow_cloud`. Always re-fetched at decision
@@ -129,7 +226,6 @@ export function AIChat() {
   // runs the LLM polish pass and persists an `entries` row, both of which
   // are wrong for chat input. See plan: bug-fix-required-in-abundant-duckling.md.
   const [micState, setMicState] = useState<'idle' | 'recording' | 'stopping'>('idle');
-  loadingRef.current = loading;
   providerRef.current = provider;
   micStateRef.current = micState;
   engineRef.current = engine;
@@ -141,20 +237,13 @@ export function AIChat() {
   const session = activeSession();
   const messages = session?.messages ?? [];
 
-  // Clear local streaming/loading state whenever the active session id
-  // changes. Without this, a partial response that was accumulating in
-  // chat A's `streaming` buffer would stay rendered as part of chat B's
-  // view after the user switched chats. The AIManager has already
-  // emitted/will continue to emit ai:output events tagged with A's id,
-  // but the global onAiOutput handler above filters those out. Here we
-  // also drop whatever buffer was already accumulated locally so the
-  // new chat starts visually clean.
+  // No per-session cleanup effect needed: streaming / sendPhase / inFlight
+  // are all per-session in the store, so switching `activeSessionId`
+  // naturally re-selects the right buffer (or 'idle' / '' for sessions
+  // without one). A response that's still streaming for the previous
+  // session keeps accumulating in its own slot — when the user navigates
+  // back, the partial text is still there.
   const activeSessionId = useAiChatStore((s) => s.activeSessionId);
-  useEffect(() => {
-    setStreaming('');
-    setLoading(false);
-    setSendPhase('idle');
-  }, [activeSessionId]);
 
   // Load auth & auto-create session on mount
   useEffect(() => {
@@ -187,35 +276,10 @@ export function AIChat() {
     })();
   }, []);
 
-  // Listen for streaming output. EVERY event from AIManager now carries a
-  // sessionId; we discard tokens whose session isn't the currently-active
-  // one so a long-running response from chat A doesn't bleed into chat B
-  // after the user switches. Reading activeSessionId from the store at
-  // event time (not as a closed-over value) so a session switch mid-render
-  // doesn't leave the handler comparing against stale state.
-  useEffect(() => {
-    const cleanupOutput = window.ironmic.onAiOutput((data: any) => {
-      if (data.type !== 'text' || !data.content) return;
-      const currentSession = useAiChatStore.getState().activeSessionId;
-      if (data.sessionId && currentSession && data.sessionId !== currentSession) {
-        return; // Token belongs to a different chat — drop it.
-      }
-      // First token in = we're actively streaming. Flip the phase indicator
-      // so the user sees "Composing answer…" instead of "Sending to Claude…"
-      // and knows tokens are actually arriving (not just queued).
-      setSendPhase((p) => (p === 'streaming' ? p : 'streaming'));
-      setStreaming((prev) => prev + data.content);
-    });
-    const cleanupEnd = window.ironmic.onAiTurnEnd((data: any) => {
-      const currentSession = useAiChatStore.getState().activeSessionId;
-      if (data?.sessionId && currentSession && data.sessionId !== currentSession) {
-        return; // End event for a different chat — ignore.
-      }
-      setStreaming('');
-      setLoading(false);
-    });
-    return () => { cleanupOutput(); cleanupEnd(); };
-  }, []);
+  // Streaming token subscription moved to Layout (Fix 1 — always-mounted
+  // sink so events arrive whether or not AIChat is rendered). The store's
+  // per-session `streamingBySession` and `sendPhaseBySession` maps replace
+  // the former component-local accumulator + phase state.
 
   // Auto-scroll
   useEffect(() => {
@@ -263,269 +327,124 @@ export function AIChat() {
       setMicState('recording');
     } catch (err: any) {
       const msg = err?.message || String(err);
-      setError(msg.includes('already active')
-        ? 'Dictation is already running in another window. Stop it first.'
-        : msg);
+      // Surface dictation startup errors through the same lastError channel
+      // as send errors. Lifts the message into the (now-shared) error card.
+      const id = useAiChatStore.getState().activeSessionId;
+      if (id) {
+        useAiChatStore.getState().setLastError(id, {
+          message: msg.includes('already active')
+            ? 'Dictation is already running in another window. Stop it first.'
+            : msg,
+          // No retry payload — this is a dictation startup failure, not a
+          // send failure. Null replay tells the UI to hide the Retry
+          // button while still rendering the error message + Dismiss.
+          replay: null,
+        });
+      }
     }
   }, []);
 
-  const sendText = useCallback(async (text: string): Promise<string | null> => {
-    if (!text || loading || !provider) return null;
+  /** Build the post-success TTS / auto-listen callback used by
+   *  conversational mode. Closes over `mountedRef` AND `conversationalRef`
+   *  so it short-circuits if either becomes invalid mid-send.
+   *
+   *  Returned closure runs inside `dispatchSend`'s success branch, which
+   *  may execute AFTER the component has unmounted (the user navigated
+   *  away mid-send). Touching `setMicState` on an unmounted component
+   *  would trigger React's "state update on an unmounted component"
+   *  warning, and a TTS playback the user no longer wants would just be
+   *  annoying. The two gates handle both cases. */
+  const buildAssistantTextCallback = useCallback((): ((text: string) => void) => {
+    return (response: string) => {
+      if (!mountedRef.current || !conversationalRef.current) return;
+      if (!response.trim()) return;
+      // Strip markdown for cleaner TTS — same logic as the previous inline branch.
+      const plainText = response
+        .replace(/```[\s\S]*?```/g, '')
+        .replace(/`([^`]+)`/g, '$1')
+        .replace(/\*\*([^*]+)\*\*/g, '$1')
+        .replace(/\*([^*]+)\*/g, '$1')
+        .replace(/#{1,6}\s/g, '')
+        .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+        .replace(/[>\-|]/g, '')
+        .replace(/\n{2,}/g, '. ')
+        .replace(/\n/g, ' ')
+        .trim();
+      if (!plainText) return;
+      // Fire-and-forget: synthesize & play, then re-arm dictation when TTS
+      // finishes. All operations check both gates so a mid-flight unmount
+      // / conversational-off cleanly aborts the chain.
+      void (async () => {
+        // Use the last assistant message id from the active session as the
+        // TTS entry id — close enough for the playback state to track.
+        const active = useAiChatStore.getState().activeSession();
+        const lastAssistant = active?.messages
+          .slice()
+          .reverse()
+          .find((m) => m.role === 'assistant');
+        const ttsEntryId = lastAssistant?.id ?? `ai-${Date.now()}`;
+        try {
+          await useTtsStore.getState().synthesizeAndPlay(plainText, ttsEntryId);
+          const waitForTtsEnd = () => new Promise<void>((resolve) => {
+            const check = setInterval(() => {
+              if (useTtsStore.getState().state === 'idle') {
+                clearInterval(check);
+                resolve();
+              }
+            }, 300);
+            setTimeout(() => { clearInterval(check); resolve(); }, 120000);
+          });
+          await waitForTtsEnd();
+          if (mountedRef.current && conversationalRef.current) {
+            void startAiDictation();
+          }
+        } catch {
+          /* TTS is optional — failures are silent. */
+        }
+      })();
+    };
+  }, [startAiDictation]);
 
-    // Get the current session ID directly from the store (avoids stale closure)
-    let sessionId = useAiChatStore.getState().activeSessionId;
-    if (!sessionId) {
-      sessionId = createSession(provider);
-    }
+  /** Thin dispatcher. The full request lifecycle (phase, in-flight, retrieval,
+   *  IPC, message commits, error capture) lives in `useAiChatStore.dispatchSend`
+   *  — see Fix 1. AIChat collects the sync UI snapshot, ensures a session,
+   *  fires the dispatch, and returns immediately. NOT awaited so navigating
+   *  away mid-send doesn't leave a dangling component-owned Promise. */
+  const sendText = useCallback((text: string): void => {
+    if (!text || !provider) return;
+    // Resolve / create the session BEFORE the dispatch so `pendingDraft`
+    // gets promoted into `draftBySession[newId]` correctly.
+    const sessionId = useAiChatStore.getState().ensureAiSessionForDraft(provider);
 
     // Manually attaching items via the picker IS the user's consent for
     // their content to go to the currently-selected provider. We DON'T gate
     // here — gating belongs on the future automatic-retrieval path (RAG),
-    // not on an explicit user action. The user picked items, the user picked
-    // the provider; honor both. The earlier reroute-to-local behavior
-    // created a "context doesn't work" UX hole when the user's cloud
-    // provider was the entire point of attaching.
+    // not on an explicit user action.
     const effectiveProvider: AIProvider = provider;
 
-    // Build prompt with attached items as context. Picker emits prefixed ids
-    // for dictations and meetings; we label the block accordingly so the LLM
-    // knows what kind of source it's reading (raw dictation may be rough vs.
-    // a polished meeting summary). The stored user message stays as the bare
-    // typed text — the pill row above the input already shows what's
-    // attached, so duplicating that info inside the chat bubble would be
-    // redundant clutter. Attached pills also persist across turns by design
-    // (no setAttachedNotes([])) so the filter-bar visual is the single
-    // source of truth for "what does the AI know about right now?".
-    //
-    // Search-mode adds a SECOND context block: when the toggle is on we
-    // run retrieval over the full corpus on the current query, take top-N
-    // chunks, and append them as `[Retrieved: …]` entries to the same
-    // context block. Manual attachments win for accuracy (user explicitly
-    // picked them); retrieved chunks are best-effort augmentation.
-    let fullPrompt = text;
-    const contextBlocks: string[] = [];
-    if (attachedNotes.length > 0) {
-      const block = attachedNotes.map((n) => {
-        // Internal id prefix is 'dictation:' for legacy reasons but the
-        // user calls these "Notes". Labeling the prompt block "Note" here
-        // matches the picker UI and the user's mental model.
-        const kindLabel = n.id.startsWith('meeting:')
-          ? 'Meeting'
-          : 'Note';
-        return `[${kindLabel}: ${n.title || 'Untitled'}]\n${n.content}`;
-      }).join('\n\n');
-      contextBlocks.push(`[Pinned context — items you attached]\n${block}`);
-    }
-    if (searchModeEnabled) {
-      setSendPhase('retrieving');
-      try {
-        const k = (provider === 'local') ? 6 : 12;
-        // Classify intent first so temporal queries ("yesterday", "last
-        // week") and single-doc queries ("what did Sarah say") get their
-        // metadata filters applied. Without this, every query was a bare
-        // FTS5 keyword scan and a phrase like "yesterday" — which doesn't
-        // appear in any chunk text — returned zero hits.
-        let filters: any = {};
-        try {
-          const intentJson = await (window as any).ironmic.ragClassifyIntent?.(text);
-          if (intentJson) {
-            const intent = JSON.parse(intentJson);
-            filters = intent?.filters ?? {};
-            console.log('[Search] intent classified:', intent);
-          } else {
-            console.warn('[Search] ragClassifyIntent is missing — addon may be stale (restart npm run dev).');
-          }
-        } catch (intentErr) {
-          console.warn('[Search] intent classification failed (using empty filters):', intentErr);
-        }
-        const opts = {
-          model_version: 'bge-small-en-v1.5',
-          k,
-          filters,
-          skip_archived: true,
-        };
-        console.log('[Search] calling ragRetrieveHybrid with:', { query: text, opts });
-        // Hard 12-second timeout. The retrieval call CAN take a while
-        // when the IndexerService is mid-meeting-chunk (Rust addon
-        // serializes SQL through one mutex). The Rust side will still
-        // finish eventually, but blocking the user-visible send for
-        // longer than that is unacceptable.
-        const retrievalPromise: Promise<string | null> = (window as any).ironmic.ragRetrieveHybrid
-          ? (window as any).ironmic.ragRetrieveHybrid(text, new Uint8Array(), JSON.stringify(opts))
-          : Promise.resolve(null);
-        const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 12_000));
-        const json = await Promise.race([retrievalPromise, timeoutPromise]);
-        if (json) {
-          const parsed = JSON.parse(json);
-          const hits: Array<{ label: string; text: string }> = parsed?.hits ?? [];
-          console.log(`[Search] retrieval returned ${hits.length} hits (fts: ${parsed?.fts_count ?? 0}, vector: ${parsed?.vector_count ?? 0})`);
-          if (hits.length > 0) {
-            const block = hits
-              .map((h, i) => `[${i + 1}] ${h.label}\n${h.text}`)
-              .join('\n\n');
-            contextBlocks.push(`[Retrieved from your IronMic — ${hits.length} sources]\n${block}`);
-          } else {
-            // Zero hits even after fallback means the chunks table is
-            // empty (indexer hasn't run yet, or genuinely no content
-            // matches the filter). Fall back AGAIN — this time by
-            // dropping the filters entirely and pulling the user's most
-            // recent N raw entries directly. This guarantees the model
-            // gets SOMETHING to work with on first-use.
-            try {
-              const recentEntries = await (window as any).ironmic.listEntries?.({
-                limit: k,
-                offset: 0,
-                archived: false,
-              });
-              if (Array.isArray(recentEntries) && recentEntries.length > 0) {
-                const block = recentEntries
-                  .map((e: any, i: number) => {
-                    const body = (e.polishedText || e.rawTranscript || '').slice(0, 1200);
-                    const date = e.createdAt ? new Date(e.createdAt).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '';
-                    return `[${i + 1}] Dictation ${date}\n${body}`;
-                  })
-                  .join('\n\n');
-                contextBlocks.push(`[Your most recent dictations — fallback context, index may still be building]\n${block}`);
-                console.log(`[Search] fell back to ${recentEntries.length} most-recent entries directly`);
-              } else {
-                console.warn('[Search] zero hits AND no recent entries — the user genuinely has no indexable content yet.');
-              }
-            } catch (fallbackErr) {
-              console.warn('[Search] last-resort entry fallback failed:', fallbackErr);
-            }
-          }
-        } else {
-          console.warn('[Search] retrieval timed out — sending without retrieved context.');
-        }
-      } catch (err) {
-        console.warn('[Search] retrieval failed (continuing without retrieved context):', err);
-      }
-    }
-    if (contextBlocks.length > 0) {
-      fullPrompt = `${contextBlocks.join('\n\n---\n\n')}\n\n---\n\n${text}`;
-    }
-    setSendPhase('sending');
+    // Snapshot the current attached notes + search-mode AT DISPATCH TIME
+    // (store reads are reactive; we want the values as they are right now,
+    // not whatever they happen to be when dispatchSend's awaits resolve).
+    const storeNow = useAiChatStore.getState();
+    const snapshotAttached = storeNow.attachedContextBySession[sessionId] ?? [];
+    const snapshotSearchMode = !!storeNow.searchModeBySession[sessionId];
 
-    const userMsg: ChatMessage = {
-      id: Date.now().toString(),
-      role: 'user',
-      content: text,
-      timestamp: Date.now(),
-    };
-
-    addMessage(sessionId, userMsg);
-    setInput('');
-    setLoading(true);
-    setError(null);
-    setStreaming('');
-
-    try {
-      // Resolve the model ID for the CURRENT provider. We can't just trust
-      // the persisted `ai_model` setting — it may carry a stale cloud model
-      // id (e.g. `claude-sonnet-4-...`) from a previous session that would
-      // then be sent to the local LLM, which rejects it with "Unknown local
-      // LLM model". Filter by provider convention: local model IDs start
-      // with `llm`; cloud IDs do not. If the stored value doesn't match the
-      // current provider's convention, drop it and let the main process
-      // pick a reasonable default.
-      const [genericModel, localModel] = await Promise.all([
-        window.ironmic.getSetting('ai_model'),
-        window.ironmic.getSetting('ai_local_model'),
-      ]);
-      let modelId: string | undefined;
-      if (effectiveProvider === 'local') {
-        const candidate = localModel || genericModel;
-        modelId = candidate && candidate.startsWith('llm') ? candidate : undefined;
-      } else {
-        // Cloud providers: accept the generic setting iff it's NOT a local id.
-        modelId = genericModel && !genericModel.startsWith('llm') ? genericModel : undefined;
-      }
-      // Build a bounded conversation tail for the main process. Sending the
-      // last 20 messages (capped server-side at MAX_HISTORY_MESSAGES) lets
-      // resumed sessions retain context across app restarts: local replays
-      // them into the LLM history, CLI bakes them into the prompt prefix.
-      const sessSnapshot = useAiChatStore.getState().sessions.find((s) => s.id === sessionId);
-      const priorMessages = sessSnapshot
-        ? sessSnapshot.messages
-            .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.id !== userMsg.id)
-            .slice(-20)
-            .map((m) => ({ role: m.role, content: m.content }))
-        : undefined;
-      const response = await window.ironmic.aiSendMessage(fullPrompt, effectiveProvider, modelId, sessionId, priorMessages);
-
-      const assistantMsg: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        role: 'assistant',
-        content: response,
-        provider: effectiveProvider,
-        timestamp: Date.now(),
-      };
-      addMessage(sessionId, assistantMsg);
-
-      // In conversational mode: TTS the response, then auto-record
-      if (conversationalRef.current && response.trim()) {
-        const plainText = response
-          .replace(/```[\s\S]*?```/g, '')
-          .replace(/`([^`]+)`/g, '$1')
-          .replace(/\*\*([^*]+)\*\*/g, '$1')
-          .replace(/\*([^*]+)\*/g, '$1')
-          .replace(/#{1,6}\s/g, '')
-          .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
-          .replace(/[>\-|]/g, '')
-          .replace(/\n{2,}/g, '. ')
-          .replace(/\n/g, ' ')
-          .trim();
-
-        if (plainText) {
-          try {
-            await useTtsStore.getState().synthesizeAndPlay(plainText, assistantMsg.id);
-            // Wait for TTS to finish, then auto-start recording
-            const waitForTtsEnd = () => new Promise<void>((resolve) => {
-              const check = setInterval(() => {
-                const tts = useTtsStore.getState();
-                if (tts.state === 'idle') {
-                  clearInterval(check);
-                  resolve();
-                }
-              }, 300);
-              // Safety timeout: 2 minutes
-              setTimeout(() => { clearInterval(check); resolve(); }, 120000);
-            });
-            await waitForTtsEnd();
-            // If still in conversational mode, auto-start recording.
-            // Uses the streaming AI-chat path (no polish, review-before-send).
-            if (conversationalRef.current) {
-              void startAiDictation();
-            }
-          } catch { /* TTS optional */ }
-        }
-      }
-
-      return response;
-    } catch (err: any) {
-      setError(err.message || 'AI request failed');
-      const errorMsg: ChatMessage = {
-        id: (Date.now() + 1).toString(),
-        role: 'system',
-        content: err.message || 'Request failed',
-        timestamp: Date.now(),
-      };
-      addMessage(sessionId, errorMsg);
-      return null;
-    } finally {
-      setLoading(false);
-      setStreaming('');
-      setSendPhase('idle');
-    }
-    // `attachedNotes` MUST be in this dep list: without it the closure freezes
-    // to whatever value `attachedNotes` had when sendText was last rebuilt,
-    // so the very first send after attaching reads `[]` and the context
-    // silently vanishes. (Turn 2 looked like it worked because the loading
-    // toggle from turn 1 re-created the callback with the fresh state.)
-  }, [loading, provider, attachedNotes, searchModeEnabled, addMessage, createSession, startAiDictation]);
+    void useAiChatStore.getState().dispatchSend({
+      sessionId,
+      text,
+      attachedNotes: snapshotAttached,
+      searchModeEnabled: snapshotSearchMode,
+      knowledgeQaEnabled,
+      effectiveProvider,
+      onAssistantText: buildAssistantTextCallback(),
+    });
+  }, [provider, knowledgeQaEnabled, buildAssistantTextCallback]);
 
   // Keep a ref to the latest sendText so the long-lived dictation listener
   // (mounted once with [] deps) can call it without re-binding on every change.
+  // Note: sendText is now fire-and-forget (no Promise<string | null>). The
+  // dictation listener doesn't use the return value, so the type narrowing
+  // is purely cosmetic — `sendTextRef.current?.(finalText)` works either way.
   sendTextRef.current = sendText;
 
   const handleSend = useCallback(async () => {
@@ -619,7 +538,7 @@ export function AIChat() {
     // may not have flushed by the time this handler runs.
     const offEot = api.onDictationStreamEndOfTurn?.(async (payload: { source: 'ai-chat'; text: string }) => {
       if (!conversationalRef.current) return;
-      if (autoSendingRef.current || loadingRef.current) return;
+      if (autoSendingRef.current || isCurrentSessionInFlight()) return;
       const eotText = (payload?.text || '').trim();
       if (!eotText) return;
       // Cloud guard — read live so a Settings flip in another tab takes
@@ -678,7 +597,7 @@ export function AIChat() {
       // Toggle OFF
       try { await api.dictationStreamStop?.(); } catch { /* ignore */ }
       try { useTtsStore.getState().stop(); } catch { /* ignore */ }
-      if (loadingRef.current) {
+      if (isCurrentSessionInFlight()) {
         try { await api.aiCancel?.(); } catch { /* ignore */ }
       }
       setConversational(false);
@@ -741,7 +660,7 @@ export function AIChat() {
       if (allowed) return; // continue loop against the new cloud provider
       try { await api.dictationStreamStop?.(); } catch { /* ignore */ }
       try { useTtsStore.getState().stop(); } catch { /* ignore */ }
-      if (loadingRef.current) {
+      if (isCurrentSessionInFlight()) {
         try { await api.aiCancel?.(); } catch { /* ignore */ }
       }
       setConversational(false);
@@ -970,10 +889,49 @@ export function AIChat() {
 
         {/* Input */}
         <div className="px-4 py-3 border-t border-iron-border">
-          {error && (
-            <div className="flex items-center gap-2 text-xs text-iron-danger mb-2">
-              <AlertCircle className="w-3 h-3" />
-              {error}
+          {lastError && (
+            <div
+              className="flex items-start gap-2 mb-2 rounded-lg border border-iron-danger/30 bg-iron-danger/5 px-3 py-2"
+              role="alert"
+            >
+              <AlertCircle className="w-3.5 h-3.5 text-iron-danger flex-shrink-0 mt-0.5" />
+              <div className="flex-1 min-w-0">
+                <div className="text-xs text-iron-danger break-words">
+                  {lastError.message}
+                </div>
+                <div className="mt-1.5 flex items-center gap-2">
+                  {/* Retry replays the EXACT request that failed — same prompt,
+                      same attachments, same provider, same resolved model.
+                      Hidden when replay is null (e.g. a dictation-startup
+                      failure rather than a send failure). */}
+                  {lastError.replay && (
+                    <button
+                      onClick={() => {
+                        const id = useAiChatStore.getState().activeSessionId;
+                        if (!id) return;
+                        const err = useAiChatStore.getState().lastErrorBySession[id];
+                        if (!err?.replay) return;
+                        useAiChatStore.getState().setLastError(id, null);
+                        void useAiChatStore.getState().dispatchSend(err.replay);
+                      }}
+                      className="inline-flex items-center gap-1 text-[11px] px-2 py-1 rounded-md bg-iron-accent/10 text-iron-accent-light hover:bg-iron-accent/20 transition-colors"
+                      title="Retry with the same prompt and provider"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      Retry
+                    </button>
+                  )}
+                  <button
+                    onClick={() => {
+                      const id = useAiChatStore.getState().activeSessionId;
+                      if (id) useAiChatStore.getState().setLastError(id, null);
+                    }}
+                    className="text-[11px] px-2 py-1 rounded-md text-iron-text-muted hover:text-iron-text-secondary hover:bg-iron-surface-hover transition-colors"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
             </div>
           )}
 

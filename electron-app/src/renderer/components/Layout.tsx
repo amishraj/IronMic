@@ -27,6 +27,7 @@ import { useSettingsStore } from '../stores/useSettingsStore';
 import { useEntryStore } from '../stores/useEntryStore';
 import { useToastStore } from '../stores/useToastStore';
 import { useMeetingStore } from '../stores/useMeetingStore';
+import { useAiChatStore } from '../stores/useAiChatStore';
 import iconSmall from '../assets/icon-64.png';
 import micIdle from '../assets/mic-idle.png';
 import micRecording from '../assets/mic-recording.png';
@@ -266,6 +267,46 @@ export function Layout() {
     };
     window.addEventListener('ironmic:navigate', handler);
     return () => window.removeEventListener('ironmic:navigate', handler);
+  }, []);
+
+  // ── AI Assistant streaming sink (always-mounted) ──
+  // Subscribes once at Layout level so streaming `ai:output` tokens land in
+  // the store even when <AIChat /> is unmounted (the user navigated away
+  // mid-send). The previous architecture mounted the listener inside AIChat
+  // itself, so tokens fired by the main process during a navigation gap
+  // were dropped on the floor.
+  //
+  // Filtering rule: `ai:output` is shared with other surfaces (Ask,
+  // Knowledge Q&A). We only forward to the chat store when `data.sessionId`
+  // names a session the chat store actually owns — otherwise we let the
+  // other surface handle its own event.
+  //
+  // We intentionally DO NOT clear streaming on `ai:turn-end` here. That
+  // would briefly blank the streaming bubble between turn-end and the
+  // final assistant-message bubble landing. `dispatchSend` clears it
+  // atomically with the message commit.
+  useEffect(() => {
+    const isChatSession = (sessionId: string | undefined): sessionId is string => {
+      if (!sessionId) return false;
+      return useAiChatStore.getState().sessions.some((s) => s.id === sessionId);
+    };
+    const unsubOutput = window.ironmic?.onAiOutput?.((data: any) => {
+      if (data?.type !== 'text' || !data?.content) return;
+      if (!isChatSession(data.sessionId)) return;
+      const store = useAiChatStore.getState();
+      store.setSendPhase(data.sessionId, 'streaming');
+      store.appendStreamingToken(data.sessionId, data.content);
+    });
+    const unsubTurnStart = window.ironmic?.onAiTurnStart?.(() => {
+      // No-op. dispatchSend already set the phase before the IPC; turn-start
+      // would only flap the indicator back to 'sending' once tokens flip it
+      // to 'streaming'. Keep the subscription registered so the channel
+      // doesn't sit unread, but don't update store state from it.
+    });
+    return () => {
+      try { unsubOutput?.(); } catch { /* noop */ }
+      try { unsubTurnStart?.(); } catch { /* noop */ }
+    };
   }, []);
 
   // ── Whisper readiness banner ──

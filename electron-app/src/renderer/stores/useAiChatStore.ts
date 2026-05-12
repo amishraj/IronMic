@@ -31,6 +31,40 @@ export interface AiSessionSearchHit {
   matchedMessageId: string;
 }
 
+/** Arguments for `dispatchSend`. Sync UI snapshot only — no Promises, no
+ *  async lookups; `dispatchSend` does ALL awaits itself, AFTER setting
+ *  inFlight on the resolved session. */
+export interface DispatchSendArgs {
+  /** Resolved by the caller (via `ensureAiSessionForDraft` if needed). Baked
+   *  into replay snapshots so Retry always targets the original chat. */
+  sessionId: string;
+  text: string;
+  attachedNotes: Note[];
+  searchModeEnabled: boolean;
+  knowledgeQaEnabled: boolean;
+  effectiveProvider: AIProvider;
+  /** Optional on first send. Set by `dispatchSend` after settings resolve and
+   *  baked into the replay snapshot so Retry uses the same model the failed
+   *  request used, even if the user later changes `ai_model`. */
+  modelIdOverride?: string;
+  /** TTS / auto-listen conversational branch. Intentionally omitted from
+   *  replay snapshots so Retry doesn't unexpectedly trigger TTS.
+   *  CONTRACT: callback body MUST short-circuit on BOTH a mountedRef
+   *  check and a conversationalRef check before touching ANY state. */
+  onAssistantText?: (text: string) => void;
+}
+
+/** Per-session captured failure for the retry UI. `replay` is null when the
+ *  failure isn't a send failure (e.g. dictation startup error) and Retry
+ *  doesn't apply — the UI hides the Retry button in that case but still
+ *  shows the error message + Dismiss. */
+export interface AiChatError {
+  message: string;
+  replay: DispatchSendArgs | null;
+}
+
+export type SendPhase = 'retrieving' | 'sending' | 'streaming';
+
 interface AiChatStore {
   sessions: AiSession[];
   activeSessionId: string | null;
@@ -59,6 +93,33 @@ interface AiChatStore {
    *  key family as the attached pills. */
   searchModeBySession: Record<string, boolean>;
 
+  // ── Transient per-session UI state (in-memory only; survives navigation,
+  // not app restart). Keys are deleted when reaching the neutral value
+  // (no '' / false / 'idle' sentinel rows accumulating across long sessions). ──
+
+  /** Textarea contents per session. Absence = ''. */
+  draftBySession: Record<string, string>;
+  /** Textarea contents when no session exists yet — promoted into
+   *  `draftBySession[newId]` by `ensureAiSessionForDraft`. Single string, not a
+   *  map, because there can only be one "not-yet-created" chat at a time. */
+  pendingDraft: string;
+  /** UI phase indicator beneath the input. Absence = 'idle'. */
+  sendPhaseBySession: Record<string, SendPhase>;
+  /** True iff a `dispatchSend` is currently running for this session. Source
+   *  of truth for the send-button disabled state and the duplicate-send guard
+   *  (more reliable than React-local `loading` after AIChat unmount/remount).
+   *  Absence = false. */
+  inFlightBySession: Record<string, true>;
+  /** Accumulated streaming text from `ai:output` events. Cleared atomically
+   *  with the assistant-message commit (NOT on raw `ai:turn-end`) so the
+   *  streaming bubble doesn't briefly blank between turn-end and the final
+   *  message bubble appearing. Absence = no streaming text. */
+  streamingBySession: Record<string, string>;
+  /** Most recent failure for the retry card. Replay payload is the full
+   *  DispatchSendArgs that failed (minus `onAssistantText`), so Retry replays
+   *  the same INPUTS regardless of UI changes since the failure. */
+  lastErrorBySession: Record<string, AiChatError | null>;
+
   // Getters
   activeSession: () => AiSession | null;
   /** Convenience for components that just need "what's attached on the
@@ -86,6 +147,38 @@ interface AiChatStore {
 
   // Search-mode actions
   setSearchMode: (sessionId: string, enabled: boolean) => void;
+
+  // ── Transient state setters (delete-on-neutral) ────────────────────────
+  /** Writes to `draftBySession[sessionId]`, or to `pendingDraft` when
+   *  sessionId is null (no session created yet). Empty text deletes the key
+   *  rather than leaving an empty-string sentinel. */
+  setDraft: (sessionId: string | null, text: string) => void;
+  /** Set the UI phase. 'idle' DELETES the key. */
+  setSendPhase: (sessionId: string, phase: SendPhase | 'idle') => void;
+  /** Toggle the in-flight flag. false DELETES the key. */
+  setInFlight: (sessionId: string, inFlight: boolean) => void;
+  /** Append to the per-session streaming buffer. */
+  appendStreamingToken: (sessionId: string, token: string) => void;
+  /** Clear the per-session streaming buffer (deletes the key). */
+  clearStreaming: (sessionId: string) => void;
+  /** Set or clear the per-session failure. null DELETES the key. */
+  setLastError: (sessionId: string, err: AiChatError | null) => void;
+
+  // ── Session lifecycle for drafts ───────────────────────────────────────
+  /** Resolve a sessionId for the current draft: returns activeSessionId if
+   *  one exists, otherwise creates a session AND promotes `pendingDraft`
+   *  into `draftBySession[newId]`. Call this from attach / search-mode /
+   *  send handlers BEFORE writing per-session state so `pendingDraft`
+   *  doesn't get orphaned when the session is created via a side effect. */
+  ensureAiSessionForDraft: (provider: AIProvider | null) => string;
+
+  // ── Send orchestration ─────────────────────────────────────────────────
+  /** Owns the full request lifecycle for a chat send: phase state, in-flight
+   *  flag, retrieval, IPC, message commits, error capture. Runs inside the
+   *  store closure so the AIChat component can unmount mid-send without
+   *  losing the assistant-message commit. Caller must not await — fire and
+   *  forget. */
+  dispatchSend: (args: DispatchSendArgs) => Promise<void>;
 
   /** Background LLM-inferred chat title. Fires once per session after the
    *  first complete user→assistant exchange — calls the local LLM (cheap,
@@ -261,6 +354,130 @@ function api() {
   return (window as any).ironmic;
 }
 
+// ── Module-private helpers for dispatchSend ────────────────────────────────
+
+/** Format any thrown value into a user-facing string. */
+function normalizeAiError(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === 'string' && err) return err;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return 'AI request failed';
+  }
+}
+
+/** Build the prompt body from the user's text, manually-attached items, and
+ *  optional retrieved chunks. Mirrors the inline logic that used to live in
+ *  `AIChat.sendText`. Attached items take precedence visually (listed first)
+ *  because the user explicitly picked them; retrieved chunks are
+ *  best-effort augmentation. */
+function buildPromptText(
+  text: string,
+  attachedNotes: Note[],
+  retrievedBlock: string | null,
+): string {
+  const blocks: string[] = [];
+  if (attachedNotes.length > 0) {
+    const block = attachedNotes
+      .map((n) => {
+        const kindLabel = n.id.startsWith('meeting:') ? 'Meeting' : 'Note';
+        return `[${kindLabel}: ${n.title || 'Untitled'}]\n${n.content}`;
+      })
+      .join('\n\n');
+    blocks.push(`[Pinned context — items you attached]\n${block}`);
+  }
+  if (retrievedBlock) blocks.push(retrievedBlock);
+  if (blocks.length === 0) return text;
+  return `${blocks.join('\n\n---\n\n')}\n\n---\n\n${text}`;
+}
+
+/** Run RAG retrieval against the user's local index. Returns a
+ *  human-readable context block to splice into the prompt, or null on
+ *  timeout / disabled / zero hits. Mirrors the inline retrieval flow in
+ *  the old sendText; preserved verbatim including the 12s timeout and the
+ *  "fall back to most recent entries" last-resort path. */
+async function runRetrieval(
+  text: string,
+  provider: AIProvider,
+): Promise<string | null> {
+  const a = api();
+  if (!a) return null;
+  try {
+    const k = provider === 'local' ? 6 : 12;
+    let filters: any = {};
+    try {
+      const intentJson = await a.ragClassifyIntent?.(text);
+      if (intentJson) {
+        const intent = JSON.parse(intentJson);
+        filters = intent?.filters ?? {};
+      }
+    } catch {
+      // Intent classification is best-effort; fall back to empty filters.
+    }
+    const opts = {
+      model_version: 'bge-small-en-v1.5',
+      k,
+      filters,
+      skip_archived: true,
+    };
+    const retrievalPromise: Promise<string | null> = a.ragRetrieveHybrid
+      ? a.ragRetrieveHybrid(text, new Uint8Array(), JSON.stringify(opts))
+      : Promise.resolve(null);
+    const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 12_000));
+    const json = await Promise.race([retrievalPromise, timeoutPromise]);
+    if (json) {
+      const parsed = JSON.parse(json);
+      const hits: Array<{ label: string; text: string }> = parsed?.hits ?? [];
+      if (hits.length > 0) {
+        const block = hits.map((h, i) => `[${i + 1}] ${h.label}\n${h.text}`).join('\n\n');
+        return `[Retrieved from your IronMic — ${hits.length} sources]\n${block}`;
+      }
+    }
+    // Last-resort fallback when retrieval returns zero hits (likely an
+    // empty index on first use): inject the user's most recent N raw
+    // entries directly so the model has something to ground against.
+    try {
+      const recent = await a.listEntries?.({ limit: 6, offset: 0, archived: false });
+      if (Array.isArray(recent) && recent.length > 0) {
+        const block = recent
+          .map((e: any, i: number) => {
+            const body = (e.polishedText || e.rawTranscript || '').slice(0, 1200);
+            const date = e.createdAt
+              ? new Date(e.createdAt).toLocaleString(undefined, {
+                  dateStyle: 'medium',
+                  timeStyle: 'short',
+                })
+              : '';
+            return `[${i + 1}] Dictation ${date}\n${body}`;
+          })
+          .join('\n\n');
+        return `[Your most recent dictations — fallback context, index may still be building]\n${block}`;
+      }
+    } catch {
+      // Last-resort fallback failure is non-fatal.
+    }
+  } catch (err) {
+    console.warn('[ai-chat] retrieval failed (continuing without retrieved context):', err);
+  }
+  return null;
+}
+
+/** Filter `ai_model` / `ai_local_model` settings down to a model id that
+ *  matches the provider. Mirrors the inline logic that used to live in
+ *  AIChat.sendText: local model ids start with `llm`; cloud ids don't. */
+function selectModelIdForProvider(
+  provider: AIProvider,
+  genericModel: string | null,
+  localModel: string | null,
+): string | undefined {
+  if (provider === 'local') {
+    const candidate = localModel || genericModel;
+    return candidate && candidate.startsWith('llm') ? candidate : undefined;
+  }
+  return genericModel && !genericModel.startsWith('llm') ? genericModel : undefined;
+}
+
 async function migrateLocalStorageOnce(): Promise<void> {
   if (typeof localStorage === 'undefined') return;
   if (localStorage.getItem(MIGRATED_FLAG) === '1') return;
@@ -330,6 +547,12 @@ export const useAiChatStore = create<AiChatStore>((set, get) => ({
   closedForWrites: new Set(),
   attachedContextBySession: loadAttachedContextMap(),
   searchModeBySession: loadSearchModeMap(),
+  draftBySession: {},
+  pendingDraft: '',
+  sendPhaseBySession: {},
+  inFlightBySession: {},
+  streamingBySession: {},
+  lastErrorBySession: {},
 
   activeSession: () => {
     const { sessions, activeSessionId } = get();
@@ -507,11 +730,23 @@ export const useAiChatStore = create<AiChatStore>((set, get) => ({
     saveAttachedContextMap(remainingAttached);
     const { [id]: _dropSearch, ...remainingSearch } = get().searchModeBySession;
     saveSearchModeMap(remainingSearch);
+    // Also drop transient per-session UI state so a late-arriving event for
+    // a deleted session can't recreate a stuck inFlight/streaming row.
+    const { [id]: _dropDraft, ...remainingDraft } = get().draftBySession;
+    const { [id]: _dropPhase, ...remainingPhase } = get().sendPhaseBySession;
+    const { [id]: _dropInFlight, ...remainingInFlight } = get().inFlightBySession;
+    const { [id]: _dropStream, ...remainingStream } = get().streamingBySession;
+    const { [id]: _dropErr, ...remainingErr } = get().lastErrorBySession;
 
     set({
       sessions, activeSessionId, closedForWrites,
       attachedContextBySession: remainingAttached,
       searchModeBySession: remainingSearch,
+      draftBySession: remainingDraft,
+      sendPhaseBySession: remainingPhase,
+      inFlightBySession: remainingInFlight,
+      streamingBySession: remainingStream,
+      lastErrorBySession: remainingErr,
     });
 
     // Tombstone runs at the tail of the queue — prior writes drain in order.
@@ -616,6 +851,230 @@ export const useAiChatStore = create<AiChatStore>((set, get) => ({
     const map = { ...get().searchModeBySession, [sessionId]: enabled };
     saveSearchModeMap(map);
     set({ searchModeBySession: map });
+  },
+
+  // ── Transient state setters (delete-on-neutral) ─────────────────────────
+
+  setDraft: (sessionId, text) => {
+    if (sessionId === null) {
+      set({ pendingDraft: text });
+      return;
+    }
+    const current = get().draftBySession;
+    if (!text) {
+      // Empty draft → drop the key entirely. Avoids long-lived
+      // empty-string sentinels accumulating in the map.
+      if (current[sessionId] === undefined) return;
+      const { [sessionId]: _drop, ...remaining } = current;
+      set({ draftBySession: remaining });
+      return;
+    }
+    set({ draftBySession: { ...current, [sessionId]: text } });
+  },
+
+  setSendPhase: (sessionId, phase) => {
+    const current = get().sendPhaseBySession;
+    if (phase === 'idle') {
+      if (current[sessionId] === undefined) return;
+      const { [sessionId]: _drop, ...remaining } = current;
+      set({ sendPhaseBySession: remaining });
+      return;
+    }
+    set({ sendPhaseBySession: { ...current, [sessionId]: phase } });
+  },
+
+  setInFlight: (sessionId, inFlight) => {
+    const current = get().inFlightBySession;
+    if (!inFlight) {
+      if (current[sessionId] === undefined) return;
+      const { [sessionId]: _drop, ...remaining } = current;
+      set({ inFlightBySession: remaining });
+      return;
+    }
+    if (current[sessionId] === true) return;
+    set({ inFlightBySession: { ...current, [sessionId]: true } });
+  },
+
+  appendStreamingToken: (sessionId, token) => {
+    if (!token) return;
+    const current = get().streamingBySession;
+    const prev = current[sessionId] ?? '';
+    set({ streamingBySession: { ...current, [sessionId]: prev + token } });
+  },
+
+  clearStreaming: (sessionId) => {
+    const current = get().streamingBySession;
+    if (current[sessionId] === undefined) return;
+    const { [sessionId]: _drop, ...remaining } = current;
+    set({ streamingBySession: remaining });
+  },
+
+  setLastError: (sessionId, err) => {
+    const current = get().lastErrorBySession;
+    if (err === null) {
+      if (current[sessionId] === undefined || current[sessionId] === null) return;
+      const { [sessionId]: _drop, ...remaining } = current;
+      set({ lastErrorBySession: remaining });
+      return;
+    }
+    set({ lastErrorBySession: { ...current, [sessionId]: err } });
+  },
+
+  // ── Session lifecycle for drafts ────────────────────────────────────────
+
+  ensureAiSessionForDraft: (provider) => {
+    const active = get().activeSessionId;
+    if (active) return active;
+    const id = get().createSession(provider);
+    const pending = get().pendingDraft;
+    if (pending) {
+      set({
+        draftBySession: { ...get().draftBySession, [id]: pending },
+        pendingDraft: '',
+      });
+    }
+    return id;
+  },
+
+  // ── Send orchestration (lifecycle owner) ────────────────────────────────
+
+  dispatchSend: async (args) => {
+    const { sessionId } = args;
+    const finishSend = (id: string) => {
+      // Single funnel for resolve + reject so future edits can't leave a
+      // session stuck with inFlight=true / phase!='idle'.
+      get().clearStreaming(id);
+      get().setInFlight(id, false);
+      get().setSendPhase(id, 'idle');
+    };
+
+    // 1. Synchronous pre-flight guards. Three reasons to bail before any
+    //    state mutation:
+    //    - Session was deleted (closedForWrites). A stale Retry mustn't
+    //      recreate transient state for a tombstoned chat.
+    //    - Session doesn't exist (race with deleteSession that hasn't yet
+    //      been written by closedForWrites? defensive).
+    //    - Another dispatch is already in flight for this session. UI
+    //      button-disable is necessary but not sufficient — programmatic
+    //      callers (e.g. dictation auto-send) can still re-enter.
+    if (get().closedForWrites.has(sessionId)) return;
+    if (!get().sessions.some((s) => s.id === sessionId)) return;
+    if (get().inFlightBySession[sessionId]) return;
+
+    // 2. Lifecycle ownership starts NOW. From here on, every await is
+    //    followed by a closedForWrites re-check before any mutation.
+    get().setInFlight(sessionId, true);
+    const shouldRetrieve = args.searchModeEnabled && args.knowledgeQaEnabled;
+    get().setSendPhase(sessionId, shouldRetrieve ? 'retrieving' : 'sending');
+
+    // 3. User-bubble commit (synchronous, before any await).
+    const userMsg: ChatMessage = {
+      id: generateId(),
+      role: 'user',
+      content: args.text,
+      timestamp: Date.now(),
+    };
+    get().addMessage(sessionId, userMsg);
+    get().setDraft(sessionId, '');
+
+    // 6. Resolve modelId. Initialize from override BEFORE any await so a
+    //    reject inside settings resolution still has a defined value to
+    //    bake into the replay snapshot.
+    let resolvedModelId: string | undefined = args.modelIdOverride;
+    try {
+      if (resolvedModelId === undefined) {
+        const a = api();
+        const [genericModel, localModel] = await Promise.all([
+          a?.getSetting?.('ai_model') ?? Promise.resolve(null),
+          a?.getSetting?.('ai_local_model') ?? Promise.resolve(null),
+        ]);
+        if (get().closedForWrites.has(sessionId)) return;
+        resolvedModelId = selectModelIdForProvider(
+          args.effectiveProvider,
+          genericModel,
+          localModel,
+        );
+      }
+
+      // 7. Optional retrieval pass.
+      let retrievedBlock: string | null = null;
+      if (shouldRetrieve) {
+        retrievedBlock = await runRetrieval(args.text, args.effectiveProvider);
+        if (get().closedForWrites.has(sessionId)) return;
+        get().setSendPhase(sessionId, 'sending');
+      }
+
+      // 8. Build the full prompt.
+      const fullPrompt = buildPromptText(args.text, args.attachedNotes, retrievedBlock);
+
+      // Build a bounded conversation tail for the main process (matches
+      // the prior renderer-side logic). Server-side caps at MAX_HISTORY.
+      const sessSnapshot = get().sessions.find((s) => s.id === sessionId);
+      const priorMessages = sessSnapshot
+        ? sessSnapshot.messages
+            .filter((m) => (m.role === 'user' || m.role === 'assistant') && m.id !== userMsg.id)
+            .slice(-20)
+            .map((m) => ({ role: m.role, content: m.content }))
+        : undefined;
+
+      // 9. The IPC send. Streaming tokens arrive concurrently at the
+      //    Layout-level subscription (Fix 1b).
+      const a = api();
+      const response: string = await a.aiSendMessage(
+        fullPrompt,
+        args.effectiveProvider,
+        resolvedModelId,
+        sessionId,
+        priorMessages,
+      );
+
+      // 10. Resolve path. Atomic: assistant message lands AND streaming
+      //     buffer clears AND lastError clears, then in-flight releases.
+      if (get().closedForWrites.has(sessionId)) return;
+      const assistantMsg: ChatMessage = {
+        id: generateId(),
+        role: 'assistant',
+        content: response,
+        provider: args.effectiveProvider,
+        timestamp: Date.now(),
+      };
+      get().addMessage(sessionId, assistantMsg);
+      get().setLastError(sessionId, null);
+      finishSend(sessionId);
+
+      // TTS / conversational hook — callback is responsible for its own
+      // mountedRef + conversationalRef gating (see DispatchSendArgs).
+      try {
+        args.onAssistantText?.(response);
+      } catch (cbErr) {
+        console.warn('[ai-chat] onAssistantText callback threw:', cbErr);
+      }
+    } catch (err) {
+      // 11. Reject path. Build a replay snapshot with the same INPUTS that
+      //     failed (modelIdOverride stamped with resolvedModelId so the
+      //     retry uses the same model even if `ai_model` changes later).
+      //     Skip onAssistantText so Retry doesn't unexpectedly trigger TTS.
+      if (get().closedForWrites.has(sessionId)) return;
+      const replay: DispatchSendArgs = {
+        sessionId,
+        text: args.text,
+        attachedNotes: args.attachedNotes,
+        searchModeEnabled: args.searchModeEnabled,
+        knowledgeQaEnabled: args.knowledgeQaEnabled,
+        effectiveProvider: args.effectiveProvider,
+        modelIdOverride: resolvedModelId,
+      };
+      const message = normalizeAiError(err);
+      get().setLastError(sessionId, { message, replay });
+      const errorMsg: ChatMessage = {
+        id: generateId(),
+        role: 'system',
+        content: message,
+        timestamp: Date.now(),
+      };
+      get().addMessage(sessionId, errorMsg);
+      finishSend(sessionId);
+    }
   },
 
   // ── Title inference ─────────────────────────────────────────────────────
