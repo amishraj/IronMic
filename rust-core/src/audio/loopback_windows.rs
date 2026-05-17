@@ -212,10 +212,16 @@ mod imp {
             }
             let mix_format: WAVEFORMATEX = *mix_format_ptr;
             let sample_format = describe_format(mix_format_ptr);
+            // Copy out of the packed struct into local primitives before
+            // logging — the `debug!` macro's valueset_all expansion takes
+            // references to its args, which is UB on a packed field.
+            let log_channels = mix_format.nChannels;
+            let log_sample_rate = mix_format.nSamplesPerSec;
+            let log_bits = mix_format.wBitsPerSample;
             debug!(
-                channels = mix_format.nChannels,
-                sample_rate = mix_format.nSamplesPerSec,
-                bits = mix_format.wBitsPerSample,
+                channels = log_channels,
+                sample_rate = log_sample_rate,
+                bits = log_bits,
                 ?sample_format,
                 "WASAPI loopback mix format"
             );
