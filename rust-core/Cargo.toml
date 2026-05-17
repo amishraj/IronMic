@@ -62,6 +62,25 @@ ndarray = { version = "0.17", optional = true }
 transcribe-rs = { version = "0.3", features = ["onnx"], optional = true }
 enigo = { version = "0.6", optional = true }
 
+# Native WASAPI loopback capture for the dual-stream meeting recorder.
+# Windows-only — cpal's WASAPI host does not expose AUDCLNT_STREAMFLAGS_LOOPBACK,
+# so we drive IAudioClient directly via the windows crate. The feature list is
+# kept fine-grained on purpose; see CLAUDE.md and the loopback_windows module
+# for the WASAPI lifecycle details (COM init, event-driven pump,
+# AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED rebuild,
+# IMMNotificationClient for default-device changes).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Media_Audio",
+  "Win32_Media_KernelStreaming",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_Foundation",
+] }
+
 [build-dependencies]
 napi-build = { version = "2", optional = true }
 

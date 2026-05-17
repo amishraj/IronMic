@@ -350,8 +350,17 @@ const api = {
     deviceName?: string | null,
     chunkIntervalS?: number,
     hostDisplayName?: string | null,
+    /**
+     * Remote-meeting capture: when `enabled`, the recorder runs the dual-
+     * stream pipeline (mic + WASAPI loopback) and tags each segment with
+     * its source ('mic' = "You", 'loopback' = "Remote"). `loopbackDevice`
+     * is 'system_default' (Windows default speakers) or 'device:<id>' for
+     * a specific render endpoint. Pass `null` to defer to the global
+     * `meeting_remote_capture_enabled` setting.
+     */
+    remoteCaptureOpts?: { enabled?: boolean; loopbackDevice?: string | null } | null,
   ) =>
-    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS, hostDisplayName),
+    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS, hostDisplayName, remoteCaptureOpts),
   meetingStopRecording: () => ipcRenderer.invoke('ironmic:meeting-stop-recording'),
   meetingGetCurrentSummary: (): Promise<{ summary: string; insufficient: boolean }> =>
     ipcRenderer.invoke('ironmic:meeting-get-current-summary'),

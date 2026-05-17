@@ -83,6 +83,21 @@ export interface MeetingRecordingState {
    */
   streamingMode: boolean;
   /**
+   * True when this session is using the dual-stream remote-meeting capture
+   * pipeline (mic + WASAPI loopback). When true, segments carry
+   * `source: 'mic'` ("You") or `source: 'loopback'` ("Remote"); diarization
+   * runs only on loopback segments. Mutually exclusive with `streamingMode`
+   * — v1 forces the chunked path when remote capture is on.
+   */
+  remoteCaptureMode: boolean;
+  /**
+   * True when the dual-stream engine successfully opened a loopback stream
+   * at start. False when the user enabled remote capture but the native
+   * loopback was unavailable (non-Windows, exclusive-mode endpoint, etc.).
+   * Renderer reads this to surface the "loopback unavailable" toast.
+   */
+  remoteCaptureLoopbackActive: boolean;
+  /**
    * Self-mute flag during a live meeting. When true: drained audio is
    * discarded before STT, no segments emitted locally, and outbound segment
    * broadcast on the room server/client is suppressed. Reset to `false` on
@@ -196,6 +211,8 @@ class MeetingRecorderManager {
     streamingMode: false,
     isMicMuted: false,
     engineSwapping: false,
+    remoteCaptureMode: false,
+    remoteCaptureLoopbackActive: false,
   };
 
   /**
@@ -295,6 +312,17 @@ class MeetingRecorderManager {
         status: this.state.status,
         engine: newEngineKind,
       });
+      return;
+    }
+
+    // Remote-meeting capture forces the dual-stream chunked path; the
+    // streaming session API can't drive two independent streams. The new
+    // engine still gets activated for transcribe() calls inside
+    // processChunkDual(), but we never transition to streamingMode. Push
+    // a fresh state event so the renderer's engine label refreshes.
+    if (this.state.remoteCaptureMode) {
+      debugLog('meeting.engine-swap.dual-mode-noop', { engine: newEngineKind });
+      this.pushStateToRenderer();
       return;
     }
 
@@ -523,6 +551,14 @@ class MeetingRecorderManager {
     deviceName?: string | null,
     chunkIntervalS = 15,
     hostDisplayName?: string | null,
+    /**
+     * Remote-meeting capture options. When present, the recorder runs the
+     * dual-stream pipeline (mic + WASAPI loopback) and forces the chunked
+     * path. `loopbackDevice` is forwarded to the native engine — typically
+     * 'system_default' so loopback follows the user's default speakers.
+     * Pass `null` (or omit) for the legacy single-stream behavior.
+     */
+    remoteCaptureOpts?: { loopbackDevice: string } | null,
   ): Promise<void> {
     if (this.state.status !== 'idle') {
       throw new Error('Meeting recording is already active');
@@ -553,6 +589,22 @@ class MeetingRecorderManager {
       }
     } catch {
       // getTranscriptionEngine missing on older Rust addon — skip the clamp.
+    }
+    // Remote-meeting capture: STT cost roughly doubles (mic + loopback both
+    // hit Whisper). Floor the interval at 30 s so two-way conversation stays
+    // ahead of the chunk loop on CPU-bound Windows boxes. Users can still
+    // raise it; we only push it up.
+    if (remoteCaptureOpts && effectiveChunkIntervalS < 30) {
+      debugLog('remote-capture.chunk-clamp', {
+        requestedSec: effectiveChunkIntervalS,
+        clampedSec: 30,
+        reason: 'dual-stream-stt-cost',
+      });
+      console.info(
+        `[MeetingRecorder] Remote-meeting capture: clamping chunk_interval_s ` +
+          `from ${effectiveChunkIntervalS}s to 30s (dual-stream STT cost).`,
+      );
+      effectiveChunkIntervalS = 30;
     }
     this.chunkIntervalMs = effectiveChunkIntervalS * 1000;
     this.segments = [];
@@ -602,26 +654,45 @@ class MeetingRecorderManager {
       catch { return ''; }
     })();
     const isMoonshine = engineKind.startsWith('moonshine');
-    const canStream = isMoonshine
+    const wantsRemoteCapture = !!remoteCaptureOpts;
+    // Remote-meeting capture forces the chunked dual-stream path. Streaming
+    // would require two independent Moonshine sessions; defer to v1.1.
+    const canStream = !wantsRemoteCapture
+      && isMoonshine
       && typeof native.addon.moonshineSessionAppend === 'function'
       && typeof native.addon.drainRecordingBuffer === 'function'
       && (native.addon.moonshineSessionSupports?.() ?? false);
 
-    debugLog('meeting.start', { engine: engineKind, isMoonshine, canStream });
+    debugLog('meeting.start', { engine: engineKind, isMoonshine, canStream, remoteCapture: wantsRemoteCapture });
 
     // Claim the audio stream before starting capture.
     audioStream.acquire('meeting');
+    let loopbackActive = false;
     try {
-      // Start audio capture — use named device if available in compiled addon
-      if (deviceName && typeof native.addon.startRecordingFromDevice === 'function') {
+      if (wantsRemoteCapture && native.meetingDualSupported()) {
+        // Dual-stream path: mic + WASAPI loopback, drained by processChunkDual().
+        const mode = remoteCaptureOpts!.loopbackDevice || 'system_default';
+        native.startMeetingRecordingDual(deviceName ?? null, mode);
+        // The dual engine may have failed to open loopback (non-Windows,
+        // exclusive-mode endpoint, etc.) and silently continued with mic only.
+        // Probe the engine to know which way the recorder should behave.
+        loopbackActive = native.meetingHasLoopback();
+        debugLog('capture.start.dual', {
+          owner: 'meeting',
+          deviceName: deviceName ?? null,
+          loopbackMode: mode,
+          loopbackActive,
+        });
+      } else if (deviceName && typeof native.addon.startRecordingFromDevice === 'function') {
         await native.addon.startRecordingFromDevice(deviceName);
+        debugLog('capture.start', { owner: 'meeting', deviceName, success: true });
       } else {
         // Works with default mic and BlackHole (via OS aggregate device)
         native.addon.startRecording();
+        debugLog('capture.start', { owner: 'meeting', deviceName: null, success: true });
       }
-      debugLog('capture.start', { owner: 'meeting', deviceName: deviceName ?? null, success: true });
     } catch (err: any) {
-      debugLog('capture.start', { owner: 'meeting', deviceName: deviceName ?? null, success: false, error: err?.message ?? String(err) });
+      debugLog('capture.start', { owner: 'meeting', deviceName: deviceName ?? null, success: false, error: err?.message ?? String(err), remoteCapture: wantsRemoteCapture });
       audioStream.release('meeting');
       throw err;
     }
@@ -636,6 +707,8 @@ class MeetingRecorderManager {
       streamingMode: canStream,
       isMicMuted: false,
       engineSwapping: false,
+      remoteCaptureMode: wantsRemoteCapture,
+      remoteCaptureLoopbackActive: loopbackActive,
     };
 
     this.pushStateToRenderer();
@@ -654,9 +727,16 @@ class MeetingRecorderManager {
         // Resolve, never re-throw — stopMeetingRecording awaits this promise.
       });
     } else {
-      // Legacy chunked path — fixed-interval setInterval.
+      // Chunked path — fixed-interval setInterval. The dual-stream path uses
+      // processChunkDual() (drain mic + loopback, no stop/restart gap); the
+      // single-stream legacy path uses processChunk() with the stop/restart
+      // pattern.
       this.chunkTimer = setInterval(() => {
-        void this.processChunk();
+        if (this.state.remoteCaptureMode) {
+          void this.processChunkDual();
+        } else {
+          void this.processChunk();
+        }
       }, this.chunkIntervalMs);
     }
   }
@@ -702,17 +782,23 @@ class MeetingRecorderManager {
         // didn't run (e.g. if it threw before the final commit).
         try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
       } else {
-        // Legacy chunked path.
-        // Wait for any in-flight chunk to complete before processing the final one
+        // Chunked path (single-stream legacy or dual-stream remote capture).
+        // Wait for any in-flight chunk to complete before processing the final one.
         let waited = 0;
         while (this.isProcessingChunk && waited < 10_000) {
           await new Promise(r => setTimeout(r, 100));
           waited += 100;
         }
 
-        // Process the final partial chunk (whatever accumulated since last drain)
-        try { await this.processChunk(true /* isFinal */); }
-        catch (err) { console.error('[MeetingRecorder] Final chunk failed:', err); }
+        try {
+          if (this.state.remoteCaptureMode) {
+            await this.processChunkDual(true /* isFinal */);
+          } else {
+            await this.processChunk(true /* isFinal */);
+          }
+        } catch (err) {
+          console.error('[MeetingRecorder] Final chunk failed:', err);
+        }
       }
 
       // Assemble the full transcript from in-memory segments
@@ -723,20 +809,22 @@ class MeetingRecorderManager {
 
       const finalSegments = [...this.segments];
 
-      // Decide whether to run diarization at all. Skip when:
-      //   - there's only one distinct participant (solo recording — speaker
-      //     labels are meaningless and the LLM call just burns 10-30s)
-      //   - the transcript is short (< 400 chars — not enough for the model
-      //     to reliably discriminate speakers anyway)
-      // When we DO run diarization, we run it in the BACKGROUND — the stop
-      // handler returns immediately, so the user isn't blocked on it. The
-      // labels show up on the next detail-page load once the update finishes.
+      // Decide whether to run diarization at all. Two complementary signals:
+      //   • participant_id > 1  — multi-user room mode (existing path).
+      //   • presence of unlabeled `source === 'loopback'` segments — remote-
+      //     meeting capture: the mic side is already labeled "You" at
+      //     capture time, only the loopback side needs speaker discrimination.
+      // We also keep the legacy `> 400 chars && > 1 segment` floor so a
+      // 5-second meeting doesn't burn a 30 s LLM pass for nothing.
       const uniqueParticipants = new Set(
         finalSegments.map(s => s.participant_id || 'local'),
       );
+      const hasUnlabeledLoopback = finalSegments.some(
+        s => s.source === 'loopback' && !s.speaker_label,
+      );
       const shouldDiarize = fullTranscript.length >= 400
         && finalSegments.length > 1
-        && uniqueParticipants.size > 1;
+        && (uniqueParticipants.size > 1 || hasUnlabeledLoopback);
 
       if (shouldDiarize) {
         // Fire and forget. Capture the segments array explicitly so we
@@ -757,8 +845,13 @@ class MeetingRecorderManager {
     } finally {
       // Belt-and-braces: make sure the native recorder is stopped even if we
       // never reached the restart branch in processChunk. Ignore errors —
-      // stopRecording throws if no stream is active.
-      try { native.addon.stopRecording(); } catch { /* expected if already stopped */ }
+      // both stop calls throw if no stream is active.
+      if (this.state.remoteCaptureMode) {
+        try { native.stopMeetingRecordingDual(); } catch { /* expected if final chunk already stopped */ }
+        try { native.resetMeetingRecordingDual(); } catch { /* ignore */ }
+      } else {
+        try { native.addon.stopRecording(); } catch { /* expected if already stopped */ }
+      }
       audioStream.release('meeting');
       this.state = {
         status: 'idle',
@@ -769,6 +862,8 @@ class MeetingRecorderManager {
         streamingMode: false,
         isMicMuted: false,
         engineSwapping: false,
+        remoteCaptureMode: false,
+        remoteCaptureLoopbackActive: false,
       };
       // Reset streaming-session bookkeeping so a stop-without-start path or
       // an exception still leaves the manager in a clean state.
@@ -910,7 +1005,10 @@ class MeetingRecorderManager {
         text = correctTranscript(text, terms);
       }
 
-      // Build the segment object and store in memory
+      // Build the segment object and store in memory. New local recordings
+      // always write source = 'mic' (never the legacy 'meeting' value); the
+      // diarization gate downstream checks source/speaker_label, not the
+      // legacy value. See CLAUDE.md "Source semantics".
       const segment: TranscriptSegment = {
         id: `seg-${Date.now()}-${segmentCount}`,
         session_id: sessionId,
@@ -918,7 +1016,7 @@ class MeetingRecorderManager {
         start_ms: chunkStartMs,
         end_ms: chunkEndMs,
         text,
-        source: 'meeting',
+        source: 'mic',
         participant_id: null,
         confidence: null,
         created_at: new Date().toISOString(),
@@ -935,7 +1033,7 @@ class MeetingRecorderManager {
             chunkStartMs,
             chunkEndMs,
             segment.text,
-            'meeting',
+            'mic',
           );
           const parsed = JSON.parse(json);
           if (parsed && parsed.id) persisted = parsed as TranscriptSegment;
@@ -952,6 +1050,177 @@ class MeetingRecorderManager {
     } finally {
       this.isProcessingChunk = false;
     }
+  }
+
+  /**
+   * Dual-stream chunk: drain mic + loopback in one no-gap call, transcribe
+   * each independently, and emit two source-tagged segments.
+   *
+   * Backpressure rules (worst-case STT cost ~doubles):
+   *  • Serialized through `isProcessingChunk` — never run two passes of
+   *    this method (or processChunk) concurrently.
+   *  • RMS-gated per stream so a silent half doesn't pay the Whisper cost.
+   *  • Each stream's transcribe call is awaited sequentially against the
+   *    SAME Whisper engine — running them in parallel would race on the
+   *    model lock.
+   *  • Chunk interval is clamped to >= 30 s for remote-capture meetings
+   *    in startMeetingRecording (callers pass interval directly; we
+   *    re-clamp here as a safety net).
+   */
+  private async processChunkDual(isFinal = false): Promise<void> {
+    if (this.isProcessingChunk && !isFinal) {
+      console.warn('[MeetingRecorder] Dual chunk still processing, skipping tick');
+      return;
+    }
+
+    const { sessionId, startedAt, segmentCount } = this.state;
+    if (!sessionId || !startedAt) return;
+
+    this.isProcessingChunk = true;
+
+    try {
+      const currentChunkIndex = this.chunkIndex;
+      this.chunkIndex++;
+      const chunkStartMs = currentChunkIndex * this.chunkIntervalMs;
+      const chunkEndMs = isFinal
+        ? Date.now() - startedAt
+        : chunkStartMs + this.chunkIntervalMs;
+
+      let drained: { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean };
+      try {
+        drained = isFinal
+          ? native.stopMeetingRecordingDual()
+          : native.drainMeetingBuffers();
+      } catch (err: any) {
+        console.warn('[MeetingRecorder] Failed to drain dual buffers:', err);
+        debugLog('capture.drained.dual', {
+          owner: 'meeting',
+          chunkIndex: currentChunkIndex,
+          isFinal,
+          error: err?.message ?? String(err),
+        });
+        return;
+      }
+
+      debugLog('capture.drained.dual', {
+        owner: 'meeting',
+        chunkIndex: currentChunkIndex,
+        micBytes: drained.mic.length,
+        loopbackBytes: drained.loopback?.length ?? 0,
+        loopbackActive: drained.loopbackActive,
+        isFinal,
+      });
+
+      // Mute gate: drop both buffers entirely (no STT, no segment, no broadcast).
+      if (this.state.isMicMuted) {
+        debugLog('meeting.chunk.muted', { chunkIndex: currentChunkIndex, isFinal });
+        return;
+      }
+
+      const engineKind = (() => {
+        try { return native.getTranscriptionEngine?.() ?? 'unknown'; }
+        catch { return 'unknown'; }
+      })();
+
+      // Transcribe each stream serially so we don't race on the Whisper
+      // model lock. Mic first (always tagged "You"), then loopback.
+      await this.transcribeAndPersistDual(
+        sessionId, segmentCount, currentChunkIndex, chunkStartMs, chunkEndMs,
+        drained.mic, 'mic', 'You', engineKind,
+      );
+
+      if (drained.loopback && drained.loopback.length > 0) {
+        await this.transcribeAndPersistDual(
+          sessionId, this.state.segmentCount, currentChunkIndex, chunkStartMs, chunkEndMs,
+          drained.loopback, 'loopback', null, engineKind,
+        );
+      }
+    } finally {
+      this.isProcessingChunk = false;
+    }
+  }
+
+  /**
+   * Shared helper for processChunkDual: transcribe one PCM16 buffer,
+   * sanitize, fuzzy-correct, persist with the given source + speaker label,
+   * and push to the renderer.
+   */
+  private async transcribeAndPersistDual(
+    sessionId: string,
+    segmentCount: number,
+    chunkIndex: number,
+    chunkStartMs: number,
+    chunkEndMs: number,
+    audioBuffer: Buffer,
+    source: 'mic' | 'loopback',
+    speakerLabel: string | null,
+    engineKind: string,
+  ): Promise<void> {
+    if (audioBuffer.length === 0) return;
+    if (isAudioSilent(audioBuffer)) return;
+
+    const whisperStart = Date.now();
+    debugLog('whisper.in', {
+      engine: engineKind, owner: 'meeting', source, chunkIndex,
+      byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000,
+    });
+    let rawText: string | null = null;
+    try {
+      rawText = await transcribeWithTimeout(
+        native.transcribeWithContext(audioBuffer, this.contextTerms),
+        TRANSCRIBE_TIMEOUT_MS,
+        `MeetingRecorder.transcribe.${source}`,
+      );
+      debugLog('whisper.raw', {
+        engine: engineKind, owner: 'meeting', source, chunkIndex,
+        rawText: rawText ?? '<null/timeout>',
+        length: rawText?.length ?? 0,
+        latencyMs: Date.now() - whisperStart,
+      });
+    } catch (err: any) {
+      debugLog('whisper.error', {
+        engine: engineKind, owner: 'meeting', source, chunkIndex,
+        message: err?.message ?? String(err),
+        latencyMs: Date.now() - whisperStart,
+      });
+      return;
+    }
+    if (!rawText) return;
+
+    let text = sanitizeTranscribedText(rawText);
+    if (!text) return;
+    const terms = this.correctionTerms();
+    if (terms.length > 0) text = correctTranscript(text, terms);
+
+    const segment: TranscriptSegment = {
+      id: `seg-${Date.now()}-${segmentCount}`,
+      session_id: sessionId,
+      speaker_label: speakerLabel,
+      start_ms: chunkStartMs,
+      end_ms: chunkEndMs,
+      text,
+      source,
+      participant_id: null,
+      confidence: null,
+      created_at: new Date().toISOString(),
+    };
+
+    let persisted: TranscriptSegment = segment;
+    if (typeof native.addon.addTranscriptSegment === 'function') {
+      try {
+        const json = native.addon.addTranscriptSegment(
+          sessionId, speakerLabel, chunkStartMs, chunkEndMs, text, source,
+        );
+        const parsed = JSON.parse(json);
+        if (parsed && parsed.id) persisted = parsed as TranscriptSegment;
+      } catch (err) {
+        console.warn('[MeetingRecorder] Failed to persist dual segment:', err);
+      }
+    }
+
+    this.segments.push(persisted);
+    this.state = { ...this.state, segmentCount: this.state.segmentCount + 1 };
+    this.pushSegmentToRenderer(persisted);
   }
 
   /**
@@ -1029,11 +1298,17 @@ class MeetingRecorderManager {
 
     const targets = segmentsToLabel ?? this.segments;
     for (const segment of targets) {
-      // Don't overwrite labels already assigned by the room server (remote
-      // joiner segments arrive with their displayName already on
-      // speaker_label — see meeting-room-server.ts handleMessage). LLM
-      // diarization only fills in unlabeled local/mixed segments.
+      // Don't overwrite labels already assigned upstream:
+      //  • room-peer segments arrive with displayName already on speaker_label
+      //    (see meeting-room-server.ts handleMessage),
+      //  • dual-stream mic segments are pre-labeled "You" at capture time.
       if (segment.speaker_label) continue;
+      // Remote-meeting capture: when both mic and loopback streams were
+      // running, diarization is intended ONLY for the loopback side. Mic
+      // segments are already "You". Skip anything else (e.g. legacy
+      // 'meeting' rows in a mixed session) to avoid relabeling the local
+      // user as a generic [Speaker N].
+      if (segment.source !== 'loopback' && segment.source !== 'meeting') continue;
 
       const segWords = new Set(segment.text.toLowerCase().split(/\s+/).filter(w => w.length > 3));
       let bestLabel = labeledChunks[0].label;

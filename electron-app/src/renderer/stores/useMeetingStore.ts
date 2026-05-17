@@ -62,6 +62,13 @@ interface MeetingStore {
    *  path (live grey-typing). False for the legacy chunked path (Whisper or
    *  Moonshine fallback). Driven by the recorder's MeetingRecordingState. */
   streamingMode: boolean;
+  /** True when the active recording is using the dual-stream remote-meeting
+   *  capture pipeline (mic + WASAPI loopback). Drives the gear-popover hint
+   *  that streaming is disabled in this mode. */
+  remoteCaptureMode: boolean;
+  /** True when remote capture was requested but the loopback half failed to
+   *  open. Used to surface a "loopback unavailable" indicator. */
+  remoteCaptureLoopbackActive: boolean;
   selectedAudioDevice: string | null;
   isGranolaRecording: boolean;
   /** True while backend is finishing the previous recording (draining buffer + diarization).
@@ -121,6 +128,8 @@ interface MeetingStore {
   clearSegments: () => void;
   setDraftHypothesis: (text: string) => void;
   setStreamingMode: (enabled: boolean) => void;
+  setRemoteCaptureMode: (enabled: boolean) => void;
+  setRemoteCaptureLoopbackActive: (active: boolean) => void;
   loadSegmentsForSession: (sessionId: string) => Promise<void>;
   setSelectedAudioDevice: (device: string | null) => void;
   setIsGranolaRecording: (recording: boolean) => void;
@@ -156,6 +165,8 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   segments: [],
   draftHypothesis: '',
   streamingMode: false,
+  remoteCaptureMode: false,
+  remoteCaptureLoopbackActive: false,
   selectedAudioDevice: null,
   isGranolaRecording: false,
   isGranolaStopping: false,
@@ -268,6 +279,8 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
 
   setDraftHypothesis: (text) => set({ draftHypothesis: text }),
   setStreamingMode: (enabled) => set({ streamingMode: enabled }),
+  setRemoteCaptureMode: (enabled) => set({ remoteCaptureMode: enabled }),
+  setRemoteCaptureLoopbackActive: (active) => set({ remoteCaptureLoopbackActive: active }),
 
   loadSegmentsForSession: async (sessionId) => {
     try {
