@@ -59,6 +59,28 @@ module.exports = {
       to: 'ml-models/',
       filter: ['*.tar.gz'],
     },
+    // WeSpeaker ResNet34 ONNX for acoustic speaker diarization on the
+    // loopback (remote-meeting) capture path. ~26 MB.
+    // ensureBundledWeSpeaker() in main copies it to userData on first run.
+    // The glob filter means electron-builder silently skips this if the
+    // ONNX has not been fetched yet — speaker diarization stays gated by
+    // the M2.5b runtime readiness check, which returns false when the
+    // model file is missing and the meeting recorder gracefully falls
+    // back to the legacy text-LLM diarization at stop.
+    //
+    // Fetch the artifact from
+    //   https://huggingface.co/hbredin/wespeaker-voxceleb-resnet34-LM
+    //   → voxceleb_resnet34_LM.onnx (pin a commit SHA via the manifest)
+    // and place it at
+    //   electron-app/resources/models/speaker-embedding/voxceleb_resnet34_LM.onnx
+    // alongside the LICENSE / model-card files. scripts/verify-models-manifest.js
+    // re-hashes and fails the build if the bundled bytes don't match the
+    // manifest's sha256.
+    {
+      from: 'resources/models/speaker-embedding/',
+      to: 'models/speaker-embedding/',
+      filter: ['*.onnx', '*.md', 'LICENSE*'],
+    },
     // BlackHole 2ch pkg for macOS system-audio capture (optional — if the file
     // is absent the app downloads it at runtime from the official GitHub release).
     // To bundle it: download BlackHole2ch.v0.6.0.pkg from

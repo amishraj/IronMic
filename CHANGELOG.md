@@ -2,6 +2,125 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.9.0] - 2026-05-17
+
+Acoustic speaker diarization for remote-meeting capture. Replaces the
+v1.8 LLM-text heuristic with WeSpeaker ResNet34 voice embeddings and
+agglomerative clustering, so 12–20 distinct speakers on a Zoom / Teams /
+Meet call get labeled `[Speaker 1..N]` live during the meeting instead
+of all collapsing into a single "Remote" bucket. Windows-only this
+release (matches the v1.8 loopback-capture scope); macOS / Linux
+inherit automatically once their loopback paths land.
+
+### Added
+
+- **WeSpeaker ResNet34 ONNX speaker-embedding model** (~26 MB, Apache-2.0,
+  pinned to commit `0ae88dca…` from
+  `hbredin/wespeaker-voxceleb-resnet34-LM`). Bundled into the installer
+  alongside Moonshine and Phi-3 — works fully offline on first launch.
+  Inference runs in Rust via the existing `ort` dependency through the
+  new `speaker-diarization` Cargo feature.
+- **Live `[Speaker N]` labels during remote-meeting capture.** Each
+  Whisper-detected segment on the loopback stream gets sliced (800 ms
+  min, middle 3 s of segments > 6 s, RMS gate to skip silence), embedded
+  to a 256-d L2-normalized vector, and assigned a cluster label via
+  online clustering — all before the segment renders. Embed-before-push
+  discipline means the renderer never sees a row twice.
+- **End-of-meeting AHC refinement** consolidates online drift via
+  agglomerative hierarchical clustering (average linkage, 0.48 cutoff)
+  over every persisted embedding pulled from SQLite (DB-canonical, not
+  live state — survives crashes / mid-session restarts). Cluster labels
+  reassigned in first-occurrence order so `[Speaker 1]` is always the
+  earliest-detected remote speaker.
+- **Optional LLM roster-rename pass** (`meeting_llm_name_pass_enabled`,
+  default off) maps `[Speaker N]` → roster display names when a meeting
+  has a participant roster, applied uniformly per cluster.
+- **`MEETING_SEGMENTS_RELABELED` IPC event** patches the renderer's
+  segment list in place after refinement — no full reload, no flicker
+  for users viewing the detail view at meeting-stop time.
+- **`SpeakerClusterer`** TypeScript module
+  ([`electron-app/src/main/SpeakerClusterer.ts`](electron-app/src/main/SpeakerClusterer.ts))
+  with online `assign()` + offline `refine()`. Empty-state branch seeds
+  `[Speaker 1]` correctly, floor at cosine 0.40 routes weak embeddings
+  to `[Speaker ?]` without polluting centroids, overflow at the
+  20-speaker cap also returns `[Speaker ?]`. Synthetic 10-cluster ×
+  50-sample Gaussian-blob vitest reaches V-measure ≥ 0.9.
+- **`transcribe_with_segments` API** on the `TranscriptionEngine` trait
+  exposes Whisper's per-segment timestamps (centiseconds → ms) so the
+  meeting recorder can slice loopback PCM at utterance boundaries
+  rather than the legacy 30 s chunk boundary. Moonshine falls back to a
+  single segment via the default trait impl (POC accepts the coarser
+  granularity until Moonshine segment timestamps land).
+- **Models manifest pipeline.**
+  [`electron-app/resources/models/models-manifest.json`](electron-app/resources/models/models-manifest.json)
+  records every bundled model's path, sha256, license, source URL, and
+  pinned commit revision.
+  [`electron-app/scripts/verify-models-manifest.mjs`](electron-app/scripts/verify-models-manifest.mjs)
+  runs at packaging time to re-hash each entry and require an
+  attribution block in `THIRD_PARTY_NOTICES.md` for every license that
+  carries an attribution clause.
+- **`THIRD_PARTY_NOTICES.md`** at repo root with Apache-2.0 attribution
+  for WeSpeaker plus carry-over entries for Moonshine, Whisper, Kokoro,
+  and the TF.js model bundles.
+- **Runtime readiness flip on app start** — the new
+  `meeting_diarization_mode` setting flips from `'off'` to
+  `'embedding'` only when (a) the WeSpeaker model file is on disk, AND
+  (b) the user hasn't explicitly opted out via
+  `meeting_diarization_user_overridden`. The flip never sets the
+  user-override flag, so it can retry on a later boot if the model
+  arrives via download-models.sh in the interim.
+- **`speakerDiarizationAvailable` N-API export** lets the main process
+  check WeSpeaker presence without loading the ONNX.
+- **Schema migration v15** — `speaker_embedding BLOB`,
+  `speaker_embedding_model`, `diarization_confidence` columns on
+  `transcript_segments`; new `idx_transcript_segments_session_source`
+  index; seven new `meeting_diarization_*` settings keys with
+  conservative defaults (`mode = 'off'` until M2.5b flips it).
+- **`scripts/download-models.sh --include-wespeaker`** convenience flag
+  pulls the pinned WeSpeaker ONNX + Apache-2.0 LICENCE.md for local
+  installer builds. `scripts/package.sh` invokes it automatically.
+
+### Changed
+
+- **Loopback transcript rows are now one-per-Whisper-segment** rather
+  than one-per-30 s chunk. Mic side unchanged (still one row per chunk,
+  pre-labeled `'You'`). This is what enables per-utterance embedding;
+  it also gives users finer-grained transcripts on long monologues.
+- **`processChunkDual` zeroes drained PCM16 buffers on every exit path**
+  (mute gate, silent buffer, Whisper error, empty text, success) via a
+  `try { } finally { zeroDrainedBuffersFinally(drained) }` wrapper. The
+  helper is exported for direct unit testing. Closes a latent gap where
+  the JS Buffer returned by `drainMeetingBuffers` survived past every
+  early return until GC.
+- **Stop-of-meeting diarization pipeline** is now strictly:
+  final chunk → AHC refinement (DB-canonical) → optional LLM
+  roster-rename → single `MEETING_SEGMENTS_RELABELED` emission. The
+  legacy text-LLM diarization stays in place but only fires when the
+  embedding pipeline never ran (Moonshine engine, multi-user room mode,
+  or any segment whose embedding step failed). Per-segment word-overlap
+  matching is removed — cluster labels are uniform per cluster.
+- **Speaker embeddings persisted as raw little-endian f32 bytes** in a
+  new BLOB column kept out of the default `SELECT_COLS` — loads only
+  through the dedicated `listSegmentEmbeddings` path at refinement
+  time, so list-transcript-segments stays lean.
+- **CI clippy step is green again.** Resolved 16 pre-existing
+  `-D warnings` violations on `main` (redundant closures, type
+  complexity, manual `repeat_n`, dead-code in feature-gated paths) so
+  the v1.9.0 PR can land on green.
+
+### Privacy
+
+- **Speaker embeddings are biometric-adjacent identifiers** even though
+  no raw audio is retained. The new BLOB column is local-only,
+  cascade-deleted with its `meeting_sessions` row, excluded from every
+  export path, and covered by retention sweeps. Documented in
+  `THIRD_PARTY_NOTICES.md` and surfaced in Settings → Security &
+  Privacy.
+- **Per-segment PCM slices are zeroed immediately after embedding**
+  (Buffer.subarray shares memory with the parent, so the zero also
+  wipes that range of the chunk Buffer). The outer chunk try/finally
+  remains the backstop.
+
 ## [1.7.5] - 2026-05-10
 
 Major upgrade to the polish + meeting-summary experience: every dictation

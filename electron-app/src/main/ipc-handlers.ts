@@ -77,6 +77,30 @@ const ALLOWED_SETTING_KEYS = new Set([
   // endpoint to capture from ('system_default' picks the default speakers
   // and follows device changes; 'device:<id>' targets a named MMDevice id).
   'meeting_remote_capture_enabled', 'meeting_loopback_device',
+  // Speaker diarization for loopback (v1.9.x — M1 plumbing, M2 turns on):
+  //   meeting_diarization_mode             — 'off' (M1 default) | 'embedding' | 'llm-text'.
+  //     Flipped to 'embedding' by the M2 runtime readiness check once the
+  //     WeSpeaker model is bundled and the user hasn't explicitly opted out.
+  //   meeting_diarization_threshold        — cosine sim (default 0.55) above
+  //     which an embedding attaches to an existing cluster vs. spawns a new one.
+  //   meeting_diarization_max_speakers     — hard cap on clusters per session
+  //     (default '20'); overflow embeddings get '[Speaker ?]'.
+  //   meeting_diarization_min_slice_ms     — Whisper segments shorter than this
+  //     skip embedding (default '800').
+  //   meeting_diarization_max_slice_ms     — long segments are sub-sampled to
+  //     the middle 3 s (default '6000').
+  //   meeting_diarization_user_overridden  — set 'true' only when the user
+  //     explicitly toggled the Settings UI. Auto-readiness flip MUST NOT
+  //     set it, otherwise the flip would fire once and never retry.
+  //   meeting_llm_name_pass_enabled        — opt-in LLM pass that maps
+  //     [Speaker N] → roster names after AHC refinement. Default 'false'.
+  'meeting_diarization_mode',
+  'meeting_diarization_threshold',
+  'meeting_diarization_max_speakers',
+  'meeting_diarization_min_slice_ms',
+  'meeting_diarization_max_slice_ms',
+  'meeting_diarization_user_overridden',
+  'meeting_llm_name_pass_enabled',
   // Collaboration (v1.6.0)
   'meeting_collab_display_name',
   // Notebooks — JSON array of {id,name,createdAt}

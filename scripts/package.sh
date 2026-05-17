@@ -17,8 +17,14 @@ echo ""
 # verify each of the three required filenames exists with non-zero size.
 # Without this guarantee, electron-builder silently skips a missing
 # `extraResources` `from` directory and produces a Moonshine-less installer.
-echo "[1/4] Staging Moonshine Base for bundling..."
-./scripts/download-models.sh
+echo "[1/4] Staging Moonshine Base + WeSpeaker for bundling..."
+# --include-wespeaker pulls the 26 MB speaker-embedding ONNX into
+# electron-app/resources/models/speaker-embedding/ so electron-builder's
+# extraResources glob can pick it up. Speaker diarization (M2) needs this
+# file; without it the M2.5b runtime readiness check keeps
+# meeting_diarization_mode = 'off' and meetings degrade to the legacy
+# text-LLM diarization at stop.
+./scripts/download-models.sh --include-wespeaker
 MOONSHINE_DIR="$ROOT/rust-core/models/moonshine-base"
 REQUIRED_FILES=(
     "encoder_model.onnx"
@@ -65,6 +71,18 @@ echo "[3/4] Building Electron app..."
 cd electron-app
 npm install
 npm run build
+cd ..
+echo ""
+
+# Step 3b: Verify the models manifest. Re-hashes every bundled model
+# file against resources/models/models-manifest.json and confirms
+# CC-BY-licensed entries are attributed in THIRD_PARTY_NOTICES.md.
+# Optional entries (e.g. WeSpeaker for speaker diarization) only emit a
+# warning when missing — the M2.5b runtime readiness check handles the
+# degraded case at first launch.
+echo "[3b/4] Verifying models manifest..."
+cd electron-app
+npm run verify-models
 cd ..
 echo ""
 

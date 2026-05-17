@@ -1,6 +1,6 @@
 {
   "name": "ironmic",
-  "version": "1.8.3",
+  "version": "1.9.0",
   "description": "IronMic – fully-local voice transcription and text-to-speech, built for privacy",
   "main": "dist/main/index.js",
   "author": {
@@ -26,6 +26,7 @@
     "build:preload": "tsc -p tsconfig.preload.json",
     "build:renderer": "vite build",
     "start": "electron .",
+    "verify-models": "node scripts/verify-models-manifest.mjs",
     "test": "vitest run",
     "lint": "eslint src/"
   },

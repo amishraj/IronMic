@@ -55,6 +55,20 @@ fn read_segment(row: &rusqlite::Row<'_>) -> rusqlite::Result<TranscriptSegment> 
 const SELECT_COLS: &str =
     "id, session_id, speaker_label, start_ms, end_ms, text, source, participant_id, confidence, created_at, remote_segment_id";
 
+/// Minimal row for the AHC refinement pass at stop-of-meeting. Carries just
+/// enough metadata to (a) compute a label-change diff against existing
+/// `speaker_label` values, (b) order rows deterministically by `start_ms`
+/// for first-occurrence Speaker N assignment, and (c) cluster on the raw
+/// embedding bytes without a second DB round-trip. Embeddings are kept out
+/// of the default `SELECT_COLS` so list_transcript_segments stays lean.
+#[derive(Debug, Clone, Serialize)]
+pub struct SegmentEmbeddingRow {
+    pub id: String,
+    pub speaker_label: Option<String>,
+    pub start_ms: i64,
+    pub embedding: Vec<u8>,
+}
+
 impl Database {
     /// Add a new transcript segment for a meeting session.
     #[allow(clippy::too_many_arguments)]
@@ -199,6 +213,32 @@ impl Database {
         Ok(())
     }
 
+    /// Attach a speaker embedding (and the model id that produced it) to a
+    /// segment. Called from the meeting recorder right after Whisper segment
+    /// → WeSpeaker embed in `processChunkDual`. Embeddings are stored as raw
+    /// f32 little-endian bytes (256 floats = 1024 bytes for WeSpeaker
+    /// ResNet34) and never read by `SELECT_COLS` — they only come back out
+    /// via `list_segment_embeddings` for the AHC refinement pass at stop.
+    pub fn update_segment_embedding(
+        &self,
+        id: &str,
+        embedding: &[u8],
+        model: &str,
+        confidence: f32,
+    ) -> Result<(), IronMicError> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE transcript_segments
+                SET speaker_embedding = ?1,
+                    speaker_embedding_model = ?2,
+                    diarization_confidence = ?3
+              WHERE id = ?4",
+            rusqlite::params![embedding, model, confidence as f64, id],
+        )
+        .map_err(|e| IronMicError::Storage(format!("Failed to update segment embedding: {e}")))?;
+        Ok(())
+    }
+
     /// Get a single transcript segment by ID.
     pub fn get_transcript_segment(
         &self,
@@ -212,6 +252,67 @@ impl Database {
         )
         .optional()
         .map_err(|e| IronMicError::Storage(format!("Failed to get segment: {e}")))
+    }
+
+    /// Load every per-segment embedding for a session, optionally filtered
+    /// to a single `source` (e.g. `'loopback'`). Returns enough metadata for
+    /// the AHC refinement pass at stop-of-meeting to compute the label-change
+    /// diff in a single round-trip: the current `speaker_label`, the segment
+    /// `id` (for the UPDATE), and `start_ms` for deterministic ordering /
+    /// first-occurrence label assignment. Rows without an embedding are
+    /// skipped — those segments either failed to embed or pre-date M2 and
+    /// can't participate in clustering.
+    pub fn list_segment_embeddings(
+        &self,
+        session_id: &str,
+        source_filter: Option<&str>,
+    ) -> Result<Vec<SegmentEmbeddingRow>, IronMicError> {
+        let conn = self.conn();
+        let (sql, has_filter) = match source_filter {
+            Some(_) => (
+                "SELECT id, speaker_label, start_ms, speaker_embedding
+                   FROM transcript_segments
+                  WHERE session_id = ?1 AND source = ?2
+                    AND speaker_embedding IS NOT NULL
+                  ORDER BY start_ms ASC",
+                true,
+            ),
+            None => (
+                "SELECT id, speaker_label, start_ms, speaker_embedding
+                   FROM transcript_segments
+                  WHERE session_id = ?1
+                    AND speaker_embedding IS NOT NULL
+                  ORDER BY start_ms ASC",
+                false,
+            ),
+        };
+
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|e| IronMicError::Storage(format!("Failed to prepare query: {e}")))?;
+
+        let read = |row: &rusqlite::Row<'_>| -> rusqlite::Result<SegmentEmbeddingRow> {
+            Ok(SegmentEmbeddingRow {
+                id: row.get(0)?,
+                speaker_label: row.get(1)?,
+                start_ms: row.get(2)?,
+                embedding: row.get(3)?,
+            })
+        };
+
+        let rows = if has_filter {
+            stmt.query_map(
+                rusqlite::params![session_id, source_filter.unwrap()],
+                read,
+            )
+        } else {
+            stmt.query_map([session_id], read)
+        }
+        .map_err(|e| IronMicError::Storage(format!("Failed to list embeddings: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| IronMicError::Storage(format!("Failed to collect embeddings: {e}")))?;
+
+        Ok(rows)
     }
 
     /// Delete all transcript segments for a session.

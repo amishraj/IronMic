@@ -113,10 +113,36 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
     };
     window.addEventListener('ironmic:entries-changed', onEntriesChanged);
 
+    // Subscribe to end-of-meeting speaker-label patches. The main process
+    // emits this once at stop after AHC refinement (+ optional LLM
+    // roster-rename). Patches arrive even when this page is the active
+    // view at meeting-stop time, so we mutate `segments` in place rather
+    // than triggering a DB re-fetch. Empty `patches` means refinement
+    // ran but produced no changes — no UI update needed.
+    interface RelabelPayload {
+      sessionId: string;
+      patches: Array<{ segmentId: string; newLabel: string }>;
+    }
+    const unsubRelabel: (() => void) | undefined =
+      window.ironmic.onMeetingSegmentsRelabeled?.((payload: RelabelPayload) => {
+        if (!payload || payload.sessionId !== sessionId) return;
+        if (!Array.isArray(payload.patches) || payload.patches.length === 0) return;
+        const byId = new Map<string, string>(
+          payload.patches.map(p => [p.segmentId, p.newLabel] as const),
+        );
+        setSegments(prev =>
+          prev.map(seg => {
+            const next = byId.get(seg.id);
+            return next ? { ...seg, speaker_label: next } : seg;
+          }),
+        );
+      });
+
     return () => {
       cancelled = true;
       clearInterval(poll);
       window.removeEventListener('ironmic:entries-changed', onEntriesChanged);
+      if (typeof unsubRelabel === 'function') unsubRelabel();
     };
   }, [sessionId, processingMeetings, editing]);
 

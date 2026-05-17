@@ -512,6 +512,19 @@ const api = {
     ipcRenderer.on('ironmic:meeting-recording-state', handler);
     return () => ipcRenderer.removeListener('ironmic:meeting-recording-state', handler);
   },
+  /**
+   * End-of-meeting speaker-label patches from AHC refinement + optional
+   * LLM roster-rename. Emitted once per meeting stop. Empty `patches`
+   * means refinement ran but produced no changes — renderer should
+   * clear any "diarization pending" UI state.
+   */
+  onMeetingSegmentsRelabeled: (
+    callback: (payload: { sessionId: string; patches: Array<{ segmentId: string; newLabel: string }> }) => void,
+  ) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-segments-relabeled', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-segments-relabeled', handler);
+  },
   onMeetingLiveSummary: (callback: (payload: any) => void) => {
     const handler = (_event: any, payload: any) => callback(payload);
     ipcRenderer.on('ironmic:meeting-live-summary', handler);

@@ -5,6 +5,23 @@
 
 import path from 'path';
 
+/**
+ * One Whisper-style transcript segment with in-clip timing. Returned from
+ * `transcribeWithSegments` so the meeting recorder can slice loopback audio
+ * per-segment for speaker embedding before the chunk buffer is zeroed.
+ *
+ * `start_ms` / `end_ms` are relative to the start of the audio buffer passed
+ * to the call (not to the meeting). `no_speech_prob` is best-effort —
+ * Whisper-rs 0.13 does not expose it, so it's null on every engine today and
+ * callers fall back to RMS / text-length gating.
+ */
+export interface TranscriptSegmentDto {
+  text: string;
+  start_ms: number;
+  end_ms: number;
+  no_speech_prob: number | null;
+}
+
 // The native addon will be loaded from the compiled .node file
 // In development: ../rust-core/target/release/ironmic_core.node
 // In production: bundled with the app
@@ -65,6 +82,11 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     listDictionary: () => [],
     refreshTranscriptionDictionary: () => 0,
     transcribeWithContext: async () => '[stub transcription with context]',
+    transcribeWithSegments: async () => JSON.stringify([
+      { text: '[stub transcription]', start_ms: 0, end_ms: 0, no_speech_prob: null },
+    ]),
+    embedSpeaker: async () => Buffer.alloc(0),
+    speakerDiarizationAvailable: () => false,
     getSetting: (key: string) => {
       const defaults: Record<string, string> = {
         hotkey_record: 'CommandOrControl+Shift+V',
@@ -261,6 +283,82 @@ export const native = {
       return this.addon.transcribeWithContext(audioBuffer, JSON.stringify(terms));
     }
     return this.addon.transcribe(audioBuffer);
+  },
+
+  /**
+   * Embed a 16 kHz mono PCM16 audio slice into a 256-d L2-normalized speaker
+   * embedding (WeSpeaker ResNet34, run via `ort` in `rust-core/src/speaker/`).
+   *
+   * Input: PCM16 little-endian Buffer (same layout as the loopback slices
+   * produced by `drainMeetingBuffers`). Output: 1024-byte Buffer = 256 × f32
+   * little-endian. Empty Buffer (length 0) signals "not available" — either
+   * the speaker-diarization feature isn't compiled, the WeSpeaker model
+   * file is missing, or the ONNX inference failed. The meeting recorder
+   * treats any of these as "skip diarization for this slice; persist with
+   * speaker_label = null".
+   *
+   * **Caller-side zeroing discipline:** mutating a napi-rs `Buffer` from
+   * Rust is footgun-prone, so the JS-side meeting recorder is responsible
+   * for `.fill(0)` on the input PCM16 slice in a `finally` immediately
+   * after this resolves. The outer chunk try/finally (M1.4) wipes the
+   * parent chunk Buffer as a backstop.
+   */
+  /**
+   * Whether the speaker-diarization runtime is ready. Used by the M2.5b
+   * readiness flip on app start. Conservative on older addon binaries:
+   * returns `false` if the export isn't there.
+   */
+  speakerDiarizationAvailable(): boolean {
+    if (typeof this.addon.speakerDiarizationAvailable !== 'function') return false;
+    try { return Boolean(this.addon.speakerDiarizationAvailable()); }
+    catch { return false; }
+  },
+
+  async embedSpeaker(pcm: Buffer): Promise<Float32Array> {
+    if (typeof this.addon.embedSpeaker !== 'function') {
+      // Older addon binaries predate this export. Return an empty array
+      // so callers fall through to the "no embedding" path without
+      // crashing.
+      return new Float32Array(0);
+    }
+    if (pcm.length === 0) return new Float32Array(0);
+    const out: Buffer = await this.addon.embedSpeaker(pcm);
+    if (!out || out.length === 0) return new Float32Array(0);
+    // Buffer → Float32Array view (no copy). The caller treats this as
+    // read-only — Rust already L2-normalized the vector.
+    return new Float32Array(out.buffer, out.byteOffset, out.byteLength / 4);
+  },
+
+  /**
+   * Transcribe and return per-segment timing. Used by the dual-stream meeting
+   * recorder to slice loopback audio for per-speaker embedding before the
+   * chunk buffer is zeroed.
+   *
+   * On older addon binaries that predate this export, falls back to a single
+   * synthesized segment spanning the clip — diarization quality degrades to
+   * chunk-level (same as the Moonshine path).
+   */
+  async transcribeWithSegments(
+    audioBuffer: Buffer,
+    terms: string[],
+  ): Promise<TranscriptSegmentDto[]> {
+    if (typeof this.addon.transcribeWithSegments === 'function') {
+      const json = await this.addon.transcribeWithSegments(
+        audioBuffer,
+        JSON.stringify(terms),
+      );
+      try {
+        const parsed = JSON.parse(json) as TranscriptSegmentDto[];
+        return Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return [];
+      }
+    }
+    // Fallback: wrap the existing text-only call in a single segment.
+    const text = await this.transcribeWithContext(audioBuffer, terms);
+    if (!text) return [];
+    const endMs = Math.round((audioBuffer.length / 2 / 16000) * 1000);
+    return [{ text, start_ms: 0, end_ms: endMs, no_speech_prob: null }];
   },
 
   getSetting(key: string): string | null { return this.addon.getSetting(key); },

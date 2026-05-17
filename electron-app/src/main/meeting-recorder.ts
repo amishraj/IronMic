@@ -31,6 +31,36 @@ import { audioStream } from './audio-stream-manager';
 import { debugLog } from './debug-log';
 import { correctTranscript } from '../shared/transcript-correction';
 import { getWords as getDictionaryWords } from './dictionary-cache';
+import { SpeakerClusterer, type SegmentEmbeddingRow as SegmentEmbeddingRowJs } from './SpeakerClusterer';
+
+/**
+ * Zero every PCM16 Buffer in a drained dual-stream tick. Module-level so it
+ * is reachable from the `processChunkDual` `finally` and unit tests without
+ * punching through the manager's private surface.
+ *
+ * Privacy invariant: every audio buffer that crossed the N-API boundary
+ * must be wiped before its JS reference is released. `CapturedAudio::drop`
+ * in Rust already zeros the underlying f32 vec at conversion time, but the
+ * resulting JS Buffer survives until GC unless we explicitly fill it. This
+ * helper closes that gap on every early-return path of `processChunkDual`:
+ * mute gate, silent buffer, empty buffer, Whisper error, empty sanitized
+ * text, and the M2 embed-failure path.
+ */
+export function zeroDrainedBuffersFinally(
+  drained: { mic: Buffer; loopback: Buffer | null } | null,
+): void {
+  if (!drained) return;
+  try {
+    drained.mic?.fill(0);
+  } catch {
+    /* defensive — Buffer may have been transferred / detached */
+  }
+  try {
+    drained.loopback?.fill(0);
+  } catch {
+    /* defensive */
+  }
+}
 
 /** Upper bound on how long we wait for a single transcribe call to return
  *  before moving on. If the native call hangs (rare under Moonshine ONNX,
@@ -53,6 +83,12 @@ const TRANSCRIBE_TIMEOUT_MS = 20_000;
 const SESSION_DRAIN_INTERVAL_MS = 200;
 const SESSION_SILENCE_COMMIT_MS = 1500;
 const SESSION_CAP_MS = 25_000; // Moonshine is trained on ≤30s utterances; commit at 25s to stay safe.
+
+/** Dimensionality of the WeSpeaker ResNet34 speaker embedding. Mirrors
+ *  `SPEAKER_EMBEDDING_DIM` in `rust-core/src/speaker/mod.rs`. Used by the
+ *  meeting recorder to sanity-check `embedSpeaker` return values before
+ *  feeding them to the clusterer or packing them into the DB. */
+const SPEAKER_EMBED_FLOATS = 256;
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -187,6 +223,15 @@ class MeetingRecorderManager {
    * tracks emitted segments and is used for IDs.
    */
   private chunkIndex = 0;
+
+  /**
+   * Per-session online speaker clusterer. Allocated in startMeetingRecording
+   * for `remoteCaptureMode` sessions only — mic-only meetings always label
+   * the local user `'You'` and don't need diarization. `assign()` is NOT
+   * called yet in M1 (no WeSpeaker model bundled); the lifecycle exists so
+   * M2 can drop in the embedding model without restructuring the recorder.
+   */
+  private speakerClusterer: SpeakerClusterer | null = null;
 
   /**
    * In-memory copy of participant display names for the active meeting.
@@ -713,6 +758,16 @@ class MeetingRecorderManager {
 
     this.pushStateToRenderer();
 
+    // Allocate the per-session speaker clusterer for remote-capture meetings.
+    // M1 only confirms lifecycle (created here, dropped in stop's finally);
+    // M2.3 will start calling assign() inline in processChunkDual once the
+    // WeSpeaker embedder is wired up.
+    if (wantsRemoteCapture) {
+      this.speakerClusterer = new SpeakerClusterer();
+    } else {
+      this.speakerClusterer = null;
+    }
+
     if (canStream) {
       // Streaming path — the loop owns audio drain, session append, draft
       // emission, silence/cap commits, and final drain on stop.
@@ -809,34 +864,91 @@ class MeetingRecorderManager {
 
       const finalSegments = [...this.segments];
 
-      // Decide whether to run diarization at all. Two complementary signals:
-      //   • participant_id > 1  — multi-user room mode (existing path).
-      //   • presence of unlabeled `source === 'loopback'` segments — remote-
-      //     meeting capture: the mic side is already labeled "You" at
-      //     capture time, only the loopback side needs speaker discrimination.
-      // We also keep the legacy `> 400 chars && > 1 segment` floor so a
-      // 5-second meeting doesn't burn a 30 s LLM pass for nothing.
-      const uniqueParticipants = new Set(
-        finalSegments.map(s => s.participant_id || 'local'),
-      );
-      const hasUnlabeledLoopback = finalSegments.some(
-        s => s.source === 'loopback' && !s.speaker_label,
-      );
-      const shouldDiarize = fullTranscript.length >= 400
-        && finalSegments.length > 1
-        && (uniqueParticipants.size > 1 || hasUnlabeledLoopback);
+      // ── Stop-of-meeting diarization pipeline ────────────────────────────
+      //
+      // Strict order (M2.4):
+      //   1. Final chunk drain (already done above via processChunkDual(true))
+      //   2. AHC refinement on the persisted loopback embeddings
+      //      (DB-canonical — survives drift)
+      //   3. Optional LLM roster-rename pass (gated by
+      //      `meeting_llm_name_pass_enabled`, default off)
+      //   4. Single `MEETING_SEGMENTS_RELABELED` emission covering both
+      //
+      // Two legacy diarization triggers are preserved for paths that
+      // don't go through the embedding pipeline (multi-user rooms, or
+      // remote-capture meetings where the model is unavailable so
+      // segments came out unlabeled):
+      //   • participant_id > 1 — multi-user room mode.
+      //   • loopback segments with `speaker_label = null` — embedding
+      //     was skipped (no model, Moonshine engine, low confidence,
+      //     under min_slice_ms duration). Fall back to legacy text-LLM
+      //     diarization which is better than nothing.
+      const sessionIdForDiarize = this.state.sessionId;
+      const segmentsSnapshot = finalSegments;
 
-      if (shouldDiarize) {
-        // Fire and forget. Capture the segments array explicitly so we
-        // label the RIGHT session's segments even if a new meeting starts
-        // before this completes.
-        const segmentsSnapshot = finalSegments;
+      // Pipeline step 2 + 3 + 4. Fire-and-forget so the caller of
+      // stopMeetingRecording isn't blocked on LLM latency. The async
+      // closure captures `segmentsSnapshot` explicitly so a follow-up
+      // session can't corrupt the in-flight refinement.
+      if (sessionIdForDiarize) {
+        const hasEmbedding = segmentsSnapshot.some(
+          s => s.source === 'loopback' && s.speaker_label, // M2.3 labeled
+        );
+        const hasUnlabeledLoopback = segmentsSnapshot.some(
+          s => s.source === 'loopback' && !s.speaker_label,
+        );
+        const uniqueParticipants = new Set(
+          segmentsSnapshot.map(s => s.participant_id || 'local'),
+        );
+
         void (async () => {
           try {
-            const labeled = await this.runDiarization(fullTranscript);
-            if (labeled) this.applyDiarizationLabels(labeled, segmentsSnapshot);
+            // Step 2: AHC refinement (no-op if no embeddings exist).
+            const ahcPatches = await this.refineLoopbackSpeakers(
+              sessionIdForDiarize,
+              segmentsSnapshot,
+            );
+
+            // Step 3: optional LLM roster-rename.
+            const llmPatches = await this.runLlmRosterRename(
+              sessionIdForDiarize,
+              segmentsSnapshot,
+            );
+
+            // Step 3-fallback: legacy text-LLM diarization for paths
+            // where the embedding pipeline never ran. Triggered when
+            // no AHC patches landed AND we have unlabeled loopback or
+            // multi-user data that still needs speaker discrimination.
+            const ranEmbeddingPath = hasEmbedding || ahcPatches.length > 0;
+            const needsLegacy =
+              !ranEmbeddingPath
+              && fullTranscript.length >= 400
+              && segmentsSnapshot.length > 1
+              && (uniqueParticipants.size > 1 || hasUnlabeledLoopback);
+            if (needsLegacy) {
+              try {
+                const labeled = await this.runDiarization(fullTranscript);
+                if (labeled) {
+                  this.applyDiarizationLabels(labeled, segmentsSnapshot);
+                }
+              } catch (err) {
+                console.error('[MeetingRecorder] Legacy LLM diarization failed:', err);
+              }
+            }
+
+            // Step 4: single emission. Merge patches by segmentId,
+            // last-write-wins, so LLM-rename overrides AHC when both
+            // touched the same segment.
+            const byId = new Map<string, string>();
+            for (const p of ahcPatches) byId.set(p.segmentId, p.newLabel);
+            for (const p of llmPatches) byId.set(p.segmentId, p.newLabel);
+            const merged = Array.from(byId, ([segmentId, newLabel]) => ({
+              segmentId,
+              newLabel,
+            }));
+            this.pushSegmentsRelabeledToRenderer(sessionIdForDiarize, merged);
           } catch (err) {
-            console.error('[MeetingRecorder] Background diarization failed:', err);
+            console.error('[MeetingRecorder] Stop-of-meeting diarization pipeline failed:', err);
           }
         })();
       }
@@ -873,6 +985,9 @@ class MeetingRecorderManager {
       this.lastSpeechEndMs = 0;
       this.muteGeneration = 0;
       this.chunkIndex = 0;
+      // Drop the per-session speaker clusterer — its in-memory centroids
+      // are session-local and never persist across meetings.
+      this.speakerClusterer = null;
       // Make sure the grey line is cleared on stop, in case the streaming
       // loop's catch handler didn't run.
       this.pushDraftToRenderer('');
@@ -1078,6 +1193,13 @@ class MeetingRecorderManager {
 
     this.isProcessingChunk = true;
 
+    // Drained dual-stream buffers are zeroed in the outer finally regardless
+    // of how the chunk exits — mute, silent, Whisper error, empty text, or
+    // an exception bubbling up. CapturedAudio::drop in Rust already zeros
+    // the f32 vec at conversion time, but the resulting JS Buffer survives
+    // until GC; this finally closes that gap.
+    let drained: { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean } | null = null;
+
     try {
       const currentChunkIndex = this.chunkIndex;
       this.chunkIndex++;
@@ -1086,7 +1208,6 @@ class MeetingRecorderManager {
         ? Date.now() - startedAt
         : chunkStartMs + this.chunkIntervalMs;
 
-      let drained: { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean };
       try {
         drained = isFinal
           ? native.stopMeetingRecordingDual()
@@ -1122,21 +1243,270 @@ class MeetingRecorderManager {
         catch { return 'unknown'; }
       })();
 
-      // Transcribe each stream serially so we don't race on the Whisper
-      // model lock. Mic first (always tagged "You"), then loopback.
+      // Mic side stays one row per chunk — local user is always labeled
+      // "You", no diarization concern.
       await this.transcribeAndPersistDual(
         sessionId, segmentCount, currentChunkIndex, chunkStartMs, chunkEndMs,
         drained.mic, 'mic', 'You', engineKind,
       );
 
+      // Loopback side switches to per-Whisper-segment rows so each one
+      // can carry its own start/end timing — the slice basis for the
+      // M2 speaker-embedding pass. Whisper-family engines emit real
+      // boundaries; Moonshine returns a single segment via the default
+      // trait impl (POC accepts the coarser granularity until segment
+      // timestamps are added to Moonshine).
       if (drained.loopback && drained.loopback.length > 0) {
-        await this.transcribeAndPersistDual(
-          sessionId, this.state.segmentCount, currentChunkIndex, chunkStartMs, chunkEndMs,
-          drained.loopback, 'loopback', null, engineKind,
+        await this.transcribeAndPersistLoopbackSegments(
+          sessionId, currentChunkIndex, chunkStartMs, chunkEndMs,
+          drained.loopback, engineKind,
         );
       }
     } finally {
       this.isProcessingChunk = false;
+      // Last thing in the chunk lifecycle: wipe both drained buffers
+      // unconditionally. Tested directly via the exported
+      // `zeroDrainedBuffersFinally` helper.
+      zeroDrainedBuffersFinally(drained);
+    }
+  }
+
+  /**
+   * Loopback-only variant of transcribeAndPersistDual: runs
+   * `transcribeWithSegments` so each Whisper-detected utterance lands as
+   * its own `transcript_segments` row. `start_ms` / `end_ms` are offsets
+   * into the chunk window plus the chunk's start; the M2 speaker-embedding
+   * pass uses these to slice the chunk PCM per utterance for embedding.
+   *
+   * In M1 every persisted segment still has `speaker_label = null` (UI
+   * shows "Remote") — M2.3 fills it inline before `pushSegmentToRenderer`.
+   */
+  private async transcribeAndPersistLoopbackSegments(
+    sessionId: string,
+    chunkIndex: number,
+    chunkStartMs: number,
+    chunkEndMs: number,
+    audioBuffer: Buffer,
+    engineKind: string,
+  ): Promise<void> {
+    if (audioBuffer.length === 0) return;
+    if (isAudioSilent(audioBuffer)) return;
+
+    const whisperStart = Date.now();
+    debugLog('whisper.in', {
+      engine: engineKind, owner: 'meeting', source: 'loopback', chunkIndex,
+      byteLength: audioBuffer.length, durationSec: audioBuffer.length / 2 / 16000,
+      mode: 'segments',
+    });
+
+    let dtos: Awaited<ReturnType<typeof native.transcribeWithSegments>> = [];
+    try {
+      dtos = await transcribeWithTimeout(
+        native.transcribeWithSegments(audioBuffer, this.contextTerms),
+        TRANSCRIBE_TIMEOUT_MS,
+        'MeetingRecorder.transcribe.loopback',
+      ) ?? [];
+      debugLog('whisper.raw', {
+        engine: engineKind, owner: 'meeting', source: 'loopback', chunkIndex,
+        segmentCount: dtos.length,
+        latencyMs: Date.now() - whisperStart,
+      });
+    } catch (err: any) {
+      debugLog('whisper.error', {
+        engine: engineKind, owner: 'meeting', source: 'loopback', chunkIndex,
+        message: err?.message ?? String(err),
+        latencyMs: Date.now() - whisperStart,
+      });
+      return;
+    }
+
+    if (dtos.length === 0) return;
+
+    const terms = this.correctionTerms();
+    const chunkSpan = Math.max(1, chunkEndMs - chunkStartMs);
+
+    // ── Diarization gates (read once per chunk) ─────────────────────────────
+    //
+    // Embedding-based diarization is gated by THREE conditions:
+    //   1. The `speakerClusterer` instance exists (set on remote-capture start)
+    //   2. `meeting_diarization_mode === 'embedding'`
+    //   3. The active transcription engine is Whisper-family — Moonshine's
+    //      `transcribe_with_segments` falls back to one segment spanning the
+    //      whole chunk, which would give chunk-level diarization (useless).
+    // Any miss → segments persist with `speaker_label = null`, UI shows
+    // "Remote", and AHC at stop has nothing to refine.
+    const diarizeMode = (() => {
+      try { return native.getSetting('meeting_diarization_mode') ?? 'off'; }
+      catch { return 'off'; }
+    })();
+    const isWhisperEngine = engineKind.startsWith('whisper-');
+    const diarizationEnabled =
+      this.speakerClusterer !== null
+      && diarizeMode === 'embedding'
+      && isWhisperEngine;
+
+    // Slice-length guardrails (in milliseconds). Reading once keeps per-tick
+    // cost down; the defaults match `migrate_v15` seeds.
+    const minSliceMs = diarizationEnabled
+      ? Math.max(100, Number(native.getSetting('meeting_diarization_min_slice_ms') ?? '800') || 800)
+      : 0;
+    const maxSliceMs = diarizationEnabled
+      ? Math.max(minSliceMs, Number(native.getSetting('meeting_diarization_max_slice_ms') ?? '6000') || 6000)
+      : 0;
+
+    // Process segments in start_ms order so any Buffer.subarray slice
+    // zeroing we do can't clobber a later un-embedded segment. dtos are
+    // already in time order from whisper-rs's segment iterator; sort
+    // defensively in case a future engine breaks that contract.
+    const sortedDtos = [...dtos].sort((a, b) => a.start_ms - b.start_ms);
+
+    for (const dto of sortedDtos) {
+      const raw = (dto.text ?? '').toString();
+      if (!raw) continue;
+      let text = sanitizeTranscribedText(raw);
+      if (!text) continue;
+      if (terms.length > 0) text = correctTranscript(text, terms);
+
+      // Clamp the DTO's per-clip offsets into the chunk's absolute window.
+      const segStart = chunkStartMs + Math.max(0, Math.min(chunkSpan, dto.start_ms));
+      const segEnd = chunkStartMs + Math.max(segStart - chunkStartMs, Math.min(chunkSpan, dto.end_ms));
+
+      // ── Diarization: embed → cluster → final label ─────────────────────
+      //
+      // Discipline: compute the final label (or `null`) BEFORE the first
+      // renderer push. The renderer's segment list appends blindly — if we
+      // pushed an unlabeled segment first and a labeled one later, the UI
+      // would render two rows. `MEETING_SEGMENTS_RELABELED` is reserved for
+      // post-stop AHC patches only.
+      let finalLabel: string | null = null;
+      let embeddingBytes: Buffer | null = null;
+      let diarConfidence: number | null = null;
+
+      if (diarizationEnabled && text.split(/\s+/).filter(Boolean).length >= 2) {
+        // Reject segments with high `no_speech_prob` when available
+        // (whisper-rs 0.13 currently returns null, so this is a forward-
+        // compat guard for when the API surfaces it).
+        const passesNoSpeechGate =
+          dto.no_speech_prob == null || dto.no_speech_prob < 0.6;
+
+        if (passesNoSpeechGate) {
+          // Convert ms → PCM16-byte offsets. PCM16 mono at 16 kHz =
+          // 32 bytes/ms (16000 samples × 2 bytes ÷ 1000 ms).
+          const BYTES_PER_MS = 32;
+          let sliceStartMs = Math.max(0, dto.start_ms);
+          let sliceEndMs = Math.max(sliceStartMs, Math.min(chunkSpan, dto.end_ms));
+          const durMs = sliceEndMs - sliceStartMs;
+
+          if (durMs < minSliceMs) {
+            // Too short to embed reliably — skip diarization, keep transcript.
+          } else {
+            // Long-segment guardrail: use the middle 3 s. Anything beyond
+            // ~6 s on a single speaker is rare; longer windows risk
+            // straddling speaker boundaries.
+            if (durMs > maxSliceMs) {
+              const center = (sliceStartMs + sliceEndMs) / 2;
+              sliceStartMs = Math.max(0, Math.round(center - 1500));
+              sliceEndMs = Math.min(chunkSpan, Math.round(center + 1500));
+            }
+
+            const byteStart = Math.min(audioBuffer.length, sliceStartMs * BYTES_PER_MS);
+            const byteEnd = Math.min(audioBuffer.length, sliceEndMs * BYTES_PER_MS);
+            // Buffer.subarray shares memory with the parent — zeroing the
+            // slice mutates the parent's range. That's safe here because
+            // dtos are processed in start_ms order with no overlap.
+            const slice = audioBuffer.subarray(byteStart, byteEnd);
+
+            if (slice.length > 0 && !isAudioSilent(slice)) {
+              try {
+                const emb = await native.embedSpeaker(slice);
+                if (emb.length === SPEAKER_EMBED_FLOATS) {
+                  const result = this.speakerClusterer!.assign(emb);
+                  finalLabel = result.label;
+                  diarConfidence = result.confidence;
+                  // Pack the embedding back to LE bytes for DB persistence.
+                  const buf = Buffer.alloc(emb.length * 4);
+                  for (let i = 0; i < emb.length; i++) {
+                    buf.writeFloatLE(emb[i], i * 4);
+                  }
+                  embeddingBytes = buf;
+                } else if (emb.length === 0) {
+                  // Speaker module unavailable (model missing / feature
+                  // not compiled). Fall through with null label.
+                  debugLog('diarize.unavailable', { chunkIndex, segStart, segEnd });
+                } else {
+                  console.warn(
+                    `[MeetingRecorder] Unexpected embedding length ${emb.length}, expected ${SPEAKER_EMBED_FLOATS}`,
+                  );
+                }
+              } catch (err: any) {
+                // Diarization is best-effort — log and continue with a
+                // null label. The user always sees the transcript.
+                debugLog('diarize.error', {
+                  chunkIndex, segStart, segEnd,
+                  message: err?.message ?? String(err),
+                });
+              } finally {
+                // Zero the PCM16 slice as soon as we're done with it.
+                // Because it's a Buffer.subarray view, this also wipes
+                // that range of the parent chunk buffer — the outer
+                // try/finally in processChunkDual zeroes the rest.
+                try { slice.fill(0); } catch { /* defensive */ }
+              }
+            }
+          }
+        }
+      }
+
+      const seg: TranscriptSegment = {
+        id: `seg-${Date.now()}-${this.state.segmentCount}`,
+        session_id: sessionId,
+        speaker_label: finalLabel,
+        start_ms: segStart,
+        end_ms: segEnd,
+        text,
+        source: 'loopback',
+        participant_id: null,
+        confidence: null,
+        created_at: new Date().toISOString(),
+      };
+
+      let persisted: TranscriptSegment = seg;
+      if (typeof native.addon.addTranscriptSegment === 'function') {
+        try {
+          const json = native.addon.addTranscriptSegment(
+            sessionId, finalLabel, segStart, segEnd, text, 'loopback',
+          );
+          const parsed = JSON.parse(json);
+          if (parsed && parsed.id) persisted = parsed as TranscriptSegment;
+        } catch (err) {
+          console.warn('[MeetingRecorder] Failed to persist loopback segment:', err);
+        }
+      }
+
+      // Attach the embedding AFTER the segment write succeeds. Failure
+      // here is non-fatal — the segment is still valid, it just won't
+      // participate in AHC refinement at stop.
+      if (
+        embeddingBytes
+        && !persisted.id.startsWith('seg-')
+        && typeof native.addon.updateSegmentEmbedding === 'function'
+      ) {
+        try {
+          native.addon.updateSegmentEmbedding(
+            persisted.id,
+            embeddingBytes,
+            'wespeaker-resnet34-LM-v1',
+            diarConfidence ?? 0.0,
+          );
+        } catch (err) {
+          console.warn('[MeetingRecorder] Failed to persist embedding:', err);
+        }
+      }
+
+      this.segments.push(persisted);
+      this.state = { ...this.state, segmentCount: this.state.segmentCount + 1 };
+      // Push once, after the segment + (optional) embedding writes settle.
+      this.pushSegmentToRenderer(persisted);
     }
   }
 
@@ -1343,6 +1713,242 @@ class MeetingRecorderManager {
     const windows = BrowserWindow.getAllWindows();
     if (windows.length > 0) {
       windows[0].webContents.send(IPC_CHANNELS.MEETING_RECORDING_STATE, s);
+    }
+  }
+
+  /**
+   * AHC refinement pass at stop-of-meeting. Pulls every persisted
+   * loopback embedding out of SQLite (DB is canonical at stop —
+   * survives crashes, drift, missed pushes from the live state), runs
+   * `SpeakerClusterer.refine(rows)`, and writes the diff back to the
+   * `transcript_segments` table + the in-memory `segmentsSnapshot`.
+   *
+   * Returns the patch list so the caller can:
+   *   1. Run the optional LLM roster-rename pass on top, and
+   *   2. Emit a single `MEETING_SEGMENTS_RELABELED` event covering both.
+   */
+  private async refineLoopbackSpeakers(
+    sessionId: string,
+    segmentsSnapshot: TranscriptSegment[],
+  ): Promise<Array<{ segmentId: string; newLabel: string }>> {
+    if (typeof native.addon.listSegmentEmbeddings !== 'function') {
+      return [];
+    }
+
+    let rows: Array<{ id: string; speaker_label: string | null; start_ms: number; embedding_b64: string }>;
+    try {
+      const json = native.addon.listSegmentEmbeddings(sessionId, 'loopback');
+      rows = JSON.parse(json);
+      if (!Array.isArray(rows)) return [];
+    } catch (err) {
+      console.warn('[MeetingRecorder] AHC: failed to load embeddings:', err);
+      return [];
+    }
+    if (rows.length === 0) return [];
+
+    // Decode base64 embedding bytes → Float32Array. The Rust side
+    // packed 256 × f32 little-endian; host endianness is LE on every
+    // platform IronMic targets.
+    const decoded: SegmentEmbeddingRowJs[] = [];
+    for (const r of rows) {
+      try {
+        const bytes = Buffer.from(r.embedding_b64, 'base64');
+        if (bytes.length !== SPEAKER_EMBED_FLOATS * 4) {
+          console.warn(
+            `[MeetingRecorder] AHC: skipping row ${r.id} with wrong embedding size ${bytes.length}`,
+          );
+          continue;
+        }
+        const f32 = new Float32Array(
+          bytes.buffer,
+          bytes.byteOffset,
+          bytes.byteLength / 4,
+        );
+        // Defensive copy — `bytes` is a Node Buffer that may be GC'd
+        // while the clusterer holds the embedding reference.
+        decoded.push({
+          segmentId: r.id,
+          oldLabel: r.speaker_label,
+          startMs: r.start_ms,
+          embedding: new Float32Array(f32),
+        });
+      } catch (err) {
+        console.warn(`[MeetingRecorder] AHC: decode failed for row ${r.id}:`, err);
+      }
+    }
+    if (decoded.length === 0) return [];
+
+    // DB is canonical — build a FRESH clusterer rather than reading the
+    // live (potentially-drifted) `this.speakerClusterer`. This makes
+    // refinement robust against crashes / mid-session restarts.
+    const refiner = new SpeakerClusterer();
+    const diff = refiner.refine(decoded);
+
+    const out: Array<{ segmentId: string; newLabel: string }> = [];
+    for (const d of diff) {
+      if (d.oldLabel === d.newLabel) continue;
+      // Persist
+      if (typeof native.addon.updateSegmentSpeaker === 'function') {
+        try {
+          native.addon.updateSegmentSpeaker(d.segmentId, d.newLabel);
+        } catch (err) {
+          console.warn(
+            `[MeetingRecorder] AHC: failed to persist label for ${d.segmentId}:`,
+            err,
+          );
+          continue;
+        }
+      }
+      // Mirror into in-memory snapshot so the caller's view matches DB.
+      const seg = segmentsSnapshot.find(s => s.id === d.segmentId);
+      if (seg) seg.speaker_label = d.newLabel;
+      out.push({ segmentId: d.segmentId, newLabel: d.newLabel });
+    }
+    return out;
+  }
+
+  /**
+   * Optional LLM roster-rename pass (M2.5). Gated by
+   * `meeting_llm_name_pass_enabled` (default `'false'`). When on AND a
+   * participant roster is present, asks the LLM to map cluster labels
+   * ([Speaker 1], …) to roster names ([Alice], …) and applies the
+   * mapping uniformly across every segment that carries the same cluster
+   * label. Per-segment word-overlap matching is intentionally NOT used
+   * here — cluster labels are already stable after AHC, so a uniform
+   * cluster→name remap is sufficient and avoids relabeling individual
+   * utterances based on transcript content.
+   *
+   * Returns the patches actually applied, so the caller can fold them
+   * into the single `MEETING_SEGMENTS_RELABELED` emission.
+   */
+  private async runLlmRosterRename(
+    sessionId: string,
+    segmentsSnapshot: TranscriptSegment[],
+  ): Promise<Array<{ segmentId: string; newLabel: string }>> {
+    const enabled = (() => {
+      try { return native.getSetting('meeting_llm_name_pass_enabled') === 'true'; }
+      catch { return false; }
+    })();
+    if (!enabled) return [];
+
+    // Need a roster to map to — without it the LLM has nothing to do.
+    let participantNames: string[] = [];
+    try {
+      const json = native.getMeetingParticipants(sessionId);
+      const roster = JSON.parse(json) as Array<{ displayName?: string }>;
+      participantNames = (Array.isArray(roster) ? roster : [])
+        .map(p => (p?.displayName ?? '').trim())
+        .filter(name => name.length > 0);
+    } catch (err) {
+      console.warn('[MeetingRecorder] LLM rename: roster fetch failed:', err);
+      return [];
+    }
+    if (participantNames.length === 0) return [];
+
+    // Build the labeled transcript from the AHC-refined snapshot.
+    const labeledLoopback = segmentsSnapshot
+      .filter(s => s.source === 'loopback' && s.speaker_label)
+      .map(s => `${s.speaker_label}: ${s.text}`)
+      .join('\n');
+    if (!labeledLoopback) return [];
+
+    // Distinct cluster labels in the transcript — what we ask the LLM
+    // to map. Anything not in this set is left alone.
+    const clusterLabels = Array.from(
+      new Set(
+        segmentsSnapshot
+          .filter(s => s.source === 'loopback' && s.speaker_label)
+          .map(s => s.speaker_label!),
+      ),
+    );
+    if (clusterLabels.length === 0) return [];
+
+    const resolved = resolveActiveChatModel(native);
+    if (!resolved) return [];
+
+    const prompt = [
+      'You are a speaker-attribution assistant. Given a transcript with',
+      'placeholder speaker labels (like [Speaker 1], [Speaker 2]) and a',
+      'roster of meeting participants, decide which roster name (if any)',
+      'each placeholder most likely refers to. If you cannot tell, keep',
+      'the placeholder.',
+      '',
+      'Output JSON only — an object mapping each placeholder label to',
+      'either a roster name (without brackets) or null. Example output:',
+      '{"[Speaker 1]": "Alice", "[Speaker 2]": null}',
+      '',
+      `Roster: ${participantNames.join(', ')}`,
+      `Placeholders to resolve: ${clusterLabels.join(', ')}`,
+      '',
+      'Transcript:',
+      labeledLoopback,
+    ].join('\n');
+
+    let raw: string | null = null;
+    try {
+      raw = await llmSubprocess.chatComplete({
+        modelPath: resolved.modelPath,
+        modelType: resolved.modelType,
+        messages: [{ role: 'user', content: prompt }],
+        maxTokens: 512,
+        temperature: 0.1,
+      });
+    } catch (err) {
+      console.warn('[MeetingRecorder] LLM rename: chat failed:', err);
+      return [];
+    }
+    if (!raw) return [];
+
+    // Best-effort JSON extraction — LLMs sometimes wrap in prose.
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (!m) return [];
+    let mapping: Record<string, string | null>;
+    try {
+      mapping = JSON.parse(m[0]);
+    } catch {
+      return [];
+    }
+
+    const out: Array<{ segmentId: string; newLabel: string }> = [];
+    for (const seg of segmentsSnapshot) {
+      if (seg.source !== 'loopback' || !seg.speaker_label) continue;
+      const target = mapping[seg.speaker_label];
+      if (!target || typeof target !== 'string') continue;
+      const newLabel = `[${target.trim()}]`;
+      if (newLabel === seg.speaker_label) continue;
+      if (typeof native.addon.updateSegmentSpeaker === 'function') {
+        try {
+          native.addon.updateSegmentSpeaker(seg.id, newLabel);
+        } catch (err) {
+          console.warn(
+            `[MeetingRecorder] LLM rename: persist failed for ${seg.id}:`,
+            err,
+          );
+          continue;
+        }
+      }
+      seg.speaker_label = newLabel;
+      out.push({ segmentId: seg.id, newLabel });
+    }
+    return out;
+  }
+
+  /**
+   * Emit a single `MEETING_SEGMENTS_RELABELED` event so the renderer
+   * can patch its in-memory segment list in place after AHC + LLM
+   * rename. Empty `patches` is allowed and signals to the renderer
+   * that refinement ran but produced no changes (clear any pending UI).
+   */
+  private pushSegmentsRelabeledToRenderer(
+    sessionId: string,
+    patches: Array<{ segmentId: string; newLabel: string }>,
+  ): void {
+    const windows = BrowserWindow.getAllWindows();
+    if (windows.length > 0) {
+      windows[0].webContents.send(
+        IPC_CHANNELS.MEETING_SEGMENTS_RELABELED,
+        { sessionId, patches },
+      );
     }
   }
 

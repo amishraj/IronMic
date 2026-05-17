@@ -14,13 +14,13 @@ jobs:
         include:
           - os: macos-latest
             rust-target: aarch64-apple-darwin
-            cargo-features: '--features metal,tts,engine-multi,forge'
+            cargo-features: '--features metal,tts,engine-multi,forge,speaker-diarization'
           - os: ubuntu-latest
             rust-target: x86_64-unknown-linux-gnu
-            cargo-features: '--features whisper,tts,engine-multi,forge'
+            cargo-features: '--features whisper,tts,engine-multi,forge,speaker-diarization'
           - os: windows-latest
             rust-target: x86_64-pc-windows-msvc
-            cargo-features: '--features whisper,tts,engine-multi,forge'
+            cargo-features: '--features whisper,tts,engine-multi,forge,speaker-diarization'
     steps:
       - uses: actions/checkout@v4
 
@@ -106,6 +106,28 @@ jobs:
             "https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q2_K.gguf" \
             || { rm -f "$PARTIAL"; echo "Phi-3 download failed"; exit 1; }
           mv "$PARTIAL" "$DEST"
+
+      - name: Download bundled WeSpeaker (speaker diarization)
+        shell: bash
+        run: |
+          # Pinned to the same commit SHA recorded in
+          # electron-app/resources/models/models-manifest.json so the bundled
+          # bytes are reproducible across release builds. ~26 MB. Apache-2.0
+          # license requires preserving the LICENCE.md alongside the binary.
+          REV="0ae88dcaf48cacdf741275d6d1a8101f45eee220"
+          BASE="https://huggingface.co/hbredin/wespeaker-voxceleb-resnet34-LM/resolve/$REV"
+          DEST_DIR="electron-app/resources/models/speaker-embedding"
+          mkdir -p "$DEST_DIR"
+          curl -L --fail -o "$DEST_DIR/speaker-embedding.onnx" \
+            "$BASE/speaker-embedding.onnx"
+          curl -L --fail -o "$DEST_DIR/LICENCE.md" \
+            "$BASE/LICENCE.md" || true  # license is auxiliary; failure is non-fatal
+          ls -lh "$DEST_DIR/speaker-embedding.onnx"
+
+      - name: Verify models manifest
+        shell: bash
+        working-directory: electron-app
+        run: npm run verify-models
 
       - name: Build frontend
         working-directory: electron-app

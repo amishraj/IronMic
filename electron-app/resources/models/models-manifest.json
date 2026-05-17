@@ -1,0 +1,21 @@
+{
+  "$schema": "./models-manifest.schema.json",
+  "version": 1,
+  "comment": "Authoritative list of every model file bundled into the packaged IronMic app. scripts/verify-models-manifest.js re-hashes each `path` at postbuild and fails the build on mismatch. CC-BY 4.0 entries also require THIRD_PARTY_NOTICES.md to carry an attribution block referencing this manifest entry.",
+  "models": [
+    {
+      "id": "wespeaker-resnet34-LM",
+      "path": "resources/models/speaker-embedding/speaker-embedding.onnx",
+      "sha256": "REPLACE_WITH_SHA256_AFTER_DOWNLOAD",
+      "sizeBytes": 26572362,
+      "license": "Apache-2.0",
+      "sourceUrl": "https://huggingface.co/hbredin/wespeaker-voxceleb-resnet34-LM",
+      "sourceRevision": "0ae88dcaf48cacdf741275d6d1a8101f45eee220",
+      "fetchUrl": "https://huggingface.co/hbredin/wespeaker-voxceleb-resnet34-LM/resolve/0ae88dcaf48cacdf741275d6d1a8101f45eee220/speaker-embedding.onnx",
+      "purpose": "Speaker embedding for remote-meeting loopback diarization (M2)",
+      "consumer": "rust-core/src/speaker/wespeaker.rs",
+      "optional": true,
+      "optionalReason": "When missing, M2.5b runtime readiness check declines to flip meeting_diarization_mode to 'embedding'; meeting recorder falls back to legacy text-LLM diarization at stop."
+    }
+  ]
+}

@@ -256,6 +256,16 @@ export const IPC_CHANNELS = {
   MEETING_SEGMENT_READY: 'ironmic:meeting-segment-ready',      // main → renderer push (committed final)
   MEETING_DRAFT_READY: 'ironmic:meeting-draft-ready',          // main → renderer push (live grey hypothesis)
   MEETING_RECORDING_STATE: 'ironmic:meeting-recording-state',  // main → renderer push
+  /**
+   * main → renderer push: emitted once at end-of-meeting after AHC
+   * speaker-embedding refinement (and optional LLM roster-rename) so the
+   * transcript panel can patch its segment list in place rather than
+   * full-reloading. Payload:
+   *   { sessionId: string, patches: Array<{ segmentId, newLabel }> }
+   * Empty `patches` means refinement ran but produced no label changes —
+   * the renderer may still want to clear any "diarization pending" UI.
+   */
+  MEETING_SEGMENTS_RELABELED: 'ironmic:meeting-segments-relabeled',
   MEETING_LIVE_SUMMARY: 'ironmic:meeting-live-summary',        // main → renderer push (incremental notes)
   MEETING_USER_NOTES_CHANGED: 'ironmic:meeting-user-notes-changed', // renderer → main (fire-and-forget)
   MEETING_USER_NOTES_BROADCAST: 'ironmic:meeting-user-notes-broadcast', // main → renderer push (collaborative Your Notes update)

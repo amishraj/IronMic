@@ -12,9 +12,11 @@ MODELS_DIR="$(dirname "$0")/../rust-core/models"
 mkdir -p "$MODELS_DIR"
 
 INCLUDE_WHISPER_LARGE=0
+INCLUDE_WESPEAKER=0
 for arg in "$@"; do
     case "$arg" in
         --include-whisper-large) INCLUDE_WHISPER_LARGE=1 ;;
+        --include-wespeaker) INCLUDE_WESPEAKER=1 ;;
     esac
 done
 
@@ -142,5 +144,48 @@ if [ ! -f "$PHI3_FILE" ]; then
 fi
 
 echo ""
+
+# ── WeSpeaker ResNet34 (optional, M2 speaker diarization on loopback) ───
+# Pinned to a specific HuggingFace commit so the bundled bytes are
+# reproducible. The file is small (~26 MB) but kept opt-in because the
+# remote-meeting capture pipeline is Windows-only today and not every
+# downstream packager needs it.
+WESPEAKER_DIR="$(dirname "$0")/../electron-app/resources/models/speaker-embedding"
+WESPEAKER_SHA="0ae88dcaf48cacdf741275d6d1a8101f45eee220"
+WESPEAKER_FILE="$WESPEAKER_DIR/speaker-embedding.onnx"
+WESPEAKER_LICENSE="$WESPEAKER_DIR/LICENCE.md"
+WESPEAKER_BASE="https://huggingface.co/hbredin/wespeaker-voxceleb-resnet34-LM/resolve/$WESPEAKER_SHA"
+
+if [ "$INCLUDE_WESPEAKER" -eq 1 ]; then
+    echo "[+] WeSpeaker ResNet34 — speaker diarization on remote-meeting loopback"
+    mkdir -p "$WESPEAKER_DIR"
+    if [ ! -f "$WESPEAKER_FILE" ]; then
+        echo "  [DOWNLOAD] speaker-embedding.onnx (~26 MB)"
+        if command -v curl >/dev/null 2>&1; then
+            curl -L --fail -o "${WESPEAKER_FILE}.partial" "$WESPEAKER_BASE/speaker-embedding.onnx" \
+                && mv "${WESPEAKER_FILE}.partial" "$WESPEAKER_FILE" \
+                || { rm -f "${WESPEAKER_FILE}.partial"; echo "    [FAIL] Download failed"; exit 1; }
+        else
+            echo "    curl not found — manual download required:"
+            echo "      curl -L -o '$WESPEAKER_FILE' '$WESPEAKER_BASE/speaker-embedding.onnx'"
+            exit 1
+        fi
+    fi
+    if [ ! -f "$WESPEAKER_LICENSE" ]; then
+        echo "  [DOWNLOAD] LICENCE.md (Apache-2.0 attribution — required for redistribution)"
+        curl -L --fail -o "$WESPEAKER_LICENSE" "$WESPEAKER_BASE/LICENCE.md" || true
+    fi
+    if command -v shasum >/dev/null 2>&1; then
+        echo "  sha256:  $(shasum -a 256 "$WESPEAKER_FILE" | awk '{print $1}')"
+        echo "  → paste this into electron-app/resources/models/models-manifest.json"
+        echo "    (wespeaker-resnet34-LM entry) so the postbuild verifier becomes deterministic"
+    fi
+    echo "  [OK] $(du -h "$WESPEAKER_FILE" | cut -f1) at $WESPEAKER_FILE"
+    echo ""
+else
+    echo "[+] WeSpeaker — SKIPPED (use --include-wespeaker to fetch for M2 speaker diarization)"
+    echo ""
+fi
+
 echo "Done. After downloading, run:"
 echo "  cd rust-core && cargo build --release --features napi-export,whisper,engine-multi"

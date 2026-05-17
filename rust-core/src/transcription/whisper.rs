@@ -5,6 +5,7 @@ use tracing::{info, warn};
 
 use crate::error::IronMicError;
 use crate::transcription::dictionary::Dictionary;
+use crate::transcription::engine::TranscriptSegmentDto;
 
 /// Default model filename.
 const DEFAULT_MODEL_FILENAME: &str = "whisper-large-v3-turbo.bin";
@@ -469,6 +470,116 @@ impl WhisperEngine {
         );
 
         Ok(transcript)
+    }
+
+    /// Transcribe and return per-segment timing (start/end in ms relative to
+    /// the start of `samples`). Used by the dual-stream meeting recorder to
+    /// slice loopback audio for per-speaker embedding before the chunk
+    /// buffer is zeroed.
+    ///
+    /// Implementation mirrors `transcribe_with_whisper` but iterates Whisper's
+    /// segment boundaries instead of concatenating the text. `single_segment`
+    /// is intentionally NOT set even for short chunks — segment boundaries
+    /// are the whole point of this entry point.
+    ///
+    /// `no_speech_prob` is left `None` — whisper-rs 0.13 does not expose
+    /// `whisper_full_get_segment_no_speech_prob`. Callers fall back to
+    /// duration + RMS gating.
+    pub fn transcribe_with_segments(
+        &self,
+        samples: &[f32],
+        _short_chunk: bool,
+        extra_terms: &[String],
+    ) -> Result<Vec<TranscriptSegmentDto>, IronMicError> {
+        if samples.is_empty() {
+            return Err(IronMicError::Processing(
+                "No audio samples to transcribe".into(),
+            ));
+        }
+
+        #[cfg(feature = "whisper")]
+        {
+            use whisper_rs::FullParams;
+            use whisper_rs::SamplingStrategy;
+
+            let ctx = self.ctx.as_ref().ok_or_else(|| {
+                IronMicError::Audio("Whisper model not loaded. Call load_model() first.".into())
+            })?;
+
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            params.set_n_threads(self.config.n_threads as i32);
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            params.set_suppress_blank(true);
+            params.set_suppress_non_speech_tokens(true);
+            params.set_temperature(0.0);
+            params.set_temperature_inc(0.0);
+            params.set_no_speech_thold(0.3);
+            params.set_no_context(true);
+            params.set_detect_language(false);
+
+            if let Some(ref lang) = self.config.language {
+                params.set_language(Some(lang));
+            }
+            params.set_translate(self.config.translate);
+
+            let prompt_owned = self.dictionary.build_whisper_prompt_with_extras(extra_terms);
+            if let Some(prompt) = prompt_owned.as_deref() {
+                params.set_initial_prompt(prompt);
+            }
+
+            let mut state = ctx.create_state().map_err(|e| {
+                IronMicError::Audio(format!("Failed to create Whisper state: {e}"))
+            })?;
+            state.full(params, samples).map_err(|e| {
+                IronMicError::Audio(format!("Whisper transcription failed: {e}"))
+            })?;
+
+            let num_segments = state.full_n_segments().map_err(|e| {
+                IronMicError::Audio(format!("Failed to get segment count: {e}"))
+            })?;
+
+            // Cap end_ms at the clip's actual duration. Whisper sometimes
+            // reports t1 slightly past the end on the final segment; clamping
+            // keeps PCM slice math safe in the caller.
+            let clip_end_ms = ((samples.len() as f64 / 16_000.0) * 1000.0).round() as u32;
+
+            let mut out: Vec<TranscriptSegmentDto> = Vec::with_capacity(num_segments as usize);
+            for i in 0..num_segments {
+                let text = state.full_get_segment_text(i).unwrap_or_default();
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Whisper t-units are centiseconds (1 unit = 10 ms).
+                let t0 = state.full_get_segment_t0(i).unwrap_or(0).max(0) as u64 * 10;
+                let t1 = state.full_get_segment_t1(i).unwrap_or(0).max(0) as u64 * 10;
+                let start_ms = (t0 as u32).min(clip_end_ms);
+                let end_ms = (t1 as u32).min(clip_end_ms).max(start_ms);
+                out.push(TranscriptSegmentDto {
+                    text: trimmed.to_string(),
+                    start_ms,
+                    end_ms,
+                    no_speech_prob: None,
+                });
+            }
+            Ok(out)
+        }
+
+        #[cfg(not(feature = "whisper"))]
+        {
+            let _ = extra_terms;
+            let text = self.transcribe_stub(samples)?;
+            let end_ms = ((samples.len() as f64 / 16_000.0) * 1000.0).round() as u32;
+            Ok(vec![TranscriptSegmentDto {
+                text,
+                start_ms: 0,
+                end_ms,
+                no_speech_prob: None,
+            }])
+        }
     }
 
     #[cfg(not(feature = "whisper"))]

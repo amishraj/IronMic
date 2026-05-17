@@ -571,6 +571,83 @@ export function ensureBundledMoonshineBase(): MoonshineBundleStatus {
 }
 
 /**
+ * Filename of the WeSpeaker ResNet34 speaker-embedding ONNX. Mirrors
+ * `MODEL_FILENAME` in `rust-core/src/speaker/wespeaker.rs`. The upstream
+ * Hugging Face repo `hbredin/wespeaker-voxceleb-resnet34-LM` publishes
+ * the ONNX as `speaker-embedding.onnx` (not the WeSpeaker upstream's
+ * `voxceleb_resnet34_LM.onnx`); keeping the bundled filename identical
+ * means no rename on copy.
+ */
+const WESPEAKER_FILENAME = 'speaker-embedding.onnx';
+
+/**
+ * Status of the WeSpeaker first-launch copy. Mirrors
+ * {@link MoonshineBundleStatus} so the caller can branch on the same shape.
+ */
+export type WeSpeakerBundleStatus =
+  | 'already-present'
+  | 'copied'
+  | 'bundle-missing';
+
+/**
+ * Mirror of `ensureBundledMoonshineBase` for the speaker-embedding ONNX.
+ * On packaged builds copies `voxceleb_resnet34_LM.onnx` from
+ * `process.resourcesPath/models/speaker-embedding/` into the writable
+ * user-data models dir on first launch — same offline-safe path the
+ * Moonshine bundle uses.
+ *
+ * Returns `'bundle-missing'` in dev mode (no resourcesPath) and on
+ * packaged builds that did not ship the ONNX (the electron-builder glob
+ * filter `*.onnx` silently skips when the file is absent, so this is the
+ * expected path until the maintainer downloads the artifact). The
+ * meeting recorder then falls through to the legacy text-LLM diarization
+ * at meeting stop, and the M2.5b readiness check keeps
+ * `meeting_diarization_mode = 'off'`.
+ */
+export function ensureBundledWeSpeaker(): WeSpeakerBundleStatus {
+  const destDir = path.join(resolveModelsDir(), 'speaker-embedding');
+  const destFile = path.join(destDir, WESPEAKER_FILENAME);
+  if (fs.existsSync(destFile)) {
+    try {
+      if (fs.statSync(destFile).size > 0) return 'already-present';
+    } catch { /* fall through to re-copy */ }
+  }
+
+  if (!process.resourcesPath) return 'bundle-missing';
+
+  const bundledDir = path.join(
+    process.resourcesPath,
+    'models',
+    'speaker-embedding',
+  );
+  const bundledFile = path.join(bundledDir, WESPEAKER_FILENAME);
+  if (!fs.existsSync(bundledFile)) return 'bundle-missing';
+  try {
+    if (fs.statSync(bundledFile).size === 0) return 'bundle-missing';
+  } catch {
+    return 'bundle-missing';
+  }
+
+  fs.mkdirSync(destDir, { recursive: true });
+  fs.copyFileSync(bundledFile, destFile);
+  console.log(
+    `[model-downloader] Copied bundled WeSpeaker model to ${destFile}`,
+  );
+
+  // Also copy the LICENSE / model-card alongside if present, so the
+  // user-data dir carries the attribution required by CC-BY 4.0.
+  for (const aux of ['LICENSE', 'LICENSE.txt', 'README.md']) {
+    const srcAux = path.join(bundledDir, aux);
+    const destAux = path.join(destDir, aux);
+    if (fs.existsSync(srcAux) && !fs.existsSync(destAux)) {
+      try { fs.copyFileSync(srcAux, destAux); } catch { /* best-effort */ }
+    }
+  }
+
+  return 'copied';
+}
+
+/**
  * True when the packaged app shipped with all 3 Moonshine Base files in
  * `process.resourcesPath/models/moonshine-base/`. False in dev mode and on
  * installers that lost their bundled copy. The renderer uses this to decide

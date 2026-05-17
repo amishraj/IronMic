@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 14;
+const SCHEMA_VERSION: u32 = 15;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -169,6 +169,10 @@ impl Database {
 
         if current_version < 14 {
             self.migrate_v14(&conn)?;
+        }
+
+        if current_version < 15 {
+            self.migrate_v15(&conn)?;
         }
 
         // Update version
@@ -1092,6 +1096,56 @@ impl Database {
         Ok(())
     }
 
+    /// Migration v15: speaker diarization plumbing. Adds per-segment speaker
+    /// embedding columns to `transcript_segments` and seeds the new
+    /// `meeting_diarization_*` settings. M1 ships with mode = 'off' so live
+    /// behavior is unchanged; the M2 runtime readiness check flips it once
+    /// the WeSpeaker model is bundled. Allowed mode values: 'off' /
+    /// 'embedding' / 'llm-text'.
+    ///
+    /// Idempotent: ALTER TABLE ADD COLUMN is wrapped in best-effort error
+    /// handling so re-running on a partially-migrated DB is safe.
+    fn migrate_v15(&self, conn: &Connection) -> Result<(), IronMicError> {
+        // `ALTER TABLE ADD COLUMN` errors if the column already exists. Run
+        // each statement individually and swallow "duplicate column" errors
+        // so the migration is idempotent on partial state.
+        let alters = [
+            "ALTER TABLE transcript_segments ADD COLUMN speaker_embedding BLOB",
+            "ALTER TABLE transcript_segments ADD COLUMN speaker_embedding_model TEXT",
+            "ALTER TABLE transcript_segments ADD COLUMN diarization_confidence REAL",
+        ];
+        for stmt in alters {
+            if let Err(e) = conn.execute(stmt, []) {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column name") {
+                    return Err(IronMicError::Storage(format!(
+                        "Migration v15 failed on `{stmt}`: {e}"
+                    )));
+                }
+            }
+        }
+
+        conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_transcript_segments_session_source
+                ON transcript_segments(session_id, source);
+
+            INSERT OR IGNORE INTO settings (key, value) VALUES
+                ('meeting_diarization_mode', 'off'),
+                ('meeting_diarization_threshold', '0.55'),
+                ('meeting_diarization_max_speakers', '20'),
+                ('meeting_diarization_min_slice_ms', '800'),
+                ('meeting_diarization_max_slice_ms', '6000'),
+                ('meeting_diarization_user_overridden', 'false'),
+                ('meeting_llm_name_pass_enabled', 'false');
+            ",
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v15 failed: {e}")))?;
+
+        info!("Migration v15 applied: diarization columns + settings");
+        Ok(())
+    }
+
     fn seed_builtin_templates(&self, conn: &Connection) -> Result<(), IronMicError> {
         let now = chrono::Utc::now().to_rfc3339();
         let templates = vec![
@@ -1201,6 +1255,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn schema_version_is_15() {
+        // Pin SCHEMA_VERSION so accidentally regressing it (e.g. during a
+        // rebase) fails loud. Diarization plumbing depends on v15.
+        assert_eq!(SCHEMA_VERSION, 15);
+    }
+
+    #[test]
+    fn migration_v15_adds_diarization_columns() {
+        let db = Database::open_in_memory().unwrap();
+        let conn = db.conn();
+
+        // Confirm the three new columns exist on transcript_segments.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(transcript_segments)")
+            .unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for required in [
+            "speaker_embedding",
+            "speaker_embedding_model",
+            "diarization_confidence",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == required),
+                "transcript_segments missing column `{}`; columns = {:?}",
+                required,
+                cols
+            );
+        }
+
+        // Confirm the seven new settings landed with the documented defaults.
+        for (key, expected) in [
+            ("meeting_diarization_mode", "off"),
+            ("meeting_diarization_threshold", "0.55"),
+            ("meeting_diarization_max_speakers", "20"),
+            ("meeting_diarization_min_slice_ms", "800"),
+            ("meeting_diarization_max_slice_ms", "6000"),
+            ("meeting_diarization_user_overridden", "false"),
+            ("meeting_llm_name_pass_enabled", "false"),
+        ] {
+            let value: String = conn
+                .query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    [key],
+                    |row| row.get(0),
+                )
+                .unwrap_or_else(|_| panic!("missing setting `{}`", key));
+            assert_eq!(value, expected, "setting `{}` has wrong default", key);
+        }
     }
 
     #[test]

@@ -22,6 +22,7 @@ import {
   ensureBundledTFJSModels,
   ensureBundledMoonshineBase,
   ensureBundledLlm,
+  ensureBundledWeSpeaker,
 } from './model-downloader';
 import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
 import { meetingRecorder } from './meeting-recorder';
@@ -396,6 +397,28 @@ app.whenReady().then(async () => {
     console.warn('[startup] Failed to copy bundled Moonshine Base:', err);
   }
 
+  // Copy bundled WeSpeaker ResNet34 ONNX to user data so the speaker
+  // module's lazy session-load (rust-core/src/speaker/wespeaker.rs) finds
+  // the file in `IRONMIC_MODELS_DIR/speaker-embedding/`. Must run BEFORE
+  // the diarization readiness flip below so `speakerDiarizationAvailable()`
+  // can see the file on the same boot it's copied.
+  try {
+    const speakerStatus = ensureBundledWeSpeaker();
+    switch (speakerStatus) {
+      case 'copied':
+        console.log('[startup] WeSpeaker: bundled copy restored from app resources');
+        break;
+      case 'already-present':
+        console.log('[startup] WeSpeaker: already present in user data');
+        break;
+      case 'bundle-missing':
+        console.log('[startup] WeSpeaker: no bundled copy — speaker diarization stays off until shipped or downloaded');
+        break;
+    }
+  } catch (err) {
+    console.warn('[startup] Failed to copy bundled WeSpeaker:', err);
+  }
+
   // Copy bundled Phi-3 Mini Q2_K (default LLM for polish + AI Assist) to user data.
   try {
     const llmStatus = ensureBundledLlm();
@@ -443,6 +466,29 @@ app.whenReady().then(async () => {
   // BEFORE startMeetingAppDetection reads the setting.
   try { applyAutoDetectDefaultMigration(); } catch (err) {
     console.warn('[meeting-app-detector] Migration failed (non-fatal):', err);
+  }
+
+  // M2.5b: runtime readiness flip for embedding-based speaker diarization.
+  // `migrate_v15` seeds `meeting_diarization_mode = 'off'` so M1-only
+  // installs see no behavior change. Once the WeSpeaker model file is
+  // bundled (M2) and the user hasn't explicitly opted out via the
+  // Settings UI (`meeting_diarization_user_overridden`), flip the mode to
+  // 'embedding' so the loopback path actually uses the new diarization
+  // pipeline.
+  //
+  // **Important:** the automatic flip MUST NOT set `..._user_overridden`
+  // — only an explicit Settings UI toggle sets that flag. Otherwise this
+  // check would fire once per install and stay permanently disabled
+  // even when the user did nothing.
+  try {
+    const mode = native.getSetting('meeting_diarization_mode') ?? 'off';
+    const userOverridden = native.getSetting('meeting_diarization_user_overridden') === 'true';
+    if (mode === 'off' && !userOverridden && native.speakerDiarizationAvailable()) {
+      native.setSetting('meeting_diarization_mode', 'embedding');
+      console.log('[diarization] Readiness flip: mode → embedding (WeSpeaker model present)');
+    }
+  } catch (err) {
+    console.warn('[diarization] Readiness flip failed (non-fatal):', err);
   }
 
   // Start meeting app auto-detection (default: enabled; user can disable in Settings)

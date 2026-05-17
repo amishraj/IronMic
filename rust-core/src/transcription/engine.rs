@@ -119,6 +119,22 @@ impl EngineKind {
 /// Engine.
 pub const DEFAULT_ENGINE: EngineKind = EngineKind::MoonshineBase;
 
+/// One Whisper-style segment with its in-clip timing. Used by the dual-stream
+/// meeting recorder to slice loopback audio for per-speaker embedding before
+/// the chunk buffer is zeroed. `start_ms` / `end_ms` are relative to the start
+/// of the clip passed to `transcribe_with_segments` (not to the meeting).
+///
+/// `no_speech_prob` is best-effort — only the Whisper-backed engine populates
+/// it (via whisper-rs's `full_get_segment_no_speech_prob`); other engines
+/// return `None` and callers must fall back to RMS / text-length gating.
+#[derive(Debug, Clone)]
+pub struct TranscriptSegmentDto {
+    pub text: String,
+    pub start_ms: u32,
+    pub end_ms: u32,
+    pub no_speech_prob: Option<f32>,
+}
+
 /// Unified speech-to-text interface. All concrete engines implement this.
 ///
 /// Engines are stored as `Box<dyn TranscriptionEngine>` in the global
@@ -160,6 +176,38 @@ pub trait TranscriptionEngine: Send {
         _context_terms: &[String],
     ) -> Result<String, IronMicError> {
         self.transcribe(samples, short)
+    }
+
+    /// Transcribe and return per-segment timing. The default impl runs
+    /// `transcribe_with_context` and wraps the whole result in a single
+    /// segment spanning [0, clip_duration_ms]. Whisper overrides this to
+    /// expose its real segment boundaries via whisper-rs.
+    ///
+    /// Used by the dual-stream meeting recorder to slice loopback audio for
+    /// per-speaker embedding. Engines that only have a single-segment view
+    /// (Moonshine) still satisfy the contract — diarization quality just
+    /// degrades to chunk-level. See "Moonshine fallback policy" in the
+    /// diarization plan.
+    fn transcribe_with_segments(
+        &mut self,
+        samples: &[f32],
+        short: bool,
+        context_terms: &[String],
+    ) -> Result<Vec<TranscriptSegmentDto>, IronMicError> {
+        let text = self.transcribe_with_context(samples, short, context_terms)?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Sample rate is fixed at 16 kHz for every code path that calls into
+        // this trait (cpal capture is resampled before reaching here).
+        let end_ms = ((samples.len() as f64 / 16_000.0) * 1000.0).round() as u32;
+        Ok(vec![TranscriptSegmentDto {
+            text: trimmed.to_string(),
+            start_ms: 0,
+            end_ms,
+            no_speech_prob: None,
+        }])
     }
 
     /// Replace the engine's stored dictionary with the given word list.
@@ -418,6 +466,16 @@ mod whisper_adapter {
             self.engine.transcribe_with_context(samples, short, context_terms)
         }
 
+        fn transcribe_with_segments(
+            &mut self,
+            samples: &[f32],
+            short: bool,
+            context_terms: &[String],
+        ) -> Result<Vec<TranscriptSegmentDto>, IronMicError> {
+            self.load()?;
+            self.engine.transcribe_with_segments(samples, short, context_terms)
+        }
+
         fn replace_dictionary(&mut self, words: Vec<String>) {
             self.engine.dictionary_mut().replace_words(words);
         }
@@ -591,6 +649,21 @@ pub fn transcribe_active_with_context(
         IronMicError::Transcription(format!("engine mutex poisoned: {}", e))
     })?;
     slot.transcribe_with_context(samples, short, context_terms)
+}
+
+/// Run inference and return per-segment timing. Whisper exposes its real
+/// segment boundaries; other engines return one segment spanning the clip.
+/// Used by the dual-stream meeting recorder to slice loopback audio for
+/// per-speaker embedding before the chunk buffer is zeroed.
+pub fn transcribe_active_with_segments(
+    samples: &[f32],
+    short: bool,
+    context_terms: &[String],
+) -> Result<Vec<TranscriptSegmentDto>, IronMicError> {
+    let mut slot = ENGINE.lock().map_err(|e| {
+        IronMicError::Transcription(format!("engine mutex poisoned: {}", e))
+    })?;
+    slot.transcribe_with_segments(samples, short, context_terms)
 }
 
 /// Replace the active engine's stored dictionary in one lock acquisition.

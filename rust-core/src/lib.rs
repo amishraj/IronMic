@@ -7,6 +7,7 @@ pub mod hotkey;
 pub mod keystroke;
 pub mod llm;
 pub mod rag;
+pub mod speaker;
 pub mod storage;
 pub mod transcription;
 pub mod tts;
@@ -1486,6 +1487,65 @@ mod napi_exports {
         samples.fill(0.0);
 
         Ok(transcript)
+    }
+
+    /// Transcribe and return per-segment timing as JSON. Used by the
+    /// dual-stream meeting recorder to slice loopback audio for per-speaker
+    /// embedding before the chunk buffer is zeroed.
+    ///
+    /// Return shape: JSON array of
+    /// `{ "text": string, "start_ms": u32, "end_ms": u32, "no_speech_prob": number | null }`.
+    /// Whisper provides real boundaries; Moonshine returns one segment
+    /// spanning the clip. JSON-first to match the existing
+    /// `addTranscriptSegment` / `listEntries` napi-rs surface and avoid a
+    /// shared `#[napi(object)]` type the renderer would have to import.
+    #[napi]
+    pub async fn transcribe_with_segments(
+        audio_buffer: Buffer,
+        terms_json: String,
+    ) -> napi::Result<String> {
+        init_tracing();
+        let context_terms: Vec<String> =
+            serde_json::from_str(&terms_json).unwrap_or_default();
+        info!(
+            terms = context_terms.len(),
+            "transcribeWithSegments called from N-API"
+        );
+
+        let bytes: &[u8] = &audio_buffer;
+        let mut samples = pcm16_to_f32(bytes)?;
+
+        let segments = engine::transcribe_active_with_segments(
+            &samples,
+            /* short */ false,
+            &context_terms,
+        )
+        .map_err(napi::Error::from)?;
+
+        samples.fill(0.0);
+
+        // Serialize manually — TranscriptSegmentDto isn't a Serialize type
+        // and we don't want to pull serde_derive onto it just for this.
+        let mut out = String::with_capacity(64 + segments.len() * 96);
+        out.push('[');
+        for (i, seg) in segments.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            // Escape text via serde_json — segment text is user-derived.
+            let text = serde_json::to_string(&seg.text)
+                .unwrap_or_else(|_| "\"\"".to_string());
+            let nsp = match seg.no_speech_prob {
+                Some(p) => format!("{}", p),
+                None => "null".to_string(),
+            };
+            out.push_str(&format!(
+                "{{\"text\":{},\"start_ms\":{},\"end_ms\":{},\"no_speech_prob\":{}}}",
+                text, seg.start_ms, seg.end_ms, nsp
+            ));
+        }
+        out.push(']');
+        Ok(out)
     }
 
     // ── Settings N-API exports ──
@@ -3099,6 +3159,123 @@ mod napi_exports {
         DATABASE
             .update_segment_speaker(&id, &speaker_label)
             .map_err(Into::into)
+    }
+
+    /// Whether the speaker-diarization runtime is ready: feature compiled
+    /// in AND the WeSpeaker model file is present on disk. Called by the
+    /// main-process readiness check on app start (M2.5b) to decide whether
+    /// to flip `meeting_diarization_mode` from `'off'` to `'embedding'`
+    /// for users who haven't explicitly opted out.
+    #[napi]
+    pub fn speaker_diarization_available() -> bool {
+        crate::speaker::is_available()
+    }
+
+    /// Embed a 16 kHz mono PCM16 audio slice into a 256-d L2-normalized
+    /// WeSpeaker ResNet34 speaker embedding.
+    ///
+    /// Input: PCM16 little-endian Buffer (same layout as
+    /// `drainMeetingBuffers().loopback`). Internally converts to Float32
+    /// in `[-1.0, 1.0]`, runs the ONNX inference, zeros the intermediate
+    /// Float32 vector, and returns the embedding as a 1024-byte Buffer
+    /// (256 × f32 little-endian).
+    ///
+    /// **Caller-side zeroing discipline:** mutating a napi-rs `Buffer`
+    /// from Rust is footgun-prone; the JS-side meeting recorder is
+    /// responsible for `.fill(0)` on the input PCM16 slice in a `finally`
+    /// block immediately after this resolves. The outer chunk
+    /// `try/finally` (M1.4) wipes the parent chunk Buffer as a backstop.
+    ///
+    /// Returns a Transcription-tagged error when the
+    /// `speaker-diarization` feature is not compiled in or the WeSpeaker
+    /// model file is missing — the meeting recorder treats these as
+    /// "skip embedding for this chunk; persist with speaker_label = null".
+    #[napi]
+    pub fn embed_speaker(audio_buffer: Buffer) -> napi::Result<Buffer> {
+        let bytes: &[u8] = &audio_buffer;
+        if bytes.is_empty() {
+            return Err(napi::Error::from_reason("empty audio buffer"));
+        }
+        let mut samples = pcm16_to_f32(bytes)?;
+
+        let embedding =
+            crate::speaker::embed(&samples).map_err(napi::Error::from);
+
+        // Always zero the intermediate Float32 vec — the audio must not
+        // outlive the embedding call regardless of success or failure.
+        samples.fill(0.0);
+
+        let embedding = embedding?;
+        debug_assert_eq!(embedding.len(), crate::speaker::SPEAKER_EMBEDDING_DIM);
+
+        // Pack 256 × f32 little-endian into a Buffer. Use to_le_bytes to
+        // make the wire format explicit and portable; the JS side reads
+        // it as a Float32Array view (host endianness is LE on every
+        // platform IronMic targets, but the explicit pack is cheap).
+        let mut out = Vec::with_capacity(embedding.len() * 4);
+        for f in embedding.iter() {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+        Ok(Buffer::from(out))
+    }
+
+    /// Attach a speaker embedding to a transcript segment. Called from the
+    /// meeting recorder right after Whisper segment → WeSpeaker embed in the
+    /// dual-stream chunk loop. `embedding` is raw f32 little-endian bytes
+    /// (256 floats = 1024 bytes for WeSpeaker ResNet34); `model` is a stable
+    /// version string (e.g. `'wespeaker-resnet34-LM-v1'`) so a future model
+    /// swap can be detected and re-embedded.
+    #[napi]
+    pub fn update_segment_embedding(
+        id: String,
+        embedding: Buffer,
+        model: String,
+        confidence: f64,
+    ) -> napi::Result<()> {
+        DATABASE
+            .update_segment_embedding(&id, &embedding, &model, confidence as f32)
+            .map_err(Into::into)
+    }
+
+    /// List per-segment speaker embeddings for a session, optionally filtered
+    /// by `source` (typically `'loopback'`). Returns a JSON array of
+    /// `{ id, speaker_label, start_ms, embedding }` where `embedding` is
+    /// base64-encoded raw f32 little-endian bytes. The AHC refinement pass
+    /// at stop-of-meeting reads this to rebuild a temporary clusterer from
+    /// the DB (which is canonical at stop) rather than relying on live state.
+    ///
+    /// Base64 encoding is used so the JSON stays valid and renderer-side
+    /// callers don't have to handle a binary multipart payload — the AHC
+    /// caller decodes back to a Float32Array.
+    #[napi]
+    pub fn list_segment_embeddings(
+        session_id: String,
+        source_filter: Option<String>,
+    ) -> napi::Result<String> {
+        use base64::{engine::general_purpose, Engine as _};
+        let rows = DATABASE
+            .list_segment_embeddings(&session_id, source_filter.as_deref())
+            .map_err(Into::<napi::Error>::into)?;
+        // Emit base64 manually so we don't need a serde adapter for Vec<u8>.
+        let mut out = String::with_capacity(64 + rows.len() * 1500);
+        out.push('[');
+        for (i, r) in rows.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let label_json = match &r.speaker_label {
+                Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
+                None => "null".into(),
+            };
+            let id_json = serde_json::to_string(&r.id).unwrap_or_else(|_| "\"\"".into());
+            let emb_b64 = general_purpose::STANDARD.encode(&r.embedding);
+            out.push_str(&format!(
+                "{{\"id\":{},\"speaker_label\":{},\"start_ms\":{},\"embedding_b64\":\"{}\"}}",
+                id_json, label_json, r.start_ms, emb_b64
+            ));
+        }
+        out.push(']');
+        Ok(out)
     }
 
     /// Assemble the full transcript text for a session by joining all segments.
