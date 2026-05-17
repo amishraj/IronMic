@@ -46,6 +46,7 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
   // EITHER is true so it never blinks off between the renderer ack and the
   // backend's first push.
   const isEngineSwapping = useMeetingStore((s) => s.isEngineSwapping);
+  const remoteCaptureMode = useMeetingStore((s) => s.remoteCaptureMode);
   const showSpinner = busy || (isRecording && isEngineSwapping);
   const popoverRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
@@ -195,6 +196,13 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
               ? 'Switching applies on the next 30 s chunk.'
               : 'Used for this and future meetings. Dictation is unaffected.'}
           </p>
+          {isRecording && remoteCaptureMode && (
+            <p className="mx-2 mb-2 text-[10px] text-amber-400/90 bg-amber-500/5 border border-amber-500/20 rounded-md px-2 py-1.5 leading-snug">
+              Remote-meeting capture is on — engines run in chunked mode (no
+              live grey-typing). Picking a Moonshine engine still works, but
+              dual-stream streaming is deferred to a future release.
+            </p>
+          )}
           <div className="flex flex-col gap-1">
             {TRANSCRIPTION_ENGINES.map((e) => {
               const isSelected = e.id === currentMeetingEngine;

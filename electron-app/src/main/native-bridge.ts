@@ -126,6 +126,15 @@ function createStubs(): Record<string, (...args: any[]) => any> {
     // Meeting recording stubs (Granola mode)
     startRecordingFromDevice: () => {},
     drainRecordingBuffer: () => Buffer.alloc(0),
+    // Dual-stream meeting capture stubs (remote-meeting mode).
+    // Real impls live in rust-core/src/audio/meeting_capture.rs +
+    // loopback_windows.rs. The stub claims no loopback so renderer falls
+    // back to single-stream behavior on un-rebuilt addons.
+    startMeetingRecordingDual: () => {},
+    drainMeetingBuffers: () => ({ mic: Buffer.alloc(0), loopback: null, loopbackActive: false }),
+    stopMeetingRecordingDual: () => ({ mic: Buffer.alloc(0), loopback: null, loopbackActive: false }),
+    meetingHasLoopback: () => false,
+    resetMeetingRecordingDual: () => {},
     addTranscriptSegment: () => JSON.stringify({ id: 'stub', session_id: '', speaker_label: null, start_ms: 0, end_ms: 0, text: '', source: 'meeting', participant_id: null, confidence: null, created_at: new Date().toISOString() }),
     listTranscriptSegments: () => '[]',
     updateSegmentSpeaker: () => {},
@@ -331,6 +340,52 @@ export const native = {
   moonshineSessionReset(): void {
     if (typeof this.addon.moonshineSessionReset === 'function') {
       this.addon.moonshineSessionReset();
+    }
+  },
+
+  // ── Dual-stream meeting capture (remote-meeting mode) ─────────────────────
+  // Mic + WASAPI loopback into separate ring buffers, so segments can be
+  // tagged 'mic' vs 'loopback' at capture time instead of relying on LLM
+  // diarization. Only the Windows target ships a working loopback half;
+  // other platforms (and un-rebuilt addons) return loopbackActive=false and
+  // the recorder falls back to mic-only.
+  meetingDualSupported(): boolean {
+    return typeof this.addon.startMeetingRecordingDual === 'function'
+      && typeof this.addon.drainMeetingBuffers === 'function'
+      && typeof this.addon.stopMeetingRecordingDual === 'function';
+  },
+  startMeetingRecordingDual(micDeviceName: string | null, loopbackMode: string): void {
+    if (typeof this.addon.startMeetingRecordingDual === 'function') {
+      this.addon.startMeetingRecordingDual(micDeviceName ?? undefined, loopbackMode);
+    } else {
+      throw new Error('Dual-stream meeting capture not supported by this addon build');
+    }
+  },
+  drainMeetingBuffers(): { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean } {
+    const raw = this.addon.drainMeetingBuffers();
+    return {
+      mic: raw.mic,
+      loopback: raw.loopback ?? null,
+      loopbackActive: !!raw.loopbackActive,
+    };
+  },
+  stopMeetingRecordingDual(): { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean } {
+    const raw = this.addon.stopMeetingRecordingDual();
+    return {
+      mic: raw.mic,
+      loopback: raw.loopback ?? null,
+      loopbackActive: !!raw.loopbackActive,
+    };
+  },
+  meetingHasLoopback(): boolean {
+    if (typeof this.addon.meetingHasLoopback === 'function') {
+      return !!this.addon.meetingHasLoopback();
+    }
+    return false;
+  },
+  resetMeetingRecordingDual(): void {
+    if (typeof this.addon.resetMeetingRecordingDual === 'function') {
+      this.addon.resetMeetingRecordingDual();
     }
   },
 

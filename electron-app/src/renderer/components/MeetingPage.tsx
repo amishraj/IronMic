@@ -33,6 +33,7 @@ export function MeetingPage() {
     segments, addSegment, clearSegments,
     draftHypothesis, setDraftHypothesis,
     streamingMode, setStreamingMode,
+    setRemoteCaptureMode, setRemoteCaptureLoopbackActive,
     selectedAudioDevice, setSelectedAudioDevice,
     isGranolaRecording, setIsGranolaRecording,
     isGranolaStopping, setIsGranolaStopping,
@@ -177,6 +178,21 @@ export function MeetingPage() {
   // Cleared on leave/end.
   const [welcomeNotesHtml, setWelcomeNotesHtml] = useState<string | undefined>(undefined);
 
+  // Remote-meeting capture toggle (per-meeting, defaults to the global
+  // `meeting_remote_capture_enabled` setting). When ON, the recorder runs
+  // dual-stream mic + WASAPI loopback so segments are tagged "You" / "Remote"
+  // at capture time. Solo-mode only in v1; host/participant modes hide this.
+  const [remoteCaptureEnabled, setRemoteCaptureEnabled] = useState<boolean>(false);
+  const remoteCaptureIsAvailable = navigator.userAgent.toLowerCase().includes('windows');
+  useEffect(() => {
+    (async () => {
+      try {
+        const v = await window.ironmic.getSetting('meeting_remote_capture_enabled');
+        setRemoteCaptureEnabled(v === 'true' && remoteCaptureIsAvailable);
+      } catch { /* default false */ }
+    })();
+  }, [remoteCaptureIsAvailable]);
+
   // Live meeting title — editable by host, read-only on participant. Defaults
   // to the local "Meeting #N" placeholder until the host (or solo user)
   // provides one. Synced live via the room server's title_update broadcast.
@@ -215,6 +231,11 @@ export function MeetingPage() {
       // Mirror the recorder's streamingMode so the empty-state copy and any
       // future UI affordances can branch on it. Defaults to false on idle.
       setStreamingMode(!!state.streamingMode && state.status === 'recording');
+      // Mirror dual-stream remote-meeting capture state. Used by the engine
+      // gear popover to surface a "live streaming disabled" hint and by any
+      // future UI affordances keyed to capture mode.
+      setRemoteCaptureMode(!!state.remoteCaptureMode && state.status === 'recording');
+      setRemoteCaptureLoopbackActive(!!state.remoteCaptureLoopbackActive && state.status === 'recording');
       // Mirror backend self-mute. Backend is source of truth — we never flip
       // isMicMuted optimistically; the renderer's toolbar button calls IPC
       // and waits for the recording-state event to update the store.
@@ -625,11 +646,20 @@ export function MeetingPage() {
       // never throws, so the original `err` is what gets re-thrown to the
       // outer catch.
       try {
+        // Remote-meeting capture is solo-mode only in v1. Host/participant
+        // modes already mix peer audio via the room layer; layering loopback
+        // on top would produce overlapping source semantics.
+        const wantRemoteCapture = remoteCaptureEnabled
+          && roomMode === 'solo'
+          && remoteCaptureIsAvailable;
         await window.ironmic.meetingStartRecording(
           session.id,
           selectedAudioDevice ?? null,
           undefined,
           roomDisplayName || null,
+          wantRemoteCapture
+            ? { enabled: true, loopbackDevice: 'system_default' }
+            : null,
         );
       } catch (err) {
         await restoreMeetingEngine();
@@ -653,7 +683,7 @@ export function MeetingPage() {
     } catch (err) {
       console.error('[MeetingPage] Failed to start Granola recording:', err);
     }
-  }, [selectedTemplate, detectedApp, selectedAudioDevice, roomMode, roomDisplayName, isGranolaStopping, isGranolaRecording]);
+  }, [selectedTemplate, detectedApp, selectedAudioDevice, roomMode, roomDisplayName, isGranolaStopping, isGranolaRecording, remoteCaptureEnabled, remoteCaptureIsAvailable]);
 
   // ── Join an existing room ──
   const parseInvite = (raw: string): { ip: string; port: number; code: string } | null => {
@@ -1949,6 +1979,37 @@ export function MeetingPage() {
               onDeviceChange={setSelectedAudioDevice}
             />
           </div>
+
+          {/* Remote-meeting capture (per-meeting toggle). Solo mode only;
+              hidden in host/participant modes where room semantics already
+              mix peer audio. Disabled with explanation on non-Windows. */}
+          {roomMode === 'solo' && (
+            <div className="space-y-1">
+              <label className="flex items-center justify-between gap-2 cursor-pointer">
+                <div className="flex-1">
+                  <p className="text-[11px] text-iron-text-muted">Capture remote participants</p>
+                  <p className="text-[10px] text-iron-text-muted/80 leading-snug mt-0.5">
+                    {remoteCaptureIsAvailable
+                      ? 'Transcribes both your mic and the audio playing through your speakers, with separate "You" / "Remote" labels. Use headphones for clean separation.'
+                      : 'Windows-only in v1. On macOS / Linux, install BlackHole or VB-CABLE and pick it as the audio source above.'}
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="w-4 h-4 accent-iron-accent shrink-0"
+                  checked={remoteCaptureEnabled}
+                  disabled={!remoteCaptureIsAvailable}
+                  onChange={(e) => setRemoteCaptureEnabled(e.target.checked)}
+                />
+              </label>
+              {remoteCaptureEnabled && remoteCaptureIsAvailable && (
+                <p className="text-[10px] text-amber-400/90 bg-amber-500/5 border border-amber-500/20 rounded-md px-2 py-1.5 leading-snug">
+                  Tip: wear headphones. Audio leaking from speakers back into your mic
+                  will appear once under "Remote" and faintly again under "You".
+                </p>
+              )}
+            </div>
+          )}
 
           {/* Meeting transcription engine picker (pre-recording).
               Persists `meeting_transcription_engine`; applyMeetingEngine

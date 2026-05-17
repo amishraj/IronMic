@@ -1445,6 +1445,12 @@ function VoiceAISettings() {
   const [workflowConfidence, setWorkflowConfidence] = useState(0.7);
   const [semanticSearchEnabled, setSemanticSearchEnabled] = useState(false);
   const [meetingAutoDetect, setMeetingAutoDetect] = useState(false);
+  // Remote-meeting capture: dual-stream mic + WASAPI loopback so segments can
+  // be tagged "You" / "Remote" at capture time without LLM diarization.
+  // Windows-only in v1; non-Windows users see a disabled toggle with an
+  // explanation pointing at the virtual-loopback setup modal.
+  const [remoteCaptureEnabled, setRemoteCaptureEnabled] = useState(false);
+  const isWindows = navigator.userAgent.toLowerCase().includes('windows');
 
   useEffect(() => {
     (async () => {
@@ -1462,6 +1468,7 @@ function VoiceAISettings() {
       setWorkflowConfidence(parseFloat(await val('ml_workflows_confidence', '0.7')));
       setSemanticSearchEnabled((await val('ml_semantic_search_enabled', 'false')) === 'true');
       setMeetingAutoDetect((await val('meeting_auto_detect_enabled', 'false')) === 'true');
+      setRemoteCaptureEnabled((await val('meeting_remote_capture_enabled', 'false')) === 'true');
     })();
   }, []);
 
@@ -1519,6 +1526,22 @@ function VoiceAISettings() {
               <Toggle
                 checked={meetingAutoDetect}
                 onChange={(v) => { setMeetingAutoDetect(v); update('meeting_auto_detect_enabled', String(v)); }}
+              />
+            }
+          />
+          <SettingRow
+            icon={Users}
+            title="Capture Remote Participants by Default"
+            description={
+              isWindows
+                ? 'Run new meetings in dual-stream mode: your mic AND system audio (the remote participants you hear) are transcribed separately, so the transcript labels "You" vs "Remote" without LLM guessing. Recommended with headphones — speakers can leak remote audio back into your mic.'
+                : 'Available on Windows only in v1. On macOS / Linux, install a virtual loopback driver (BlackHole, VB-CABLE, PulseAudio monitor sink) and pick it as the meeting audio device.'
+            }
+            control={
+              <Toggle
+                checked={remoteCaptureEnabled}
+                disabled={!isWindows}
+                onChange={(v) => { setRemoteCaptureEnabled(v); update('meeting_remote_capture_enabled', String(v)); }}
               />
             }
           />

@@ -2872,6 +2872,160 @@ mod napi_exports {
         Ok(bytes.into())
     }
 
+    // ── Dual-stream Meeting Recording (remote-meeting capture) ──
+    //
+    // A separate engine from the dictation `CaptureEngine` so that
+    // dictation / Forge / streaming meetings keep working unchanged. The
+    // engine pairs a cpal mic stream with a WASAPI loopback stream so the
+    // recorder can tag each drained chunk's source ("You" vs "Remote") at
+    // capture time, without relying on LLM diarization to disambiguate
+    // overlapping voices in a single mixed transcript.
+
+    use crate::audio::meeting_capture::{LoopbackMode, MeetingCaptureEngine};
+
+    static MEETING_CAPTURE_ENGINE: std::sync::LazyLock<Mutex<MeetingCaptureEngine>> =
+        std::sync::LazyLock::new(|| Mutex::new(MeetingCaptureEngine::new()));
+
+    /// Result type for the dual-drain / dual-stop N-API exports. Each side
+    /// is a 16 kHz mono PCM16 little-endian buffer ready for Whisper; the
+    /// loopback side is `None` when remote capture was disabled or
+    /// unavailable on this platform.
+    #[napi(object)]
+    pub struct DualBuffers {
+        pub mic: Buffer,
+        pub loopback: Option<Buffer>,
+        /// True when a loopback stream was successfully started. The
+        /// recorder uses this to decide whether to tag any 'loopback'
+        /// segments at all.
+        pub loopback_active: bool,
+    }
+
+    fn loopback_mode_from_str(s: &str) -> LoopbackMode {
+        if s == "system_default" {
+            LoopbackMode::SystemDefault
+        } else if s == "none" || s.is_empty() {
+            LoopbackMode::None
+        } else if let Some(id) = s.strip_prefix("device:") {
+            LoopbackMode::Device(id.to_string())
+        } else {
+            // Unknown selector — be conservative.
+            LoopbackMode::None
+        }
+    }
+
+    /// Start dual-stream meeting capture.
+    ///
+    /// * `mic_device_name` — optional cpal input device name. `None` =
+    ///   system default mic.
+    /// * `loopback_mode` — `"system_default"` for WASAPI default render,
+    ///   `"device:<id>"` for a specific render endpoint, `"none"` for
+    ///   mic-only.
+    #[napi]
+    pub fn start_meeting_recording_dual(
+        mic_device_name: Option<String>,
+        loopback_mode: String,
+    ) -> napi::Result<()> {
+        init_tracing();
+        info!(
+            mic_device = ?mic_device_name,
+            loopback_mode = %loopback_mode,
+            "startMeetingRecordingDual called from N-API"
+        );
+        let mode = loopback_mode_from_str(&loopback_mode);
+        let mut engine = MEETING_CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+        engine
+            .start_dual(mic_device_name.as_deref(), mode)
+            .map_err(Into::into)
+    }
+
+    /// Drain both meeting buffers WITHOUT stopping the streams. Returns
+    /// 16 kHz mono PCM16 buffers for mic and (optionally) loopback.
+    #[napi]
+    pub fn drain_meeting_buffers() -> napi::Result<DualBuffers> {
+        let mut engine = MEETING_CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+        let drained = engine.drain_dual().map_err(napi::Error::from)?;
+        let loopback_active = drained.loopback.is_some();
+        let mic_buf = captured_to_pcm16_buffer(drained.mic)?;
+        let loopback_buf = match drained.loopback {
+            Some(c) => Some(captured_to_pcm16_buffer(c)?),
+            None => None,
+        };
+        Ok(DualBuffers {
+            mic: mic_buf,
+            loopback: loopback_buf,
+            loopback_active,
+        })
+    }
+
+    /// Stop both meeting streams and return the final flush of each.
+    #[napi]
+    pub fn stop_meeting_recording_dual() -> napi::Result<DualBuffers> {
+        info!("stopMeetingRecordingDual called from N-API");
+        let mut engine = MEETING_CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+        let drained = engine.stop_dual().map_err(napi::Error::from)?;
+        let loopback_active = drained.loopback.is_some();
+        let mic_buf = captured_to_pcm16_buffer(drained.mic)?;
+        let loopback_buf = match drained.loopback {
+            Some(c) => Some(captured_to_pcm16_buffer(c)?),
+            None => None,
+        };
+        Ok(DualBuffers {
+            mic: mic_buf,
+            loopback: loopback_buf,
+            loopback_active,
+        })
+    }
+
+    /// True when the meeting engine has an active loopback stream. Cheap
+    /// readiness probe for the renderer engine-picker interlock.
+    #[napi]
+    pub fn meeting_has_loopback() -> napi::Result<bool> {
+        let engine = MEETING_CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+        Ok(engine.has_loopback())
+    }
+
+    /// Reset the dual engine to idle for error recovery.
+    #[napi]
+    pub fn reset_meeting_recording_dual() -> napi::Result<()> {
+        let mut engine = MEETING_CAPTURE_ENGINE
+            .lock()
+            .map_err(|e| napi::Error::from_reason(format!("Lock poisoned: {e}")))?;
+        engine.force_reset();
+        Ok(())
+    }
+
+    /// Convert a CapturedAudio into the 16 kHz mono PCM16 little-endian
+    /// Node Buffer shape the rest of the meeting pipeline expects. Zeroes
+    /// the source samples on the way out, mirroring `stop_recording`.
+    fn captured_to_pcm16_buffer(mut captured: CapturedAudio) -> napi::Result<Buffer> {
+        // Empty buffers can happen on the very first drain — return an
+        // empty Buffer rather than treating that as an error.
+        if captured.samples.is_empty() {
+            return Ok(Vec::<u8>::new().into());
+        }
+        let mut processed =
+            processor::prepare_for_whisper(&captured).map_err(napi::Error::from)?;
+        captured.zero();
+        let pcm_i16 = processor::f32_to_i16_pcm(&processed.samples);
+        processed.samples.fill(0.0);
+        processed.samples.clear();
+        let mut bytes: Vec<u8> = Vec::with_capacity(pcm_i16.len() * 2);
+        for sample in &pcm_i16 {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        Ok(bytes.into())
+    }
+
+    use crate::audio::capture::CapturedAudio;
+
     // ── Transcript Segments ──
 
     /// Add a transcript segment to a meeting session.

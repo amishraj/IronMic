@@ -313,7 +313,7 @@ impl CaptureEngine {
     /// WASAPI devices that report 192 kHz as their max — rubato handles the
     /// resampling but the very high ratio degrades quality. 48 kHz → 16 kHz
     /// (3:1) is the ideal target; 44100 and 96000 also resample cleanly.
-    fn preferred_config(device: &Device) -> Result<(StreamConfig, SampleFormat), IronMicError> {
+    pub(crate) fn preferred_config(device: &Device) -> Result<(StreamConfig, SampleFormat), IronMicError> {
         const PREFERRED_RATES: &[u32] = &[48_000, 44_100, 16_000, 24_000, 96_000, 192_000];
 
         let supported: Vec<_> = device
@@ -360,7 +360,7 @@ impl CaptureEngine {
 /// buffer regardless of the device's native sample format. Dispatches on
 /// SampleFormat so I16 / U16 devices (common on Windows WASAPI laptop and USB
 /// mics) are converted to f32 inside the audio callback before being pushed.
-fn build_input_stream_for_format(
+pub(crate) fn build_input_stream_for_format(
     device: &Device,
     config: &StreamConfig,
     format: SampleFormat,

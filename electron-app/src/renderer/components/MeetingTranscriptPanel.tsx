@@ -37,6 +37,7 @@ const SPEAKER_COLORS = [
 ];
 
 const ME_COLOR = 'bg-green-100 text-green-700';
+const REMOTE_COLOR = 'bg-sky-100 text-sky-700';
 
 function getSpeakerColor(label: string): string {
   // Extract the numeric part of "Speaker N" or participant name hash
@@ -46,13 +47,19 @@ function getSpeakerColor(label: string): string {
 }
 
 /** A segment is "mine" (produced by this machine's mic) when its source is
- *  neither a broadcast received from the host nor a `participant:<name>`
- *  segment forwarded from another room peer. */
+ *  the local microphone — either the new explicit 'mic' value or the legacy
+ *  'meeting' value used by pre-v1.8 single-stream recordings. Broadcast,
+ *  participant:*, and 'loopback' (remote-meeting capture) are NOT mine. */
 function isOwnSegment(seg: TranscriptSegment): boolean {
   const src = seg.source ?? '';
-  if (src === 'broadcast') return false;
-  if (src.startsWith('participant:')) return false;
-  return true;
+  return src === 'mic' || src === 'meeting';
+}
+
+/** A segment is "remote" (loopback / system-audio capture) when its source
+ *  is 'loopback'. Rendered with the REMOTE_COLOR badge and, while diarization
+ *  is still pending, shows the placeholder "Remote (pending diarization…)". */
+function isLoopbackSegment(seg: TranscriptSegment): boolean {
+  return (seg.source ?? '') === 'loopback';
 }
 
 function formatMs(ms: number): string {
@@ -222,12 +229,26 @@ function MeetingTranscriptPanelInner({ segments, isLive, draftHypothesis, stream
     >
       {segments.map((segment) => {
         const own = isOwnSegment(segment);
-        const badgeText = own ? 'Me' : segment.speaker_label;
-        const badgeClass = own
-          ? ME_COLOR
-          : segment.speaker_label
+        const loopback = isLoopbackSegment(segment);
+        let badgeText: string | null;
+        let badgeClass: string;
+        if (own) {
+          badgeText = 'Me';
+          badgeClass = ME_COLOR;
+        } else if (loopback) {
+          // Loopback: prefer a diarization label if one has landed; otherwise
+          // show "Remote" with a pending-diarization sublabel underneath.
+          badgeText = segment.speaker_label ?? 'Remote';
+          badgeClass = segment.speaker_label
+            ? getSpeakerColor(segment.speaker_label)
+            : REMOTE_COLOR;
+        } else {
+          badgeText = segment.speaker_label;
+          badgeClass = segment.speaker_label
             ? getSpeakerColor(segment.speaker_label)
             : 'bg-iron-surface-hover text-iron-text-muted';
+        }
+        const showPending = loopback && !segment.speaker_label;
         return (
           <div key={segment.id} className="group">
             <div className="flex items-start gap-2">
@@ -242,7 +263,14 @@ function MeetingTranscriptPanelInner({ segments, isLive, draftHypothesis, stream
                 {badgeText ?? '–'}
               </span>
               {/* Transcript text */}
-              <p className="text-sm text-iron-text leading-relaxed flex-1">{segment.text}</p>
+              <div className="flex-1">
+                <p className="text-sm text-iron-text leading-relaxed">{segment.text}</p>
+                {showPending && (
+                  <p className="text-[10px] text-iron-text-muted italic mt-0.5">
+                    pending diarization…
+                  </p>
+                )}
+              </div>
             </div>
           </div>
         );

@@ -17,7 +17,12 @@ pub struct TranscriptSegment {
     pub start_ms: i64,
     pub end_ms: i64,
     pub text: String,
-    /// 'meeting' | 'participant:{name}' (Phase 2)
+    /// Source of this segment. Possible values:
+    ///   'mic'              — local user's microphone (default for new local recordings)
+    ///   'loopback'         — local system audio output (remote-meeting capture)
+    ///   'participant:NAME' — forwarded from a room peer over WebSocket
+    ///   'broadcast'        — host's audio broadcast in room mode
+    ///   'meeting'          — legacy single-stream segments (read-only / historical)
     pub source: String,
     /// NULL for solo; peer UUID for multi-user (Phase 2)
     pub participant_id: Option<String>,

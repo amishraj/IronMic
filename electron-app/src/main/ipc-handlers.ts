@@ -71,6 +71,12 @@ const ALLOWED_SETTING_KEYS = new Set([
   'meeting_auto_detect_enabled', 'meeting_default_template',
   // Meeting recording / Granola mode (v1.5.0)
   'meeting_audio_device', 'meeting_chunk_interval_s', 'meeting_display_name',
+  // Remote-meeting capture (v1.8.x): dual-stream mic + system-audio loopback.
+  // `meeting_remote_capture_enabled` is the global default for the per-meeting
+  // toggle on the start screen; `meeting_loopback_device` selects which render
+  // endpoint to capture from ('system_default' picks the default speakers
+  // and follows device changes; 'device:<id>' targets a named MMDevice id).
+  'meeting_remote_capture_enabled', 'meeting_loopback_device',
   // Collaboration (v1.6.0)
   'meeting_collab_display_name',
   // Notebooks — JSON array of {id,name,createdAt}
@@ -1426,7 +1432,14 @@ If the text is too short or unclear, output: ["General"]`;
 
   // ── Meeting Recording (Granola-style chunk loop) ──
 
-  ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (_event, sessionId: string, deviceName?: string | null, chunkIntervalS?: number, hostDisplayName?: string | null) => {
+  ipcMain.handle(IPC_CHANNELS.MEETING_START_RECORDING, async (
+    _event,
+    sessionId: string,
+    deviceName?: string | null,
+    chunkIntervalS?: number,
+    hostDisplayName?: string | null,
+    remoteCaptureOpts?: { enabled?: boolean; loopbackDevice?: string | null } | null,
+  ) => {
     assertString(sessionId, 'sessionId');
     // If the renderer didn't pass an interval, read the user's configured value
     // from settings; fall back to 15s. Clamp to [10, 60] — shorter hurts Whisper
@@ -1442,7 +1455,33 @@ If the text is too short or unclear, output: ["General"]`;
       }
     }
     interval = Math.max(10, Math.min(60, Math.round(interval)));
-    await meetingRecorder.startMeetingRecording(sessionId, deviceName, interval, hostDisplayName ?? null);
+
+    // Resolve remote-capture opts. If the renderer passed an explicit toggle,
+    // honor it; otherwise fall back to the global default in settings.
+    let remoteCaptureEnabled = remoteCaptureOpts?.enabled;
+    let loopbackDevice = remoteCaptureOpts?.loopbackDevice ?? null;
+    if (typeof remoteCaptureEnabled !== 'boolean') {
+      try {
+        remoteCaptureEnabled = (native.getSetting('meeting_remote_capture_enabled') ?? 'false') === 'true';
+      } catch {
+        remoteCaptureEnabled = false;
+      }
+    }
+    if (remoteCaptureEnabled && !loopbackDevice) {
+      try {
+        loopbackDevice = native.getSetting('meeting_loopback_device') ?? 'system_default';
+      } catch {
+        loopbackDevice = 'system_default';
+      }
+    }
+
+    await meetingRecorder.startMeetingRecording(
+      sessionId,
+      deviceName,
+      interval,
+      hostDisplayName ?? null,
+      remoteCaptureEnabled ? { loopbackDevice: loopbackDevice || 'system_default' } : null,
+    );
     // Kick off the live-summary stream for this session.
     try { liveSummarizer.start(sessionId); }
     catch (err) { console.warn('[ipc] liveSummarizer.start failed:', err); }
