@@ -80,6 +80,11 @@ windows = { version = "0.58", features = [
   "Win32_System_Variant",
   "Win32_Devices_FunctionDiscovery",
   "Win32_Foundation",
+  # CreateEventW's `lpEventAttributes` is `Option<*const SECURITY_ATTRIBUTES>`,
+  # and `windows = "0.58"` gates the function on `Win32_Security`. Without
+  # this feature, `use windows::Win32::System::Threading::CreateEventW`
+  # is gated out and the import fails to resolve.
+  "Win32_Security",
 ] }
 
 [build-dependencies]

@@ -44,7 +44,7 @@ mod imp {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
     use tracing::{debug, error, info, warn};
-    use windows::core::{Interface, GUID, HRESULT, PCWSTR};
+    use windows::core::{GUID, HRESULT, PCWSTR};
     use windows::Win32::Foundation::{BOOL, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::{
         eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
@@ -160,7 +160,7 @@ mod imp {
                     }
                     Err(err) => {
                         error!(%err, "WASAPI loopback session failed");
-                        return Err(err);
+                        return Err(err.into());
                     }
                 }
             }
@@ -351,7 +351,7 @@ mod imp {
                     .map_err(LoopbackError::from)?;
 
                 if frames_available > 0 {
-                    let f32_samples = if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0) != 0 {
+                    let f32_samples = if (flags & AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
                         // Silent packet — fill zeros rather than reading
                         // undefined buffer contents.
                         vec![0.0_f32; frames_available as usize * channels]
@@ -398,11 +398,16 @@ mod imp {
                 return SampleFormat::F32;
             }
             if fmt.wFormatTag == WAVE_FORMAT_EXTENSIBLE as u16 {
-                let ext = &*(fmt_ptr as *const WAVEFORMATEXTENSIBLE);
-                if ext.SubFormat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
+                // WAVEFORMATEXTENSIBLE is `#[repr(C, packed(1))]`, so taking a
+                // reference to `ext.SubFormat` is UB even on a properly-aligned
+                // allocation. Read it through a raw pointer instead.
+                let ext_ptr = fmt_ptr as *const WAVEFORMATEXTENSIBLE;
+                let subformat: GUID =
+                    std::ptr::read_unaligned(std::ptr::addr_of!((*ext_ptr).SubFormat));
+                if subformat == KSDATAFORMAT_SUBTYPE_IEEE_FLOAT {
                     return SampleFormat::F32;
                 }
-                if ext.SubFormat == KSDATAFORMAT_SUBTYPE_PCM {
+                if subformat == KSDATAFORMAT_SUBTYPE_PCM {
                     if fmt.wBitsPerSample == 32 {
                         return SampleFormat::I32;
                     }
