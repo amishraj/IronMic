@@ -110,10 +110,8 @@ pub fn retrieve(
                 |row| Ok((row.get::<_, String>(0)?, -row.get::<_, f64>(1)?)),
             )
             .map_err(|e| IronMicError::Storage(format!("fts query failed: {e}")))?;
-        for r in rows {
-            if let Ok(pair) = r {
-                fts_hits.push(pair);
-            }
+        for pair in rows.flatten() {
+            fts_hits.push(pair);
         }
     }
 
@@ -147,12 +145,10 @@ pub fn retrieve(
             // smarter version would heap-bound, but at ~10k chunks the full
             // scan is faster than a heap due to branch prediction and cache.
             let mut scored: Vec<(String, f64)> = Vec::new();
-            for r in rows {
-                if let Ok((id, bytes)) = r {
-                    let s = vector::score_against_query(&q_vec, &bytes, dim);
-                    if s.is_finite() && s > 0.0 {
-                        scored.push((id, s as f64));
-                    }
+            for (id, bytes) in rows.flatten() {
+                let s = vector::score_against_query(&q_vec, &bytes, dim);
+                if s.is_finite() && s > 0.0 {
+                    scored.push((id, s as f64));
                 }
             }
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -254,7 +250,7 @@ fn is_stopword(token: &str) -> bool {
     STOPWORDS.binary_search(&token).is_ok()
         // Linear fallback if STOPWORDS isn't sorted (it isn't — we keep it
         // readable rather than alphabetic). Cheap enough at ~70 items.
-        || STOPWORDS.iter().any(|w| *w == token)
+        || STOPWORDS.contains(&token)
 }
 
 /// FTS5 syntax requires a `MATCH` clause that's valid. User input goes
@@ -515,7 +511,7 @@ fn build_vector_candidate_sql(filters: &IntentFilters, skip_archived: bool) -> S
 /// `model_version` here. For now we use byte-length / 4 as a sanity dim
 /// inference — caller has already chosen a model so this is just defensive.
 fn guess_dim_for_query_bytes(bytes: &[u8]) -> usize {
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return 384; // sane default; decode will fail gracefully
     }
     bytes.len() / 4
@@ -533,8 +529,7 @@ fn hydrate_hits(conn: &rusqlite::Connection, merged: &[(String, f64)]) -> Result
         return Ok(Vec::new());
     }
 
-    let placeholders = std::iter::repeat("?")
-        .take(merged.len())
+    let placeholders = std::iter::repeat_n("?", merged.len())
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
@@ -552,7 +547,7 @@ fn hydrate_hits(conn: &rusqlite::Connection, merged: &[(String, f64)]) -> Result
     }
 
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(params.iter().map(|p| *p)), |row| {
+        .query_map(rusqlite::params_from_iter(params.iter().copied()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -566,11 +561,12 @@ fn hydrate_hits(conn: &rusqlite::Connection, merged: &[(String, f64)]) -> Result
         .map_err(|e| IronMicError::Storage(format!("hydrate query failed: {e}")))?;
 
     use std::collections::HashMap;
-    let mut by_id: HashMap<String, (String, String, String, Option<i64>, Option<String>, Option<String>)> = HashMap::new();
-    for r in rows {
-        if let Ok((id, st, sid, text, sms, sl, hp)) = r {
-            by_id.insert(id, (st, sid, text, sms, sl, hp));
-        }
+    /// Hydration meta: `(source_type, source_id, text, start_ms, speaker_label, heading_path)`.
+    /// Aliased to keep the HashMap type signature readable per clippy::type_complexity.
+    type ChunkMeta = (String, String, String, Option<i64>, Option<String>, Option<String>);
+    let mut by_id: HashMap<String, ChunkMeta> = HashMap::new();
+    for (id, st, sid, text, sms, sl, hp) in rows.flatten() {
+        by_id.insert(id, (st, sid, text, sms, sl, hp));
     }
 
     // Build the final ordered list in fused-score order.
@@ -578,7 +574,7 @@ fn hydrate_hits(conn: &rusqlite::Connection, merged: &[(String, f64)]) -> Result
     for (id, score) in merged {
         let Some(meta) = by_id.remove(id) else { continue; };
         let (source_type, source_id, text, start_ms, speaker_label, heading_path) = meta;
-        let label = build_label(&conn, &source_type, &source_id, start_ms, speaker_label.as_deref(), heading_path.as_deref());
+        let label = build_label(conn, &source_type, &source_id, start_ms, speaker_label.as_deref(), heading_path.as_deref());
         let snippet = text.chars().take(120).collect::<String>().replace('\n', " ");
         let deeplink = build_deeplink(&source_type, &source_id, start_ms);
         out.push(RetrievalHit {

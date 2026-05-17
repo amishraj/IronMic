@@ -13,12 +13,14 @@ const DEFAULT_MODEL_FILENAME: &str = "Phi-3-mini-4k-instruct-Q2_K.gguf";
 
 /// Total KV cache size used when creating a llama context. The prompt plus all
 /// generated tokens must fit inside this budget.
+#[allow(dead_code)] // referenced only by the feature-gated llm/llm-bin paths
 const N_CTX_DEFAULT: u32 = 4096;
 
 /// Minimum number of tokens we insist on reserving for the model's reply. If
 /// the prompt is so long that fewer than this many tokens are free, we refuse
 /// the request with a user-actionable error rather than producing a one-word
 /// reply or undefined behavior.
+#[allow(dead_code)] // referenced only by the feature-gated llm/llm-bin paths
 const MIN_REPLY_BUDGET: u32 = 64;
 
 /// Clamp the caller's requested `max_tokens` against the residual context
@@ -30,6 +32,7 @@ const MIN_REPLY_BUDGET: u32 = 64;
 ///
 /// Kept module-private and unit-tested below so the budget arithmetic has a
 /// deterministic surface independent of the live LLM.
+#[allow(dead_code)] // referenced only by the feature-gated llm/llm-bin paths
 fn compute_effective_max_tokens(
     n_tokens: usize,
     max_tokens: u32,

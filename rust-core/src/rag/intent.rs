@@ -89,7 +89,7 @@ pub fn classify(query: &str, now: DateTime<Utc>) -> IntentResult {
     // We only flip the intent to SingleDoc if temporal didn't already win —
     // a query like "what did Sarah say last week" is fundamentally temporal
     // with a speaker filter, not a single-doc lookup.
-    if let Some(speaker) = parse_speaker(&q) {
+    if let Some(speaker) = parse_speaker(q) {
         filters.speaker = Some(speaker);
         if intent != IntentClass::Temporal {
             intent = IntentClass::SingleDoc;
@@ -192,9 +192,9 @@ fn parse_n_days(lower: &str) -> Option<u32> {
     for p in patterns {
         if let Some(start) = lower.find(p) {
             let tail = &lower[start + p.len()..];
-            let mut chars = tail.chars();
+            let chars = tail.chars();
             let mut num_str = String::new();
-            while let Some(c) = chars.next() {
+            for c in chars {
                 if c.is_ascii_digit() {
                     num_str.push(c);
                 } else if !num_str.is_empty() {
@@ -296,7 +296,7 @@ fn day_end(dt: DateTime<Utc>) -> DateTime<Utc> {
 }
 
 fn day_start_from_naive(d: NaiveDate) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0).single().unwrap_or_else(|| Utc::now())
+    Utc.with_ymd_and_hms(d.year(), d.month(), d.day(), 0, 0, 0).single().unwrap_or_else(Utc::now)
 }
 
 fn short_date(dt: DateTime<Utc>) -> String {

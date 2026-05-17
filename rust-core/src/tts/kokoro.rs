@@ -554,7 +554,7 @@ impl KokoroEngine {
                     }
                     all_audio.extend(part_samples);
                     if idx + 1 < chunks.len() {
-                        all_audio.extend(std::iter::repeat(0.0f32).take(inter_chunk_silence));
+                        all_audio.extend(std::iter::repeat_n(0.0f32, inter_chunk_silence));
                     }
                     time_offset_ms = time_offset_ms
                         .saturating_add(part_duration_ms)
@@ -768,7 +768,7 @@ impl SharedTtsEngine {
     /// behavior as the non-streaming path).
     #[cfg(feature = "tts")]
     pub fn synthesize_single_chunk(&self, text: &str) -> Result<SynthesisResult, IronMicError> {
-        let mut engine = self.inner.lock().unwrap();
+        let engine = self.inner.lock().unwrap();
         // The session lives inside KokoroEngine — we have to take a transient
         // mut borrow of the session via the engine. synthesize_chunk requires
         // &mut Session, so we lock the inner session mutex here.

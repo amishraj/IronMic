@@ -108,6 +108,12 @@ fn row_to_chunk(row: &rusqlite::Row) -> rusqlite::Result<Chunk> {
     })
 }
 
+/// Chunk-table stats tuple returned by [`ChunkStore::stats`]:
+/// `(by_source_type, total_chunks, indexed_chunks_for_active_model)`.
+/// Aliased to keep the public signature readable per
+/// `clippy::type_complexity` policy.
+pub type ChunkStats = (Vec<(String, i64)>, i64, i64);
+
 pub struct ChunkStore {
     db: Database,
 }
@@ -357,7 +363,7 @@ impl ChunkStore {
     pub fn stats(
         &self,
         active_model: &str,
-    ) -> Result<(Vec<(String, i64)>, i64, i64), IronMicError> {
+    ) -> Result<ChunkStats, IronMicError> {
         let conn = self.db.conn();
         let mut by_source = Vec::new();
         let mut stmt = conn
