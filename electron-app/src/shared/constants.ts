@@ -17,6 +17,20 @@ export const LLM_MODEL_NAME = 'mistral-7b-instruct-q4';
 export const DEFAULT_TRANSCRIPTION_ENGINE = 'moonshine-base';
 
 /**
+ * Default transcription engine for *meetings* specifically. Meetings process
+ * audio in 30 s+ chunks, so first-chunk latency doesn't matter — accuracy does.
+ * Whisper Large v3 Turbo wins on accuracy for long-form multi-speaker audio
+ * and is the recommended default. Users can override per-meeting via the gear
+ * icon in the Meetings toolbar (stored in the `meeting_transcription_engine`
+ * SQLite setting), or globally in Settings → Input.
+ *
+ * On meeting start, MeetingPage swaps `transcription_engine` to this value and
+ * restores the prior value on meeting end so dictation reverts to the user's
+ * chosen global engine (typically the faster Moonshine Base).
+ */
+export const DEFAULT_MEETING_TRANSCRIPTION_ENGINE = 'whisper-large-v3-turbo';
+
+/**
  * Registry of supported transcription engines for the Settings UI dropdown.
  * The `id` matches the Rust `EngineKind::as_str()` and is what gets persisted
  * in the SQLite settings table under `transcription_engine`.

@@ -38,13 +38,27 @@ declare global {
         systemPrompt: string,
         userPrompt: string,
         opts?: { maxTokens?: number; temperature?: number; forceLocal?: boolean },
-      ) => Promise<{ text: string; providerUsed: 'claude' | 'copilot' | 'local' }>;
+      ) => Promise<{
+        text: string;
+        providerUsed: 'claude' | 'copilot' | 'local';
+        /**
+         * Set when AIManager transparently switched providers — e.g. Copilot
+         * CLI stdin probe failed for a large prompt and we re-ran locally.
+         * Renderer reads this to surface a one-time toast. Absent on the
+         * happy path.
+         */
+        fallbackUsed?: string;
+      }>;
       // Strictly local variant — never routes to cloud regardless of setting.
       generateTextLocal: (
         systemPrompt: string,
         userPrompt: string,
         opts?: { maxTokens?: number; temperature?: number },
-      ) => Promise<{ text: string; providerUsed: 'claude' | 'copilot' | 'local' }>;
+      ) => Promise<{
+        text: string;
+        providerUsed: 'claude' | 'copilot' | 'local';
+        fallbackUsed?: string;
+      }>;
       // Markdown → projections. The only way for the renderer to access the
       // sanitization pipeline. jsonString is JSON.stringify(ProseMirror JSON);
       // caller JSON.parse before feeding the editor. html is sanitize-html-

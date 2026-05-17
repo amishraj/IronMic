@@ -25,12 +25,23 @@ import {
   type MeetingTemplate,
   type StructuredSection,
 } from '../tfjs/MeetingTemplateEngine';
+import { generateTextWithFallbackToast } from '../ai/generateTextHelper';
 
 // ── Tuning knobs ──────────────────────────────────────────────────────────
 /** Transcripts shorter than this feed straight into the final prompt. */
 const SINGLE_PASS_CHAR_LIMIT = 4_000;
-/** Chunk size for the map step of map/reduce (chars). */
-const CHUNK_CHAR_SIZE = 3_500;
+/**
+ * Chunk size for the map step of map/reduce (chars).
+ *
+ * Sized so the combined chunk-compression prompt (~600 chars of wrapper +
+ * chunk body) stays under Copilot CLI's `ARGV_SIZE_LIMIT = 4096` ceiling
+ * defined in CopilotAdapter.ts. Below that ceiling the adapter routes the
+ * prompt through argv (the documented Copilot CLI transport); above it, the
+ * adapter must fall back to stdin, which fails on older Copilot CLI builds.
+ * Keeping most chunks on argv eliminates the stdin probe entirely on the
+ * happy path. Larger meetings simply produce more chunks.
+ */
+const CHUNK_CHAR_SIZE = 2_500;
 /** Guard: transcripts below this word count aren't worth summarising. */
 const MIN_WORDS_FOR_SUMMARY = 30;
 /** Echo rejection threshold — if output/input length > this, it's an echo. */
@@ -44,7 +55,25 @@ const MAX_OUTPUT_TO_INPUT_RATIO = 1.6;
 /** Longest verbatim span we'll tolerate from the input (words). */
 const MAX_VERBATIM_SPAN_WORDS = 20;
 
-export type ProcessingState = 'generating' | 'done' | 'empty';
+/**
+ * - `'generating'` — summary pipeline is currently running.
+ * - `'done'`       — summary was produced successfully.
+ * - `'empty'`      — transcript word-count fell below MIN_WORDS_FOR_SUMMARY;
+ *                    nothing meaningful to summarize. Used by the
+ *                    "Show meetings with no audio captured" filter and the
+ *                    card-level "No audio captured" copy.
+ * - `'failed'`     — summary pipeline ran but every retry failed (e.g. local
+ *                    LLM missing AND Copilot CLI rejected large prompts).
+ *                    Different from `'empty'` because audio WAS captured.
+ *                    The card renders "Summary unavailable — open to retry";
+ *                    auto-file paths must skip this state so the placeholder
+ *                    body doesn't leak into the user's notebook.
+ *
+ * Note: the wider codebase also uses `'insufficient'` (set by
+ * `finalizeInsufficient` in MeetingPage), but that value originates outside
+ * this module — it is not part of this type union.
+ */
+export type ProcessingState = 'generating' | 'done' | 'empty' | 'failed';
 
 export interface StructuredOutput {
   sections: StructuredSection[];
@@ -221,11 +250,17 @@ export async function generateMeetingSummary(
     console.error('[SummaryGenerator] final pass failed:', err);
   }
 
-  // Fallback — never echo the transcript.
+  // Fallback — every retry failed AND we already passed the word-count
+  // guard above, so audio WAS captured. processingState: 'failed' (NOT
+  // 'empty') distinguishes this from the genuinely-no-speech case so the
+  // card UI renders "Summary unavailable — open to retry" instead of the
+  // misleading "No audio captured." The same distinction prevents the
+  // SUMMARY_UNAVAILABLE_MESSAGE placeholder from being auto-filed into
+  // the user's notebook (see guards in MeetingPage's auto-file sites).
   return {
     sections: [],
     plainSummary: SUMMARY_UNAVAILABLE_MESSAGE,
-    processingState: 'empty',
+    processingState: 'failed',
     templateId: template?.id,
     templateName: template?.name,
     generatedAt,
@@ -483,16 +518,18 @@ function cleanBulletList(raw: string, input: string): string | null {
 // ──────────────────────────────────────────────────────────────────────────
 
 async function callPolish(prompt: string): Promise<string> {
-  const ironmic = (window as any).ironmic;
   // Migrated from polishText (which layered the cleanup prompt on top of
   // the caller's system prompt — the wrong contract for summarization).
   // generateText is the dedicated transport for non-polish completions.
   // Pass empty system + full prompt as user; Phase 5 splits the prompt
   // properly into system/user when the new Auto-template prompt lands.
-  if (!ironmic?.generateText) {
-    throw new Error('generateText IPC not available');
-  }
-  const { text } = await ironmic.generateText('', prompt, { maxTokens: 1024, temperature: 0.2 });
+  //
+  // Routes through generateTextWithFallbackToast so a transparent
+  // Copilot-CLI → local-LLM fallback surfaces a one-time toast.
+  const { text } = await generateTextWithFallbackToast('', prompt, {
+    maxTokens: 1024,
+    temperature: 0.2,
+  });
   return text;
 }
 

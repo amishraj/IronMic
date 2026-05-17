@@ -7,7 +7,7 @@ use tracing::info;
 use crate::error::IronMicError;
 
 /// Schema version for migration tracking.
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 /// Get the platform-appropriate app data directory for IronMic.
 pub fn app_data_dir() -> PathBuf {
@@ -165,6 +165,10 @@ impl Database {
 
         if current_version < 13 {
             self.migrate_v13(&conn)?;
+        }
+
+        if current_version < 14 {
+            self.migrate_v14(&conn)?;
         }
 
         // Update version
@@ -1060,6 +1064,31 @@ impl Database {
         .map_err(|e| IronMicError::Storage(format!("Migration v13 failed: {e}")))?;
 
         info!("Migration v13 applied: user_notes + chunks + chunk_embeddings + ai_chat_sessions.kind + RAG settings");
+        Ok(())
+    }
+
+    /// Migration v14: Seed `meeting_transcription_engine` default.
+    ///
+    /// Meetings benefit from Whisper Large's accuracy (they process audio in
+    /// 30 s+ chunks, so first-chunk latency doesn't matter). MeetingPage reads
+    /// this on meeting start and writes the existing `transcription_engine`
+    /// key to trigger the native engine swap; on meeting end it restores the
+    /// prior dictation engine.
+    ///
+    /// Uses INSERT OR IGNORE so existing installs that have already been
+    /// fiddling with this key (e.g. via manual SQL) keep their value. The new
+    /// migration step (rather than editing v1's seed) is what makes this safe
+    /// to ship — v1 already ran on every existing install.
+    fn migrate_v14(&self, conn: &Connection) -> Result<(), IronMicError> {
+        conn.execute_batch(
+            "
+            INSERT OR IGNORE INTO settings (key, value)
+                VALUES ('meeting_transcription_engine', 'whisper-large-v3-turbo');
+            ",
+        )
+        .map_err(|e| IronMicError::Storage(format!("Migration v14 failed: {e}")))?;
+
+        info!("Migration v14 applied: meeting_transcription_engine default");
         Ok(())
     }
 

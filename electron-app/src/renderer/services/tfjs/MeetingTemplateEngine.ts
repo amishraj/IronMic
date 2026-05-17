@@ -5,6 +5,8 @@
  * substitutes the transcript, calls the LLM, and returns structured output.
  */
 
+import { generateTextWithFallbackToast } from '../ai/generateTextHelper';
+
 export interface MeetingTemplate {
   id: string;
   name: string;
@@ -88,12 +90,16 @@ export async function generateStructuredNotes(
   // instructions — generateText is the dedicated path for non-polish
   // completions. Pass empty system + full prompt as user; Phase 5 splits
   // out the system/user properly when the new Auto-template prompt lands.
+  //
+  // Routes through generateTextWithFallbackToast so a transparent
+  // Copilot-CLI → local-LLM fallback surfaces a one-time toast (matching
+  // the SummaryGenerator.callPolish path).
   const ironmic = window.ironmic;
   let rawOutput: string;
 
   if (ironmic?.generateText && transcript.length > 20) {
     try {
-      const result = await ironmic.generateText('', prompt, {
+      const result = await generateTextWithFallbackToast('', prompt, {
         maxTokens: 1024,
         temperature: 0.1,
       });

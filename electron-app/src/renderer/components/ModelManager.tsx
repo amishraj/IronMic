@@ -623,6 +623,8 @@ function SpeechRecognitionModelSection({
         />
       ))}
 
+      <MeetingEnginePreferenceRow engineReadiness={engineReadiness} />
+
       <ModelImportSection
         sectionLabel="Speech Recognition"
         filter="whisper"
@@ -630,6 +632,85 @@ function SpeechRecognitionModelSection({
         highlightOnError={downloadFailed}
       />
     </div>
+  );
+}
+
+/**
+ * Per-meeting transcription engine preference (stored as the
+ * `meeting_transcription_engine` SQLite setting). Distinct from the active
+ * `transcription_engine` row above: MeetingPage swaps to this value on
+ * meeting start and restores the prior on meeting end. Default is Whisper
+ * Large for accuracy, since meetings process audio in 30 s+ chunks where
+ * first-chunk latency doesn't matter.
+ *
+ * Same gear popover lives on the Meetings page (active toolbar +
+ * pre-recording header). This row is the Settings discovery surface for
+ * users who never opened that gear.
+ */
+function MeetingEnginePreferenceRow({
+  engineReadiness,
+}: {
+  engineReadiness: Record<string, boolean>;
+}) {
+  const [value, setValue] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const v = await window.ironmic.getSetting('meeting_transcription_engine');
+        setValue(v);
+      } catch {
+        // ignore — leave value null so the select shows the default
+      }
+    })();
+  }, []);
+
+  const handleChange = async (newValue: string) => {
+    if (newValue === value) return;
+    setSaving(true);
+    try {
+      await window.ironmic.setSetting('meeting_transcription_engine', newValue);
+      setValue(newValue);
+    } catch (err) {
+      console.warn('[ModelManager] meeting_transcription_engine save failed:', err);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Card variant="default" padding="md" className="mt-3">
+      <div className="space-y-2">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
+              Meeting engine
+            </p>
+            <p className="text-xs text-iron-text-muted mt-0.5">
+              Used for meeting transcription only. Dictation continues to use the model selected above.
+            </p>
+          </div>
+          <select
+            value={value ?? 'whisper-large-v3-turbo'}
+            disabled={saving}
+            onChange={(e) => void handleChange(e.target.value)}
+            className="bg-iron-surface border border-iron-border rounded-md px-2 py-1 text-xs text-iron-text focus:outline-none focus:border-iron-accent disabled:opacity-50"
+          >
+            {TRANSCRIPTION_ENGINES.map((e) => {
+              const ready = engineReadiness[e.id] !== false;
+              return (
+                <option key={e.id} value={e.id} disabled={!ready}>
+                  {e.label}
+                  {!ready ? ' (not downloaded)' : ''}
+                  {e.id === 'whisper-large-v3-turbo' ? ' — recommended' : ''}
+                </option>
+              );
+            })}
+          </select>
+        </div>
+      </div>
+    </Card>
   );
 }
 
