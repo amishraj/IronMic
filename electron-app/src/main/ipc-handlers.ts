@@ -87,6 +87,12 @@ const ALLOWED_SETTING_KEYS = new Set([
   // (see main/index.ts engine-startup block) — so user switches via this
   // setting last only for the current session.
   'transcription_engine',
+  // Per-meeting engine preference (default 'whisper-large-v3-turbo' —
+  // accuracy over latency since meetings process 30 s+ chunks). MeetingPage
+  // reads this on meeting start and writes the existing `transcription_engine`
+  // key so the native swap happens via the same path as the Settings UI.
+  // Same value set as `transcription_engine`.
+  'meeting_transcription_engine',
   // Polish provider preference. 'true' enables cloud polish via authenticated
   // Claude/Copilot CLIs; default 'false' keeps polish strictly on-device.
   // The renderer Settings panel surfaces this with a privacy warning + confirm.
@@ -444,7 +450,7 @@ export function registerIpcHandlers(): void {
     systemPrompt: string,
     userPrompt: string,
     opts: { forceLocal?: boolean; maxTokens?: number; temperature?: number } | undefined,
-  ): Promise<{ text: string; providerUsed: AIProvider }> => {
+  ): Promise<{ text: string; providerUsed: AIProvider; fallbackUsed?: string }> => {
     if (typeof systemPrompt !== 'string' || typeof userPrompt !== 'string') {
       throw new Error('generateText requires string system and user prompts');
     }
@@ -471,7 +477,14 @@ export function registerIpcHandlers(): void {
     opts?: { forceLocal?: boolean; maxTokens?: number; temperature?: number },
   ) => {
     const result = await dispatchGenerate(systemPrompt, userPrompt, opts);
-    return { text: result.text, providerUsed: result.providerUsed };
+    // `fallbackUsed` flags transparent provider fallback (e.g. Copilot CLI
+    // failed stdin probe → local). Renderer reads it to surface a one-time
+    // toast without forcing a hard error path.
+    return {
+      text: result.text,
+      providerUsed: result.providerUsed,
+      ...(result.fallbackUsed ? { fallbackUsed: result.fallbackUsed } : {}),
+    };
   });
 
   // Strictly local generic transport. Same shape as GENERATE_TEXT but with
@@ -487,7 +500,11 @@ export function registerIpcHandlers(): void {
       ...opts,
       forceLocal: true,
     });
-    return { text: result.text, providerUsed: result.providerUsed };
+    return {
+      text: result.text,
+      providerUsed: result.providerUsed,
+      ...(result.fallbackUsed ? { fallbackUsed: result.fallbackUsed } : {}),
+    };
   });
 
   // Markdown → { plainText, html, jsonString } projections.

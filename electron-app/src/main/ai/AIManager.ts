@@ -6,7 +6,7 @@
 
 import { ChildProcess } from 'child_process';
 import { BrowserWindow } from 'electron';
-import { CopilotAdapter } from './CopilotAdapter';
+import { CopilotAdapter, CopilotLargePromptUnsupportedError, wouldRequireStdin as copilotWouldRequireStdin } from './CopilotAdapter';
 import { ClaudeAdapter } from './ClaudeAdapter';
 import { LocalLLMAdapter, getChatModelPath, resolveActiveChatModel } from './LocalLLMAdapter';
 import { llmSubprocess } from './LlmSubprocess';
@@ -311,6 +311,23 @@ export class AIManager {
    * carries `runIds.copilotCli` / `runIds.ghModels`.
    */
   private modelLookup: Partial<Record<AIProvider, Map<string, AIModel>>> = {};
+
+  /**
+   * Set of resolved Copilot binary paths whose stdin-probe is known to fail
+   * for large prompts. Populated when AIManager.generate() catches a
+   * CopilotLargePromptUnsupportedError from CopilotAdapter; consulted before
+   * routing future generate() calls so we don't re-probe the same binary.
+   *
+   * Cache key is binaryPath alone (not backend+binary). checkAuth('copilot')
+   * gives us binaryPath; computing the backend label requires duplicating
+   * CopilotAdapter.looksLikeCopilotBinary logic. binaryPath is unique per
+   * resolved binary, which is what actually matters for routing.
+   *
+   * Scope: process-lifetime. Cleared only by app restart. Only large prompts
+   * (those that would require stdin transport per `copilotWouldRequireStdin`)
+   * bypass Copilot — small argv-eligible prompts still try Copilot normally.
+   */
+  private largePromptUnsupportedBinaries = new Set<string>();
 
   private getLocalHistory(ctx: string): Array<{ role: string; content: string }> {
     if (!this.localHistories.has(ctx)) this.localHistories.set(ctx, []);
@@ -969,7 +986,7 @@ export class AIManager {
     systemPrompt: string,
     userPrompt: string,
     opts: { allowCloud: boolean; maxTokens: number; temperature: number },
-  ): Promise<{ text: string; providerUsed: AIProvider }> {
+  ): Promise<{ text: string; providerUsed: AIProvider; fallbackUsed?: string }> {
     let savedModelId: string | null = null;
     let savedProvider: string | null = null;
     try {
@@ -990,15 +1007,57 @@ export class AIManager {
     }
     const copilot = opts.allowCloud ? await this.checkAuth('copilot') : null;
     if (copilot?.authenticated) {
+      const binaryPath = copilot.binaryPath ?? '';
+      // Cache pre-check (large-prompt only) — if this binary is known to
+      // reject large stdin prompts AND the current prompt would require
+      // stdin, skip Copilot entirely and use local. Small argv-eligible
+      // prompts on the same binary continue through normal Copilot routing.
+      const wouldNeedStdin =
+        binaryPath !== '' &&
+        copilotWouldRequireStdin(binaryPath, systemPrompt, userPrompt);
+      if (this.largePromptUnsupportedBinaries.has(binaryPath) && wouldNeedStdin) {
+        const localResult = await this.generateLocal(systemPrompt, userPrompt, opts);
+        return { ...localResult, fallbackUsed: 'local-llm-from-copilot-large-prompt' };
+      }
       const copilotModel = savedProvider === 'copilot' ? savedModelId : null;
-      const text = await this.runCliOneShotWithSystem(
-        'copilot',
-        systemPrompt,
-        userPrompt,
-        copilotModel || undefined,
-      );
-      return { text, providerUsed: 'copilot' };
+      try {
+        const text = await this.runCliOneShotWithSystem(
+          'copilot',
+          systemPrompt,
+          userPrompt,
+          copilotModel || undefined,
+        );
+        return { text, providerUsed: 'copilot' };
+      } catch (err) {
+        if (err instanceof CopilotLargePromptUnsupportedError) {
+          // Cache the binary so subsequent large-prompt calls skip Copilot
+          // immediately, and recurse with allowCloud: false. Calling back
+          // into generate() with allowCloud: false is the only way to
+          // guarantee Claude isn't tried next; just "going local loosely"
+          // would re-enter the Claude branch above on retry.
+          this.largePromptUnsupportedBinaries.add(err.binaryPath);
+          const fallback = await this.generate(systemPrompt, userPrompt, {
+            ...opts,
+            allowCloud: false,
+          });
+          return { ...fallback, fallbackUsed: 'local-llm-from-copilot-large-prompt' };
+        }
+        throw err;
+      }
     }
+    return this.generateLocal(systemPrompt, userPrompt, opts);
+  }
+
+  /**
+   * Local-LLM branch of {@link generate}, factored out so the cached-bypass
+   * path and the typed-error fallback path use identical behavior. Throws if
+   * no local chat model is configured / no llmSubprocess binary present.
+   */
+  private async generateLocal(
+    systemPrompt: string,
+    userPrompt: string,
+    opts: { maxTokens: number; temperature: number },
+  ): Promise<{ text: string; providerUsed: AIProvider }> {
     const resolvedLocal = resolveActiveChatModel(native);
     if (resolvedLocal) {
       if (!llmSubprocess.isAvailable()) {

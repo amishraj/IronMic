@@ -64,12 +64,17 @@ export function MeetingSessionCard({
   const isProcessing = processingMeetings.includes(session.id) || processingState === 'generating';
   const isEmpty = processingState === 'empty';
   const isInsufficient = processingState === 'insufficient';
+  // `'failed'` means audio WAS captured but the summary pipeline failed on
+  // every retry (e.g. Copilot CLI rejected large prompts AND local LLM
+  // unavailable). Distinct from `'empty'` so the card copy stays honest.
+  const isFailed = processingState === 'failed';
   // Notes are "done" when the LLM finished and produced at least one section or a plainSummary.
   const hasSummary = !!(
     (structuredSections && structuredSections.length > 0) ||
     session.summary
   );
-  const hasNotes = !isProcessing && !isEmpty && !isInsufficient && processingState === 'done' && hasSummary;
+  const hasNotes =
+    !isProcessing && !isEmpty && !isInsufficient && !isFailed && processingState === 'done' && hasSummary;
 
   const titleText = resolveMeetingTitle(session, parsedStructured);
 
@@ -184,6 +189,18 @@ export function MeetingSessionCard({
                   title="Audio was captured but too little speech was present to summarize faithfully."
                 >
                   Too brief to summarize
+                </span>
+              )}
+              {isFailed && !isProcessing && (
+                // Card has no regenerate prop; the existing Regenerate button
+                // lives on MeetingDetailPage. The badge label invites the
+                // user to open the detail page (the card's normal click
+                // behavior) and retry from there.
+                <span
+                  className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded"
+                  title="Audio was captured but the summary generation failed. Open the meeting to retry."
+                >
+                  Summary unavailable — open to retry
                 </span>
               )}
             </div>

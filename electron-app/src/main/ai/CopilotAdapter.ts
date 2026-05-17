@@ -63,6 +63,65 @@ function argvEligible(binaryPath: string, prompt: string): boolean {
   return true;
 }
 
+/**
+ * Build the Copilot-specific combined prompt that AIManager.runCliOneShotWithSystem
+ * would produce for the copilot provider. Kept in sync with that method so the
+ * size check below sees the same bytes that buildInvocation() will eventually see.
+ *
+ * For the gh-models / Claude paths the combine differs, but this helper is only
+ * called from the Copilot route, so the Copilot framing is the right reference.
+ */
+function combineCopilotPrompt(systemPrompt: string, userPrompt: string): string {
+  return [
+    '### INSTRUCTIONS',
+    systemPrompt,
+    '',
+    '### REQUEST',
+    userPrompt,
+    '',
+    '### RESPONSE (answer the request above using only the instructions; no preamble)',
+  ].join('\n');
+}
+
+/**
+ * Public predicate for AIManager's "skip Copilot when the binary's stdin probe
+ * is already known to fail" cache. Takes the same (binaryPath, systemPrompt,
+ * userPrompt) tuple AIManager would dispatch with, combines them the way
+ * `runCliOneShotWithSystem` does for Copilot, and returns whether the combined
+ * size would force `buildInvocation` onto the stdin transport (which is the
+ * transport that fails on older Copilot CLI builds).
+ *
+ * NOTE: signature is always (binaryPath, systemPrompt, userPrompt) — never the
+ * user prompt alone. A large system + small user can still exceed argv.
+ */
+export function wouldRequireStdin(
+  binaryPath: string,
+  systemPrompt: string,
+  userPrompt: string,
+): boolean {
+  const combined = combineCopilotPrompt(systemPrompt, userPrompt);
+  return !argvEligible(binaryPath, combined);
+}
+
+/**
+ * Typed error thrown by CopilotAdapter.buildInvocation when the stdin-probe
+ * fails for a large prompt. AIManager catches this specifically to (a) cache
+ * the unsupported binary path and (b) fall back to local LLM transparently.
+ *
+ * Preserves the original user-facing message so logs are unchanged.
+ */
+export class CopilotLargePromptUnsupportedError extends Error {
+  readonly backend: CopilotBackend;
+  readonly binaryPath: string;
+
+  constructor(args: { backend: CopilotBackend; binaryPath: string; message: string }) {
+    super(args.message);
+    this.name = 'CopilotLargePromptUnsupportedError';
+    this.backend = args.backend;
+    this.binaryPath = args.binaryPath;
+  }
+}
+
 const VENDOR_PREFIXES = [
   'gpt-',
   'claude-',
@@ -274,15 +333,15 @@ export class CopilotAdapter implements ICLIAdapter {
 
     const stdinOk = await this.probeStdinSupport(binaryPath, backend, model);
     if (!stdinOk) {
-      throw new Error(
+      const message =
         backend === 'copilot-cli'
           ? "Copilot CLI on this machine doesn't accept large prompts via stdin (probed). " +
             'Upgrade with: npm i -g @github/copilot, switch the IronMic AI provider to ' +
             'Claude or Local, or shorten the input.'
           : "GitHub Models CLI on this machine doesn't accept large prompts via stdin (probed). " +
             'Upgrade `gh` and the models extension (gh extension upgrade gh-models), switch the ' +
-            'IronMic AI provider to Claude or Local, or shorten the input.',
-      );
+            'IronMic AI provider to Claude or Local, or shorten the input.';
+      throw new CopilotLargePromptUnsupportedError({ backend, binaryPath, message });
     }
 
     if (isCopilotCli) {

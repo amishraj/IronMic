@@ -261,7 +261,17 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
         sections: [{ key: 'summary', title: 'Summary', content: finalPlain }],
         plainSummary: finalPlain,
         htmlContent: isHtmlEmpty(finalHtml) ? null : finalHtml,
-        processingState: existing.processingState === 'empty' ? 'empty' : 'done',
+        // Preserve `'empty'` (no audio) and `'failed'` (summary pipeline
+        // gave up on a real recording) so a manual edit doesn't silently
+        // mislabel the meeting as a completed summary. Everything else
+        // (including `'insufficient'`) flips to `'done'` because the user
+        // has now provided notes manually.
+        processingState:
+          existing.processingState === 'empty'
+            ? 'empty'
+            : existing.processingState === 'failed'
+              ? 'failed'
+              : 'done',
         hasUserEdits: true,
       };
       if (trimmedTitle) {
@@ -560,6 +570,11 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
     processingMeetings.includes(sessionId) || processingState === 'generating' || regenerating;
   const isEmpty = processingState === 'empty';
   const isInsufficient = processingState === 'insufficient';
+  // Summary pipeline ran but every retry failed (e.g. Copilot CLI couldn't
+  // accept large prompts AND local LLM unavailable). Distinct from `'empty'`
+  // because audio WAS captured — the user should see "Summary unavailable"
+  // and the Regenerate button below, not "No audio captured."
+  const isFailed = processingState === 'failed';
   const titleText = extractTitle(session);
 
   // ── Derived state for regenerate / history UI ──
@@ -644,6 +659,11 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
                 {isInsufficient && !isProcessing && (
                   <span className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded">
                     Not enough content
+                  </span>
+                )}
+                {isFailed && !isProcessing && (
+                  <span className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded">
+                    Summary unavailable
                   </span>
                 )}
               </div>
@@ -810,6 +830,13 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
                   <p className="font-medium mb-1">Too brief to summarize</p>
                   <p className="text-amber-300/70">
                     Audio <em>was</em> captured, but it contained too little actual speech for the AI to produce faithful notes — we'd rather leave this blank than fabricate bullets. The raw transcript is saved below, and you can write your own notes with <em>Edit</em>.
+                  </p>
+                </div>
+              ) : isFailed ? (
+                <div className="text-sm text-amber-300/90 bg-amber-500/5 border border-amber-500/20 rounded-lg px-4 py-3 leading-relaxed">
+                  <p className="font-medium mb-1">Summary unavailable</p>
+                  <p className="text-amber-300/70">
+                    Audio <em>was</em> captured, but the summary pipeline failed (e.g. the configured AI provider rejected the prompt). The raw transcript is saved below. Use <em>Regenerate</em> above to try again — switching to a different AI provider in Settings often helps — or write your own notes with <em>Edit</em>.
                   </p>
                 </div>
               ) : (

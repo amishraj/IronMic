@@ -76,6 +76,28 @@ interface MeetingStore {
   /** Meeting IDs that are currently generating notes in the background. */
   processingMeetings: string[];
 
+  // ── Per-meeting STT engine lifecycle ─────────────────────────────────────
+  /**
+   * Global `transcription_engine` value captured at meeting start, so we can
+   * restore it on meeting end. Lives here (not in MeetingPage component state)
+   * so it survives MeetingPage unmount when the user navigates to another tab
+   * mid-meeting — the meeting itself runs in main and outlives the React tree.
+   *
+   * Always captured by `applyMeetingEngine()` BEFORE any swap or readiness
+   * check, even if the meeting engine matches the prior — without this, a
+   * subsequent live-switch via the gear popover would have nothing to
+   * restore to on meeting end.
+   *
+   * Cleared by `restoreMeetingEngine()` after the swap-back. Not persisted —
+   * if the renderer reloads mid-meeting the prior is lost; crash-recovery of
+   * the dictation engine is out of scope (user fixes via Settings).
+   */
+  priorTranscriptionEngine: string | null;
+  /** True once `applyMeetingEngine()` has executed (success or graceful no-op). */
+  meetingEngineApplied: boolean;
+  setPriorTranscriptionEngine: (engine: string | null) => void;
+  setMeetingEngineApplied: (applied: boolean) => void;
+
   loadTemplates: () => Promise<void>;
   loadSessions: () => Promise<void>;
   createTemplate: (name: string, meetingType: string, sections: string[], llmPrompt: string) => Promise<void>;
@@ -127,6 +149,8 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   granolaSessionId: null,
   granolaRecordingStartedAt: null,
   processingMeetings: [],
+  priorTranscriptionEngine: null,
+  meetingEngineApplied: false,
   ...DEFAULT_ROOM_STATE,
   roomDisplayName: 'Me',
   isMicMuted: false,
@@ -267,4 +291,7 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
     set(state => ({
       sessions: state.sessions.map(s => s.id === id ? { ...s, ...patch } : s),
     })),
+
+  setPriorTranscriptionEngine: (engine) => set({ priorTranscriptionEngine: engine }),
+  setMeetingEngineApplied: (applied) => set({ meetingEngineApplied: applied }),
 }));

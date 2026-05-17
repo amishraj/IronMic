@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User, Share2, PanelRightOpen, PanelRightClose } from 'lucide-react';
 import { Card, Badge, Button } from './ui';
 import { MeetingSessionCard } from './MeetingSessionCard';
+import { MeetingEngineGearButton } from './MeetingEngineGearButton';
 import { MeetingTemplateEditor } from './MeetingTemplateEditor';
 import { MeetingTranscriptPanel } from './MeetingTranscriptPanel';
 import { MeetingNotesPanel } from './MeetingNotesPanel';
@@ -17,6 +18,10 @@ import type { TranscriptSegment } from './MeetingTranscriptPanel';
 import { upsertMeetingNoteEntry } from '../services/notebooks';
 import { resolveMeetingTitle } from '../services/meetingTitle';
 import { generateMeetingTitle } from '../services/meeting/SummaryGenerator';
+import {
+  applyMeetingEngine,
+  restoreMeetingEngine,
+} from '../services/meeting/meetingEngineLifecycle';
 import { useDictationStore } from '../stores/useDictationStore';
 import { useToastStore } from '../stores/useToastStore';
 
@@ -596,15 +601,34 @@ export function MeetingPage() {
         console.warn('[MeetingPage] Failed to assign meeting sequence number:', err);
       }
 
+      // Swap to the meeting's preferred transcription engine (default
+      // Whisper Large) BEFORE starting the recorder so the first chunk
+      // already uses the meeting engine. applyMeetingEngine never throws —
+      // any failure surfaces as a toast and we proceed on the prior
+      // engine. The prior is captured in useMeetingStore for
+      // restoreMeetingEngine() on meeting end.
+      await applyMeetingEngine();
+
       // Start the chunk recording loop via main process. Pass the host's
       // display name so the recorder can seed both contextTerms (Whisper
       // bias + fuzzy correction) and the persisted participant roster.
-      await window.ironmic.meetingStartRecording(
-        session.id,
-        selectedAudioDevice ?? null,
-        undefined,
-        roomDisplayName || null,
-      );
+      //
+      // Rollback semantics: if meetingStartRecording throws AFTER we
+      // already swapped the engine, restore the prior so dictation isn't
+      // stuck on the meeting engine after a failed start. restoreMeetingEngine
+      // never throws, so the original `err` is what gets re-thrown to the
+      // outer catch.
+      try {
+        await window.ironmic.meetingStartRecording(
+          session.id,
+          selectedAudioDevice ?? null,
+          undefined,
+          roomDisplayName || null,
+        );
+      } catch (err) {
+        await restoreMeetingEngine();
+        throw err;
+      }
 
       // If hosting, also spin up the LAN room server
       if (roomMode === 'host') {
@@ -663,13 +687,24 @@ export function MeetingPage() {
       clearSegments();
       setGranolaStructuredOutput(null);
       setGranolaPlainSummary(null);
-      const info = await window.ironmic.meetingRoomJoin({
-        hostIp: ip,
-        hostPort: port,
-        roomCode: code,
-        displayName: roomDisplayName,
-        deviceName: selectedAudioDevice ?? null,
-      });
+      // Participant also starts a local recorder inside meetingRoomJoin, so
+      // the meeting engine swap applies here too. The participant uses
+      // their own machine's `meeting_transcription_engine` setting — the
+      // host's choice is NOT synced over the room protocol.
+      await applyMeetingEngine();
+      let info: any;
+      try {
+        info = await window.ironmic.meetingRoomJoin({
+          hostIp: ip,
+          hostPort: port,
+          roomCode: code,
+          displayName: roomDisplayName,
+          deviceName: selectedAudioDevice ?? null,
+        });
+      } catch (err) {
+        await restoreMeetingEngine();
+        throw err;
+      }
       applyRoomState(info);
       // The client manages its own local session and recorder; mirror its id
       if (info?.sessionId) {
@@ -842,7 +877,13 @@ export function MeetingPage() {
 
           const plainText = (so.plainSummary || latestSession.summary || '').trim();
 
-          if (plainText && so.processingState !== 'generating') {
+          // A4 invariant: `'failed'` carries SUMMARY_UNAVAILABLE_MESSAGE in
+          // `plainSummary`, which would otherwise auto-file as a notebook
+          // entry titled after the failure message. Skip the upsert and the
+          // AI-title call entirely for failed meetings. (`'empty'` is also
+          // excluded by the existing `plainText` truthy check, since
+          // word-count-guarded entries return `plainSummary: ''`.)
+          if (plainText && so.processingState !== 'generating' && so.processingState !== 'failed') {
             // If no title is set (or only an AI-generated one was), try to
             // produce a better one from the content. Never overwrite a
             // user-authored title (titleSource === 'user').
@@ -889,6 +930,11 @@ export function MeetingPage() {
       } catch (err) {
         console.warn('[MeetingPage] Auto-file to Notes sidebar failed:', err);
       }
+
+      // Restore the dictation engine that was active before this meeting.
+      // Lives in the finally so it runs even when an upstream step threw;
+      // restoreMeetingEngine never throws, so it can't mask anything.
+      await restoreMeetingEngine();
 
       unmarkMeetingProcessing(sessionId);
       setIsGranolaStopping(false);
@@ -1158,7 +1204,17 @@ export function MeetingPage() {
       // Auto-file into "Meeting Notes" notebook so this meeting is discoverable
       // alongside regular notes (and by the AI assistant across one corpus).
       // Upsert by notebookEntryId so regenerations don't stack duplicates.
+      //
+      // A4 invariant: skip auto-file entirely for `'failed'` summaries. The
+      // SUMMARY_UNAVAILABLE_MESSAGE placeholder would otherwise create a
+      // notebook entry whose body is "A meeting summary could not be
+      // generated…" and whose title is AI-generated from that string. The
+      // meeting still appears in history; the user retries via the detail
+      // page's Regenerate button.
       try {
+        if ((structured as any).processingState === 'failed') {
+          throw new Error('SKIP_AUTOFILE_FAILED');
+        }
         // Try AI-generated title from content if no user title is set.
         if (
           summaryForColumn.trim() &&
@@ -1190,8 +1246,14 @@ export function MeetingPage() {
           rawTranscript: transcript,
         });
         (structured as any).notebookEntryId = entryId;
-      } catch (err) {
-        console.warn('[MeetingPage] Notebook auto-file failed (non-fatal):', err);
+      } catch (err: any) {
+        // Skipped on purpose for `'failed'` summaries (see A4 guard above).
+        // Log at debug level so it's distinguishable from real failures.
+        if (err?.message === 'SKIP_AUTOFILE_FAILED') {
+          console.debug('[MeetingPage] Skipped notebook auto-file for failed summary');
+        } else {
+          console.warn('[MeetingPage] Notebook auto-file failed (non-fatal):', err);
+        }
       }
 
       try {
@@ -1428,6 +1490,10 @@ export function MeetingPage() {
                   Collaborate
                 </button>
               )}
+              {/* Meeting engine gear — live-switch during recording. Selection
+                  applies on the next 30 s chunk; meetingEngineLifecycle handles
+                  readiness + DB rollback. */}
+              <MeetingEngineGearButton isRecording={true} />
               <button
                 onClick={handleGranolaStop}
                 className="px-3 py-1.5 text-xs font-medium bg-red-500/15 text-red-400 rounded-lg border border-red-500/20 hover:bg-red-500/25 transition-colors"
@@ -1842,6 +1908,16 @@ export function MeetingPage() {
               selectedDevice={selectedAudioDevice}
               onDeviceChange={setSelectedAudioDevice}
             />
+          </div>
+
+          {/* Meeting transcription engine picker (pre-recording).
+              Persists `meeting_transcription_engine`; applyMeetingEngine
+              picks it up when the user presses Start. Defaults to Whisper
+              Large for accuracy — meetings process in 30 s+ chunks so
+              latency doesn't matter. */}
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] text-iron-text-muted">Transcription engine</p>
+            <MeetingEngineGearButton isRecording={false} />
           </div>
 
           {/* Start button — only shown for solo + host modes; participant uses Join button */}
