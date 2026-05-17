@@ -45,7 +45,7 @@ mod imp {
     use std::time::Duration;
     use tracing::{debug, error, info, warn};
     use windows::core::{Interface, GUID, HRESULT, PCWSTR};
-    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::{BOOL, HANDLE, WAIT_OBJECT_0};
     use windows::Win32::Media::Audio::{
         eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
         MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED,
@@ -58,9 +58,7 @@ mod imp {
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
         COINIT_MULTITHREADED,
     };
-    use windows::Win32::System::Threading::{
-        CreateEventW, WaitForSingleObject, INFINITE,
-    };
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
     /// 100 ns ticks per millisecond — WASAPI buffer durations use REFERENCE_TIME.
     const REFTIMES_PER_MS: i64 = 10_000;
@@ -217,7 +215,11 @@ mod imp {
 
             // Try event-driven init first; on failure fall back to timed pump.
             let mut use_event = true;
-            let event_handle = CreateEventW(None, false, false, PCWSTR::null())
+            // `windows` 0.58 takes `BOOL` (newtype around i32), not `bool`, for
+            // CreateEventW's bManualReset / bInitialState — passing plain `false`
+            // fails the MSVC build with E0308. Construct BOOL(0) explicitly so
+            // we don't depend on `From<bool>` being callable from this site.
+            let event_handle = CreateEventW(None, BOOL(0), BOOL(0), PCWSTR::null())
                 .map_err(LoopbackError::from)?;
 
             let init_result = audio_client.Initialize(
