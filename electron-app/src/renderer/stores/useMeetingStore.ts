@@ -81,6 +81,10 @@ interface MeetingStore {
   granolaRecordingStartedAt: number | null;
   /** Meeting IDs that are currently generating notes in the background. */
   processingMeetings: string[];
+  /** Meeting IDs whose final audio chunk is still being transcribed in the
+   *  background (after the user clicked End Meeting). The summary is already
+   *  visible; this drives a non-blocking "Transcribing…" label. */
+  transcribingMeetings: string[];
 
   // ── Per-meeting STT engine lifecycle ─────────────────────────────────────
   /**
@@ -127,6 +131,8 @@ interface MeetingStore {
 
   markMeetingProcessing: (id: string) => void;
   unmarkMeetingProcessing: (id: string) => void;
+  markMeetingTranscribing: (id: string) => void;
+  unmarkMeetingTranscribing: (id: string) => void;
   /** Update an in-memory session (e.g. after title edit) without a DB reload. */
   patchSession: (id: string, patch: Partial<MeetingSession>) => void;
 }
@@ -157,6 +163,7 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   granolaSessionId: null,
   granolaRecordingStartedAt: null,
   processingMeetings: [],
+  transcribingMeetings: [],
   priorTranscriptionEngine: null,
   meetingEngineApplied: false,
   ...DEFAULT_ROOM_STATE,
@@ -296,6 +303,12 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
       : { processingMeetings: [...state.processingMeetings, id] }),
   unmarkMeetingProcessing: (id) =>
     set(state => ({ processingMeetings: state.processingMeetings.filter(x => x !== id) })),
+  markMeetingTranscribing: (id) =>
+    set(state => state.transcribingMeetings.includes(id)
+      ? state
+      : { transcribingMeetings: [...state.transcribingMeetings, id] }),
+  unmarkMeetingTranscribing: (id) =>
+    set(state => ({ transcribingMeetings: state.transcribingMeetings.filter(x => x !== id) })),
   patchSession: (id, patch) =>
     set(state => ({
       sessions: state.sessions.map(s => s.id === id ? { ...s, ...patch } : s),

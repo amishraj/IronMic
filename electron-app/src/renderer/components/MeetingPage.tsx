@@ -40,6 +40,7 @@ export function MeetingPage() {
     granolaSessionId, setGranolaSessionId,
     granolaRecordingStartedAt, setGranolaRecordingStartedAt,
     processingMeetings, markMeetingProcessing, unmarkMeetingProcessing,
+    markMeetingTranscribing, unmarkMeetingTranscribing,
     roomMode, setRoomMode, roomDisplayName, setRoomDisplayName,
     roomError, setRoomError, applyRoomState, applyParticipantUpdate, resetRoomState,
     isMicMuted, setIsMicMuted,
@@ -776,6 +777,10 @@ export function MeetingPage() {
         if (snap.summary && snap.summary.trim()) {
           await persistInstantSummary(sessionId, snap.summary.trim());
           unmarkMeetingProcessing(sessionId);
+          // "Transcribing…" label — shown while the final audio chunk is
+          // still being drained by Whisper in the background. Non-blocking;
+          // the user can already read their summary.
+          markMeetingTranscribing(sessionId);
           // Optimistic load so the card flips to "Notes ready + Enhancing"
           // immediately; a second loadSessions() runs after stop completes.
           loadSessions().catch(() => {});
@@ -788,6 +793,8 @@ export function MeetingPage() {
       //    down. If we tore down the room first, the final segment would
       //    never reach participants.
       const result = await window.ironmic.meetingStopRecording();
+      // STT drain complete — drop the non-blocking "Transcribing…" label.
+      unmarkMeetingTranscribing(sessionId);
       const { fullTranscript, liveSummary, liveInsufficient } = result as {
         fullTranscript: string;
         liveSummary?: string;
@@ -1000,6 +1007,7 @@ export function MeetingPage() {
       await restoreMeetingEngine();
 
       unmarkMeetingProcessing(sessionId);
+      unmarkMeetingTranscribing(sessionId);
       setIsGranolaStopping(false);
       setIsGranolaRecording(false);
 

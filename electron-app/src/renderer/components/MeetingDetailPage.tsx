@@ -64,6 +64,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
   const [dictateState, setDictateState] = useState<'idle' | 'recording' | 'processing'>('idle');
   const editorRef = useRef<Editor | null>(null);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
+  const transcribingMeetings = useMeetingStore(s => s.transcribingMeetings);
   const markMeetingProcessing = useMeetingStore(s => s.markMeetingProcessing);
   const unmarkMeetingProcessing = useMeetingStore(s => s.unmarkMeetingProcessing);
   const patchSession = useMeetingStore(s => s.patchSession);
@@ -568,6 +569,7 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
   const processingState = extractProcessingState(session);
   const isProcessing =
     processingMeetings.includes(sessionId) || processingState === 'generating' || regenerating;
+  const isTranscribing = transcribingMeetings.includes(sessionId) && !isProcessing;
   const isEmpty = processingState === 'empty';
   const isInsufficient = processingState === 'insufficient';
   // Summary pipeline ran but every retry failed (e.g. Copilot CLI couldn't
@@ -701,6 +703,15 @@ export function MeetingDetailPage({ sessionId, onBack, onUpdated }: Props) {
                     title="The template-formatted version couldn't be generated. The basic summary is available below; click Enhance to retry."
                   >
                     Basic summary only
+                  </span>
+                )}
+                {isTranscribing && (
+                  <span
+                    className="flex items-center gap-1 text-[10px] text-iron-text-muted bg-iron-surface-hover border border-iron-border px-1.5 py-0.5 rounded"
+                    title="Finishing transcription of the final audio segment. Your summary is already available."
+                  >
+                    <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                    Transcribing…
                   </span>
                 )}
               </div>

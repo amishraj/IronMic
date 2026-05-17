@@ -41,6 +41,8 @@ export function MeetingSessionCard({
 }: Props) {
   const [expanded, setExpanded] = useState(false);
   const processingMeetings = useMeetingStore(s => s.processingMeetings);
+  const transcribingMeetings = useMeetingStore(s => s.transcribingMeetings);
+  const isTranscribing = transcribingMeetings.includes(session.id);
 
   const date = new Date(session.started_at).toLocaleDateString(undefined, {
     weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
@@ -203,6 +205,15 @@ export function MeetingSessionCard({
                 >
                   <Sparkles className="w-2.5 h-2.5 animate-pulse" />
                   Enhancing…
+                </span>
+              )}
+              {isTranscribing && !isProcessing && (
+                <span
+                  className="flex items-center gap-1 text-[10px] text-iron-text-muted bg-iron-surface-hover border border-iron-border px-1.5 py-0.5 rounded"
+                  title="Finishing transcription of the final audio segment — summary already available above."
+                >
+                  <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                  Transcribing…
                 </span>
               )}
               {isEmpty && !isProcessing && (
