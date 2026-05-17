@@ -36,6 +36,7 @@ export function MeetingPage() {
     selectedAudioDevice, setSelectedAudioDevice,
     isGranolaRecording, setIsGranolaRecording,
     isGranolaStopping, setIsGranolaStopping,
+    isEngineSwapping, setIsEngineSwapping,
     granolaSessionId, setGranolaSessionId,
     granolaRecordingStartedAt, setGranolaRecordingStartedAt,
     processingMeetings, markMeetingProcessing, unmarkMeetingProcessing,
@@ -206,6 +207,11 @@ export function MeetingPage() {
     const unsubState = window.ironmic?.onMeetingRecordingState?.((state: any) => {
       setIsGranolaRecording(state.status === 'recording');
       setIsGranolaStopping(state.status === 'stopping');
+      // Mirror engineSwapping so the gear button + status row can show a
+      // spinner without the page flickering through the meetings-list view.
+      // Critical: do NOT include this in the isGranolaRecording check above;
+      // an in-progress swap MUST keep the live UI mounted.
+      setIsEngineSwapping(!!state.engineSwapping);
       // Mirror the recorder's streamingMode so the empty-state copy and any
       // future UI affordances can branch on it. Defaults to false on idle.
       setStreamingMode(!!state.streamingMode && state.status === 'recording');
@@ -956,7 +962,13 @@ export function MeetingPage() {
   const handleGranolaStop = useCallback(async () => {
     if (!granolaSessionId) return;
     const sessionId = granolaSessionId;
-    const durationSec = Math.round(durationMs / 1000);
+    // Compute duration from the immutable startedAt timestamp at stop time
+    // — NOT from `durationMs` parent state. That removes `durationMs` from
+    // this callback's deps, so the 1 Hz timer tick no longer rebuilds the
+    // callback (which previously cascaded down through React's useMemo /
+    // children identity checks and contributed to the ~1 Hz UI jitter).
+    const startedAt = granolaRecordingStartedAt ?? Date.now();
+    const durationSec = Math.round((Date.now() - startedAt) / 1000);
     const templateSnapshot = selectedTemplate;
     const roomModeSnapshot = roomMode;
 
@@ -983,7 +995,7 @@ export function MeetingPage() {
       roomModeSnapshot,
       skipRoomTeardown: false,
     });
-  }, [granolaSessionId, durationMs, selectedTemplate, roomMode, finalizeAndExitMeeting]);
+  }, [granolaSessionId, granolaRecordingStartedAt, selectedTemplate, roomMode, finalizeAndExitMeeting]);
 
   /**
    * Mark a session as having insufficient content to summarize.
@@ -1397,6 +1409,21 @@ export function MeetingPage() {
             </span>
             {isGranolaRecording && (
               <span className="text-xs text-iron-text-muted font-mono shrink-0">{formatDuration(durationMs)}</span>
+            )}
+            {/* Engine swap in progress — small inline indicator so the user
+                knows recording continues but transcription will pause for a
+                moment. The spinner is mounted ALONGSIDE the existing
+                "Recording…" label rather than replacing it, so the layout
+                doesn't shift during the swap. */}
+            {isEngineSwapping && (
+              <span
+                className="flex items-center gap-1.5 text-xs text-iron-accent-light shrink-0"
+                role="status"
+                aria-live="polite"
+              >
+                <span className="inline-block w-3 h-3 rounded-full border-2 border-iron-accent-light/30 border-t-iron-accent-light animate-spin" />
+                <span className="hidden sm:inline">Switching engine…</span>
+              </span>
             )}
             {/* Live meeting title — host & solo can edit, participant is
                 read-only (input disabled and styled flat). Saves debounced

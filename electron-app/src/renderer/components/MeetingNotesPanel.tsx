@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { FileText } from 'lucide-react';
 import type { StructuredMeetingOutput, StructuredSection } from '../services/tfjs/MeetingTemplateEngine';
 
@@ -31,7 +32,12 @@ function SectionBlock({ section }: { section: StructuredSection }) {
   );
 }
 
-export function MeetingNotesPanel({ structuredOutput, summary, htmlContent, isGenerating }: Props) {
+// Memoized below — see export at bottom. Why: this panel renders a
+// potentially-large HTML string and section blocks; without memoization
+// every MeetingPage re-render (1 Hz timer, status flips, live summary
+// pushes) rebuilds the whole subtree even when its own props are
+// reference-equal.
+function MeetingNotesPanelInner({ structuredOutput, summary, htmlContent, isGenerating }: Props) {
   // Generating skeleton
   if (isGenerating && !structuredOutput && !summary && !htmlContent) {
     return (
@@ -122,3 +128,6 @@ export function MeetingNotesPanel({ structuredOutput, summary, htmlContent, isGe
     </div>
   );
 }
+
+/** Memoized public export. See MeetingNotesPanelInner doc-comment. */
+export const MeetingNotesPanel = memo(MeetingNotesPanelInner);

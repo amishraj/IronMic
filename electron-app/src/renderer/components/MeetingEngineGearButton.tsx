@@ -18,9 +18,10 @@
  */
 
 import { useEffect, useRef, useState } from 'react';
-import { Settings, Check, AlertCircle } from 'lucide-react';
+import { Settings, Check, AlertCircle, Loader2 } from 'lucide-react';
 import { TRANSCRIPTION_ENGINES } from '../../shared/constants';
 import { swapMeetingEngineLive } from '../services/meeting/meetingEngineLifecycle';
+import { useMeetingStore } from '../stores/useMeetingStore';
 
 interface Props {
   /**
@@ -39,6 +40,13 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
   const [readyMap, setReadyMap] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
+  // Backend-reported swap state — `busy` is the renderer-side optimistic
+  // flag (covers the moment between click and IPC ack); `isEngineSwapping`
+  // is the source of truth from MeetingRecorder. Show the spinner while
+  // EITHER is true so it never blinks off between the renderer ack and the
+  // backend's first push.
+  const isEngineSwapping = useMeetingStore((s) => s.isEngineSwapping);
+  const showSpinner = busy || (isRecording && isEngineSwapping);
   const popoverRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
 
@@ -158,15 +166,21 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
         ref={buttonRef}
         onClick={() => setOpen((v) => !v)}
         className={`flex items-center gap-1.5 px-2 py-1.5 lg:px-2.5 text-xs rounded-lg border transition-colors whitespace-nowrap ${
-          open
-            ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/20'
-            : 'text-iron-text-muted border-iron-border hover:bg-iron-surface-hover'
+          showSpinner
+            ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/30'
+            : open
+              ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/20'
+              : 'text-iron-text-muted border-iron-border hover:bg-iron-surface-hover'
         }`}
-        title="Meeting transcription engine"
-        aria-label="Meeting transcription engine"
+        title={showSpinner ? 'Switching engine…' : 'Meeting transcription engine'}
+        aria-label={showSpinner ? 'Switching transcription engine' : 'Meeting transcription engine'}
       >
-        <Settings className="w-3.5 h-3.5" />
-        <span className="hidden lg:inline">Engine</span>
+        {showSpinner ? (
+          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+        ) : (
+          <Settings className="w-3.5 h-3.5" />
+        )}
+        <span className="hidden lg:inline">{showSpinner ? 'Switching…' : 'Engine'}</span>
       </button>
 
       {open && (
@@ -231,7 +245,13 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
               );
             })}
           </div>
-          {hint && (
+          {showSpinner && (
+            <div className="px-2 pt-2 flex items-center gap-1.5 text-[11px] text-iron-accent-light">
+              <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+              <span>Switching engine — recording continues. Audio is preserved.</span>
+            </div>
+          )}
+          {hint && !showSpinner && (
             <p className="px-2 pt-2 text-[11px] text-emerald-400">
               {hint}
             </p>

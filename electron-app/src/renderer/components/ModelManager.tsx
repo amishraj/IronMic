@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu, Info, Star, Globe, Gauge, Mic, FolderOpen, RefreshCw, Trash2, RotateCcw } from 'lucide-react';
+import { Download, Check, Loader2, HardDrive, AlertCircle, Zap, Cpu, Info, Star, Globe, Gauge, Mic, FolderOpen, RefreshCw, Trash2, RotateCcw, Users, ChevronRight } from 'lucide-react';
 import { Card, Toggle, Badge, Button } from './ui';
 import { ModelImportSection } from './ModelImportBanner';
 import { useDictationStore } from '../stores/useDictationStore';
@@ -623,7 +623,7 @@ function SpeechRecognitionModelSection({
         />
       ))}
 
-      <MeetingEnginePreferenceRow engineReadiness={engineReadiness} />
+      <MeetingEnginePreferenceCard engineReadiness={engineReadiness} />
 
       <ModelImportSection
         sectionLabel="Speech Recognition"
@@ -643,17 +643,22 @@ function SpeechRecognitionModelSection({
  * Large for accuracy, since meetings process audio in 30 s+ chunks where
  * first-chunk latency doesn't matter.
  *
- * Same gear popover lives on the Meetings page (active toolbar +
- * pre-recording header). This row is the Settings discovery surface for
- * users who never opened that gear.
+ * UI shape — card with tiered, clickable rows (NOT a select dropdown):
+ *  - The previous select dropdown was awkward and hid the only
+ *    information that matters when choosing (latency/size/recommended).
+ *  - The card now mirrors the gear popover on MeetingPage so users see
+ *    the same controls in both places.
+ *  - Same recommended-row treatment + "not downloaded" badge as
+ *    EngineRow above, but ONLY for the meeting-preference dimension —
+ *    selecting here does NOT switch the active dictation engine.
  */
-function MeetingEnginePreferenceRow({
+function MeetingEnginePreferenceCard({
   engineReadiness,
 }: {
   engineReadiness: Record<string, boolean>;
 }) {
   const [value, setValue] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  const [saving, setSaving] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -661,54 +666,132 @@ function MeetingEnginePreferenceRow({
         const v = await window.ironmic.getSetting('meeting_transcription_engine');
         setValue(v);
       } catch {
-        // ignore — leave value null so the select shows the default
+        // ignore — fall through to default
       }
     })();
   }, []);
 
-  const handleChange = async (newValue: string) => {
-    if (newValue === value) return;
-    setSaving(true);
+  const handleSelect = async (engineId: string) => {
+    if (engineId === value) return;
+    setSaving(engineId);
     try {
-      await window.ironmic.setSetting('meeting_transcription_engine', newValue);
-      setValue(newValue);
+      await window.ironmic.setSetting('meeting_transcription_engine', engineId);
+      setValue(engineId);
     } catch (err) {
       console.warn('[ModelManager] meeting_transcription_engine save failed:', err);
     } finally {
-      setSaving(false);
+      setSaving(null);
     }
   };
 
+  const RECOMMENDED_ID = 'whisper-large-v3-turbo';
+  const effectiveValue = value ?? RECOMMENDED_ID;
+
   return (
-    <Card variant="default" padding="md" className="mt-3">
-      <div className="space-y-2">
-        <div className="flex items-center justify-between gap-3">
+    <Card variant="default" padding="md" className="mt-3 border-iron-accent/20">
+      <div className="space-y-3">
+        {/* Header — explicit context so users understand this is the
+            MEETING dimension, not the dictation dimension. */}
+        <div className="flex items-start gap-2">
+          <div className="w-7 h-7 rounded-lg bg-iron-accent/10 flex items-center justify-center shrink-0 mt-0.5">
+            <Users className="w-3.5 h-3.5 text-iron-accent-light" />
+          </div>
           <div className="min-w-0">
-            <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
-              Meeting engine
+            <p className="text-sm font-semibold text-iron-text">
+              Meeting transcription engine
             </p>
             <p className="text-xs text-iron-text-muted mt-0.5">
-              Used for meeting transcription only. Dictation continues to use the model selected above.
+              Used only during meetings. Dictation keeps using Moonshine for sub-second latency.
+              Meetings process 30 s+ chunks where accuracy beats speed — pick the most accurate engine your machine can handle.
             </p>
           </div>
-          <select
-            value={value ?? 'whisper-large-v3-turbo'}
-            disabled={saving}
-            onChange={(e) => void handleChange(e.target.value)}
-            className="bg-iron-surface border border-iron-border rounded-md px-2 py-1 text-xs text-iron-text focus:outline-none focus:border-iron-accent disabled:opacity-50"
-          >
-            {TRANSCRIPTION_ENGINES.map((e) => {
-              const ready = engineReadiness[e.id] !== false;
-              return (
-                <option key={e.id} value={e.id} disabled={!ready}>
-                  {e.label}
-                  {!ready ? ' (not downloaded)' : ''}
-                  {e.id === 'whisper-large-v3-turbo' ? ' — recommended' : ''}
-                </option>
-              );
-            })}
-          </select>
         </div>
+
+        {/* Engine choices — clickable rows. Disabled rows are not-downloaded
+            engines; same affordance as EngineRow's "Download" CTA above
+            (we don't repeat the download button here — that lives in the
+            dictation EngineRow above this card). */}
+        <div className="space-y-1.5">
+          {TRANSCRIPTION_ENGINES.map((meta) => {
+            const ready = engineReadiness[meta.id] !== false;
+            const isSelected = effectiveValue === meta.id;
+            const isRecommended = meta.id === RECOMMENDED_ID;
+            const isSaving = saving === meta.id;
+            return (
+              <button
+                key={meta.id}
+                onClick={() => handleSelect(meta.id)}
+                disabled={!ready || isSaving}
+                className={`w-full text-left p-2.5 rounded-lg border transition-all ${
+                  isSelected
+                    ? 'bg-iron-accent/15 border-iron-accent/40 shadow-[0_0_0_1px_rgba(99,102,241,0.15)]'
+                    : 'bg-iron-surface border-iron-border hover:border-iron-accent/30 hover:bg-iron-surface-hover'
+                } ${!ready ? 'opacity-50 cursor-not-allowed' : ''}`}
+                aria-pressed={isSelected}
+                title={!ready ? 'Model not downloaded — install via the row above.' : undefined}
+              >
+                <div className="flex items-center gap-2.5">
+                  {/* Radio dot — visual selection cue without a real
+                      radio input (the button itself is the control) */}
+                  <span
+                    className={`w-3.5 h-3.5 rounded-full border-2 shrink-0 flex items-center justify-center ${
+                      isSelected
+                        ? 'border-iron-accent-light bg-iron-accent-light'
+                        : 'border-iron-text-muted/40'
+                    }`}
+                  >
+                    {isSelected && <span className="w-1.5 h-1.5 rounded-full bg-iron-surface" />}
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-sm font-medium text-iron-text">
+                        {meta.label}
+                      </span>
+                      {isRecommended && (
+                        <span className="text-[9px] uppercase tracking-wider text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-1.5 py-0.5 rounded">
+                          Recommended
+                        </span>
+                      )}
+                      {meta.family === 'moonshine' && (
+                        <span className="text-[9px] uppercase tracking-wider text-iron-accent-light bg-iron-accent/10 border border-iron-accent/20 px-1.5 py-0.5 rounded">
+                          Live captions
+                        </span>
+                      )}
+                      {!ready && (
+                        <span className="text-[9px] uppercase tracking-wider text-amber-300 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded">
+                          Not downloaded
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-iron-text-muted mt-0.5 line-clamp-2">
+                      {meta.description}
+                    </p>
+                    <p className="text-[10px] text-iron-text-muted/70 mt-0.5">
+                      {meta.sizeLabel} · {meta.latencyHint}
+                    </p>
+                  </div>
+                  {isSaving ? (
+                    <Loader2 className="w-4 h-4 text-iron-accent-light animate-spin shrink-0" />
+                  ) : isSelected ? (
+                    <Check className="w-4 h-4 text-iron-accent-light shrink-0" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 text-iron-text-muted/40 shrink-0" />
+                  )}
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Helper note — explains the live-switch capability so power users
+            know they don't need to come back here to change mid-meeting. */}
+        <p className="text-[11px] text-iron-text-muted/80 flex items-start gap-1.5 pt-0.5">
+          <Info className="w-3 h-3 mt-0.5 shrink-0" />
+          <span>
+            You can also switch the engine mid-meeting using the gear button in the meeting toolbar.
+            Audio is preserved across the switch.
+          </span>
+        </p>
       </div>
     </Card>
   );

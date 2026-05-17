@@ -67,6 +67,12 @@ interface MeetingStore {
   /** True while backend is finishing the previous recording (draining buffer + diarization).
    *  Blocks starting a new recording until it returns to idle. */
   isGranolaStopping: boolean;
+  /** True while the recorder is mid-flight on a streaming↔chunked engine
+   *  swap. Renderer reads this to show a spinner / "Switching engine…"
+   *  indicator without unmounting the live meeting UI (which would happen
+   *  if the swap flipped status through 'stopping'). Cleared by the
+   *  recorder when the swap completes. */
+  isEngineSwapping: boolean;
   /** Active session ID — kept in Zustand (not component local state) so it survives
    *  MeetingPage unmount when the user switches tabs mid-recording. */
   granolaSessionId: string | null;
@@ -115,6 +121,7 @@ interface MeetingStore {
   setSelectedAudioDevice: (device: string | null) => void;
   setIsGranolaRecording: (recording: boolean) => void;
   setIsGranolaStopping: (stopping: boolean) => void;
+  setIsEngineSwapping: (swapping: boolean) => void;
   setGranolaSessionId: (id: string | null) => void;
   setGranolaRecordingStartedAt: (ts: number | null) => void;
 
@@ -146,6 +153,7 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
   selectedAudioDevice: null,
   isGranolaRecording: false,
   isGranolaStopping: false,
+  isEngineSwapping: false,
   granolaSessionId: null,
   granolaRecordingStartedAt: null,
   processingMeetings: [],
@@ -278,6 +286,7 @@ export const useMeetingStore = create<MeetingStore>((set, get) => ({
     isMicMuted: false,
   }),
   setIsGranolaStopping: (stopping) => set({ isGranolaStopping: stopping }),
+  setIsEngineSwapping: (swapping) => set({ isEngineSwapping: swapping }),
   setGranolaSessionId: (id) => set({ granolaSessionId: id }),
   setGranolaRecordingStartedAt: (ts) => set({ granolaRecordingStartedAt: ts }),
 

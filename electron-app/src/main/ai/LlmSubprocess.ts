@@ -103,6 +103,50 @@ class LlmSubprocessManager {
       },
     });
 
+    // Lower OS-level priority of the LLM subprocess so its CPU usage
+    // doesn't compete with the renderer + audio capture thread for
+    // scheduler time. The LLM is "soft real-time" — a 500 ms delay in
+    // a polish/summary response is invisible to the user, but a 50 ms
+    // scheduling hiccup in the renderer event loop or audio capture
+    // shows up as visible UI jank or skipped audio frames.
+    //
+    // Behavior per platform (best-effort — failures are silently
+    // ignored, the subprocess just runs at default priority):
+    //   • Windows: spawn the subprocess at BELOW_NORMAL_PRIORITY_CLASS
+    //     via `wmic process where ProcessId=<pid> CALL setpriority "below normal"`.
+    //     This is the supported way to renice a process from another
+    //     process on Windows without native APIs.
+    //   • macOS / Linux: setpriority(PRIO_PROCESS, pid, +5). Same
+    //     effect — slightly nicer than default, so other processes
+    //     preempt it.
+    //
+    // We do this AFTER spawn (rather than via `windowsPriority`/
+    // `detached`) so the parent retains full ownership: if Electron
+    // exits, the subprocess is killed normally by the existing cleanup
+    // path.
+    try {
+      const pid = this.proc.pid;
+      if (pid && pid > 0) {
+        if (process.platform === 'win32') {
+          // 16384 = BELOW_NORMAL_PRIORITY_CLASS (Win32). wmic ships with
+          // every Windows install and the call is non-blocking from our
+          // perspective (we don't await its exit).
+          spawn('wmic', [
+            'process', 'where', `ProcessId=${pid}`,
+            'CALL', 'setpriority', '"below normal"',
+          ], { stdio: 'ignore', windowsHide: true });
+        } else {
+          // POSIX renice +5. `renice` is always on PATH on macOS/Linux.
+          spawn('renice', ['+5', '-p', String(pid)], { stdio: 'ignore' });
+        }
+      }
+    } catch (err) {
+      // Best-effort — running at default priority is OK if this fails.
+      if (process.env.NODE_ENV === 'development') {
+        console.warn('[llm-subprocess] priority adjust failed:', (err as Error)?.message);
+      }
+    }
+
     this.proc.stdout?.on('data', (chunk: Buffer) => {
       this.handleStdout(chunk.toString());
     });

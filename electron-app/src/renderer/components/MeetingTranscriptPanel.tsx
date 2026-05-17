@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { Mic, Clock } from 'lucide-react';
 
 export interface TranscriptSegment {
@@ -121,7 +121,26 @@ function ChunkCountdown({
   );
 }
 
-export function MeetingTranscriptPanel({ segments, isLive, draftHypothesis, streamingMode }: Props) {
+/**
+ * Inner component — receives all props by value. Wrapped in React.memo
+ * below so the panel only re-renders when its own props actually change.
+ *
+ * Why this matters: MeetingPage triggers many re-renders during a live
+ * meeting (timer tick every 1 s, status flags toggling, live summary
+ * updates every chunk). Without memoization, every parent re-render
+ * rebuilds the transcript list — which is expensive at 50+ segments
+ * because the speaker-color lookup and timestamp formatting run for
+ * every row. On Windows machines that are already CPU-bound on Whisper
+ * inference, this shows up as visible UI jank.
+ *
+ * `streamingMode` and `isLive` flip rarely; `draftHypothesis` updates
+ * frequently (every ~200 ms in streaming mode) but causes only the
+ * draft line to re-render, not the whole list (segments is reference-
+ * equal across draft-only updates). `segments` is appended in place
+ * by Zustand so its reference DOES change on commit — that's the
+ * intentional re-render trigger.
+ */
+function MeetingTranscriptPanelInner({ segments, isLive, draftHypothesis, streamingMode }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
@@ -256,3 +275,9 @@ export function MeetingTranscriptPanel({ segments, isLive, draftHypothesis, stre
     </div>
   );
 }
+
+/**
+ * Public export — memoized so re-renders are gated on actual prop change.
+ * See MeetingTranscriptPanelInner doc-comment for rationale.
+ */
+export const MeetingTranscriptPanel = memo(MeetingTranscriptPanelInner);
