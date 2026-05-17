@@ -77,6 +77,11 @@ const ALLOWED_SETTING_KEYS = new Set([
   'notebooks',
   // Debug toggle for the audio pipeline log channel (renderer DevTools)
   'debug_audio_logging',
+  // One-time discoverability flag: 'true' once the close-to-tray hint
+  // notification has been shown. Persisted so the hint never re-fires.
+  // Read/written from main process (not via this IPC), but listed here
+  // so a future "reset onboarding" admin tool can clear it via setSetting.
+  'tray_hint_shown',
   // Whisper thread count override — default is min(4, num_cpus).
   // Reduce on VDI / shared machines if first-transcription hangs.
   'whisper_threads',

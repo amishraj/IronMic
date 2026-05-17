@@ -2,7 +2,7 @@
  * Electron main process entry point.
  */
 
-import { app, BrowserWindow, session, globalShortcut, nativeImage, dialog } from 'electron';
+import { app, BrowserWindow, Notification, session, globalShortcut, nativeImage, dialog } from 'electron';
 import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
 import { debugLog } from './debug-log';
@@ -42,6 +42,67 @@ const ICON_PATH = path.join(__dirname, '..', '..', 'resources', 'icon.png');
 
 let mainWindow: BrowserWindow | null = null;
 
+/**
+ * "Real quit" flag — flipped to true only by an explicit user request to
+ * exit the app (tray menu → Quit, Cmd+Q / Alt+F4, OS shutdown). When false,
+ * the window's `close` event is intercepted and the window is hidden to the
+ * system tray instead — same pattern Discord/Slack/Teams use. This makes
+ * IronMic feel like a professional always-available tool: closing the X
+ * never tears down the running meeting/recording in main process state.
+ *
+ * Reset to false if the user CANCELS the in-progress warning dialog so a
+ * subsequent X click correctly hides-to-tray rather than re-prompting.
+ */
+let isAppQuitting = false;
+
+/**
+ * One-time discoverability hint shown the FIRST time the user closes the
+ * window via X (which now hides to tray rather than quits). The hint
+ * answers "wait, where did the app go?" before the user goes hunting for
+ * it. Stored in the SQLite settings table so it persists across launches
+ * but only fires once per install.
+ *
+ * Key: `tray_hint_shown`. Default 'false'. Flipped to 'true' on first
+ * hide-to-tray.
+ */
+function maybeShowTrayHint(): void {
+  try {
+    const shown = native.getSetting('tray_hint_shown');
+    if (shown === 'true') return;
+    if (!Notification.isSupported()) {
+      // No native notifications (rare — headless Linux, etc.). Just persist
+      // so we don't probe Notification.isSupported() on every close.
+      native.setSetting('tray_hint_shown', 'true');
+      return;
+    }
+    const body =
+      process.platform === 'win32'
+        ? 'IronMic is still running. Right-click the tray icon to quit.'
+        : 'IronMic is still running. Right-click the menu-bar icon to quit.';
+    const n = new Notification({
+      title: 'IronMic is in the background',
+      body,
+      silent: true,
+    });
+    // Clicking the notification re-shows the window — same affordance as
+    // clicking the tray icon. Pro-app behavior.
+    n.on('click', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (!mainWindow.isVisible()) mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+    n.show();
+    native.setSetting('tray_hint_shown', 'true');
+  } catch (err) {
+    // Best-effort — failing here just means the user might be briefly
+    // confused. Not worth crashing for.
+    if (process.env.NODE_ENV === 'development') {
+      console.warn('[main] tray-hint failed:', (err as Error)?.message);
+    }
+  }
+}
+
 function createWindow(): void {
   mainWindow = new BrowserWindow({
     width: 900,
@@ -68,19 +129,54 @@ function createWindow(): void {
     mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   }
 
-  // Intercept window close to warn about in-progress recording or note generation.
-  // We must call event.preventDefault() synchronously and re-try the close from
-  // inside the async dialog callback — that's Electron's required pattern.
+  // Window close handler — two distinct paths.
+  //
+  // Path A (default — user clicks X / Cmd+W / Alt+F4): hide to tray. The
+  // app keeps running in main process state, the system tray icon stays
+  // visible, and a one-time hint notification fires on the first
+  // close-to-tray so the user knows what happened. This matches the
+  // behavior of Discord/Slack/Teams — closing the window does NOT exit
+  // the app.
+  //
+  // Path B (user explicitly quits via tray menu / OS shutdown): the
+  // tray's Quit click sets isAppQuitting=true before calling app.quit().
+  // We then run the existing "warn about in-progress recording/notes"
+  // flow. If the user cancels in the dialog, we reset isAppQuitting back
+  // to false so the next X click correctly hides-to-tray.
+  //
+  // We must call event.preventDefault() synchronously and re-try the
+  // close from inside the async dialog callback — Electron's required
+  // pattern.
   mainWindow.on('close', (event) => {
+    if (!isAppQuitting) {
+      // Path A — soft close, hide to tray.
+      event.preventDefault();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.hide();
+      }
+      maybeShowTrayHint();
+      return;
+    }
+
+    // Path B — real quit; check for in-progress work.
     const isRecording = meetingRecorder.isActive();
     const generatingCount: number =
       typeof (global as any).__ironmicActiveGeneratingCount === 'function'
         ? (global as any).__ironmicActiveGeneratingCount()
         : 0;
 
-    if (!isRecording && generatingCount === 0) return; // nothing to warn about
+    if (!isRecording && generatingCount === 0) return; // nothing to warn about; let close proceed
 
     event.preventDefault(); // hold the close while the dialog is shown
+
+    // If the user invoked Quit from the tray while the window is hidden
+    // (close-to-tray state), the warning dialog would otherwise be
+    // application-modal but visually invisible. Show + focus the window
+    // first so the dialog parents to something the user can see.
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
 
     const lines: string[] = [];
     if (isRecording) lines.push('• A meeting is currently being recorded.');
@@ -99,8 +195,12 @@ function createWindow(): void {
         // User confirmed — force close (remove this listener so it doesn't loop)
         mainWindow?.removeAllListeners('close');
         mainWindow?.close();
+      } else {
+        // User cancelled — keep window open AND reset isAppQuitting so a
+        // subsequent X click does the right thing (hide to tray) instead
+        // of re-prompting.
+        isAppQuitting = false;
       }
-      // Otherwise: do nothing, window stays open
     }).catch(() => {
       // Dialog failed (unlikely) — close anyway
       mainWindow?.removeAllListeners('close');
@@ -257,7 +357,14 @@ app.whenReady().then(async () => {
   blockAllNetworkRequests();
   registerIpcHandlers();
   createWindow();
-  createTray(() => app.quit());
+  // Tray "Quit" → set quit flag BEFORE app.quit() so the window-close
+  // handler routes to the "real quit" path (warning dialog) instead of
+  // hide-to-tray. `before-quit` will also set the flag — setting it twice
+  // is harmless, but doing it here removes a one-tick race window.
+  createTray(() => {
+    isAppQuitting = true;
+    app.quit();
+  });
   registerGlobalHotkey();
 
   // Copy bundled TTS voices to user data on first launch
@@ -451,16 +558,54 @@ function sendWhisperFailure(message: string, permanent: boolean): void {
   setTimeout(send, 3000);
 }
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+/**
+ * `before-quit` fires whenever something requests the app to quit — Cmd+Q,
+ * Alt+F4, OS shutdown, taskkill, dock → Quit, app.quit() programmatic
+ * call. We flip the quit flag so the window close handler routes through
+ * the "real quit" path (warning dialog, then exit) instead of the
+ * default soft-close (hide-to-tray) path.
+ *
+ * The tray's Quit menu item ALSO sets this flag before calling app.quit()
+ * — that's defense-in-depth: setting it twice is harmless.
+ */
+app.on('before-quit', () => {
+  isAppQuitting = true;
 });
 
+/**
+ * `window-all-closed` — intentionally NOT quitting the app here, on any
+ * platform. The app stays alive in the system tray until the user
+ * explicitly chooses Quit. Previously this called app.quit() on non-
+ * darwin, which made Windows fully exit on X-button close. Now both
+ * platforms behave like Discord/Slack/Teams — the tray icon is the
+ * single source of truth for app lifetime.
+ *
+ * If the user did request a real quit (isAppQuitting=true), the windows
+ * are closing because the quit sequence is in progress; we let it
+ * proceed to `will-quit` naturally without re-entering here.
+ */
+app.on('window-all-closed', () => {
+  // No-op by design. See doc-comment above.
+});
+
+/**
+ * macOS dock-click handler. Two scenarios:
+ *
+ *   1. Window is hidden (close-to-tray happened earlier this session) →
+ *      show + focus it. Faster than re-creating a window.
+ *   2. Window was destroyed (e.g. app was re-launched from Finder while
+ *      already running, before close-to-tray was added) → re-create.
+ *
+ * Also useful on Windows when a second-instance lock forwards a launch
+ * attempt to the existing instance (we surface the existing window).
+ */
 app.on('activate', () => {
-  if (mainWindow === null) {
-    createWindow();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (!mainWindow.isVisible()) mainWindow.show();
+    mainWindow.focus();
+    return;
   }
+  createWindow();
 });
 
 app.on('will-quit', () => {
