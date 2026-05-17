@@ -869,6 +869,30 @@ export function MeetingPage() {
           // above (empty / insufficient) have already filtered out the
           // cases where it would be empty.
           await persistInstantSummary(sessionId, liveSummary || '');
+
+          // CRITICAL: unmark "processing" RIGHT NOW so the
+          // RecordingIndicator pill drops "Generating notes",
+          // MeetingSessionCard drops "Processing…" + shows "Notes ready"
+          // + "Enhancing…", and MeetingDetailPage drops the "currently
+          // being processed" banner. The summary is readable; the
+          // enhancement is a separate background concern that's
+          // surfaced via the enhancementState='enhancing' flag, NOT via
+          // processingMeetings.
+          //
+          // Without this early unmark, the UI keeps showing "Processing"
+          // for the full duration of the heavy template pass (10-60 s),
+          // defeating the entire instant-summary UX even though the DB
+          // has the live summary written and the user could read it.
+          //
+          // The finally block below still calls unmarkMeetingProcessing
+          // as a safety net for paths that DON'T reach Phase A (empty /
+          // insufficient / host overrides) and as idempotent defense.
+          //
+          // Intentionally NOT touching notifyProcessingState here — the
+          // main-process close-warning counter is owned by
+          // generateStructuredNotes (which still SHOULD warn the user
+          // about losing work if they try to quit during enhancement).
+          unmarkMeetingProcessing(sessionId);
           await loadSessions();
 
           // Always run the structured pass through a template — never the
@@ -1378,6 +1402,23 @@ export function MeetingPage() {
       }
 
       try {
+        // SummaryGenerator returns `processingState: 'failed'` when all
+        // retries exhausted (e.g. local LLM unavailable AND Copilot
+        // rejected the prompt). We MUST NOT propagate that 'failed'
+        // into the persisted structured_output when we have a Phase A
+        // baseline — that would replace the readable live summary with
+        // SUMMARY_UNAVAILABLE_MESSAGE and flip the detail page to the
+        // "Summary unavailable" banner, regressing the instant-summary UX.
+        //
+        // Detect that case here and route through the failure-preserves-
+        // baseline path. Phase A laid down a non-empty plainSummary so
+        // existingBeforeRecovery contains the baseline; the catch block
+        // below is what we want to reuse for this path too. Throwing a
+        // sentinel error keeps the logic in one place.
+        if ((structured as any).processingState === 'failed' && existingBeforeRecovery.plainSummary) {
+          throw new Error('ENHANCEMENT_FAILED_PRESERVE_BASELINE');
+        }
+
         // Tag the enhanced result so the card / detail page can show an
         // "Enhanced" indicator (or just clear the "Enhancing…" badge).
         // Also strip the recovery-only fields — they're no longer
@@ -1389,7 +1430,11 @@ export function MeetingPage() {
         delete enhancedPayload._recoveryTemplateId;
         delete enhancedPayload._recoveryDurationSec;
         await window.ironmic.meetingSetStructuredOutput(sessionId, JSON.stringify(enhancedPayload));
-      } catch (err) {
+      } catch (err: any) {
+        // Re-throw so the outer catch handles BOTH the sentinel and any
+        // actual save-failure. The outer catch is the path that
+        // preserves the Phase A baseline.
+        if (err?.message === 'ENHANCEMENT_FAILED_PRESERVE_BASELINE') throw err;
         console.error('[MeetingPage] Failed to save structured output:', err);
       }
 
