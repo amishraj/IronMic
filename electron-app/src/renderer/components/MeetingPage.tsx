@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User, Share2, PanelRightOpen, PanelRightClose } from 'lucide-react';
+import { Mic, MicOff, Plus, Users, Clock, LayoutTemplate, Trash2, Wifi, LogIn, User, Share2, PanelRightOpen, PanelRightClose, PhoneOff } from 'lucide-react';
 import { Card, Badge, Button } from './ui';
 import { MeetingSessionCard } from './MeetingSessionCard';
 import { MeetingEngineGearButton } from './MeetingEngineGearButton';
@@ -1449,7 +1449,13 @@ export function MeetingPage() {
             )}
           </div>
           {isGranolaRecording && (
-            <div className="flex items-center gap-2">
+            // Toolbar — buttons collapse to icons-only below `lg` (1024px)
+            // so the full toolbar fits comfortably alongside the title input
+            // on narrow viewports. `hidden lg:inline` on the labels keeps
+            // text on wide screens. `whitespace-nowrap` on the button itself
+            // prevents the icon+label from wrapping mid-render when the
+            // viewport is right at the breakpoint.
+            <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
               {/* Mic on/off — privacy boundary. When muted: no local STT, no
                   segment broadcast, no final-drain on stop. Backend is source
                   of truth; we only invoke the IPC and the state event flips
@@ -1464,30 +1470,32 @@ export function MeetingPage() {
                   }
                 }}
                 disabled={!granolaSessionId}
-                className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-lg border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+                className={`flex items-center gap-1.5 px-2 py-1.5 lg:px-2.5 text-xs rounded-lg border transition-colors whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed ${
                   isMicMuted
                     ? 'bg-red-500/15 text-red-400 border-red-500/30 hover:bg-red-500/25'
                     : 'text-iron-text-muted border-iron-border hover:bg-iron-surface-hover'
                 }`}
                 title={isMicMuted ? 'Unmute microphone' : 'Mute microphone'}
+                aria-label={isMicMuted ? 'Unmute microphone' : 'Mute microphone'}
               >
                 {isMicMuted ? <MicOff className="w-3.5 h-3.5" /> : <Mic className="w-3.5 h-3.5" />}
-                {isMicMuted ? 'Mic off' : 'Mic on'}
+                <span className="hidden lg:inline">{isMicMuted ? 'Mic off' : 'Mic on'}</span>
               </button>
               {/* Collaborate toggle — host only. Hides/shows the invite block
                   (IP/port/code) so it can be kept off-screen during a share. */}
               {roomMode === 'host' && (
                 <button
                   onClick={() => setShowInviteDetails(v => !v)}
-                  className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-lg border transition-colors ${
+                  className={`flex items-center gap-1.5 px-2 py-1.5 lg:px-2.5 text-xs rounded-lg border transition-colors whitespace-nowrap ${
                     showInviteDetails
                       ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/20'
                       : 'text-iron-text-muted border-iron-border hover:bg-iron-surface-hover'
                   }`}
                   title={showInviteDetails ? 'Hide invite details' : 'Show invite details'}
+                  aria-label={showInviteDetails ? 'Hide invite details' : 'Show invite details'}
                 >
                   <Share2 className="w-3.5 h-3.5" />
-                  Collaborate
+                  <span className="hidden lg:inline">Collaborate</span>
                 </button>
               )}
               {/* Meeting engine gear — live-switch during recording. Selection
@@ -1496,9 +1504,14 @@ export function MeetingPage() {
               <MeetingEngineGearButton isRecording={true} />
               <button
                 onClick={handleGranolaStop}
-                className="px-3 py-1.5 text-xs font-medium bg-red-500/15 text-red-400 rounded-lg border border-red-500/20 hover:bg-red-500/25 transition-colors"
+                className="px-2 py-1.5 lg:px-3 text-xs font-medium bg-red-500/15 text-red-400 rounded-lg border border-red-500/20 hover:bg-red-500/25 transition-colors whitespace-nowrap"
+                title={roomMode === 'participant' ? 'Leave Room' : 'End Meeting'}
+                aria-label={roomMode === 'participant' ? 'Leave Room' : 'End Meeting'}
               >
-                {roomMode === 'participant' ? 'Leave Room' : 'End Meeting'}
+                <PhoneOff className="w-3.5 h-3.5 lg:hidden inline" />
+                <span className="hidden lg:inline">
+                  {roomMode === 'participant' ? 'Leave Room' : 'End Meeting'}
+                </span>
               </button>
             </div>
           )}

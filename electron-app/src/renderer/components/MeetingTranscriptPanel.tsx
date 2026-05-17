@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react';
-import { Mic } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import { Mic, Clock } from 'lucide-react';
 
 export interface TranscriptSegment {
   id: string;
@@ -78,6 +78,49 @@ function DraftLine({ text }: { text: string }) {
   );
 }
 
+/**
+ * Chunked-mode pacing indicator. Shows when the next ~30 s transcript
+ * block is expected to arrive — without it, switching from Moonshine to
+ * Whisper mid-meeting looks broken because the panel goes silent for the
+ * full chunk window.
+ *
+ * Resets to `chunkIntervalSec` whenever a new segment lands (we observe
+ * this via the prop change in the parent) — so the countdown always
+ * reflects the gap until the NEXT chunk, not since meeting start.
+ *
+ * `lastSegmentTick` is incremented by the parent whenever `segments.length`
+ * goes up. We don't read `segments` directly here to keep the prop surface
+ * narrow.
+ */
+function ChunkCountdown({
+  lastSegmentTick,
+  chunkIntervalSec,
+  hasSegments,
+}: {
+  lastSegmentTick: number;
+  chunkIntervalSec: number;
+  hasSegments: boolean;
+}) {
+  const [secondsLeft, setSecondsLeft] = useState(chunkIntervalSec);
+
+  useEffect(() => {
+    setSecondsLeft(chunkIntervalSec);
+    const id = window.setInterval(() => {
+      setSecondsLeft((s) => (s > 0 ? s - 1 : chunkIntervalSec));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [lastSegmentTick, chunkIntervalSec]);
+
+  return (
+    <div className="flex items-center gap-1.5 text-[10px] text-iron-text-muted/80 px-2 py-1 rounded bg-iron-surface-hover/40 mb-2 w-fit">
+      <Clock className="w-3 h-3" />
+      <span>
+        {hasSegments ? 'Next block in' : 'First block in'} ~{secondsLeft}s
+      </span>
+    </div>
+  );
+}
+
 export function MeetingTranscriptPanel({ segments, isLive, draftHypothesis, streamingMode }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -85,6 +128,14 @@ export function MeetingTranscriptPanel({ segments, isLive, draftHypothesis, stre
 
   const draft = (draftHypothesis ?? '').trim();
   const showDraft = isLive && draft.length > 0;
+
+  // Chunked-mode indicator gate. Live chunked path's typical interval is
+  // 15–30 s (Whisper meeting setting). The user-facing copy uses ~30 s
+  // because that's what the gear popover advertises and what most users
+  // will run. The countdown resets on every new segment (parent-driven
+  // tick) so the displayed value is always "time until the NEXT block".
+  const showChunkCountdown = isLive && !streamingMode;
+  const CHUNK_INTERVAL_SEC = 30;
 
   // Auto-scroll to bottom when new segments OR a draft update arrives,
   // unless the user has scrolled up to read history.
@@ -128,8 +179,17 @@ export function MeetingTranscriptPanel({ segments, isLive, draftHypothesis, stre
           <p className="text-xs text-iron-text-muted/80 mt-1">
             {streamingMode
               ? 'Live transcription — words appear as you speak.'
-              : 'Segments appear every ~15 seconds.'}
+              : `Segments appear every ~${CHUNK_INTERVAL_SEC} seconds.`}
           </p>
+        )}
+        {showChunkCountdown && (
+          <div className="mt-3">
+            <ChunkCountdown
+              lastSegmentTick={0}
+              chunkIntervalSec={CHUNK_INTERVAL_SEC}
+              hasSegments={false}
+            />
+          </div>
         )}
       </div>
     );
@@ -171,6 +231,18 @@ export function MeetingTranscriptPanel({ segments, isLive, draftHypothesis, stre
 
       {/* Live grey-typing line — appears below the latest committed segment */}
       {showDraft && <DraftLine text={draft} />}
+
+      {/* Chunked-mode countdown — only shown when isLive AND non-streaming.
+          The lastSegmentTick uses segments.length so the timer resets each
+          time a new chunk arrives (mirroring user expectation: "how long
+          until the next block"). */}
+      {showChunkCountdown && (
+        <ChunkCountdown
+          lastSegmentTick={segments.length}
+          chunkIntervalSec={CHUNK_INTERVAL_SEC}
+          hasSegments={true}
+        />
+      )}
 
       {/* Live pulse indicator */}
       {isLive && (

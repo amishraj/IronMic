@@ -776,6 +776,22 @@ export function registerIpcHandlers(): void {
         debugLog('engine.swap', { kind: value, error: err?.message ?? String(err) });
         throw err;
       }
+      // If a meeting is currently recording, the MeetingRecorder's
+      // `streamingMode` was fixed at meeting start. Without an explicit
+      // mode transition here, the recorder would keep running the old
+      // path against the new engine — manifesting as
+      // "session_append not supported by this engine" when switching to
+      // Whisper, or silent/missing chunks when switching to Moonshine.
+      // handleEngineSwap performs the streaming↔chunked transition and
+      // pushes a fresh state event so the renderer's UI mode reflects
+      // reality. Fire-and-forget; method never throws.
+      try {
+        if (meetingRecorder.isActive()) {
+          void meetingRecorder.handleEngineSwap(value);
+        }
+      } catch (err) {
+        console.warn('[ipc] meetingRecorder.handleEngineSwap failed:', err);
+      }
     }
     return result;
   });

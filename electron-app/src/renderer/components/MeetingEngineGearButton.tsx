@@ -113,9 +113,23 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
     try {
       if (isRecording) {
         // Live path — swapMeetingEngineLive handles readiness + DB
-        // rollback + persistence of both keys. Never throws.
+        // rollback + persistence of both keys. Never throws. After it
+        // resolves the native engine is swapped AND the MeetingRecorder
+        // has handled its streaming↔chunked mode transition (the IPC
+        // handler dispatches handleEngineSwap immediately after).
         await swapMeetingEngineLive(engineId);
-        setHint(`Switching to ${engineId} on the next chunk…`);
+        // Set a mode-aware hint so the user knows what to expect. Both
+        // engine families behave very differently:
+        //   • Moonshine → live grey-typing draft + commits on pause/cap
+        //   • Whisper   → silent ~Ns blocks, then a fully-formed segment
+        // Without the hint, switching mid-meeting feels broken because
+        // the panel doesn't update for many seconds either way.
+        const isMoonshine = engineId.startsWith('moonshine');
+        setHint(
+          isMoonshine
+            ? 'Switched to live transcription — next words will appear as you speak.'
+            : 'Switched. The next transcript block will appear in ~30 s.',
+        );
         // Reflect optimistically; the lifecycle helper may have rolled
         // back on failure, but its toast already explains.
         setCurrentMeetingEngine(engineId);
@@ -126,7 +140,8 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
         setCurrentMeetingEngine(engineId);
       }
       // Auto-close after a beat so the user sees the checkmark move.
-      window.setTimeout(() => setOpen(false), isRecording ? 1500 : 250);
+      // Slightly longer for live swap so the hint is readable.
+      window.setTimeout(() => setOpen(false), isRecording ? 2200 : 250);
     } finally {
       setBusy(false);
     }
@@ -142,7 +157,7 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
       <button
         ref={buttonRef}
         onClick={() => setOpen((v) => !v)}
-        className={`flex items-center gap-1.5 px-2.5 py-1.5 text-xs rounded-lg border transition-colors ${
+        className={`flex items-center gap-1.5 px-2 py-1.5 lg:px-2.5 text-xs rounded-lg border transition-colors whitespace-nowrap ${
           open
             ? 'bg-iron-accent/15 text-iron-accent-light border-iron-accent/20'
             : 'text-iron-text-muted border-iron-border hover:bg-iron-surface-hover'
@@ -151,7 +166,7 @@ export function MeetingEngineGearButton({ isRecording }: Props) {
         aria-label="Meeting transcription engine"
       >
         <Settings className="w-3.5 h-3.5" />
-        Engine
+        <span className="hidden lg:inline">Engine</span>
       </button>
 
       {open && (

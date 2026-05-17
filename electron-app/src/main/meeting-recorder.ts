@@ -222,6 +222,201 @@ class MeetingRecorderManager {
   }
 
   /**
+   * Handle a mid-meeting engine swap initiated by the renderer's
+   * `swapMeetingEngineLive()`. The settings IPC has already called
+   * `native.setTranscriptionEngine(newEngineKind)` BEFORE calling this, so
+   * the active engine in the Rust addon is already the new one when we run.
+   *
+   * What this method does:
+   *   1. Decides whether the NEW engine wants the streaming-session path
+   *      (Moonshine + addon supports it) or the legacy chunked path
+   *      (everything else — including all Whisper variants).
+   *   2. If the mode is the SAME as the current one → no transition needed.
+   *      Just push a fresh state event so the renderer's `streamingMode`
+   *      mirror stays in sync (and the engine label is fresh).
+   *   3. If the mode CHANGES:
+   *        streaming → chunked  (Moonshine → Whisper):
+   *          • Flip status flag so the streaming loop exits cleanly on its
+   *            next tick. The loop's exit branch handles final drain +
+   *            commit + native.stopRecording(), so we wait for that to
+   *            finish before starting the chunk timer.
+   *          • Reset Moonshine session state so any half-buffered audio is
+   *            zeroed (privacy + no stale-content commit at meeting end).
+   *          • Restart capture and start the fixed-interval chunk timer.
+   *          • Reset chunkIndex bookkeeping so the first Whisper chunk
+   *            lands at "now" rather than "0" — totalDrainedAudioMs already
+   *            reflects the meeting's true elapsed time and we use it to
+   *            initialize chunkIndex.
+   *        chunked → streaming  (Whisper → Moonshine):
+   *          • Cancel the chunk timer and wait for any in-flight
+   *            processChunk() to settle.
+   *          • Drain whatever is buffered (so partial Whisper-chunk audio
+   *            doesn't leak into the Moonshine session as the first
+   *            append) and discard.
+   *          • Reset the Moonshine session, then start runStreamingSession
+   *            in the background.
+   *
+   * Hard contract: never throws. Errors are logged + the recorder is left
+   * in whatever consistent state is reachable; the worst case is the
+   * meeting falls back to the chunked path (always-safe, always-works).
+   *
+   * Note on `state.streamingMode`: this is the SINGLE source of truth the
+   * renderer uses for UI-mode branching (live grey-typing vs. chunk timer).
+   * It must be updated atomically with the mode transition + immediately
+   * pushed to renderer. Doing it after the transition completes (rather
+   * than at the very start) means renderer briefly sees "old mode" during
+   * the ~50 ms transition — that's fine and avoids a false "live" hint
+   * before Moonshine is actually ready.
+   */
+  async handleEngineSwap(newEngineKind: string): Promise<void> {
+    if (this.state.status !== 'recording') {
+      // Not in a meeting (or already stopping) — nothing to do. The next
+      // meeting start will read the active engine fresh.
+      debugLog('meeting.engine-swap.noop', {
+        status: this.state.status,
+        engine: newEngineKind,
+      });
+      return;
+    }
+
+    // Decide what mode the NEW engine should run in. Identical gate to
+    // startMeetingRecording so behavior is consistent.
+    const isMoonshine = newEngineKind.startsWith('moonshine');
+    const canStream = isMoonshine
+      && typeof native.addon.moonshineSessionAppend === 'function'
+      && typeof native.addon.drainRecordingBuffer === 'function'
+      && (native.addon.moonshineSessionSupports?.() ?? false);
+
+    const wasStreaming = this.state.streamingMode;
+    debugLog('meeting.engine-swap.begin', {
+      from: wasStreaming ? 'streaming' : 'chunked',
+      to: canStream ? 'streaming' : 'chunked',
+      engine: newEngineKind,
+    });
+
+    if (wasStreaming === canStream) {
+      // Same path; nothing structural to change. Push state so the
+      // renderer can refresh anything keyed to the engine (e.g. a label).
+      this.pushStateToRenderer();
+      return;
+    }
+
+    if (wasStreaming && !canStream) {
+      // STREAMING → CHUNKED  (e.g. Moonshine → Whisper)
+      // Flag so runStreamingSession's `while (state.status === 'recording')`
+      // gate trips immediately. We temporarily move to 'stopping' for the
+      // duration of the streaming loop's exit, then restore to 'recording'
+      // so the new chunked timer can run.
+      this.state = { ...this.state, status: 'stopping' };
+      this.pushStateToRenderer();
+
+      if (this.streamLoopPromise) {
+        try { await this.streamLoopPromise; } catch (err) {
+          console.warn('[MeetingRecorder] streaming loop drain on swap failed:', err);
+        }
+        this.streamLoopPromise = null;
+      }
+      // Defensive: zero the Moonshine session so nothing leaks across.
+      try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+
+      // The streaming-loop's exit branch already called stopRecording().
+      // Restart capture for the new chunked path.
+      try {
+        if (this.state.deviceName && typeof native.addon.startRecordingFromDevice === 'function') {
+          await native.addon.startRecordingFromDevice(this.state.deviceName);
+        } else {
+          native.addon.startRecording();
+        }
+      } catch (err) {
+        console.error('[MeetingRecorder] failed to restart capture after engine swap:', err);
+        // Fall through to status=idle so the user gets a clear "stopped"
+        // state rather than a frozen recording UI.
+        this.state = {
+          ...this.state,
+          status: 'idle',
+          streamingMode: false,
+        };
+        this.pushStateToRenderer();
+        return;
+      }
+
+      // Align chunkIndex so the FIRST post-swap chunk lands at a sensible
+      // start_ms (now), not at 0. totalDrainedAudioMs holds the cumulative
+      // wall-clock-equivalent up to the swap; divide by the new chunk
+      // interval and round up so the next chunk is "next slot".
+      this.chunkIndex = Math.ceil(this.totalDrainedAudioMs / this.chunkIntervalMs);
+
+      this.state = {
+        ...this.state,
+        status: 'recording',
+        streamingMode: false,
+      };
+      this.pushStateToRenderer();
+
+      // Start the chunk timer.
+      this.chunkTimer = setInterval(() => {
+        void this.processChunk();
+      }, this.chunkIntervalMs);
+
+      debugLog('meeting.engine-swap.done', { mode: 'chunked', engine: newEngineKind });
+      return;
+    }
+
+    // CHUNKED → STREAMING  (e.g. Whisper → Moonshine)
+    // Stop the chunk timer first so no new processChunk() fires.
+    if (this.chunkTimer) {
+      clearInterval(this.chunkTimer);
+      this.chunkTimer = null;
+    }
+    // Wait for any in-flight chunk to settle. Up to 5 s — typical Whisper
+    // chunk transcription is 1–3 s. We don't want to race with it.
+    let waited = 0;
+    while (this.isProcessingChunk && waited < 5_000) {
+      await new Promise((r) => setTimeout(r, 100));
+      waited += 100;
+    }
+
+    // Drain (and discard) any leftover audio so it doesn't leak into the
+    // first Moonshine session_append. Then restart capture and reset
+    // session state cleanly.
+    try {
+      const drained = native.addon.stopRecording();
+      debugLog('meeting.engine-swap.drain-discard', {
+        byteLength: drained?.length ?? 0,
+      });
+    } catch { /* may already be stopped between ticks */ }
+
+    try {
+      if (this.state.deviceName && typeof native.addon.startRecordingFromDevice === 'function') {
+        await native.addon.startRecordingFromDevice(this.state.deviceName);
+      } else {
+        native.addon.startRecording();
+      }
+    } catch (err) {
+      console.error('[MeetingRecorder] failed to restart capture for streaming swap:', err);
+      this.state = { ...this.state, status: 'idle', streamingMode: false };
+      this.pushStateToRenderer();
+      return;
+    }
+
+    try { native.addon.moonshineSessionReset?.(); } catch { /* defensive */ }
+
+    this.state = {
+      ...this.state,
+      streamingMode: true,
+    };
+    this.pushStateToRenderer();
+
+    this.streamLoopPromise = this.runStreamingSession().catch((err) => {
+      console.error('[MeetingRecorder] streaming loop crashed after swap:', err);
+      this.pushDraftToRenderer('');
+      try { native.addon.moonshineSessionReset?.(); } catch { /* ignore */ }
+    });
+
+    debugLog('meeting.engine-swap.done', { mode: 'streaming', engine: newEngineKind });
+  }
+
+  /**
    * Read-only accessor used by meeting-room-server / meeting-room-client to
    * gate outbound segment broadcast on self-mute (defense-in-depth — the
    * audio gate inside the recorder already prevents most muted segments

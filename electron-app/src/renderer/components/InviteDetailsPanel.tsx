@@ -31,14 +31,20 @@ export function InviteDetailsPanel() {
         </p>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
-        <div>
+      {/* Two-up on wide; stacked on narrow.
+          `min-w-0` lets the children shrink below intrinsic content width so
+          the address+port string ("10.147.59.102:63184" — 18 chars) can wrap
+          via `break-all` instead of bleeding into the Room Code cell. The old
+          `grid-cols-2` layout had no min-width-0 and so the IP/port forced
+          the column wider than its share, overlapping the next column. */}
+      <div className="flex flex-col sm:grid sm:grid-cols-2 gap-3">
+        <div className="min-w-0">
           <p className="text-[10px] text-iron-text-muted uppercase tracking-wider mb-1">Address</p>
-          <p className="text-sm font-mono text-iron-text">{roomHostIp}:{roomHostPort}</p>
+          <p className="text-sm font-mono text-iron-text break-all">{roomHostIp}:{roomHostPort}</p>
         </div>
-        <div>
+        <div className="min-w-0">
           <p className="text-[10px] text-iron-text-muted uppercase tracking-wider mb-1">Room Code</p>
-          <p className="text-sm font-mono text-iron-accent-light tracking-widest">{roomCode}</p>
+          <p className="text-sm font-mono text-iron-accent-light tracking-widest break-all">{roomCode}</p>
         </div>
       </div>
 

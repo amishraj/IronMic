@@ -49,8 +49,10 @@ const LIVE_SUMMARY_PROMPT = `You are a meeting notes assistant producing concise
 
 You receive a MEETING CONTEXT block containing what was said in the meeting and any annotations participants typed alongside it. Treat all of this as a single, unified source of truth about what the meeting is about. Do NOT label content as coming from "the transcript" vs "user notes" vs "annotations" — weave it together so the result reads as one coherent picture of the meeting. Never prefix a bullet with "Note:", "User:", "Annotation:", or any similar source tag.
 
+You may also receive a MEETING MEMORY block — a running tally of participants, topics, decisions, and action items distilled from earlier passes. Use it as additional grounding so important details that have scrolled out of the latest bullets aren't lost. Cross-reference it against the MEETING CONTEXT; if memory says something contradicted by the latest context, trust the context.
+
 HARD RULES — violating any of these is a failure:
-- STAY ON SCOPE. Every bullet must reference specific content present in the MEETING CONTEXT. Do not extrapolate, generalize, or pull in outside knowledge. If a topic is mentioned briefly, the bullet about it must be brief.
+- STAY ON SCOPE. Every bullet must reference specific content present in the MEETING CONTEXT or MEETING MEMORY. Do not extrapolate, generalize, or pull in outside knowledge. If a topic is mentioned briefly, the bullet about it must be brief.
 - NEVER invent facts, topics, participants, decisions, action items, dates, numbers, or names not explicitly present in the input.
 - NEVER use generic filler like "The team discussed project goals", "Key topics were reviewed", "Several points were raised", or anything that could apply to any meeting.
 - The participants' typed annotations signal what they find important — emphasize those topics — but always keep them in the meeting's scope. A typed annotation reminding someone to do something later is in scope; a typed annotation about an unrelated subject is not.
@@ -64,6 +66,32 @@ OUTPUT FORMAT:
 - Each bullet is one concise sentence about the meeting itself.
 - Keep existing bullets stable across updates — refine and extend rather than rewriting from scratch, unless a bullet is now inaccurate or off-scope.
 `;
+
+/**
+ * Compact prompt for distilling a running MEETING MEMORY from the full
+ * meeting context. The memory is a small structured block that carries
+ * forward facts even after bullets get refined — so e.g. a decision made
+ * 20 minutes ago doesn't get lost when the bullets re-focus on the
+ * current discussion.
+ *
+ * Kept deliberately short (max ~400 tokens) so it can be included in
+ * subsequent prompts without ballooning cost.
+ */
+const MEMORY_DISTILL_PROMPT = `You are extracting durable meeting facts from a transcript and user notes. Produce ONE compact block in this exact shape:
+
+participants: <comma-separated names mentioned or speaking; "unknown" if none>
+topics: <comma-separated topics actually discussed; ≤ 8 items>
+decisions: <bulleted list ("- ") of explicit decisions made; "(none yet)" if none>
+action_items: <bulleted list ("- ") of explicit action items / owners / due dates; "(none yet)" if none>
+open_questions: <bulleted list ("- ") of unresolved questions raised; "(none yet)" if none>
+
+RULES:
+- Only include facts EXPLICITLY present in the MEETING CONTEXT or PREVIOUS MEMORY.
+- Never invent participants, topics, decisions, action items, or dates.
+- When the PREVIOUS MEMORY contradicts new context, trust the new context.
+- Never output preamble, code fences, headers, or commentary — just the five labeled lines/blocks in the exact order above.
+- If a section has nothing yet, output "(none yet)".
+- Keep the whole block under 350 words.`;
 
 interface LiveSummaryEvent {
   sessionId: string;
@@ -142,6 +170,48 @@ class LiveSummarizerManager {
   private debounceMs = 1000;
   private minSegmentsBeforeSummary = 1;
 
+  /**
+   * Durable structured memory of the meeting (participants, topics,
+   * decisions, action items, open questions). Distilled by a separate
+   * LLM pass that runs less frequently than the bullets. Carries forward
+   * facts that might otherwise scroll out of the active bullet list when
+   * the LLM refines them.
+   *
+   * Treated as a STRING (the LLM's raw block output) rather than a parsed
+   * structure — we don't act on it programmatically; we just feed it back
+   * to the next bullets-pass as additional context. Keeping it as text
+   * means parsing drift can't break the renderer.
+   */
+  private currentMemory = '';
+
+  /** Last segment count + last user notes covered by `currentMemory`. The
+   *  memory is regenerated only when there's enough new content to make
+   *  the LLM call worth its 5–10 s cost. */
+  private lastMemorizedCount = 0;
+  private lastMemorizedUserNotes = '';
+
+  /**
+   * Periodic-refresh tick. Fires on a fixed interval during an active
+   * meeting and forces a `scheduleSummary()` call even if no new segments
+   * have arrived. This catches two cases the segment-driven trigger misses:
+   *
+   *   1. Quiet stretches — silence/inaudible audio doesn't commit segments,
+   *      but the user-typed annotations panel may have grown meaningfully.
+   *      The user-notes IPC trigger handles SOME of this, but mid-tab
+   *      remounts and live-summary post-recovery can both leave the
+   *      summarizer with "no new content" when content actually exists.
+   *   2. Memory refresh — durable memory benefits from a steady-cadence
+   *      revisit (every ~60 s) so it can incorporate facts that just
+   *      arrived without waiting for many segment-driven updates to
+   *      stabilize the bullets.
+   *
+   * 60 s is the sweet spot: long enough that we're not burning LLM cycles
+   * on near-silent stretches, short enough that a user typing notes
+   * silently still sees the AI panel keep up.
+   */
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private heartbeatMs = 60_000;
+
   /** Begin tracking a new meeting. Clears prior state. */
   start(sessionId: string): void {
     this.stop();
@@ -153,12 +223,30 @@ class LiveSummarizerManager {
     this.hasSubstantiveSummary = false;
     this.currentInsufficient = false;
     this.pendingRefresh = false;
+    this.currentMemory = '';
+    this.lastMemorizedCount = 0;
+    this.lastMemorizedUserNotes = '';
 
     this.unsubscribeSegments = meetingRecorder.onSegment((seg) => {
       if (!this.sessionId || seg.session_id !== this.sessionId) return;
       this.segmentsBuffer.push(seg);
       this.scheduleSummary();
     });
+
+    // Heartbeat — see comment on `heartbeatTimer`. Cleared in stop().
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.sessionId) return;
+      // Only kick a refresh if there's actual reason to: either new
+      // unsummarized segments OR potentially-new user notes (we don't
+      // diff here; scheduleSummary's eventual runSummary() guards on
+      // material change).
+      const hasNewSegments = this.segmentsBuffer.length > this.lastSummarizedCount;
+      const userNotes = readUserNotes(this.sessionId);
+      const userNotesChanged = userNotes !== this.lastUserNotesSnapshot;
+      if (hasNewSegments || userNotesChanged) {
+        this.scheduleSummary();
+      }
+    }, this.heartbeatMs);
   }
 
   /** Called by the renderer (via IPC) when the user's typed notes change.
@@ -179,6 +267,10 @@ class LiveSummarizerManager {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
     if (this.activeController) {
       try { this.activeController.abort(); } catch { /* noop */ }
       this.activeController = null;
@@ -192,6 +284,9 @@ class LiveSummarizerManager {
     this.currentInsufficient = false;
     this.pendingRefresh = false;
     this.activeRunPromise = null;
+    this.currentMemory = '';
+    this.lastMemorizedCount = 0;
+    this.lastMemorizedUserNotes = '';
   }
 
   /**
@@ -363,8 +458,16 @@ class LiveSummarizerManager {
       ? `\n\nPREVIOUS BULLETS (extend and refine; correct any that drift off-scope):\n${this.currentSummary}`
       : '';
 
+    // MEETING MEMORY block — only injected once we've built one. The first
+    // bullets-pass runs WITHOUT memory (we don't have any yet); from the
+    // second pass on, the prior memory grounds the bullets even after they
+    // get refined and topics scroll out of the active list.
+    const memorySection = this.currentMemory
+      ? `\n\nMEETING MEMORY (durable facts distilled from earlier passes — use as grounding):\n${this.currentMemory}`
+      : '';
+
     const userContent =
-      `${contextSection}${previousSection}\n\n` +
+      `${contextSection}${memorySection}${previousSection}\n\n` +
       `Produce the updated bullet-point notes now. Stay strictly within what the MEETING CONTEXT supports. If nothing substantive is present, output ONLY ${INSUFFICIENT_MARKER}.`;
 
     const controller = new AbortController();
@@ -441,6 +544,12 @@ class LiveSummarizerManager {
       // window reopen) re-hydrates the AI Notes panel instead of going
       // blank until the next LLM pass lands.
       this.persistRunningSummaryToHostSession(sessionId, trimmed);
+
+      // Opportunistically refresh durable memory if enough new content has
+      // arrived since the last memory pass. Runs in the background so we
+      // don't block the next bullets-pass on it. Gated to avoid burning
+      // LLM cycles when the meeting is just incrementing one chunk at a time.
+      void this.maybeRefreshMemory(sessionId, fullTranscript, userNotes, snapshotCount, snapshotUserNotes);
     } catch (err: any) {
       if (err?.message?.includes('aborted')) return;
       console.warn('[LiveSummarizer] Summary generation failed:', err?.message || err);
@@ -454,6 +563,136 @@ class LiveSummarizerManager {
         // Catch-up run, no debounce.
         this.activeRunPromise = this.runSummary();
       }
+    }
+  }
+
+  /**
+   * Refresh the durable MEETING MEMORY block. Runs OPPORTUNISTICALLY:
+   *
+   *   - Skipped on the first bullets pass entirely (no prior memory to
+   *     refine; the first bullets serve as the seed).
+   *   - After that, runs only if at least 25 new words OR meaningful
+   *     user-notes changes have accumulated since the last memory pass.
+   *     This bounds cost — the memory call is ~5–10 s on local LLM and
+   *     we don't want to run it on every chunk.
+   *   - Runs in the background (no await on the caller side) so the
+   *     bullets-pass response latency isn't impacted.
+   *
+   * On success, updates `this.currentMemory` and the snapshot counters.
+   * On failure, leaves the previous memory in place (better than blanking
+   * it on a transient model error).
+   *
+   * Hard contract: never throws. The memory is best-effort grounding;
+   * losing a memory refresh is acceptable, blocking on it is not.
+   */
+  private async maybeRefreshMemory(
+    sessionId: string,
+    fullTranscript: string,
+    userNotes: string,
+    snapshotCount: number,
+    snapshotUserNotes: string,
+  ): Promise<void> {
+    if (this.sessionId !== sessionId) return;
+
+    // Gate 1: skip on the very first bullets-pass. We need at least one
+    // round of grounded bullets before extracting durable facts.
+    if (!this.hasSubstantiveSummary || this.currentSummary === '') return;
+
+    // Gate 2: only refresh if enough new content has arrived since the
+    // last memory pass. lastMemorizedCount==0 means we've never done one
+    // — always do the first one once we have substantive bullets.
+    const isFirstMemoryPass = this.lastMemorizedCount === 0 && !this.currentMemory;
+    const newSegmentsSinceMemory = Math.max(0, snapshotCount - this.lastMemorizedCount);
+    const newWordsSinceMemory = this.segmentsBuffer
+      .slice(this.lastMemorizedCount, snapshotCount)
+      .reduce((sum, s) => sum + wordCount(s.text), 0);
+    const userNotesChangedSinceMemory = snapshotUserNotes !== this.lastMemorizedUserNotes;
+
+    if (!isFirstMemoryPass && newWordsSinceMemory < 25 && !userNotesChangedSinceMemory) {
+      return;
+    }
+
+    const resolved = resolveActiveChatModel(native);
+    if (!resolved) return;
+
+    const transcriptBody = fullTranscript.trim() || '(no substantive spoken content yet)';
+    const contextBody = userNotes.trim()
+      ? `${transcriptBody}\n\n${userNotes.trim()}`
+      : transcriptBody;
+    const contextSection = `MEETING CONTEXT:\n${contextBody}`;
+    const previousMemorySection = this.currentMemory
+      ? `\n\nPREVIOUS MEMORY (carry forward unless contradicted):\n${this.currentMemory}`
+      : '';
+    const memoryPrompt =
+      `${contextSection}${previousMemorySection}\n\n` +
+      `Produce the updated MEETING MEMORY block now, using EXACTLY the five labeled lines/blocks specified in the system prompt.`;
+
+    const controller = new AbortController();
+    try {
+      const out = await llmSubprocess.chatComplete({
+        modelPath: resolved.modelPath,
+        modelType: resolved.modelType,
+        messages: [
+          { role: 'system', content: MEMORY_DISTILL_PROMPT },
+          { role: 'user', content: memoryPrompt },
+        ],
+        maxTokens: 512,
+        temperature: 0.1,
+        signal: controller.signal,
+      });
+
+      if (controller.signal.aborted) return;
+      if (this.sessionId !== sessionId) return;
+
+      const trimmed = out.trim();
+      // Sanity-check the output looks like a memory block. We're not
+      // strict — the model may format it slightly differently — but if
+      // we don't see at least 3 of the expected labels we treat it as
+      // garbage and keep the previous memory.
+      const labelHits = [
+        /participants\s*:/i,
+        /topics\s*:/i,
+        /decisions\s*:/i,
+        /action_items\s*:/i,
+        /open_questions\s*:/i,
+      ].filter((re) => re.test(trimmed)).length;
+      if (labelHits < 3) {
+        console.warn('[LiveSummarizer] memory refresh returned unparseable output; keeping previous memory');
+        return;
+      }
+
+      this.currentMemory = trimmed;
+      this.lastMemorizedCount = snapshotCount;
+      this.lastMemorizedUserNotes = snapshotUserNotes;
+      this.persistRunningMemoryToHostSession(sessionId, trimmed);
+    } catch (err: any) {
+      if (err?.message?.includes('aborted')) return;
+      console.warn('[LiveSummarizer] memory refresh failed:', err?.message || err);
+    }
+  }
+
+  /** Mirror of `persistRunningSummaryToHostSession` for the memory block.
+   *  Persisted under a separate key so a renderer remount can hydrate
+   *  both panels independently. */
+  private persistRunningMemoryToHostSession(sessionId: string, memory: string): void {
+    try {
+      let merged: Record<string, unknown> = {};
+      try {
+        const raw = native.addon.getMeetingSession(sessionId);
+        if (raw && raw !== 'null') {
+          const session = JSON.parse(raw);
+          const structuredRaw = session?.structured_output;
+          if (typeof structuredRaw === 'string') {
+            const parsed = JSON.parse(structuredRaw);
+            if (parsed && typeof parsed === 'object') merged = parsed as Record<string, unknown>;
+          }
+        }
+      } catch { /* fall through with empty merged */ }
+      merged.liveAiMemory = memory;
+      merged.liveAiMemoryAt = Date.now();
+      native.setMeetingStructuredOutput(sessionId, JSON.stringify(merged));
+    } catch (err) {
+      console.warn('[LiveSummarizer] persistRunningMemory failed:', (err as Error)?.message);
     }
   }
 
