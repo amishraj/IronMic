@@ -127,11 +127,13 @@ function main() {
 
     // Checksum
     if (!m.sha256 || m.sha256 === PLACEHOLDER_SHA) {
-      console.warn(
-        `[verify-models] ${m.id}: sha256 placeholder — set the real hash in ` +
-          `${path.relative(REPO_ROOT, MANIFEST_PATH)} before shipping.`,
+      console.error(
+        `[verify-models] ${m.id}: sha256 placeholder — paste the real hash into ` +
+          `${path.relative(REPO_ROOT, MANIFEST_PATH)}. ` +
+          `Compute it with: shasum -a 256 ${path.relative(REPO_ROOT, abs)}`,
       );
-      warnings++;
+      hardErrors++;
+      continue;
     } else {
       const actual = sha256(abs);
       if (actual !== m.sha256) {

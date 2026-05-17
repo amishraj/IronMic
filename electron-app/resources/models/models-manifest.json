@@ -6,7 +6,7 @@
     {
       "id": "wespeaker-resnet34-LM",
       "path": "resources/models/speaker-embedding/speaker-embedding.onnx",
-      "sha256": "REPLACE_WITH_SHA256_AFTER_DOWNLOAD",
+      "sha256": "7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068",
       "sizeBytes": 26572362,
       "license": "Apache-2.0",
       "sourceUrl": "https://huggingface.co/hbredin/wespeaker-voxceleb-resnet34-LM",
