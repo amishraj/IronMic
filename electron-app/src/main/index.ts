@@ -399,9 +399,9 @@ app.whenReady().then(async () => {
 
   // Copy bundled WeSpeaker ResNet34 ONNX to user data so the speaker
   // module's lazy session-load (rust-core/src/speaker/wespeaker.rs) finds
-  // the file in `IRONMIC_MODELS_DIR/speaker-embedding/`. Must run BEFORE
-  // the diarization readiness flip below so `speakerDiarizationAvailable()`
-  // can see the file on the same boot it's copied.
+  // the file in `IRONMIC_MODELS_DIR/speaker-embedding/` when the user
+  // opts into Advanced diarization mode. The copy is a no-op when the
+  // bundled file is already present in user data.
   try {
     const speakerStatus = ensureBundledWeSpeaker();
     switch (speakerStatus) {
@@ -468,27 +468,28 @@ app.whenReady().then(async () => {
     console.warn('[meeting-app-detector] Migration failed (non-fatal):', err);
   }
 
-  // M2.5b: runtime readiness flip for embedding-based speaker diarization.
-  // `migrate_v15` seeds `meeting_diarization_mode = 'off'` so M1-only
-  // installs see no behavior change. Once the WeSpeaker model file is
-  // bundled (M2) and the user hasn't explicitly opted out via the
-  // Settings UI (`meeting_diarization_user_overridden`), flip the mode to
-  // 'embedding' so the loopback path actually uses the new diarization
-  // pipeline.
-  //
-  // **Important:** the automatic flip MUST NOT set `..._user_overridden`
-  // — only an explicit Settings UI toggle sets that flag. Otherwise this
-  // check would fire once per install and stay permanently disabled
-  // even when the user did nothing.
+  // v1.9.1: Simple mode is the default for remote-meeting capture. The
+  // embedding-based diarization pipeline ([Speaker N] live labels + AHC
+  // refinement) is now opt-in via Settings → Voice AI → "Identify
+  // individual remote speakers". This block guarantees Simple is the
+  // active default — covers both fresh installs (which already get
+  // 'off' from migrate_v15) and v1.9.0 upgraders whose mode was
+  // auto-flipped to 'embedding' by the old readiness check. We only
+  // override when `meeting_diarization_user_overridden` is unset/'false'
+  // — an explicit user toggle is preserved.
   try {
-    const mode = native.getSetting('meeting_diarization_mode') ?? 'off';
     const userOverridden = native.getSetting('meeting_diarization_user_overridden') === 'true';
-    if (mode === 'off' && !userOverridden && native.speakerDiarizationAvailable()) {
-      native.setSetting('meeting_diarization_mode', 'embedding');
-      console.log('[diarization] Readiness flip: mode → embedding (WeSpeaker model present)');
+    if (!userOverridden) {
+      const current = native.getSetting('meeting_diarization_mode') ?? 'off';
+      if (current !== 'off') {
+        native.setSetting('meeting_diarization_mode', 'off');
+        console.log(
+          '[diarization] Default reset: mode → off (Simple). Toggle Advanced in Settings to opt in.',
+        );
+      }
     }
   } catch (err) {
-    console.warn('[diarization] Readiness flip failed (non-fatal):', err);
+    console.warn('[diarization] Default reset failed (non-fatal):', err);
   }
 
   // Start meeting app auto-detection (default: enabled; user can disable in Settings)

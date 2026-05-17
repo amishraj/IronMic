@@ -185,12 +185,21 @@ export function MeetingPage() {
   // at capture time. Solo-mode only in v1; host/participant modes hide this.
   const [remoteCaptureEnabled, setRemoteCaptureEnabled] = useState<boolean>(false);
   const remoteCaptureIsAvailable = navigator.userAgent.toLowerCase().includes('windows');
+  // Snapshot of the diarization mode setting at meeting start. Drives the
+  // transcript panel's "pending diarization…" hint — in 'off' (Simple,
+  // default) the hint is suppressed because every loopback row is
+  // intentionally labeled "Remote" without any diarization in flight.
+  const [diarizationMode, setDiarizationMode] = useState<'off' | 'embedding'>('off');
   useEffect(() => {
     (async () => {
       try {
         const v = await window.ironmic.getSetting('meeting_remote_capture_enabled');
         setRemoteCaptureEnabled(v === 'true' && remoteCaptureIsAvailable);
       } catch { /* default false */ }
+      try {
+        const m = await window.ironmic.getSetting('meeting_diarization_mode');
+        setDiarizationMode(m === 'embedding' ? 'embedding' : 'off');
+      } catch { /* default off */ }
     })();
   }, [remoteCaptureIsAvailable]);
 
@@ -1941,6 +1950,7 @@ export function MeetingPage() {
                     isLive={isGranolaRecording}
                     draftHypothesis={draftHypothesis}
                     streamingMode={streamingMode}
+                    diarizationMode={diarizationMode}
                   />
                 </div>
               </>

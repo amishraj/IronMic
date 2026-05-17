@@ -1450,6 +1450,11 @@ function VoiceAISettings() {
   // Windows-only in v1; non-Windows users see a disabled toggle with an
   // explanation pointing at the virtual-loopback setup modal.
   const [remoteCaptureEnabled, setRemoteCaptureEnabled] = useState(false);
+  // Speaker diarization mode for the remote-meeting loopback stream.
+  // 'off'       → Simple: one row per chunk labeled "Remote" (default, fast)
+  // 'embedding' → Advanced: per-utterance rows with WeSpeaker [Speaker N]
+  //               labels + post-meeting AHC refinement. Slower per chunk.
+  const [diarizationAdvanced, setDiarizationAdvanced] = useState(false);
   const isWindows = navigator.userAgent.toLowerCase().includes('windows');
 
   useEffect(() => {
@@ -1469,6 +1474,7 @@ function VoiceAISettings() {
       setSemanticSearchEnabled((await val('ml_semantic_search_enabled', 'false')) === 'true');
       setMeetingAutoDetect((await val('meeting_auto_detect_enabled', 'false')) === 'true');
       setRemoteCaptureEnabled((await val('meeting_remote_capture_enabled', 'false')) === 'true');
+      setDiarizationAdvanced((await val('meeting_diarization_mode', 'off')) === 'embedding');
     })();
   }, []);
 
@@ -1545,6 +1551,29 @@ function VoiceAISettings() {
               />
             }
           />
+          {remoteCaptureEnabled && isWindows && (
+            <SettingRow
+              icon={Users}
+              title="Identify Individual Remote Speakers (Advanced)"
+              description={
+                'Off (Simple, default): all remote audio is labeled "Remote" and appears with the same low latency as your mic stream. ' +
+                'On (Advanced): a local 26 MB WeSpeaker model assigns [Speaker 1], [Speaker 2]… labels to distinguish up to ~20 distinct voices. ' +
+                'Advanced doubles the per-chunk processing cost and is best for meetings where knowing who said what matters more than instant transcript.'
+              }
+              control={
+                <Toggle
+                  checked={diarizationAdvanced}
+                  onChange={(v) => {
+                    setDiarizationAdvanced(v);
+                    update('meeting_diarization_mode', v ? 'embedding' : 'off');
+                    // Mark as explicitly user-chosen so the startup default
+                    // reset (main/index.ts) won't override the choice.
+                    update('meeting_diarization_user_overridden', 'true');
+                  }}
+                />
+              }
+            />
+          )}
 
           <div className="border-t border-iron-border" />
 

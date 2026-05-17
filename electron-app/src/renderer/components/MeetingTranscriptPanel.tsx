@@ -24,6 +24,12 @@ interface Props {
    *  Drives the empty-state copy: streaming → "words appear as you speak",
    *  chunked → "segments every ~15 seconds". */
   streamingMode?: boolean;
+  /** Speaker-diarization mode for the active meeting. Drives whether
+   *  unlabeled loopback segments render the "pending diarization…"
+   *  sub-line — in Simple mode ('off'), every loopback row is labeled
+   *  "Remote" with no diarization in flight, so the pending hint would
+   *  be a UX lie. Defaults to 'off'. */
+  diarizationMode?: 'off' | 'embedding';
 }
 
 // Stable color palette for OTHER speakers' badges — cycles for > 5 speakers.
@@ -147,7 +153,7 @@ function ChunkCountdown({
  * by Zustand so its reference DOES change on commit — that's the
  * intentional re-render trigger.
  */
-function MeetingTranscriptPanelInner({ segments, isLive, draftHypothesis, streamingMode }: Props) {
+function MeetingTranscriptPanelInner({ segments, isLive, draftHypothesis, streamingMode, diarizationMode = 'off' }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const userScrolledUpRef = useRef(false);
@@ -248,7 +254,11 @@ function MeetingTranscriptPanelInner({ segments, isLive, draftHypothesis, stream
             ? getSpeakerColor(segment.speaker_label)
             : 'bg-iron-surface-hover text-iron-text-muted';
         }
-        const showPending = loopback && !segment.speaker_label;
+        // Only flag the "pending diarization…" sub-line when the meeting
+        // is actually running embedding-based diarization. In Simple mode
+        // every loopback segment is intentionally null-labeled and renders
+        // as a plain "Remote" badge — no pending state.
+        const showPending = loopback && !segment.speaker_label && diarizationMode === 'embedding';
         return (
           <div key={segment.id} className="group">
             <div className="flex items-start gap-2">

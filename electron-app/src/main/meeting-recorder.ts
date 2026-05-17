@@ -62,6 +62,22 @@ export function zeroDrainedBuffersFinally(
   }
 }
 
+/**
+ * Read the current diarization mode setting. 'off' means Simple mode
+ * (one segment per chunk, labeled "Remote", no embedding work). 'embedding'
+ * means Advanced mode (per-utterance rows with WeSpeaker embeddings and
+ * post-meeting AHC refinement). Defaults to 'off' if the setting is
+ * missing or the read fails.
+ */
+function readDiarizationMode(): 'off' | 'embedding' {
+  try {
+    const v = native.getSetting('meeting_diarization_mode') ?? 'off';
+    return v === 'embedding' ? 'embedding' : 'off';
+  } catch {
+    return 'off';
+  }
+}
+
 /** Upper bound on how long we wait for a single transcribe call to return
  *  before moving on. If the native call hangs (rare under Moonshine ONNX,
  *  more common with Whisper on CPU-bound VDIs), we drop the chunk rather
@@ -919,9 +935,21 @@ class MeetingRecorderManager {
             // where the embedding pipeline never ran. Triggered when
             // no AHC patches landed AND we have unlabeled loopback or
             // multi-user data that still needs speaker discrimination.
+            //
+            // v1.9.1: Simple-mode (`meeting_diarization_mode === 'off'`)
+            // remote-capture meetings explicitly opt out of all speaker
+            // labeling — keep loopback rows as "Remote" through the end.
+            // The legacy fallback is reserved for Advanced-mode meetings
+            // where some embedding rows failed, and for multi-user room
+            // meetings (which don't touch the diarization mode setting).
             const ranEmbeddingPath = hasEmbedding || ahcPatches.length > 0;
+            const simpleModeLoopbackOnly =
+              readDiarizationMode() === 'off'
+              && uniqueParticipants.size <= 1
+              && hasUnlabeledLoopback;
             const needsLegacy =
               !ranEmbeddingPath
+              && !simpleModeLoopbackOnly
               && fullTranscript.length >= 400
               && segmentsSnapshot.length > 1
               && (uniqueParticipants.size > 1 || hasUnlabeledLoopback);
@@ -1250,17 +1278,38 @@ class MeetingRecorderManager {
         drained.mic, 'mic', 'You', engineKind,
       );
 
-      // Loopback side switches to per-Whisper-segment rows so each one
-      // can carry its own start/end timing — the slice basis for the
-      // M2 speaker-embedding pass. Whisper-family engines emit real
-      // boundaries; Moonshine returns a single segment via the default
-      // trait impl (POC accepts the coarser granularity until segment
-      // timestamps are added to Moonshine).
+      // Loopback path: two modes, gated by `meeting_diarization_mode`.
+      //
+      //   • Simple ('off', the default): one segment per chunk, identical to
+      //     the mic path. `speaker_label = null` → renderer shows "Remote".
+      //     No embedding, no clustering, no AHC refinement. Latency matches
+      //     the mic side.
+      //
+      //   • Advanced ('embedding'): per-Whisper-segment rows with inline
+      //     speaker embedding + clustering, AHC refinement at stop. Slower
+      //     (multi-segment Whisper + N×WeSpeaker per chunk) but produces
+      //     [Speaker N] labels for distinguishing remote voices.
+      //
+      // The diarization-mode read is intentionally per-tick so a user toggle
+      // mid-meeting takes effect on the next chunk without restart.
       if (drained.loopback && drained.loopback.length > 0) {
-        await this.transcribeAndPersistLoopbackSegments(
-          sessionId, currentChunkIndex, chunkStartMs, chunkEndMs,
-          drained.loopback, engineKind,
-        );
+        const useEmbeddingDiarization =
+          this.speakerClusterer !== null
+          && readDiarizationMode() === 'embedding'
+          && engineKind.startsWith('whisper-');
+
+        if (useEmbeddingDiarization) {
+          await this.transcribeAndPersistLoopbackSegments(
+            sessionId, currentChunkIndex, chunkStartMs, chunkEndMs,
+            drained.loopback, engineKind,
+          );
+        } else {
+          // Simple-mode fast path: same shape as the mic call above.
+          await this.transcribeAndPersistDual(
+            sessionId, segmentCount, currentChunkIndex, chunkStartMs, chunkEndMs,
+            drained.loopback, 'loopback', null, engineKind,
+          );
+        }
       }
     } finally {
       this.isProcessingChunk = false;

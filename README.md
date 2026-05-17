@@ -26,12 +26,13 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 
 ## Features
 
-### Remote-Meeting Capture <sup>NEW in 1.8.3 (Windows)</sup>
+### Remote-Meeting Capture <sup>1.8.3 (Windows) · refined in 1.9.x</sup>
 - **Capture both sides of a Zoom / Teams / Meet call** without installing BlackHole or VB-CABLE. IronMic opens a WASAPI loopback stream on your default speakers alongside your mic and transcribes them in parallel.
-- **"You" vs "Remote" at capture time** — Mic segments are pre-labeled `Me`; loopback segments render as `Remote` and resolve to `[Speaker 1]`, `[Speaker 2]`, … via LLM diarization on the loopback side only. No diarization on your own voice.
+- **"You" vs "Remote" at capture time** — Mic segments are pre-labeled `Me`; loopback segments render as `Remote` with the same low latency as your mic stream.
+- **Optional speaker labels (Advanced)** <sup>NEW in 1.9</sup> — Opt-in toggle at Settings → Voice AI runs a local 26 MB WeSpeaker ResNet34 model on each remote utterance to assign `[Speaker 1]`, `[Speaker 2]`, … labels for up to ~20 distinct voices. Live online clustering during the meeting; agglomerative refinement at stop. Tradeoff is honest: Simple = same latency as your own mic; Advanced ≈ 2× per-chunk cost. Default is Simple. The WeSpeaker model is bundled in the installer — no extra download.
 - **Per-meeting toggle** in the meeting start screen (solo mode only) plus a **global default** in Settings → Voice AI. Windows-only in v1; non-Windows platforms still work via the existing virtual-loopback device picker.
 - **Headphones tip** built in: if you use speakers, remote audio may leak back into your mic. We surface a one-line warning when you enable the mode.
-- **Stays local** — Loopback captures audio your machine is already playing. No new network surface, no audio files written, same zero-on-drop ring buffers as the mic path.
+- **Stays local** — Loopback captures audio your machine is already playing. WeSpeaker embeddings are voice-derived identifiers and are treated like raw audio: stored locally, excluded from exports, cascade-deleted with the meeting, never sent anywhere. No new network surface, no audio files written, same zero-on-drop ring buffers as the mic path.
 
 ### Meetings UX polish <sup>1.8.1 – 1.8.3</sup>
 - **Instant AI summary on End Meeting** with a separate **Enhance** action for the final long-form pass. Rolling-window live summary updates throughout the meeting instead of waiting until the end.

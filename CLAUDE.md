@@ -268,7 +268,7 @@ Build: requires `--features forge` in the Rust core build (already in
 `libxdo-dev` at link time. Wayland keystroke posting is partial in
 `enigo` — Forge surfaces a clear error and is best supported on X11.
 
-### Flow 2c: Remote-Meeting Capture — Dual-Stream Mic + Loopback (v1.8.3, Windows v1)
+### Flow 2c: Remote-Meeting Capture — Dual-Stream Mic + Loopback (v1.9.1, Windows v1)
 
 Remote-Meeting Capture transcribes both the user's microphone **and** the
 system's output audio (the remote participants' voices coming out of the
@@ -298,16 +298,29 @@ to split a single mixed stream.
        `{ mic: Buffer, loopback: Buffer | null }` as 16 kHz mono PCM16.
      • Mic chunk → Whisper → segment with `source: 'mic'`,
        `speaker_label: 'You'`. **Diarization never touches mic segments.**
-     • Loopback chunk → Whisper → segment with `source: 'loopback'`,
-       `speaker_label: null`. Renderer shows `Remote (pending
-       diarization…)` until end-of-meeting.
+     • Loopback chunk → Whisper → segment with `source: 'loopback'`.
+       Label depends on the per-chunk read of `meeting_diarization_mode`:
+       - `'off'` (Simple, default): one row per chunk, `speaker_label =
+         null`, renderer shows a plain "Remote" badge. Same processing
+         shape as the mic call — no segment slicing, no embedding, no
+         AHC. This is what most users see.
+       - `'embedding'` (Advanced, opt-in): `transcribeWithSegments` →
+         per-utterance rows → WeSpeaker embed → online clustering →
+         `[Speaker N]` label persisted before render. Slower per chunk
+         (multi-segment Whisper + N×26 MB ONNX session calls) but
+         distinguishes up to ~20 speakers.
      • Both Whisper calls run serially against the same model
        (parallel would race on the lock); silent streams are
        RMS-gated to skip the model entirely.
 5. On stop, `native.stopMeetingRecordingDual()` drains a final flush of
-   both streams. Diarization runs **only** on unlabeled
-   `source === 'loopback'` segments and writes `[Speaker N]` /
-   `[<name>]` labels into them.
+   both streams. **Advanced mode only:** AHC refinement re-clusters
+   every persisted embedding (DB-canonical) and emits a single
+   `MEETING_SEGMENTS_RELABELED` event for in-place label patches; the
+   optional LLM roster-rename pass runs after AHC if enabled. In Simple
+   mode this stage is a no-op — segments stay labeled "Remote" through
+   meeting end. The legacy text-LLM diarization fallback is gated off
+   in Simple mode for solo remote-capture; multi-user room recordings
+   still use it when AHC produced no labels.
 
 Solo mode only in v1. Host/participant modes hide the toggle — the room
 layer already mixes `broadcast` + `participant:<name>` segments. v1
@@ -319,7 +332,7 @@ a later iteration (would need two independent session states).
 | `source` value | Meaning | Label policy |
 |---|---|---|
 | `'mic'` | Local user's microphone — only source written for new local recordings | `speaker_label = 'You'` (= "Me" in UI) |
-| `'loopback'` | Local system audio output (remote-meeting capture only) | `null` until post-meeting diarization fills `[Speaker N]` → renders as "Remote" |
+| `'loopback'` | Local system audio output (remote-meeting capture only) | Simple mode → `null` (renders "Remote"); Advanced mode → `[Speaker N]` set inline before render |
 | `'participant:<name>'` | Forwarded from a room peer over WebSocket | Peer display name |
 | `'broadcast'` | Host's audio broadcast in room mode | Existing |
 | `'meeting'` | **Legacy** single-stream segments | Read-only / historical (no new rows) |
@@ -329,6 +342,23 @@ Remote-Meeting Capture settings (in `settings` table):
   for the per-meeting toggle.
 - `meeting_loopback_device` — default `'system_default'`. Use
   `'device:<MMDevice id>'` to target a specific render endpoint.
+- `meeting_diarization_mode` — `'off'` (default, Simple) or
+  `'embedding'` (Advanced). Drives the per-chunk loopback branch in
+  `processChunkDual` and the renderer's "pending diarization…" hint.
+  Toggle lives at Settings → Voice AI → "Identify Individual Remote
+  Speakers (Advanced)", gated on the remote-capture toggle.
+- `meeting_diarization_user_overridden` — `'false'` by default; set to
+  `'true'` only by the explicit Settings UI toggle. When `'false'`, the
+  app reset block in `main/index.ts` forces `meeting_diarization_mode
+  = 'off'` at startup so Simple stays the default for users who never
+  touched the toggle (covers fresh installs and v1.9.0 upgraders).
+- `meeting_diarization_threshold`, `meeting_diarization_max_speakers`,
+  `meeting_diarization_min_slice_ms`, `meeting_diarization_max_slice_ms`
+  — Advanced-mode tunables read once per chunk. Defaults are sane for
+  10–20 distinct speakers on a single loopback stream.
+- `meeting_llm_name_pass_enabled` — `'false'` by default. When `'true'`
+  and a meeting has a participant roster, the LLM roster-rename pass
+  runs after AHC and maps `[Speaker N]` → roster display names.
 
 Build: requires the `windows` crate (target-gated to `cfg(windows)` in
 `rust-core/Cargo.toml`). Non-Windows builds compile a stub that returns
@@ -362,7 +392,7 @@ startRecording(): void
 stopRecording(): Promise<TranscriptionResult>
 // TranscriptionResult = { rawTranscript: string, polishedText: string | null, durationSeconds: number }
 
-// --- Remote-Meeting Capture: Dual-Stream Mic + Loopback (v1.8.3, Windows v1) ---
+// --- Remote-Meeting Capture: Dual-Stream Mic + Loopback (v1.9.1, Windows v1) ---
 // Owns a separate MeetingCaptureEngine so dictation / Forge / streaming
 // meetings keep using the untouched single-stream CaptureEngine. Returns
 // 16 kHz mono PCM16 Node Buffers (same shape as drainRecordingBuffer) so the
@@ -372,6 +402,17 @@ drainMeetingBuffers(): { mic: Buffer; loopback: Buffer | null; loopbackActive: b
 stopMeetingRecordingDual(): { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean }
 meetingHasLoopback(): boolean
 resetMeetingRecordingDual(): void
+
+// --- Speaker Diarization for Loopback (v1.9.0, Advanced mode only) ---
+// Advanced mode (`meeting_diarization_mode === 'embedding'`) slices each
+// Whisper segment from the loopback PCM and embeds it with WeSpeaker
+// ResNet34 (256-d L2-normalized Float32). Simple mode never calls these.
+transcribeWithSegments(audioBuffer: Buffer, terms: string[]): Promise<TranscriptSegmentDto[]>
+// TranscriptSegmentDto = { text: string; start_ms: number; end_ms: number; no_speech_prob: number | null }
+embedSpeaker(pcm16: Buffer): Promise<Float32Array>             // 256 floats; empty if speaker module unavailable
+speakerDiarizationAvailable(): boolean                          // WeSpeaker ONNX present + feature compiled
+updateSegmentEmbedding(segmentId: string, embedding: Buffer, model: string, confidence: number): void
+listSegmentEmbeddings(sessionId: string, source: 'loopback'): string  // JSON SegmentEmbeddingRow[]
 
 // --- On-Demand LLM ---
 polishText(rawText: string): Promise<string>
@@ -861,7 +902,7 @@ Renderer Thread                    ML Web Worker (CPU)
 | `dictionary` | v1.0 | Custom dictionary words |
 | `settings` | v1.0 | Key-value settings store |
 | `meeting_sessions` | v1.1 | Meeting session metadata, summary, action items |
-| `transcript_segments` | v1.1 | Speaker-labeled transcript segments per meeting |
+| `transcript_segments` | v1.1 | Speaker-labeled transcript segments per meeting (v15 adds `speaker_embedding BLOB`, `speaker_embedding_model TEXT`, `diarization_confidence REAL` for Advanced-mode WeSpeaker labels) |
 | `vad_training_samples` | v1.1 | MFCC features for on-device VAD fine-tuning |
 | `intent_training_samples` | v1.1 | Classification logs + corrections |
 | `voice_routing_log` | v1.1 | Route decisions for ML training |

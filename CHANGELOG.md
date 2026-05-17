@@ -2,6 +2,54 @@
 
 All notable changes to IronMic will be documented in this file.
 
+## [1.9.1] - 2026-05-17
+
+Remote-meeting capture latency fix. v1.9.0 made embedding-based
+diarization the default on every remote-capture meeting, which doubled
+the loopback chunk's processing cost (multi-segment Whisper + N×
+WeSpeaker inferences + per-segment DB writes) and left transcripts
+showing a lingering "Remote (pending diarization…)" hint that confused
+users. v1.9.1 returns the default to a single fast "Remote" label
+identical in latency to the local mic stream and moves the speaker
+labeling into an opt-in Advanced toggle.
+
+### Changed
+
+- **Default remote-capture mode is now Simple.** `meeting_diarization_mode`
+  defaults to `'off'` on fresh installs and on v1.9.0 upgraders whose
+  Settings UI never explicitly enabled the feature
+  (`meeting_diarization_user_overridden !== 'true'`). The old M2.5b
+  runtime readiness flip that auto-promoted users to embedding mode
+  is removed.
+- **Simple-mode loopback path reuses the mic path verbatim**
+  ([`meeting-recorder.ts`](electron-app/src/main/meeting-recorder.ts)):
+  one row per 30 s chunk via `transcribeWithContext`, `speaker_label =
+  null`, rendered as a plain "Remote" badge. No segment slicing, no
+  WeSpeaker inference, no AHC at stop, no LLM fallback. Loopback now
+  finalises in the same time window as the mic side.
+- **Advanced mode is unchanged** — the full v1.9.0 pipeline (per-Whisper-
+  segment rows + inline embedding + AHC refinement at stop) still
+  runs end-to-end when the user explicitly enables it.
+- **"pending diarization…" sub-line is now mode-aware.**
+  [`MeetingTranscriptPanel`](electron-app/src/renderer/components/MeetingTranscriptPanel.tsx)
+  only renders the hint when `diarizationMode === 'embedding'`; Simple-
+  mode null-labeled loopback rows just show the plain "Remote" badge.
+
+### Added
+
+- **Settings → Voice AI → "Identify Individual Remote Speakers (Advanced)"**
+  toggle, gated on the existing remote-capture toggle. Description
+  spells out the tradeoff: Simple = same latency as mic, Advanced =
+  per-speaker labels at ~2× chunk cost.
+
+### Notes
+
+- The WeSpeaker ONNX (26 MB) is still bundled in the installer. It
+  sits idle until the user enables Advanced mode — the bundling cost
+  is paid up front so opting in doesn't trigger a download. Same
+  rationale as the bundled Whisper / Phi-3 models that are always
+  shipped even though most users only use one engine.
+
 ## [1.9.0] - 2026-05-17
 
 Acoustic speaker diarization for remote-meeting capture. Replaces the
