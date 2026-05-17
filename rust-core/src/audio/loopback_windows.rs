@@ -50,10 +50,17 @@ mod imp {
         eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
         MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED,
         AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-        WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT,
-        WAVE_FORMAT_PCM,
+        WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_PCM,
     };
-    use windows::Win32::Media::KernelStreaming::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT;
+    // In windows = "0.58" these constants live in different modules from
+    // the WASAPI interfaces. `WAVE_FORMAT_EXTENSIBLE` is in KernelStreaming;
+    // `WAVE_FORMAT_IEEE_FLOAT` and `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT` are in
+    // Multimedia. Pulling them from the wrong modules silently broke the
+    // Windows release build.
+    use windows::Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE;
+    use windows::Win32::Media::Multimedia::{
+        KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT,
+    };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
         COINIT_MULTITHREADED,
