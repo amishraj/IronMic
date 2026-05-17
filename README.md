@@ -26,6 +26,20 @@ IronMic captures your voice, transcribes it with Whisper, optionally polishes it
 
 ## Features
 
+### Remote-Meeting Capture <sup>NEW in 1.8.3 (Windows)</sup>
+- **Capture both sides of a Zoom / Teams / Meet call** without installing BlackHole or VB-CABLE. IronMic opens a WASAPI loopback stream on your default speakers alongside your mic and transcribes them in parallel.
+- **"You" vs "Remote" at capture time** — Mic segments are pre-labeled `Me`; loopback segments render as `Remote` and resolve to `[Speaker 1]`, `[Speaker 2]`, … via LLM diarization on the loopback side only. No diarization on your own voice.
+- **Per-meeting toggle** in the meeting start screen (solo mode only) plus a **global default** in Settings → Voice AI. Windows-only in v1; non-Windows platforms still work via the existing virtual-loopback device picker.
+- **Headphones tip** built in: if you use speakers, remote audio may leak back into your mic. We surface a one-line warning when you enable the mode.
+- **Stays local** — Loopback captures audio your machine is already playing. No new network surface, no audio files written, same zero-on-drop ring buffers as the mic path.
+
+### Meetings UX polish <sup>1.8.1 – 1.8.3</sup>
+- **Instant AI summary on End Meeting** with a separate **Enhance** action for the final long-form pass. Rolling-window live summary updates throughout the meeting instead of waiting until the end.
+- **Non-blocking "Transcribing…" indicator** while the final STT chunk drains, so you can navigate away the moment you click End.
+- **No-flicker live engine swap** — Switch Whisper ↔ Moonshine mid-meeting via the gear button; the UI stays mounted and shows a `Switching…` spinner instead of unmounting back to the meetings list.
+- **Per-meeting transcription engine picker** with chunked-mode fallback for streaming-only engines when remote capture is on.
+- **Close-to-tray** — Clicking the window's X minimizes to the system tray instead of quitting. Only the explicit **Quit** action exits the app.
+
 ### Knowledge Q&A — RAG over your meetings & notes <sup>NEW in 1.8.0</sup>
 - **Ask questions in plain language** — "What did we decide about the auth flow?" / "Summarize my meetings from last week" / "What did Sarah say in Tuesday's standup?" — IronMic retrieves the relevant context from your meetings, notes, and dictation entries and answers with citations.
 - **Hybrid FTS5 + vector retrieval** — Full-text search and semantic similarity run together; Reciprocal Rank Fusion merges the result lists for the best of both.

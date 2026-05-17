@@ -268,6 +268,75 @@ Build: requires `--features forge` in the Rust core build (already in
 `libxdo-dev` at link time. Wayland keystroke posting is partial in
 `enigo` — Forge surfaces a clear error and is best supported on X11.
 
+### Flow 2c: Remote-Meeting Capture — Dual-Stream Mic + Loopback (v1.8.3, Windows v1)
+
+Remote-Meeting Capture transcribes both the user's microphone **and** the
+system's output audio (the remote participants' voices coming out of the
+local speakers / headphones) in parallel, so transcript segments are
+**source-labeled at capture time** instead of relying on LLM diarization
+to split a single mixed stream.
+
+1. User joins a Zoom / Teams / Meet call as normal — the meeting service
+   handles all networking, proxies, WAN routing. IronMic does not host or
+   join the call itself.
+2. User opens IronMic → New Meeting → toggles **Capture remote participants**
+   on the start screen (solo mode only) and clicks Start.
+3. Main process calls `meetingStartRecording(... , { enabled: true,
+   loopbackDevice: 'system_default' })`. The recorder calls
+   `native.startMeetingRecordingDual(micDeviceName, 'system_default')` in
+   Rust, which spins up a `MeetingCaptureEngine` owning two streams:
+     • **Mic stream** — same cpal input path as dictation, default
+       or named device.
+     • **Loopback stream** — `loopback_windows.rs` opens
+       `IAudioClient` on the default render endpoint with
+       `AUDCLNT_STREAMFLAGS_LOOPBACK` (event-driven pump, timed-pump
+       fallback, `AUDCLNT_BUFFERFLAGS_SILENT` zero-fill,
+       `AUDCLNT_E_DEVICE_INVALIDATED` rebuild, mix-format → f32).
+4. The chunk loop runs `processChunkDual()` every 30 s (clamped floor —
+   STT cost ~doubles for dual streams). Each tick:
+     • `native.drainMeetingBuffers()` returns
+       `{ mic: Buffer, loopback: Buffer | null }` as 16 kHz mono PCM16.
+     • Mic chunk → Whisper → segment with `source: 'mic'`,
+       `speaker_label: 'You'`. **Diarization never touches mic segments.**
+     • Loopback chunk → Whisper → segment with `source: 'loopback'`,
+       `speaker_label: null`. Renderer shows `Remote (pending
+       diarization…)` until end-of-meeting.
+     • Both Whisper calls run serially against the same model
+       (parallel would race on the lock); silent streams are
+       RMS-gated to skip the model entirely.
+5. On stop, `native.stopMeetingRecordingDual()` drains a final flush of
+   both streams. Diarization runs **only** on unlabeled
+   `source === 'loopback'` segments and writes `[Speaker N]` /
+   `[<name>]` labels into them.
+
+Solo mode only in v1. Host/participant modes hide the toggle — the room
+layer already mixes `broadcast` + `participant:<name>` segments. v1
+forces the chunked path; the Moonshine streaming session is deferred to
+a later iteration (would need two independent session states).
+
+`source` semantics after this change:
+
+| `source` value | Meaning | Label policy |
+|---|---|---|
+| `'mic'` | Local user's microphone — only source written for new local recordings | `speaker_label = 'You'` (= "Me" in UI) |
+| `'loopback'` | Local system audio output (remote-meeting capture only) | `null` until post-meeting diarization fills `[Speaker N]` → renders as "Remote" |
+| `'participant:<name>'` | Forwarded from a room peer over WebSocket | Peer display name |
+| `'broadcast'` | Host's audio broadcast in room mode | Existing |
+| `'meeting'` | **Legacy** single-stream segments | Read-only / historical (no new rows) |
+
+Remote-Meeting Capture settings (in `settings` table):
+- `meeting_remote_capture_enabled` — default `'false'`. Global default
+  for the per-meeting toggle.
+- `meeting_loopback_device` — default `'system_default'`. Use
+  `'device:<MMDevice id>'` to target a specific render endpoint.
+
+Build: requires the `windows` crate (target-gated to `cfg(windows)` in
+`rust-core/Cargo.toml`). Non-Windows builds compile a stub that returns
+an "unavailable on this platform" error so the recorder gracefully falls
+back to mic-only with a warning. Privacy posture is unchanged — both
+ring buffers zero-on-drop, no audio files written, no new network
+surface (the "remote" voices are already playing on the local machine).
+
 ### Flow 3: Browse History (Timeline)
 1. User toggles to Timeline view
 2. All entries displayed as cards, newest first
@@ -292,6 +361,17 @@ These are the functions exposed from Rust to Electron via napi-rs:
 startRecording(): void
 stopRecording(): Promise<TranscriptionResult>
 // TranscriptionResult = { rawTranscript: string, polishedText: string | null, durationSeconds: number }
+
+// --- Remote-Meeting Capture: Dual-Stream Mic + Loopback (v1.8.3, Windows v1) ---
+// Owns a separate MeetingCaptureEngine so dictation / Forge / streaming
+// meetings keep using the untouched single-stream CaptureEngine. Returns
+// 16 kHz mono PCM16 Node Buffers (same shape as drainRecordingBuffer) so the
+// existing Whisper / Moonshine / silence-gate call sites need no changes.
+startMeetingRecordingDual(micDeviceName: string | null, loopbackMode: 'system_default' | `device:${string}` | 'none'): void
+drainMeetingBuffers(): { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean }
+stopMeetingRecordingDual(): { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean }
+meetingHasLoopback(): boolean
+resetMeetingRecordingDual(): void
 
 // --- On-Demand LLM ---
 polishText(rawText: string): Promise<string>
