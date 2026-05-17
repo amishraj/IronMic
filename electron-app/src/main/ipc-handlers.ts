@@ -1453,6 +1453,14 @@ If the text is too short or unclear, output: ["General"]`;
     catch (err) { console.warn('[ipc] liveSummarizer.start failed:', err); }
   });
 
+  // Synchronous snapshot of the live summarizer's current bullets — no
+  // waiting for STT drain or LLM pass. Lets the renderer write an instant
+  // summary to the DB before meetingStopRecording() blocks on final chunk.
+  ipcMain.handle(IPC_CHANNELS.MEETING_GET_CURRENT_SUMMARY, () => ({
+    summary: liveSummarizer.getCurrentSummary(),
+    insufficient: liveSummarizer.isInsufficient?.() ?? false,
+  }));
+
   ipcMain.handle(IPC_CHANNELS.MEETING_STOP_RECORDING, async () => {
     // Order matters:
     //   1. Stop the recorder first — this processes the final chunk and

@@ -251,6 +251,7 @@ export const IPC_CHANNELS = {
   // Meeting Recording (Granola-style — device-select + chunk drain)
   MEETING_START_RECORDING: 'ironmic:meeting-start-recording',
   MEETING_STOP_RECORDING: 'ironmic:meeting-stop-recording',
+  MEETING_GET_CURRENT_SUMMARY: 'ironmic:meeting-get-current-summary',
   MEETING_SET_MIC_MUTED: 'ironmic:meeting-set-mic-muted',      // renderer → main (toggle self-mute)
   MEETING_SEGMENT_READY: 'ironmic:meeting-segment-ready',      // main → renderer push (committed final)
   MEETING_DRAFT_READY: 'ironmic:meeting-draft-ready',          // main → renderer push (live grey hypothesis)

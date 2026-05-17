@@ -22,10 +22,10 @@ function SectionBlock({ section }: { section: StructuredSection }) {
 
   return (
     <div className="space-y-1.5">
-      <h4 className="text-xs font-semibold uppercase tracking-wide text-gray-500">
+      <h4 className="text-xs font-semibold uppercase tracking-wide text-iron-text-muted">
         {section.title}
       </h4>
-      <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">
+      <div className="text-sm text-iron-text leading-relaxed whitespace-pre-wrap">
         {section.content}
       </div>
     </div>
@@ -68,7 +68,7 @@ function MeetingNotesPanelInner({ structuredOutput, summary, htmlContent, isGene
     return (
       <div className="space-y-3">
         {isGenerating && (
-          <p className="text-xs text-gray-400 italic">Updating notes…</p>
+          <p className="text-xs text-iron-text-muted italic">Updating notes…</p>
         )}
         <div
           className="prose prose-invert prose-sm max-w-none text-iron-text leading-relaxed"
@@ -88,14 +88,14 @@ function MeetingNotesPanelInner({ structuredOutput, summary, htmlContent, isGene
     return (
       <div className="space-y-5">
         {isGenerating && (
-          <p className="text-xs text-gray-400 italic">Updating notes…</p>
+          <p className="text-xs text-iron-text-muted italic">Updating notes…</p>
         )}
         {visibleSections.length > 0 ? (
           visibleSections.map(section => (
             <SectionBlock key={section.key} section={section} />
           ))
         ) : (
-          <p className="text-sm text-gray-400 italic">Notes will appear here after the meeting ends.</p>
+          <p className="text-sm text-iron-text-muted italic">Notes will appear here after the meeting ends.</p>
         )}
       </div>
     );
@@ -106,9 +106,9 @@ function MeetingNotesPanelInner({ structuredOutput, summary, htmlContent, isGene
     return (
       <div className="space-y-3">
         {isGenerating && (
-          <p className="text-xs text-gray-400 italic">Updating notes…</p>
+          <p className="text-xs text-iron-text-muted italic">Updating notes…</p>
         )}
-        <div className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">
+        <div className="text-sm text-iron-text leading-relaxed whitespace-pre-wrap">
           {summary}
         </div>
       </div>
@@ -118,11 +118,11 @@ function MeetingNotesPanelInner({ structuredOutput, summary, htmlContent, isGene
   // Empty state
   return (
     <div className="flex flex-col items-center justify-center h-full text-center py-12 px-4">
-      <FileText className="w-8 h-8 text-gray-300 mb-3" />
-      <p className="text-sm text-gray-400">
+      <FileText className="w-8 h-8 text-iron-text-muted mb-3" />
+      <p className="text-sm text-iron-text-muted">
         AI notes will appear here after the meeting ends.
       </p>
-      <p className="text-xs text-gray-300 mt-1">
+      <p className="text-xs text-iron-text-muted/70 mt-1">
         Notes are generated using your selected template.
       </p>
     </div>

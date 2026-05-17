@@ -765,6 +765,23 @@ export function MeetingPage() {
     const { sessionId, durationSec, template, roomModeSnapshot, skipRoomTeardown,
             hostSummaryOverride, hostTitleOverride } = opts;
     try {
+      // 0. Snapshot current live-summary BEFORE blocking on STT drain.
+      //    liveSummarizer.getCurrentSummary() is synchronous; this IPC round
+      //    trip takes ~1 ms. If we already have bullets, write them to the DB
+      //    right now and clear "Processing" so the user sees a summary
+      //    immediately — without waiting for Whisper to drain the last chunk
+      //    and the LLM to run one final flush pass (which can take 5-30 s).
+      try {
+        const snap = await window.ironmic.meetingGetCurrentSummary();
+        if (snap.summary && snap.summary.trim()) {
+          await persistInstantSummary(sessionId, snap.summary.trim());
+          unmarkMeetingProcessing(sessionId);
+          // Optimistic load so the card flips to "Notes ready + Enhancing"
+          // immediately; a second loadSessions() runs after stop completes.
+          loadSessions().catch(() => {});
+        }
+      } catch { /* best-effort — fall through to normal path */ }
+
       // 1. Stop recording FIRST. This drains the final chunk + flushes the
       //    LiveSummarizer; the resulting segment is emitted to the room
       //    server's onSegment subscription synchronously, BEFORE we tear

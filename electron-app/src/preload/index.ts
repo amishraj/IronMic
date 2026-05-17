@@ -353,6 +353,8 @@ const api = {
   ) =>
     ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS, hostDisplayName),
   meetingStopRecording: () => ipcRenderer.invoke('ironmic:meeting-stop-recording'),
+  meetingGetCurrentSummary: (): Promise<{ summary: string; insufficient: boolean }> =>
+    ipcRenderer.invoke('ironmic:meeting-get-current-summary'),
   /** Toggle self-mute during an active meeting. Backend is the source of
    *  truth — the renderer should mirror state via onMeetingRecordingState
    *  rather than flipping its store optimistically. */
