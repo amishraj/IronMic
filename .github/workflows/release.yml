@@ -154,6 +154,43 @@ jobs:
         working-directory: electron-app
         run: npx electron-builder --config electron-builder.config.js --publish never
 
+      - name: Verify DMG bundle integrity (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mapfile -t DMGS < <(find electron-app/release -maxdepth 1 -name '*.dmg' -type f)
+          [ "${#DMGS[@]}" -eq 1 ] || {
+            echo "FATAL: expected exactly one DMG, found ${#DMGS[@]}"
+            printf '  %s\n' "${DMGS[@]}"
+            exit 1
+          }
+          DMG="${DMGS[0]}"
+          MOUNTPOINT=$(mktemp -d)
+          cleanup() {
+            hdiutil detach "$MOUNTPOINT" 2>/dev/null || true
+            rmdir "$MOUNTPOINT" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNTPOINT"
+          FRAMEWORK="$MOUNTPOINT/IronMic.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Electron Framework"
+
+          test -s "$FRAMEWORK" || {
+            echo "FATAL: Electron Framework binary is missing or empty in $DMG"
+            echo "       Path checked: $FRAMEWORK"
+            exit 1
+          }
+
+          file "$FRAMEWORK" | grep -q 'Mach-O' || {
+            echo "FATAL: Electron Framework exists but is not a Mach-O binary"
+            file "$FRAMEWORK"
+            exit 1
+          }
+
+          SIZE=$(wc -c < "$FRAMEWORK" | tr -d ' ')
+          file "$FRAMEWORK"
+          echo "  Electron Framework binary: $SIZE bytes - OK"
+
       - name: Check installer size fits GitHub 2 GiB limit
         shell: bash
         run: |
