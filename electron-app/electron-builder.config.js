@@ -98,14 +98,14 @@ module.exports = {
     target: ['dmg'],
     category: 'public.app-category.productivity',
     icon: 'resources/icon.png',
-    // Ad-hoc sign ('-') produces a valid local signature so Gatekeeper shows
-    // "unidentified developer" (right-click → Open works) instead of
-    // "damaged and can't be opened" on downloaded, unsigned DMGs.
+    // Plain ad-hoc sign: Gatekeeper shows "unidentified developer"
+    // (right-click → Open works) instead of "damaged and can't be opened".
+    // Do NOT add hardenedRuntime here — it requires a real Apple Developer ID.
+    // Combining hardenedRuntime with ad-hoc (-s -) passes -o runtime to codesign,
+    // which on macOS Sequoia strips the Electron Framework binary from the bundle.
+    // Re-add hardenedRuntime + entitlements only when signing with a real Developer ID.
     identity: '-',
-    hardenedRuntime: true,
     gatekeeperAssess: false,
-    entitlements: 'resources/entitlements.mac.plist',
-    entitlementsInherit: 'resources/entitlements.mac.plist',
     extendInfo: {
       NSMicrophoneUsageDescription: 'IronMic needs microphone access for voice dictation.',
     },
