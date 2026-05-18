@@ -135,6 +135,8 @@ The user speaks, IronMic transcribes via Whisper, optionally polishes via a loca
 
 Total bundled model size: ~6 GB. Distributed as part of the installer.
 
+**Moonshine Base (default speech recognition engine)** is bundled in `electron-builder.config.js` `extraResources` and copied from `process.resourcesPath/models/moonshine-base/` to the writable user-data models dir on first launch — no network required for the default dictation flow. See `ensureBundledMoonshineBase()` in `electron-app/src/main/model-downloader.ts`.
+
 ---
 
 ## Data Model (SQLite Schema)
@@ -210,6 +212,161 @@ CREATE TABLE settings (
 5. User can continue dictating (append) or edit manually
 6. Entry is auto-saved to SQLite on every change
 
+### Flow 2b: Forge Mode — Dictate Into Any App
+Forge is the "Wispr-Flow-style" minimal floating bar that lets the user dictate
+text directly into whatever desktop app they're focused on (Outlook, Teams,
+Chrome address bar, VS Code, native Notes, etc.).
+
+1. User clicks "Forge mode" in the IronMic sidebar (or tray menu).
+2. Main IronMic window hides; a small always-on-top, **non-focusable** bar
+   appears (top-right by default). Because the bar is non-focusable, the
+   user's target app keeps the keyboard caret.
+3. User presses the same global hotkey → bar shows "Listening…", same Rust
+   audio capture, same Moonshine STT, same dictionary correction.
+4. Optional `forge_polish_enabled` LLM polish (default off — latency).
+5. **`paste_text` (Rust + `enigo`)** writes the transcript to the clipboard
+   and simulates `Cmd+V` / `Ctrl+V`. After ~500ms the prior clipboard text
+   is restored (token-cancellable so back-to-back dictations don't race).
+6. **No SQLite save by default** (`forge_persist_history = 'false'`).
+7. Audio buffer is zeroed and dropped, identical to Flow 1.
+
+Architecture details:
+- **Separate Vite entry** — `forge.html` + `forge-main.tsx` ship as their
+  own ~2 KB-gz bundle. No TipTap, no charts, no AI chat in the bar.
+- **Single Rust engine** — both windows share `CAPTURE_ENGINE` /
+  `WHISPER_ENGINE`; no duplicate audio capture or model load.
+- **Mode-aware hotkey dispatch** — main process tracks `forgeMode` and a
+  `dictationOwner: { owner, phase } | null` record (see
+  [main/dictation-owner.ts](electron-app/src/main/dictation-owner.ts)).
+  Hotkey routes to the active window; second-press from same owner is the
+  recording → processing transition; cross-owner presses are rejected.
+- **macOS Accessibility** — `enigo` posts synthetic events via
+  `CGEventPost`, which requires the host process to be trusted in
+  System Settings → Privacy & Security → Accessibility. The Forge bar
+  preflight-checks via `AXIsProcessTrusted()` and shows a permission
+  panel deep-linking to System Settings if trust is missing.
+- **Cloud polish in Forge** — gated by the AND of `polish_allow_cloud`
+  AND `forge_polish_allow_cloud`. The global setting is the upper bound;
+  Forge can be stricter than main but never looser.
+- **Clipboard restore is text only.** `arboard` does not preserve images,
+  files, HTML, or rich formats. If the user had non-text on the clipboard
+  before dictating, restore is skipped and the dictated transcript stays
+  on the clipboard until the user's next copy.
+
+Forge settings (all in the `settings` table; UI lives in main app's Settings):
+- `forge_persist_history` — default `'false'`. Save Forge dictations.
+- `forge_polish_enabled` — default `'false'`. Run polish before paste.
+- `forge_polish_allow_cloud` — default `'false'`. Cloud polish gate.
+- `forge_paste_method` — `'paste'` (default) or `'type'`. Char-by-char
+  fallback for paste-blocking apps.
+- `forge_clipboard_restore` — default `'true'`. Restore prior clipboard.
+- `forge_bar_position` — default `'top-right'`.
+
+Build: requires `--features forge` in the Rust core build (already in
+[scripts/build-rust.sh](scripts/build-rust.sh) and
+[scripts/build-rust.ps1](scripts/build-rust.ps1)). Linux X11 needs
+`libxdo-dev` at link time. Wayland keystroke posting is partial in
+`enigo` — Forge surfaces a clear error and is best supported on X11.
+
+### Flow 2c: Remote-Meeting Capture — Dual-Stream Mic + Loopback (v1.9.1, Windows v1)
+
+Remote-Meeting Capture transcribes both the user's microphone **and** the
+system's output audio (the remote participants' voices coming out of the
+local speakers / headphones) in parallel, so transcript segments are
+**source-labeled at capture time** instead of relying on LLM diarization
+to split a single mixed stream.
+
+1. User joins a Zoom / Teams / Meet call as normal — the meeting service
+   handles all networking, proxies, WAN routing. IronMic does not host or
+   join the call itself.
+2. User opens IronMic → New Meeting → toggles **Capture remote participants**
+   on the start screen (solo mode only) and clicks Start.
+3. Main process calls `meetingStartRecording(... , { enabled: true,
+   loopbackDevice: 'system_default' })`. The recorder calls
+   `native.startMeetingRecordingDual(micDeviceName, 'system_default')` in
+   Rust, which spins up a `MeetingCaptureEngine` owning two streams:
+     • **Mic stream** — same cpal input path as dictation, default
+       or named device.
+     • **Loopback stream** — `loopback_windows.rs` opens
+       `IAudioClient` on the default render endpoint with
+       `AUDCLNT_STREAMFLAGS_LOOPBACK` (event-driven pump, timed-pump
+       fallback, `AUDCLNT_BUFFERFLAGS_SILENT` zero-fill,
+       `AUDCLNT_E_DEVICE_INVALIDATED` rebuild, mix-format → f32).
+4. The chunk loop runs `processChunkDual()` every 30 s (clamped floor —
+   STT cost ~doubles for dual streams). Each tick:
+     • `native.drainMeetingBuffers()` returns
+       `{ mic: Buffer, loopback: Buffer | null }` as 16 kHz mono PCM16.
+     • Mic chunk → Whisper → segment with `source: 'mic'`,
+       `speaker_label: 'You'`. **Diarization never touches mic segments.**
+     • Loopback chunk → Whisper → segment with `source: 'loopback'`.
+       Label depends on the per-chunk read of `meeting_diarization_mode`:
+       - `'off'` (Simple, default): one row per chunk, `speaker_label =
+         null`, renderer shows a plain "Remote" badge. Same processing
+         shape as the mic call — no segment slicing, no embedding, no
+         AHC. This is what most users see.
+       - `'embedding'` (Advanced, opt-in): `transcribeWithSegments` →
+         per-utterance rows → WeSpeaker embed → online clustering →
+         `[Speaker N]` label persisted before render. Slower per chunk
+         (multi-segment Whisper + N×26 MB ONNX session calls) but
+         distinguishes up to ~20 speakers.
+     • Both Whisper calls run serially against the same model
+       (parallel would race on the lock); silent streams are
+       RMS-gated to skip the model entirely.
+5. On stop, `native.stopMeetingRecordingDual()` drains a final flush of
+   both streams. **Advanced mode only:** AHC refinement re-clusters
+   every persisted embedding (DB-canonical) and emits a single
+   `MEETING_SEGMENTS_RELABELED` event for in-place label patches; the
+   optional LLM roster-rename pass runs after AHC if enabled. In Simple
+   mode this stage is a no-op — segments stay labeled "Remote" through
+   meeting end. The legacy text-LLM diarization fallback is gated off
+   in Simple mode for solo remote-capture; multi-user room recordings
+   still use it when AHC produced no labels.
+
+Solo mode only in v1. Host/participant modes hide the toggle — the room
+layer already mixes `broadcast` + `participant:<name>` segments. v1
+forces the chunked path; the Moonshine streaming session is deferred to
+a later iteration (would need two independent session states).
+
+`source` semantics after this change:
+
+| `source` value | Meaning | Label policy |
+|---|---|---|
+| `'mic'` | Local user's microphone — only source written for new local recordings | `speaker_label = 'You'` (= "Me" in UI) |
+| `'loopback'` | Local system audio output (remote-meeting capture only) | Simple mode → `null` (renders "Remote"); Advanced mode → `[Speaker N]` set inline before render |
+| `'participant:<name>'` | Forwarded from a room peer over WebSocket | Peer display name |
+| `'broadcast'` | Host's audio broadcast in room mode | Existing |
+| `'meeting'` | **Legacy** single-stream segments | Read-only / historical (no new rows) |
+
+Remote-Meeting Capture settings (in `settings` table):
+- `meeting_remote_capture_enabled` — default `'false'`. Global default
+  for the per-meeting toggle.
+- `meeting_loopback_device` — default `'system_default'`. Use
+  `'device:<MMDevice id>'` to target a specific render endpoint.
+- `meeting_diarization_mode` — `'off'` (default, Simple) or
+  `'embedding'` (Advanced). Drives the per-chunk loopback branch in
+  `processChunkDual` and the renderer's "pending diarization…" hint.
+  Toggle lives at Settings → Voice AI → "Identify Individual Remote
+  Speakers (Advanced)", gated on the remote-capture toggle.
+- `meeting_diarization_user_overridden` — `'false'` by default; set to
+  `'true'` only by the explicit Settings UI toggle. When `'false'`, the
+  app reset block in `main/index.ts` forces `meeting_diarization_mode
+  = 'off'` at startup so Simple stays the default for users who never
+  touched the toggle (covers fresh installs and v1.9.0 upgraders).
+- `meeting_diarization_threshold`, `meeting_diarization_max_speakers`,
+  `meeting_diarization_min_slice_ms`, `meeting_diarization_max_slice_ms`
+  — Advanced-mode tunables read once per chunk. Defaults are sane for
+  10–20 distinct speakers on a single loopback stream.
+- `meeting_llm_name_pass_enabled` — `'false'` by default. When `'true'`
+  and a meeting has a participant roster, the LLM roster-rename pass
+  runs after AHC and maps `[Speaker N]` → roster display names.
+
+Build: requires the `windows` crate (target-gated to `cfg(windows)` in
+`rust-core/Cargo.toml`). Non-Windows builds compile a stub that returns
+an "unavailable on this platform" error so the recorder gracefully falls
+back to mic-only with a warning. Privacy posture is unchanged — both
+ring buffers zero-on-drop, no audio files written, no new network
+surface (the "remote" voices are already playing on the local machine).
+
 ### Flow 3: Browse History (Timeline)
 1. User toggles to Timeline view
 2. All entries displayed as cards, newest first
@@ -234,6 +391,28 @@ These are the functions exposed from Rust to Electron via napi-rs:
 startRecording(): void
 stopRecording(): Promise<TranscriptionResult>
 // TranscriptionResult = { rawTranscript: string, polishedText: string | null, durationSeconds: number }
+
+// --- Remote-Meeting Capture: Dual-Stream Mic + Loopback (v1.9.1, Windows v1) ---
+// Owns a separate MeetingCaptureEngine so dictation / Forge / streaming
+// meetings keep using the untouched single-stream CaptureEngine. Returns
+// 16 kHz mono PCM16 Node Buffers (same shape as drainRecordingBuffer) so the
+// existing Whisper / Moonshine / silence-gate call sites need no changes.
+startMeetingRecordingDual(micDeviceName: string | null, loopbackMode: 'system_default' | `device:${string}` | 'none'): void
+drainMeetingBuffers(): { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean }
+stopMeetingRecordingDual(): { mic: Buffer; loopback: Buffer | null; loopbackActive: boolean }
+meetingHasLoopback(): boolean
+resetMeetingRecordingDual(): void
+
+// --- Speaker Diarization for Loopback (v1.9.0, Advanced mode only) ---
+// Advanced mode (`meeting_diarization_mode === 'embedding'`) slices each
+// Whisper segment from the loopback PCM and embeds it with WeSpeaker
+// ResNet34 (256-d L2-normalized Float32). Simple mode never calls these.
+transcribeWithSegments(audioBuffer: Buffer, terms: string[]): Promise<TranscriptSegmentDto[]>
+// TranscriptSegmentDto = { text: string; start_ms: number; end_ms: number; no_speech_prob: number | null }
+embedSpeaker(pcm16: Buffer): Promise<Float32Array>             // 256 floats; empty if speaker module unavailable
+speakerDiarizationAvailable(): boolean                          // WeSpeaker ONNX present + feature compiled
+updateSegmentEmbedding(segmentId: string, embedding: Buffer, model: string, confidence: number): void
+listSegmentEmbeddings(sessionId: string, source: 'loopback'): string  // JSON SegmentEmbeddingRow[]
 
 // --- On-Demand LLM ---
 polishText(rawText: string): Promise<string>
@@ -326,6 +505,38 @@ endMeetingSession(id, speakerCount, summary, actionItems, duration, entryIds): v
 getMeetingSession(id): string // JSON or "null"
 listMeetingSessions(limit, offset): string // JSON
 deleteMeetingSession(id): void
+
+// --- RAG: Indexing (v1.8.0) ---
+ragChunkEntry(entryId: string): Promise<number>
+ragChunkMeeting(meetingId: string): Promise<number>
+ragChunkUserNote(noteId: string): Promise<number>
+ragGetUnembeddedChunks(limit: number, modelVersion: string): Promise<string>   // JSON [{chunk_id, text, context_prefix}]
+ragStoreChunkEmbeddings(itemsBuffer: Buffer, modelVersion: string): Promise<number>
+ragSetActiveModel(modelVersion: string): Promise<void>
+ragGetIndexStats(): Promise<string>    // JSON {active_model, total_chunks, indexed_chunks, by_source_type, last_indexed_at}
+ragDeleteChunksForSource(sourceType: string, sourceId: string): Promise<number>
+ragRebuildIndex(): Promise<void>
+
+// --- RAG: Retrieval (v1.8.0) ---
+// Note: queryEmbedding is passed FROM the renderer (BgeEmbedder); Rust never embeds.
+ragClassifyIntent(query: string): Promise<string>  // JSON IntentResult
+ragRetrieveHybrid(
+  query: string,
+  queryEmbedding: Buffer,              // 384 * 4 bytes (Float32); empty = FTS5-only fallback
+  optionsJson: string                  // {modelVersion, filters, k, sourceTypes}
+): Promise<string>                     // JSON {intent, filters, hits: [{chunk_id, source_type, source_id, score, text, citation}]}
+
+// --- User Notes (v1.8.0 — replaces localStorage useNotesStore) ---
+userNotesBulkImport(notesJson: string, notebooksJson: string): Promise<number>
+userNotesCreate(note: NewUserNote): Promise<UserNote>
+userNotesGet(id: string): Promise<UserNote | null>
+userNotesUpdate(id: string, updates: PartialUserNote): Promise<UserNote>
+userNotesDelete(id: string): Promise<void>
+userNotesList(opts: { notebookId?: string; search?: string; limit: number; offset: number }): Promise<UserNote[]>
+userNotebooksCreate(notebook: NewUserNotebook): Promise<UserNotebook>
+userNotebooksRename(id: string, name: string): Promise<void>
+userNotebooksDelete(id: string): Promise<void>
+userNotebooksList(): Promise<UserNotebook[]>
 ```
 
 ---
@@ -510,6 +721,12 @@ These are hard architectural constraints, not policies:
 
 6. **Reproducible builds.** CI builds are deterministic and verifiable. Users can build from source.
 
+**Two explicit, opt-in cloud exceptions:**
+
+1. **`polish_allow_cloud`** (default `false`) — routes the *polish* pass through Claude or Copilot CLI. Notes/Timeline show a "via Claude" / "via Copilot" / "via local" badge. Auth alone does not enable this.
+
+2. **`knowledge_qa_allow_cloud`** (default `false`) — routes *Knowledge Q&A* answers through the selected cloud provider. This is independent of `polish_allow_cloud`; enabling polish does not enable knowledge Q&A cloud access. The setting is surfaced in Settings → Security & Privacy with the same warning pattern. When off and the user selects a cloud provider for Q&A, IronMic falls back to the local LLM if available, or surfaces a "no provider available" error with a deeplink to Settings.
+
 ---
 
 ## Development Workflow
@@ -676,21 +893,35 @@ Renderer Thread                    ML Web Worker (CPU)
                                                           ActionRouter
 ```
 
-### SQLite Schema v3 Tables
+### SQLite Schema — Current Tables
 
-| Table | Feature | Purpose |
-|-------|---------|---------|
-| `vad_training_samples` | VAD | MFCC features for on-device model fine-tuning |
-| `intent_training_samples` | Intent | Classification logs + corrections |
-| `voice_routing_log` | Routing | Route decisions for ML training |
-| `meeting_sessions` | Meeting | Session metadata, summary, action items |
-| `notifications` | Notifications | In-app notification CRUD |
-| `notification_interactions` | Notifications | User engagement tracking for ML |
-| `action_log` | Workflows | Action type + temporal metadata (no content) |
-| `workflows` | Workflows | Discovered patterns |
-| `embeddings` | Search | 512-dim Float32 vectors as BLOB |
-| `ml_model_weights` | Shared | Serialized TF.js model weights |
-| `tfjs_model_metadata` | Shared | Model version tracking |
+| Table | Added | Purpose |
+|-------|-------|---------|
+| `entries` | v1.0 | Dictation entry CRUD |
+| `entries_fts` | v1.0 | FTS5 virtual table over entries |
+| `dictionary` | v1.0 | Custom dictionary words |
+| `settings` | v1.0 | Key-value settings store |
+| `meeting_sessions` | v1.1 | Meeting session metadata, summary, action items |
+| `transcript_segments` | v1.1 | Speaker-labeled transcript segments per meeting (v15 adds `speaker_embedding BLOB`, `speaker_embedding_model TEXT`, `diarization_confidence REAL` for Advanced-mode WeSpeaker labels) |
+| `vad_training_samples` | v1.1 | MFCC features for on-device VAD fine-tuning |
+| `intent_training_samples` | v1.1 | Classification logs + corrections |
+| `voice_routing_log` | v1.1 | Route decisions for ML training |
+| `notifications` | v1.1 | In-app notification CRUD |
+| `notification_interactions` | v1.1 | User engagement tracking for ML |
+| `action_log` | v1.1 | Action type + temporal metadata (no content) |
+| `workflows` | v1.1 | Discovered workflow patterns |
+| `embeddings` | v1.1 | Legacy 512-dim USE vectors (whole-document level) |
+| `ml_model_weights` | v1.1 | Serialized TF.js model weights |
+| `tfjs_model_metadata` | v1.1 | Model version tracking |
+| `ai_chat_sessions` | v1.5 | AI chat session headers |
+| `ai_chat_messages` | v1.5 | Chat message bodies |
+| `ai_chat_messages_fts` | v1.5 | FTS5 virtual table over chat messages |
+| `chunks` | v1.8 | Chunked retrievable units for RAG (entry / meeting / user_note) |
+| `chunks_fts` | v1.8 | FTS5 virtual table over chunks |
+| `chunk_embeddings` | v1.8 | Per-chunk Float32 embeddings keyed by (chunk_id, model_version) |
+| `user_notes` | v1.8 | User-authored notes (migrated from localStorage) |
+| `user_notes_fts` | v1.8 | FTS5 virtual table over user notes |
+| `user_notebooks` | v1.8 | Note notebook groupings |
 
 ### ML Settings (all in `settings` table)
 
@@ -732,6 +963,95 @@ Renderer Thread                    ML Web Worker (CPU)
 - Action log records action types only, never user content
 - All learned data in local SQLite, deletable per-feature
 - `blockAllNetworkRequests()` unchanged — no new network access
+
+---
+
+## RAG Layer (v1.8.0)
+
+### Architecture
+
+Retrieval lives in Rust (`rust-core/src/rag/`). Embedding inference runs in the renderer ML Worker and results are passed across the IPC boundary as a `Buffer` — Rust never loads an ONNX model itself.
+
+```
+Renderer                                    Rust Core
+┌──────────────────────────┐               ┌──────────────────────────┐
+│  AI Assistant / Ask        │               │  rag/retrieval.rs         │
+│  knowledgeAskStart()       │  N-API        │   ├─ intent.rs             │
+│  onKnowledgeAskEvent()     │ ◀──────────▶ │   ├─ hybrid_search.rs      │
+│  QuickSearch + SearchPage  │               │   └─ vector.rs (SIMD cos.) │
+└──────────────────────────┘               │                            │
+                                           │  rag/chunker.rs             │
+ML Worker (renderer)                       │   ├─ chunk_entry            │
+┌──────────────────────────┐               │   ├─ chunk_meeting          │
+│  BgeEmbedder (ONNX)        │               │   └─ chunk_user_note       │
+│  384-dim Float32 output    │               │                            │
+│  L2-normalized             │               │  storage/                  │
+└──────────────────────────┘               │   ├─ chunks.rs              │
+                                           │   ├─ chunk_embeddings.rs    │
+main process                               │   └─ user_notes.rs          │
+┌──────────────────────────┐               └──────────────────────────┘
+│  IndexerService.ts         │
+│  QAOrchestrator.ts         │
+│  promptBuilder.ts          │
+└──────────────────────────┘
+```
+
+### Chunking strategy
+
+| Source | Chunker | Chunk size | Extra fields |
+|--------|---------|------------|--------------|
+| Entries | `chunk_entry` — walk ProseMirror JSON (h1/h2/h3 boundaries), accumulate ~400 tokens | ~400 tok, ~50 overlap | `heading_path` |
+| Meetings | `chunk_meeting` — group consecutive same-speaker `transcript_segments` | ~400 tok, ~50 overlap | `start_ms`, `end_ms`, `speaker_label` |
+| Structured output sections | One chunk per section (`completed`, `blockers`, etc.) | Whole section | `source_type = 'meeting_segment'` |
+| User notes | `chunk_user_note` — plaintext 400-token windows | ~400 tok, no overlap | `heading_path[0] = title` |
+
+### Retrieval pipeline (per query)
+
+1. **Intent classification** (`rag::intent`) — regex + chrono date parser → `Temporal | Topic | SingleDoc | CrossDoc` + extracted filters.
+2. **SQL pre-filter** — date range, `is_archived = 0`, source type filter.
+3. **FTS5 path** — `chunks_fts MATCH ?` → top-30 with bm25.
+4. **Vector path** — load filtered `chunk_embeddings` → flat SIMD dot product against caller-supplied query embedding → top-30.
+5. **RRF merge** (k=60) → top-10 chunks returned as `hits`.
+
+### Incremental indexing
+
+`IndexerService` (main process singleton) owns a priority queue:
+- **App load** — `kickOnce()` from `Layout.tsx`; skips if already indexed.
+- **Entry / meeting / note CRUD** — IPC handlers call `scheduleUserNoteChunkRefresh` / `scheduleMeetingChunkRefresh` / `scheduleEntryChunkRefresh` via `queueMicrotask` (fire-and-forget, non-blocking).
+- **Rebuild** — `ragRebuildIndex()` wipes `chunks` + `chunk_embeddings`, then `kickOnce({ force: true })` re-chunks everything from scratch.
+
+### Settings keys (v1.8.0)
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `knowledge_qa_enabled` | `'true'` | Master toggle |
+| `knowledge_qa_allow_cloud` | `'false'` | Cloud Q&A opt-in (independent of `polish_allow_cloud`) |
+| `knowledge_qa_default_provider` | `'auto'` | `auto` / `local` / `claude` / `copilot` |
+| `embedding_active_model` | `'bge-small-en-v1.5'` | Drives query filter and indexer target |
+| `rag_chunk_size_tokens` | `'400'` | Tunable chunk target |
+| `rag_chunk_overlap_tokens` | `'50'` | Overlap between consecutive chunks |
+| `rag_contextual_prefix_enabled` | `'true'` | Best-effort one-sentence doc context prepended at embed time |
+| `rag_topic_k_local` | `'8'` | Top-k for local provider |
+| `rag_topic_k_cloud` | `'30'` | Top-k for cloud provider |
+| `notes_migrated_to_sqlite` | `'false'→'true'` | One-shot localStorage→SQLite migration guard |
+
+### New files (v1.8.0)
+
+| File | Purpose |
+|------|---------|
+| `rust-core/src/rag/mod.rs` | Module root |
+| `rust-core/src/rag/chunker.rs` | Chunking for entries, meetings, user notes |
+| `rust-core/src/rag/intent.rs` | Rule-based intent + date-filter extraction |
+| `rust-core/src/rag/hybrid_search.rs` | SQL pre-filter → FTS5 + vector → RRF |
+| `rust-core/src/rag/vector.rs` | Flat SIMD cosine via `wide` crate |
+| `rust-core/src/rag/prompts.rs` | System prompt templates per intent |
+| `rust-core/src/storage/chunks.rs` | Chunks + chunk_embeddings CRUD |
+| `rust-core/src/storage/user_notes.rs` | User notes + notebooks CRUD + FTS5 |
+| `electron-app/src/main/rag/IndexerService.ts` | Priority-queue background indexer singleton |
+| `electron-app/src/main/rag/QAOrchestrator.ts` | Query → retrieval → provider routing → streaming |
+| `electron-app/src/main/rag/promptBuilder.ts` | Per-route prompt assembly (local / Claude / Copilot) |
+| `electron-app/src/renderer/components/QuickSearch.tsx` | App-bar quick search with portal-based popover |
+| `electron-app/src/renderer/utils/searchNormalize.ts` | NFKD normalization + AND-token matching |
 
 ---
 

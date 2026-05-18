@@ -2,29 +2,31 @@
  * Electron main process entry point.
  */
 
-import { app, BrowserWindow, session, globalShortcut, nativeImage, ipcMain } from 'electron';
+import { app, BrowserWindow, Notification, session, globalShortcut, nativeImage, dialog } from 'electron';
 import path from 'path';
 import { registerIpcHandlers } from './ipc-handlers';
+import { debugLog } from './debug-log';
 import { createTray, destroyTray, updateTrayState } from './tray';
-import { ensureBundledVoices, ensureBundledTFJSModels } from './model-downloader';
-import { startMeetingAppDetection } from './meeting-app-detector';
-
-// ── Main process crash catching ──
-// Stores errors in memory so the renderer can fetch them via IPC
-const mainProcessErrors: Array<{ time: string; message: string }> = [];
-
-process.on('uncaughtException', (error) => {
-  const entry = { time: new Date().toISOString(), message: `[main] Uncaught: ${error.message}\n${error.stack}` };
-  mainProcessErrors.push(entry);
-  console.error('[main] Uncaught exception:', error);
-});
-
-process.on('unhandledRejection', (reason: any) => {
-  const msg = reason instanceof Error ? `${reason.message}\n${reason.stack}` : String(reason);
-  const entry = { time: new Date().toISOString(), message: `[main] Unhandled rejection: ${msg}` };
-  mainProcessErrors.push(entry);
-  console.error('[main] Unhandled rejection:', reason);
-});
+import {
+  isForgeMode,
+  getForgeWindow,
+} from './forge-window';
+import { tryDispatchHotkey, getOwner, clearMainOwner, clearOwner } from './dictation-owner';
+import {
+  startKeyboardListener,
+  stopKeyboardListener,
+  type ForgeKeyEvent,
+} from './keyboard-listener';
+import {
+  ensureBundledVoices,
+  ensureBundledTFJSModels,
+  ensureBundledMoonshineBase,
+  ensureBundledLlm,
+  ensureBundledWeSpeaker,
+} from './model-downloader';
+import { startMeetingAppDetection, applyAutoDetectDefaultMigration } from './meeting-app-detector';
+import { meetingRecorder } from './meeting-recorder';
+import { initShellEnv } from './utils/shell-env';
 
 // Set the models directory env var BEFORE the Rust addon loads.
 // In production, models go to the user's app-data directory (writable).
@@ -40,6 +42,67 @@ import { native } from './native-bridge';
 const ICON_PATH = path.join(__dirname, '..', '..', 'resources', 'icon.png');
 
 let mainWindow: BrowserWindow | null = null;
+
+/**
+ * "Real quit" flag — flipped to true only by an explicit user request to
+ * exit the app (tray menu → Quit, Cmd+Q / Alt+F4, OS shutdown). When false,
+ * the window's `close` event is intercepted and the window is hidden to the
+ * system tray instead — same pattern Discord/Slack/Teams use. This makes
+ * IronMic feel like a professional always-available tool: closing the X
+ * never tears down the running meeting/recording in main process state.
+ *
+ * Reset to false if the user CANCELS the in-progress warning dialog so a
+ * subsequent X click correctly hides-to-tray rather than re-prompting.
+ */
+let isAppQuitting = false;
+
+/**
+ * One-time discoverability hint shown the FIRST time the user closes the
+ * window via X (which now hides to tray rather than quits). The hint
+ * answers "wait, where did the app go?" before the user goes hunting for
+ * it. Stored in the SQLite settings table so it persists across launches
+ * but only fires once per install.
+ *
+ * Key: `tray_hint_shown`. Default 'false'. Flipped to 'true' on first
+ * hide-to-tray.
+ */
+function maybeShowTrayHint(): void {
+  try {
+    const shown = native.getSetting('tray_hint_shown');
+    if (shown === 'true') return;
+    if (!Notification.isSupported()) {
+      // No native notifications (rare — headless Linux, etc.). Just persist
+      // so we don't probe Notification.isSupported() on every close.
+      native.setSetting('tray_hint_shown', 'true');
+      return;
+    }
+    const body =
+      process.platform === 'win32'
+        ? 'IronMic is still running. Right-click the tray icon to quit.'
+        : 'IronMic is still running. Right-click the menu-bar icon to quit.';
+    const n = new Notification({
+      title: 'IronMic is in the background',
+      body,
+      silent: true,
+    });
+    // Clicking the notification re-shows the window — same affordance as
+    // clicking the tray icon. Pro-app behavior.
+    n.on('click', () => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        if (!mainWindow.isVisible()) mainWindow.show();
+        mainWindow.focus();
+      }
+    });
+    n.show();
+    native.setSetting('tray_hint_shown', 'true');
+  } catch (err) {
+    // Best-effort — failing here just means the user might be briefly
+    // confused. Not worth crashing for.
+    if (process.env.NODE_ENV === 'development') {
+      console.warn('[main] tray-hint failed:', (err as Error)?.message);
+    }
+  }
+}
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
@@ -67,6 +130,85 @@ function createWindow(): void {
     mainWindow.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   }
 
+  // Window close handler — two distinct paths.
+  //
+  // Path A (default — user clicks X / Cmd+W / Alt+F4): hide to tray. The
+  // app keeps running in main process state, the system tray icon stays
+  // visible, and a one-time hint notification fires on the first
+  // close-to-tray so the user knows what happened. This matches the
+  // behavior of Discord/Slack/Teams — closing the window does NOT exit
+  // the app.
+  //
+  // Path B (user explicitly quits via tray menu / OS shutdown): the
+  // tray's Quit click sets isAppQuitting=true before calling app.quit().
+  // We then run the existing "warn about in-progress recording/notes"
+  // flow. If the user cancels in the dialog, we reset isAppQuitting back
+  // to false so the next X click correctly hides-to-tray.
+  //
+  // We must call event.preventDefault() synchronously and re-try the
+  // close from inside the async dialog callback — Electron's required
+  // pattern.
+  mainWindow.on('close', (event) => {
+    if (!isAppQuitting) {
+      // Path A — soft close, hide to tray.
+      event.preventDefault();
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.hide();
+      }
+      maybeShowTrayHint();
+      return;
+    }
+
+    // Path B — real quit; check for in-progress work.
+    const isRecording = meetingRecorder.isActive();
+    const generatingCount: number =
+      typeof (global as any).__ironmicActiveGeneratingCount === 'function'
+        ? (global as any).__ironmicActiveGeneratingCount()
+        : 0;
+
+    if (!isRecording && generatingCount === 0) return; // nothing to warn about; let close proceed
+
+    event.preventDefault(); // hold the close while the dialog is shown
+
+    // If the user invoked Quit from the tray while the window is hidden
+    // (close-to-tray state), the warning dialog would otherwise be
+    // application-modal but visually invisible. Show + focus the window
+    // first so the dialog parents to something the user can see.
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+
+    const lines: string[] = [];
+    if (isRecording) lines.push('• A meeting is currently being recorded.');
+    if (generatingCount > 0) lines.push(`• Meeting notes are still being generated (${generatingCount} in progress).`);
+
+    dialog.showMessageBox(mainWindow!, {
+      type: 'warning',
+      buttons: ['Quit anyway', 'Cancel'],
+      defaultId: 1,
+      cancelId: 1,
+      title: 'IronMic — work in progress',
+      message: 'Quitting now may lose data:',
+      detail: lines.join('\n') + '\n\nQuit anyway?',
+    }).then(({ response }) => {
+      if (response === 0) {
+        // User confirmed — force close (remove this listener so it doesn't loop)
+        mainWindow?.removeAllListeners('close');
+        mainWindow?.close();
+      } else {
+        // User cancelled — keep window open AND reset isAppQuitting so a
+        // subsequent X click does the right thing (hide to tray) instead
+        // of re-prompting.
+        isAppQuitting = false;
+      }
+    }).catch(() => {
+      // Dialog failed (unlikely) — close anyway
+      mainWindow?.removeAllListeners('close');
+      mainWindow?.close();
+    });
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -74,25 +216,6 @@ function createWindow(): void {
 
 /** Domains allowed for model downloads (must match model-downloader.ts ALLOWED_DOMAINS) */
 const MODEL_DOWNLOAD_DOMAINS = ['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com', 'huggingface.co', 'xethub.hf.co'];
-
-function setupMediaPermissions(): void {
-  // Grant microphone access to the renderer process.
-  // Required when sandbox: true — without this, getUserMedia silently fails.
-  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
-    // Allow media (microphone) for our own renderer
-    if (permission === 'media') {
-      callback(true);
-      return;
-    }
-    // Deny everything else (camera, geolocation, notifications, etc.)
-    callback(false);
-  });
-
-  session.defaultSession.setPermissionCheckHandler((_webContents, permission) => {
-    if (permission === 'media') return true;
-    return false;
-  });
-}
 
 function blockAllNetworkRequests(): void {
   // Privacy guarantee: block ALL outbound network requests except model downloads.
@@ -126,36 +249,201 @@ function blockAllNetworkRequests(): void {
   });
 }
 
-function registerGlobalHotkey(): void {
-  const hotkey = native.getSetting('hotkey_record') || 'CommandOrControl+Shift+V';
+/**
+ * Wispr-Flow-style hotkey routing.
+ *
+ * The native keyboard listener (uiohook) emits three high-level events:
+ *   - 'push-to-talk-start'  → user is holding Fn (Mac) or Ctrl+Win (Win)
+ *   - 'push-to-talk-end'    → user released the modifier(s)
+ *   - 'hands-free-toggle'   → user tapped Fn+Space or Ctrl+Win+Space
+ *
+ * We forward each as an IPC channel to whichever window owns the active
+ * mode. The owner serialization (`tryDispatchHotkey`) prevents the toggle
+ * variant from triggering twice if the user double-taps mid-dictation.
+ */
+function dispatchForgeKeyEvent(ev: ForgeKeyEvent): void {
+  const forge = isForgeMode();
+  const target: 'forge' | 'main' = forge ? 'forge' : 'main';
 
-  try {
-    globalShortcut.register(hotkey, () => {
-      console.log('[hotkey] Global hotkey pressed');
-      if (mainWindow) {
-        mainWindow.webContents.send('ironmic:hotkey-pressed');
-      }
-    });
-    console.log(`[hotkey] Registered global hotkey: ${hotkey}`);
-  } catch (err) {
-    console.error(`[hotkey] Failed to register hotkey ${hotkey}:`, err);
+  // Owner serialization is required for FORGE because Forge has explicit
+  // PTT-start / PTT-end semantics that need to be paired. For MAIN, the
+  // existing useRecordingStore already has its own actionInProgress guard;
+  // adding owner tracking here would deadlock if main's complete-handshake
+  // ever desyncs (and main doesn't fire `notifyForgeDictationComplete`, so
+  // the owner would never clear). We dispatch directly to main and let
+  // its renderer-side store handle re-entrancy.
+  // PTT-cancel resets the owner immediately so the hands-free-toggle that
+  // arrives right after starts cleanly instead of transitioning into a
+  // 'processing' phase.
+  if (ev.kind === 'push-to-talk-cancel') {
+    clearOwner();
+  }
+
+  if (target === 'forge' && ev.kind === 'hands-free-toggle') {
+    const decision = tryDispatchHotkey('forge');
+    if (!decision.dispatch) {
+      console.log(`[forge-keys] hands-free dropped (forge): ${decision.reason}`);
+      return;
+    }
+    console.log(`[forge-keys] hands-free → forge (${decision.phase})`);
+  } else if (target === 'main') {
+    // Belt-and-braces: if owner state was somehow stuck pointing at main
+    // (shouldn't happen, but harmless to clean), reset it so we never wedge.
+    const owner = getOwner();
+    if (owner?.owner === 'main') clearMainOwner();
+    console.log(`[forge-keys] ${ev.kind} → main`);
+  }
+
+  const channel =
+    ev.kind === 'push-to-talk-start'
+      ? 'ironmic:forge-ptt-start'
+      : ev.kind === 'push-to-talk-end'
+        ? 'ironmic:forge-ptt-end'
+        : ev.kind === 'push-to-talk-cancel'
+          ? 'ironmic:forge-ptt-cancel'
+          : 'ironmic:hotkey-pressed';
+
+  if (target === 'forge') {
+    const fw = getForgeWindow();
+    if (fw && !fw.isDestroyed()) {
+      fw.webContents.send(channel);
+    } else if (ev.kind === 'hands-free-toggle' && mainWindow && !mainWindow.isDestroyed()) {
+      // Forge mode flag was on but the bar is gone — graceful fallback.
+      mainWindow.webContents.send(channel);
+    }
+  } else if (mainWindow && !mainWindow.isDestroyed()) {
+    // Main app receives only the hands-free toggle event today. PTT in main
+    // is a future enhancement (would require main's recording store to
+    // expose explicit start/end methods like Forge has).
+    if (ev.kind === 'hands-free-toggle') {
+      mainWindow.webContents.send(channel);
+    }
   }
 }
 
-app.whenReady().then(() => {
-  blockAllNetworkRequests();
-  setupMediaPermissions();
-  registerIpcHandlers();
+function registerGlobalHotkey(): void {
+  const ok = startKeyboardListener(dispatchForgeKeyEvent);
+  if (ok) {
+    console.log(
+      '[hotkey] native listener active — Mac: Fn (hold) / Fn+Space (toggle), Win: Ctrl+Win (hold) / Ctrl+Win+Space (toggle)',
+    );
+  } else {
+    console.warn(
+      '[hotkey] native listener fell back to globalShortcut — push-to-talk disabled, hands-free works via Cmd+Shift+Space (Mac) / Ctrl+Win+Space (Win)',
+    );
+  }
+}
 
-  // IPC: let renderer fetch main process errors for the logs page
-  ipcMain.handle('ironmic:get-main-errors', () => mainProcessErrors);
+// ── Single-instance lock ─────────────────────────────────────────────────
+// IronMic owns a system-wide hotkey, the Rust audio capture, and global
+// model loaders — running two copies in parallel would race on the mic and
+// double-load 100MB+ of models. If a second launch is attempted (e.g. user
+// double-clicks the dock icon while Forge is active and the main window is
+// hidden), we focus the existing instance and exit.
+const gotInstanceLock = app.requestSingleInstanceLock();
+if (!gotInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
+
+app.whenReady().then(async () => {
+  await initShellEnv();
+  blockAllNetworkRequests();
+  registerIpcHandlers();
   createWindow();
-  createTray(() => app.quit());
+  // Tray "Quit" → set quit flag BEFORE app.quit() so the window-close
+  // handler routes to the "real quit" path (warning dialog) instead of
+  // hide-to-tray. `before-quit` will also set the flag — setting it twice
+  // is harmless, but doing it here removes a one-tick race window.
+  createTray(() => {
+    isAppQuitting = true;
+    app.quit();
+  });
   registerGlobalHotkey();
 
   // Copy bundled TTS voices to user data on first launch
   try { ensureBundledVoices(); } catch (err) {
     console.warn('[startup] Failed to copy bundled voices:', err);
+  }
+
+  // Copy bundled Moonshine Base (default transcription engine) to user data
+  // on first launch. Must run before the engine pre-load below so the Rust
+  // loader finds the files where it expects them. Log the result on a single
+  // line so debugging "did the bundle work?" doesn't require digging.
+  try {
+    const status = ensureBundledMoonshineBase();
+    switch (status) {
+      case 'copied':
+        console.log('[startup] Moonshine Base: bundled copy restored from app resources');
+        break;
+      case 'already-present':
+        console.log('[startup] Moonshine Base: already present in user data');
+        break;
+      case 'incomplete-bundle':
+        console.warn('[startup] Moonshine Base: bundled directory is incomplete — user must download');
+        break;
+      case 'bundle-missing':
+        console.log('[startup] Moonshine Base: no bundled copy (dev mode or unpackaged) — user must download');
+        break;
+    }
+  } catch (err) {
+    console.warn('[startup] Failed to copy bundled Moonshine Base:', err);
+  }
+
+  // Copy bundled WeSpeaker ResNet34 ONNX to user data so the speaker
+  // module's lazy session-load (rust-core/src/speaker/wespeaker.rs) finds
+  // the file in `IRONMIC_MODELS_DIR/speaker-embedding/` when the user
+  // opts into Advanced diarization mode. The copy is a no-op when the
+  // bundled file is already present in user data.
+  try {
+    const speakerStatus = ensureBundledWeSpeaker();
+    switch (speakerStatus) {
+      case 'copied':
+        console.log('[startup] WeSpeaker: bundled copy restored from app resources');
+        break;
+      case 'already-present':
+        console.log('[startup] WeSpeaker: already present in user data');
+        break;
+      case 'bundle-missing':
+        console.log('[startup] WeSpeaker: no bundled copy — speaker diarization stays off until shipped or downloaded');
+        break;
+    }
+  } catch (err) {
+    console.warn('[startup] Failed to copy bundled WeSpeaker:', err);
+  }
+
+  // Copy bundled Phi-3 Mini Q2_K (default LLM for polish + AI Assist) to user data.
+  try {
+    const llmStatus = ensureBundledLlm();
+    switch (llmStatus) {
+      case 'copied':
+        console.log('[startup] Phi-3 Mini Q2_K: bundled copy restored from app resources');
+        break;
+      case 'already-present':
+        console.log('[startup] Phi-3 Mini Q2_K: already present in user data');
+        break;
+      case 'source-missing':
+        console.warn('[startup] Phi-3 Mini Q2_K: no bundled copy (dev mode or unpackaged) — user must download');
+        break;
+    }
+    // Seed ai_local_model to phi3 on first launch if the user has not yet chosen a model.
+    // This makes resolveActiveChatModel() pick Phi-3 first without changing the fallback array.
+    if (llmStatus !== 'source-missing') {
+      const existing = native.getSetting('ai_local_model');
+      if (!existing) {
+        native.setSetting('ai_local_model', 'llm-chat-phi3');
+        console.log('[startup] ai_local_model seeded to llm-chat-phi3');
+      }
+    }
+  } catch (err) {
+    console.warn('[startup] Failed to copy bundled Phi-3 Mini Q2_K:', err);
   }
 
   // Extract bundled TF.js ML models to user data on first launch
@@ -173,25 +461,202 @@ app.whenReady().then(() => {
     console.warn('[auto-cleanup] Failed:', err);
   }
 
-  // Start meeting app auto-detection (opt-in, checks setting)
+  // Apply the one-time migration that flips the seeded auto-detect default
+  // from 'false' to 'true' for users who never explicitly set it. Must run
+  // BEFORE startMeetingAppDetection reads the setting.
+  try { applyAutoDetectDefaultMigration(); } catch (err) {
+    console.warn('[meeting-app-detector] Migration failed (non-fatal):', err);
+  }
+
+  // v1.9.1: Simple mode is the default for remote-meeting capture. The
+  // embedding-based diarization pipeline ([Speaker N] live labels + AHC
+  // refinement) is now opt-in via Settings → Voice AI → "Identify
+  // individual remote speakers". This block guarantees Simple is the
+  // active default — covers both fresh installs (which already get
+  // 'off' from migrate_v15) and v1.9.0 upgraders whose mode was
+  // auto-flipped to 'embedding' by the old readiness check. We only
+  // override when `meeting_diarization_user_overridden` is unset/'false'
+  // — an explicit user toggle is preserved.
+  try {
+    const userOverridden = native.getSetting('meeting_diarization_user_overridden') === 'true';
+    if (!userOverridden) {
+      const current = native.getSetting('meeting_diarization_mode') ?? 'off';
+      if (current !== 'off') {
+        native.setSetting('meeting_diarization_mode', 'off');
+        console.log(
+          '[diarization] Default reset: mode → off (Simple). Toggle Advanced in Settings to opt in.',
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[diarization] Default reset failed (non-fatal):', err);
+  }
+
+  // Start meeting app auto-detection (default: enabled; user can disable in Settings)
   try { startMeetingAppDetection(); } catch (err) {
     console.warn('[meeting-app-detector] Failed to start:', err);
   }
+
+  // Whisper readiness check.  The first transcription call lazily loads the
+  // model, which on Windows can take 10s+ for large-v3-turbo and surfaces any
+  // path/feature errors only at that point — long after the user pressed the
+  // hotkey.  Pre-loading at startup turns that into an immediate, visible
+  // failure with a clear path forward.
+  try {
+    const features = native.nativeFeatures();
+    const status = native.getModelStatus();
+    console.log('[whisper] Native feature flags:', features);
+    console.log('[whisper] Model status at startup:', status);
+
+    if (!features.whisper) {
+      const msg = features.stub
+        ? 'IronMic could not load its native module. Reinstall the app from the GitHub release.'
+        : 'This build was compiled without Whisper support. Rebuild with --features whisper or reinstall from the GitHub release.';
+      console.error('[whisper]', msg);
+      sendWhisperFailure(msg, /* permanent */ true);
+    } else {
+      // Load eagerly off the critical path — don't block the UI.
+      void (async () => {
+        try {
+          // ── Force Moonshine Base as the active engine on every launch ──
+          // Policy: Moonshine Base is the always-on default. It ships bundled
+          // with the installer (electron-builder.config.js extraResources +
+          // ensureBundledMoonshineBase above), so it is always available.
+          // The persisted `transcription_engine` setting is overwritten on
+          // every launch, which means a user's in-session Switch to Whisper
+          // (or any other engine) lasts only for that session — the next
+          // launch returns to Moonshine Base. This is intentional and matches
+          // the product policy that Moonshine is the primary engine.
+          try {
+            native.setTranscriptionEngine('moonshine-base');
+            native.setSetting('transcription_engine', 'moonshine-base');
+            console.log('[engine] Active transcription engine: moonshine-base (forced default)');
+            debugLog('engine.startup', { kind: 'moonshine-base', source: 'forced-default' });
+          } catch (engineErr) {
+            console.warn('[engine] Force-default to moonshine-base failed:', engineErr);
+            debugLog('engine.startup', {
+              kind: 'moonshine-base',
+              source: 'forced-default',
+              error: String(engineErr),
+            });
+          }
+
+          // Apply user-configured thread count before the model loads.
+          // Only meaningful for Whisper engines; Moonshine uses ORT's intra-op
+          // pool which is governed separately. Harmless to call regardless.
+          const threadsSetting = native.getSetting('whisper_threads');
+          if (threadsSetting) {
+            const n = parseInt(threadsSetting, 10);
+            if (!isNaN(n) && n >= 1 && n <= 16) {
+              native.setWhisperNThreads(n);
+              console.log(`[whisper] Thread count set to ${n} from settings`);
+            }
+          }
+          // loadWhisperModel now loads the *active* engine's model (despite
+          // the legacy name kept for backwards compatibility).
+          native.loadWhisperModel();
+          console.log('[engine] Active engine model pre-loaded successfully');
+
+          // Push the persisted custom dictionary into the just-loaded engine.
+          // The Rust addon already syncs on every addWord/removeWord, but the
+          // engine is freshly constructed at boot — this seeds it from SQLite
+          // so the user's vocabulary biases the very first dictation. Cheap
+          // (single SELECT + HashSet rebuild). Skip silently on older addon
+          // binaries that lack the export.
+          try {
+            const wordCount = native.refreshTranscriptionDictionary();
+            console.log(`[dictionary] Loaded ${wordCount} custom words into active engine`);
+          } catch (dictErr) {
+            console.warn('[dictionary] refreshTranscriptionDictionary at boot failed:', dictErr);
+          }
+          // Log CPU feature flags to DevTools so AVX/AVX512 issues are
+          // visible without checking the terminal. E.g.:
+          //   [ironmic:debug] whisper.sysinfo {system_info: "AVX = 1 | AVX512 = 0 | ..."}
+          // (Whisper-specific; Moonshine doesn't expose equivalent metadata.)
+          try {
+            const sysinfo = native.getWhisperSystemInfo();
+            debugLog('whisper.sysinfo', { system_info: sysinfo });
+          } catch (siErr) {
+            console.warn('[whisper] getWhisperSystemInfo failed:', siErr);
+          }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error('[engine] Pre-load failed:', message);
+          sendWhisperFailure(message, false);
+        }
+      })();
+    }
+  } catch (err) {
+    console.warn('[whisper] Readiness probe failed (non-fatal):', err);
+  }
 });
 
+function sendWhisperFailure(message: string, permanent: boolean): void {
+  const payload = { message, permanent };
+  // Renderer may not be ready yet — retry once after a short delay.
+  const send = () => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) {
+        win.webContents.send('ironmic:whisper-load-failed', payload);
+      }
+    }
+  };
+  send();
+  setTimeout(send, 3000);
+}
+
+/**
+ * `before-quit` fires whenever something requests the app to quit — Cmd+Q,
+ * Alt+F4, OS shutdown, taskkill, dock → Quit, app.quit() programmatic
+ * call. We flip the quit flag so the window close handler routes through
+ * the "real quit" path (warning dialog, then exit) instead of the
+ * default soft-close (hide-to-tray) path.
+ *
+ * The tray's Quit menu item ALSO sets this flag before calling app.quit()
+ * — that's defense-in-depth: setting it twice is harmless.
+ */
+app.on('before-quit', () => {
+  isAppQuitting = true;
+});
+
+/**
+ * `window-all-closed` — intentionally NOT quitting the app here, on any
+ * platform. The app stays alive in the system tray until the user
+ * explicitly chooses Quit. Previously this called app.quit() on non-
+ * darwin, which made Windows fully exit on X-button close. Now both
+ * platforms behave like Discord/Slack/Teams — the tray icon is the
+ * single source of truth for app lifetime.
+ *
+ * If the user did request a real quit (isAppQuitting=true), the windows
+ * are closing because the quit sequence is in progress; we let it
+ * proceed to `will-quit` naturally without re-entering here.
+ */
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  // No-op by design. See doc-comment above.
 });
 
+/**
+ * macOS dock-click handler. Two scenarios:
+ *
+ *   1. Window is hidden (close-to-tray happened earlier this session) →
+ *      show + focus it. Faster than re-creating a window.
+ *   2. Window was destroyed (e.g. app was re-launched from Finder while
+ *      already running, before close-to-tray was added) → re-create.
+ *
+ * Also useful on Windows when a second-instance lock forwards a launch
+ * attempt to the existing instance (we surface the existing window).
+ */
 app.on('activate', () => {
-  if (mainWindow === null) {
-    createWindow();
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    if (!mainWindow.isVisible()) mainWindow.show();
+    mainWindow.focus();
+    return;
   }
+  createWindow();
 });
 
 app.on('will-quit', () => {
+  stopKeyboardListener();
   globalShortcut.unregisterAll();
   destroyTray();
 

@@ -3,6 +3,7 @@ node_modules/
 
 # Rust build artifacts
 rust-core/target/
+rust-core/target-redesign/
 
 # Electron build output
 electron-app/dist/
@@ -16,6 +17,10 @@ electron-app/release/
 rust-core/models/*.bin
 rust-core/models/*.onnx
 rust-core/models/*.gguf
+rust-core/models/**/*.bin
+rust-core/models/**/*.onnx
+rust-core/models/**/*.gguf
+rust-core/models/**/*.json
 rust-core/models/voices/*.bin
 
 # OS files

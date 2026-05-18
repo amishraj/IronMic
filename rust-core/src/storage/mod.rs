@@ -1,5 +1,7 @@
 pub mod actions;
+pub mod ai_chat;
 pub mod analytics;
+pub mod chunks;
 pub mod db;
 pub mod dictionary;
 pub mod embeddings;
@@ -7,8 +9,10 @@ pub mod entries;
 pub mod intents;
 pub mod meeting_templates;
 pub mod meetings;
+pub mod transcript_segments;
 pub mod ml_models;
 pub mod notifications;
 pub mod settings;
+pub mod user_notes;
 pub mod vad;
 pub mod workflows;

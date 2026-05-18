@@ -20,19 +20,54 @@
 
 ---
 
-IronMic captures your voice, transcribes it with Whisper, and copies the raw transcript to your clipboard or routes it to the active page — dictate, search, listen, notes, or timeline. Optionally polish text with a local LLM on-demand, or hear it read back with a built-in TTS engine. Everything runs entirely on your machine — no audio or text ever leaves the device.
+IronMic captures your voice, transcribes it with Whisper, optionally polishes it with a local LLM, and copies the result to your clipboard or saves it as a rich-text note. A built-in TTS engine can read your dictations back to you. Everything runs entirely on your machine — no audio or text ever leaves the device.
 
 ---
 
 ## Features
 
+### Remote-Meeting Capture <sup>1.8.3 (Windows) · refined in 1.9.x</sup>
+- **Capture both sides of a Zoom / Teams / Meet call** without installing BlackHole or VB-CABLE. IronMic opens a WASAPI loopback stream on your default speakers alongside your mic and transcribes them in parallel.
+- **"You" vs "Remote" at capture time** — Mic segments are pre-labeled `Me`; loopback segments render as `Remote` with the same low latency as your mic stream.
+- **Optional speaker labels (Advanced)** <sup>NEW in 1.9</sup> — Opt-in toggle at Settings → Voice AI runs a local 26 MB WeSpeaker ResNet34 model on each remote utterance to assign `[Speaker 1]`, `[Speaker 2]`, … labels for up to ~20 distinct voices. Live online clustering during the meeting; agglomerative refinement at stop. Tradeoff is honest: Simple = same latency as your own mic; Advanced ≈ 2× per-chunk cost. Default is Simple. The WeSpeaker model is bundled in the installer — no extra download.
+- **Per-meeting toggle** in the meeting start screen (solo mode only) plus a **global default** in Settings → Voice AI. Windows-only in v1; non-Windows platforms still work via the existing virtual-loopback device picker.
+- **Headphones tip** built in: if you use speakers, remote audio may leak back into your mic. We surface a one-line warning when you enable the mode.
+- **Stays local** — Loopback captures audio your machine is already playing. WeSpeaker embeddings are voice-derived identifiers and are treated like raw audio: stored locally, excluded from exports, cascade-deleted with the meeting, never sent anywhere. No new network surface, no audio files written, same zero-on-drop ring buffers as the mic path.
+
+### Meetings UX polish <sup>1.8.1 – 1.8.3</sup>
+- **Instant AI summary on End Meeting** with a separate **Enhance** action for the final long-form pass. Rolling-window live summary updates throughout the meeting instead of waiting until the end.
+- **Non-blocking "Transcribing…" indicator** while the final STT chunk drains, so you can navigate away the moment you click End.
+- **No-flicker live engine swap** — Switch Whisper ↔ Moonshine mid-meeting via the gear button; the UI stays mounted and shows a `Switching…` spinner instead of unmounting back to the meetings list.
+- **Per-meeting transcription engine picker** with chunked-mode fallback for streaming-only engines when remote capture is on.
+- **Close-to-tray** — Clicking the window's X minimizes to the system tray instead of quitting. Only the explicit **Quit** action exits the app.
+
+### Knowledge Q&A — RAG over your meetings & notes <sup>NEW in 1.8.0</sup>
+- **Ask questions in plain language** — "What did we decide about the auth flow?" / "Summarize my meetings from last week" / "What did Sarah say in Tuesday's standup?" — IronMic retrieves the relevant context from your meetings, notes, and dictation entries and answers with citations.
+- **Hybrid FTS5 + vector retrieval** — Full-text search and semantic similarity run together; Reciprocal Rank Fusion merges the result lists for the best of both.
+- **Intent classification** — Queries are automatically routed: temporal (date-scoped), topic (hybrid search), single-doc (speaker/title filter), or cross-doc (map-reduce).
+- **Incremental indexing** — Every new note, meeting, or dictation entry is chunked and embedded in the background the moment it's saved. No manual rebuild needed for day-to-day use. The Knowledge Q&A index is rebuilt automatically on app load if it doesn't exist yet.
+- **Citations** — Answers include `[1]`, `[2]` markers that resolve to the exact meeting segment or note chunk, with a timestamp deep-link for meetings.
+- **Privacy gate** — `knowledge_qa_allow_cloud` (default **off**, independent of the polish gate) must be explicitly enabled before any retrieved context is sent to a cloud provider.
+
+### QuickSearch <sup>NEW in 1.8.0</sup>
+- **Always-accessible search** — A search icon in the app bar expands into a live input that returns up to 5 results in a popover, without leaving the current page.
+- **Smart normalization** — Punctuation-agnostic AND-token matching: `high leverage` matches `High-Leverage`. NFKD decomposition + diacritic stripping means accented characters never break a search.
+- **Keyboard nav** — ↑ ↓ to move, Enter to open, Esc to close. "See all results" seeds the full Search page with the current query.
+
 ### Core Dictation
-- **Voice-to-clipboard** — Press a global hotkey, speak, press again. Raw transcript lands in your clipboard instantly, ready to paste anywhere.
-- **Page-aware recording** — Voice input routes to the active page: dictate page inserts into the editor, search page fills the search bar, listen page queues for TTS playback, notes page appends to the active note.
-- **Progressive feedback** — See your transcript appear in the timeline immediately after recording stops, with a live progress indicator. No more waiting for the full pipeline to complete.
+- **Voice-to-clipboard** — Press a global hotkey, speak, press again. Polished text lands in your clipboard, ready to paste anywhere.
+- **Voice-to-note** — Dictate directly into a rich text editor (TipTap/ProseMirror) with formatting, headings, lists, code blocks, and more.
 - **Whisper large-v3-turbo** — State-of-the-art local speech recognition with GPU acceleration (Metal on macOS).
-- **On-demand LLM text cleanup** — Click "Polish now" on any timeline entry to clean up text with a local Mistral 7B model. Removes filler words, fixes grammar, preserves your meaning. Raw text is always shown first — you control when cleanup runs.
+- **LLM text cleanup with smart formatting** <sup>NEW in 1.7.5</sup> — Polished output is now structured markdown that adapts to content shape: short notes stay clean paragraphs with **bold** for key terms (Granola-style), longer notes get H2/H3 sections, lists get bullets, file names get `inline code`, and tables for genuinely tabular data. Both local (Phi-3) and cloud (Claude / Copilot) paths produce structured output; cloud gets a richer prompt with worked examples for higher quality. Settings → "Smart formatting" toggles back to flat text if preferred.
 - **Custom dictionary** — Add domain-specific terms, names, and jargon to improve transcription accuracy.
+
+### Meeting Notes
+- **Structured summaries on every meeting** — Default template emits `## Attendees` + `## Overview` + `## Discussion` (with `### H3` per topic) + `## Decisions` (each prefixed `**Decided:**`) + `## Action Items` (markdown table with Owner / Item / Due) + `## Open Questions`. Sections are emitted only when they have content.
+- **Action items extraction emphasized** — The summarizer is explicitly tuned to surface action items with concrete pattern hints. Rendered as a proper markdown table.
+- **Attendees pulled from the session roster** — Host + every joiner is surfaced under Attendees. The summarizer prepends a metadata block so the LLM sources accurate names instead of guessing.
+- **Per-meeting-type templates** — Five built-in alternatives (Standup / 1-on-1 / Discovery / Team Sync / Retrospective) for users who want forced layouts.
+- **Meeting list grouped by date** — Today / Yesterday / This week / Last week / This month / Earlier. Hide-empty iOS-style toggle. Multi-select via mic icon click for bulk delete. Scroll position preserved across detail open + back. <sup>UX improved in 1.8.0</sup>
+- **Host/Join mode switch** — Left-aligned compact pill with high contrast in both light and dark mode. Display name lives in a slim header pill instead of a full-width field. <sup>NEW in 1.8.0</sup>
 
 ### Text-to-Speech Read-Back
 - **Kokoro 82M TTS** — Hear your dictations read back through a local neural voice engine.
@@ -42,10 +77,11 @@ IronMic captures your voice, transcribes it with Whisper, and copies the raw tra
 - **Auto read-back** — Optionally read text aloud automatically after dictation completes.
 
 ### AI Assistant
+- **Knowledge Q&A** — Ask questions about your meetings and notes; get cited answers backed by hybrid retrieval. <sup>NEW in 1.8.0</sup>
 - **Built-in AI chat** — Wrapper around GitHub Copilot CLI and Claude Code CLI.
-- **Context-aware** — Ask questions, refine text, brainstorm — powered by your existing AI subscriptions.
+- **Attach context** — Attach notes, dictations, or meetings to any chat turn; content is loaded from SQLite at send time.
 - **Streaming responses** — Real-time token-by-token output.
-- **Privacy-first** — The AI feature is off by default. When enabled, it uses your own CLI tools and credentials.
+- **Privacy-first** — AI features are off by default. When enabled, they use your own CLI tools and credentials. Knowledge Q&A has its own separate cloud-opt-in gate (`knowledge_qa_allow_cloud`, default off).
 
 ### On-Device Machine Learning <sup>NEW in 1.1.0</sup>
 
@@ -63,9 +99,10 @@ IronMic includes 5 TensorFlow.js-powered ML features that learn from your usage 
 > All ML models are under 50MB total. All training data stays in SQLite on your machine. Toggle each feature independently in **Settings > Voice AI**.
 
 ### Organization & Search
-- **Unified search** — Search across all content types from one place: dictation entries (FTS5), meeting notes, AI chat conversations, and written notes. Filter by category, see highlighted matches.
-- **Timeline view** — Scrollable card feed of all dictations, newest first. Entries show raw text by default with on-demand polishing.
-- **Full-text search** — Instant search across all transcriptions (SQLite FTS5) and meeting sessions (name, summary, transcript, action items).
+- **QuickSearch** — Permanent search icon in the app bar; instant 5-result popover with smart normalization. <sup>NEW in 1.8.0</sup>
+- **Full Search page** — Unified results across dictation entries, notes, meetings, AI sessions, and notebooks. System tags stripped from chips and titles. Meetings deep-link directly into the detail view.
+- **Timeline view** — Scrollable card feed of all dictations, newest first.
+- **Full-text search** — Instant search across all transcriptions (SQLite FTS5).
 - **Semantic search** — AI-powered meaning-based search across all content (TF.js Universal Sentence Encoder).
 - **Tags** — Categorize entries with custom tags.
 - **Pin & archive** — Pin important entries to the top, archive old ones.
@@ -104,8 +141,10 @@ Electron UI ← IPC (contextBridge) → Rust Core (napi-rs)
   │   ├── Intent classifier              ├── Kokoro ONNX (text-to-speech)
   │   ├── Semantic search (USE)          ├── Audio playback (cpal)
   │   ├── Notification ranker            ├── SQLite (storage + FTS5)
-  │   └── Workflow predictor             └── Clipboard (arboard)
-  └── Web Audio API (AudioWorklet)
+  │   └── Workflow predictor             ├── RAG engine (chunks + FTS5/vector)
+  ├── Web Audio API (AudioWorklet)       └── Clipboard (arboard)
+  ├── IndexerService (bg chunking)
+  └── QuickSearch + SearchPage
 ```
 
 | Layer | Tech | Purpose |
@@ -118,7 +157,8 @@ Electron UI ← IPC (contextBridge) → Rust Core (napi-rs)
 | LLM | llama-cpp-rs (llama.cpp) | Local text cleanup |
 | TTS | ort (ONNX Runtime) + Kokoro 82M | Local neural text-to-speech |
 | ML | TensorFlow.js (Web Worker) | VAD, intent, search, notifications, workflows |
-| Storage | rusqlite (SQLite + FTS5) | Entries, settings, ML data, embeddings |
+| RAG | Rust `rag/` module | Chunking, hybrid FTS5+vector retrieval, intent routing, citations |
+| Storage | rusqlite (SQLite + FTS5) | Entries, settings, ML data, embeddings, chunks |
 | Clipboard | arboard | Cross-platform clipboard |
 
 ---
@@ -144,15 +184,21 @@ Pre-built packages are available on the **[Releases page](https://github.com/gre
 | Windows | `.exe` installer |
 | Linux | `.AppImage` |
 
-**macOS note:** The app is not code-signed. After downloading, run this in Terminal before opening:
+**macOS note:** The app is ad-hoc signed (no Apple Developer ID), so Gatekeeper flags it as "unidentified developer." If you see **"IronMic is damaged and can't be opened"**, macOS has attached the `com.apple.quarantine` attribute to the downloaded DMG. Strip it before and after installing:
 
 ```bash
+# Before opening the DMG:
 xattr -cr ~/Downloads/IronMic-*.dmg
+
+# After dragging IronMic into /Applications:
+xattr -cr /Applications/IronMic.app
 ```
 
-Then open the `.dmg` and drag IronMic to Applications. On first launch you may need to right-click → Open → Open.
+Then right-click IronMic → **Open** → **Open** on first launch to confirm.
 
-After installing, open IronMic and go to **Settings > Models** to download the speech recognition model (~1.5 GB). The app will walk you through setup on first launch.
+The default speech recognition engine — **Moonshine Base** (~146 MB, English) — ships with the installer and is ready to use on first launch. No download required to start dictating.
+
+If you need multilingual transcription, open **Settings > Models** to download a Whisper variant (Base/Small/Medium/Large). The Text Cleanup LLM (~4.4 GB, optional) is also downloaded from there. Use the **Open folder** button on that page to see exactly where models live on disk.
 
 > Models run entirely on your machine. Nothing is sent externally.
 
@@ -192,10 +238,12 @@ npx concurrently "npx vite" "sleep 3 && npx electron ."
 
 ### Download Models
 
-Models are downloaded through the Settings UI inside the app:
-- **Whisper large-v3-turbo** (~1.5 GB) — speech recognition
-- **Mistral 7B Instruct Q4** (~4.4 GB) — text cleanup
-- **Kokoro 82M** (~163 MB + ~7.5 MB voices) — text-to-speech
+The default speech recognition engine — **Moonshine Base** (~146 MB) — is bundled with the installer and copied to the user-data models folder on first launch (no network required). Other models are downloaded through the Settings UI inside the app:
+- **Whisper Base / Small / Medium / Large-v3-turbo** (147 MB – 1.5 GB) — multilingual speech recognition
+- **Mistral 7B Instruct Q4** (~4.4 GB) — text cleanup (optional)
+- **Kokoro 82M** (~163 MB + ~7.5 MB voices) — text-to-speech (bundled with installer too)
+
+You can see the on-disk path and open it in your file browser via **Settings > Models > Open folder**. Each downloaded engine has Re-download and Delete buttons; the Moonshine Base "Restore bundled copy" action re-applies the shipped files without re-downloading.
 
 ## Running Tests
 

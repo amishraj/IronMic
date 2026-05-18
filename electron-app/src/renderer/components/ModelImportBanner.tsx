@@ -18,6 +18,8 @@ interface ImportableModel {
   downloadUrl: string;
   downloaded: boolean;
   parts?: { filename: string; url: string }[];
+  /** Moonshine engines route to a dedicated 3-file import handler. */
+  isMoonshine?: boolean;
 }
 
 interface Props {
@@ -82,6 +84,25 @@ export function ModelImportSection({ sectionLabel, filter, onImported, highlight
     setImporting(false);
   }
 
+  async function handleMoonshineImport(engineId: string, label: string) {
+    setImporting(true);
+    setImportResult(null);
+    try {
+      const result = await window.ironmic.importMoonshineEngine(engineId);
+      if (result) {
+        setImportResult({
+          success: true,
+          message: `Imported "${result.label}" (${result.fileCount} files). Click Switch on the row above to activate it.`,
+        });
+        onImported();
+        loadModels();
+      }
+    } catch (err: any) {
+      setImportResult({ success: false, message: err.message || `Import of ${label} failed` });
+    }
+    setImporting(false);
+  }
+
   const hasMultiPartModels = models.some(m => m.parts && m.parts.length > 0);
   const allReady = models.length > 0 && models.every(m => m.downloaded);
 
@@ -142,7 +163,37 @@ export function ModelImportSection({ sectionLabel, filter, onImported, highlight
                   {/* Download links — shown for models that aren't downloaded */}
                   {!m.downloaded && (
                     <div className="px-3 pb-2.5 space-y-1.5">
-                      {m.parts && m.parts.length > 0 ? (
+                      {m.isMoonshine && m.parts && m.parts.length > 0 ? (
+                        <>
+                          <p className="text-[10px] text-iron-text-muted font-medium">
+                            HuggingFace ({m.parts.length} files — download all, then click Import below):
+                          </p>
+                          <div className="space-y-0.5 ml-1">
+                            {m.parts.map((part) => (
+                              <button
+                                key={part.filename}
+                                onClick={() => window.ironmic?.openExternal?.(part.url)}
+                                className="flex items-center gap-1.5 text-[10px] text-iron-accent-light hover:underline"
+                              >
+                                <ExternalLink className="w-2.5 h-2.5" />
+                                {part.filename.split('/').pop()}
+                              </button>
+                            ))}
+                          </div>
+                          <button
+                            onClick={() => handleMoonshineImport(m.modelId, m.label)}
+                            disabled={importing}
+                            className="mt-2 w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-medium bg-iron-accent/10 text-iron-accent-light rounded-lg hover:bg-iron-accent/20 border border-iron-accent/15 transition-all disabled:opacity-50"
+                          >
+                            {importing ? (
+                              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                            ) : (
+                              <FolderOpen className="w-3.5 h-3.5" />
+                            )}
+                            <span>{importing ? 'Importing...' : `Import ${m.label} (3 files)`}</span>
+                          </button>
+                        </>
+                      ) : m.parts && m.parts.length > 0 ? (
                         <>
                           {/* Multi-part model: show each part + single-file alternative */}
                           <p className="text-[10px] text-iron-text-muted font-medium">
@@ -288,7 +339,8 @@ export function ModelImportBanner({ visible, onDismiss, onImported, filter = 'al
 function filterModels(all: ImportableModel[], filter: string): ImportableModel[] {
   if (filter === 'all') return all;
   return all.filter(m => {
-    if (filter === 'whisper') return m.modelId.startsWith('whisper');
+    // Speech-recognition section covers both Whisper *and* Moonshine engines.
+    if (filter === 'whisper') return m.modelId.startsWith('whisper') || m.modelId.startsWith('moonshine-');
     if (filter === 'llm') return m.modelId === 'llm' || m.modelId.startsWith('llm-chat');
     if (filter === 'chat') return m.modelId.startsWith('llm-chat');
     if (filter === 'tts') return m.modelId.startsWith('tts');

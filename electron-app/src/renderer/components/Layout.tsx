@@ -1,13 +1,16 @@
-import { useState, useEffect, useCallback, useRef, Component, type ReactNode } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { ErrorBoundary } from './ErrorBoundary';
 import {
   Mic, Settings, List, Sparkles, StickyNote, Search, Home,
-  ChevronLeft, ChevronRight, Volume2, PenTool, BarChart3, Users, AlertTriangle,
+  ChevronLeft, ChevronRight, Volume2, PenTool, BarChart3, Users,
+  Hammer,
 } from 'lucide-react';
 import { RecordingIndicator } from './RecordingIndicator';
+import { QuickSearch } from './QuickSearch';
 import { Timeline } from './Timeline';
 import { SettingsPanel } from './SettingsPanel';
 import { AIChat } from './AIChat';
-import { NotesPage } from './NotesPage';
+import { AskPage } from './ask/AskPage';
 import { SearchPage } from './SearchPage';
 import { WelcomePage } from './WelcomePage';
 import { ListenPage } from './ListenPage';
@@ -19,50 +22,45 @@ import { GpuPrompt } from './GpuPrompt';
 import { SessionLock } from './SessionLock';
 import { ToastContainer } from './Toast';
 import { useRecordingStore } from '../stores/useRecordingStore';
+import { useDictationStore } from '../stores/useDictationStore';
 import { useSettingsStore } from '../stores/useSettingsStore';
 import { useEntryStore } from '../stores/useEntryStore';
 import { useToastStore } from '../stores/useToastStore';
+import { useMeetingStore } from '../stores/useMeetingStore';
+import { useAiChatStore } from '../stores/useAiChatStore';
 import iconSmall from '../assets/icon-64.png';
 import micIdle from '../assets/mic-idle.png';
 import micRecording from '../assets/mic-recording.png';
 import micProcessing from '../assets/mic-processing.png';
 import micSuccess from '../assets/mic-success.png';
 
-type Page = 'home' | 'main' | 'ai' | 'dictate' | 'listen' | 'notes' | 'search' | 'analytics' | 'meetings' | 'settings';
+type Page = 'home' | 'main' | 'ai' | 'ask' | 'dictate' | 'listen' | 'search' | 'analytics' | 'meetings' | 'settings';
 
 interface NavItem {
   id: Page;
   label: string;
   icon: typeof Mic;
-  section: 'workspace' | 'discover';
+  section: 'core' | 'tools' | 'system';
 }
 
-/** Page metadata for top bar title and icons */
-const PAGE_META: Record<Page, { label: string; icon: typeof Mic }> = {
-  home: { label: 'Home', icon: Home },
-  main: { label: 'Timeline', icon: List },
-  ai: { label: 'AI Assistant', icon: Sparkles },
-  dictate: { label: 'Dictate', icon: PenTool },
-  listen: { label: 'Listen', icon: Volume2 },
-  notes: { label: 'Notes', icon: StickyNote },
-  search: { label: 'Search', icon: Search },
-  analytics: { label: 'Analytics', icon: BarChart3 },
-  meetings: { label: 'Meetings', icon: Users },
-  settings: { label: 'Settings', icon: Settings },
-};
-
 const NAV_ITEMS: NavItem[] = [
-  // Workspace: primary creation tools
-  { id: 'home', label: 'Home', icon: Home, section: 'workspace' },
-  { id: 'dictate', label: 'Dictate', icon: PenTool, section: 'workspace' },
-  { id: 'main', label: 'Timeline', icon: List, section: 'workspace' },
-  { id: 'notes', label: 'Notes', icon: StickyNote, section: 'workspace' },
-  { id: 'meetings', label: 'Meetings', icon: Users, section: 'workspace' },
-  // Discover: consumption & exploration
-  { id: 'search', label: 'Search', icon: Search, section: 'discover' },
-  { id: 'ai', label: 'AI Assistant', icon: Sparkles, section: 'discover' },
-  { id: 'listen', label: 'Listen', icon: Volume2, section: 'discover' },
-  { id: 'analytics', label: 'Analytics', icon: BarChart3, section: 'discover' },
+  { id: 'home', label: 'Home', icon: Home, section: 'core' },
+  { id: 'main', label: 'Timeline', icon: List, section: 'core' },
+  { id: 'ai', label: 'AI Assistant', icon: Sparkles, section: 'core' },
+  // The standalone Ask page was folded into AI Assistant as a
+  // "Search my IronMic" toggle in the input row — one chat surface that
+  // can either be conversational with manual attachments OR ask-style
+  // with auto-retrieval, depending on whether the toggle is on. The Ask
+  // route is left in the codebase (Layout still renders <AskPage> if
+  // `page === 'ask'`) so deeplinks and any internal navigation continue
+  // to work, but it's no longer in the primary sidebar.
+  // { id: 'ask', label: 'Ask', icon: Search, section: 'core' },
+  { id: 'dictate', label: 'Notes', icon: StickyNote, section: 'tools' },
+  { id: 'listen', label: 'Listen', icon: Volume2, section: 'tools' },
+  { id: 'search', label: 'Search', icon: Search, section: 'tools' },
+  { id: 'analytics', label: 'Analytics', icon: BarChart3, section: 'tools' },
+  { id: 'meetings', label: 'Meetings', icon: Users, section: 'tools' },
+  { id: 'settings', label: 'Settings', icon: Settings, section: 'system' },
 ];
 
 export function Layout() {
@@ -70,9 +68,16 @@ export function Layout() {
   const [sidebarExpanded, setSidebarExpanded] = useState(true);
   const [sessionTimeout, setSessionTimeout] = useState('off');
   const [micVisualState, setMicVisualState] = useState<'idle' | 'recording' | 'processing' | 'success'>('idle');
+  const [whisperFailure, setWhisperFailure] = useState<{ message: string; permanent: boolean } | null>(null);
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const { handleHotkeyPress, state: recordingState } = useRecordingStore();
-  const { loadSettings, aiEnabled } = useSettingsStore();
+  const { state: recordingState } = useRecordingStore();
+  const isGranolaRecording = useMeetingStore(s => s.isGranolaRecording);
+  const processingMeetings = useMeetingStore(s => s.processingMeetings);
+  // Streaming-dictation status drives the mic shield exactly like meeting
+  // recording does — without this, the icon stays idle/grey while the user
+  // is dictating because useRecordingStore is the legacy non-streaming pipe.
+  const dictationStatus = useDictationStore(s => s.status);
+  const { loadSettings, aiEnabled, knowledgeQaEnabled } = useSettingsStore();
   const { refresh } = useEntryStore();
   const pageRef = useRef(page);
   pageRef.current = page;
@@ -86,23 +91,72 @@ export function Layout() {
   }, []);
 
   const handleRecord = useCallback(() => {
-    // Track which page started the recording so results route back there
-    const pageSourceMap: Record<Page, string | undefined> = {
-      home: undefined,
-      main: 'timeline',
-      ai: 'ai-chat',
-      dictate: 'dictate',
-      listen: 'listen',
-      notes: 'notes',
-      search: 'search',
-      analytics: undefined,
-      meetings: undefined,
-      settings: undefined,
-    };
-    handleHotkeyPress(pageSourceMap[pageRef.current]);
-  }, [handleHotkeyPress]);
+    const currentPage = pageRef.current;
+    const status = useDictationStore.getState().status;
+
+    // Debounce: ignore presses while the pipeline is winding down.
+    if (status === 'stopping') return;
+
+    // Meeting takes precedence over dictation: if a meeting is currently
+    // recording (or its notes are still generating), the mic shield is the
+    // user's "take me back to my meeting" affordance — never start a new
+    // dictation on top of an active meeting.
+    const meetingState = useMeetingStore.getState();
+    if (meetingState.isGranolaRecording || meetingState.isGranolaStopping) {
+      if (currentPage !== 'meetings') setPage('meetings');
+      return;
+    }
+
+    if (status === 'recording') {
+      // Stop the active recording. Never set newNoteRequested here — that
+      // would wipe the in-flight note when the user is just trying to stop.
+      if (currentPage === 'dictate') {
+        window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+      } else {
+        setPage('dictate');
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+        }, 60);
+      }
+      return;
+    }
+
+    // status === 'idle' — fresh-note path.
+    useDictationStore.setState({ pendingQuickStart: true, newNoteRequested: true });
+    if (currentPage === 'dictate') {
+      // Already on the page — DictatePage's quick-action handler will see
+      // newNoteRequested === true, reset to a blank note, then toggle
+      // dictation on. Defer to next tick so React commits the state set above.
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('ironmic:quick-action-dictate'));
+      }, 0);
+    } else {
+      // Navigate; DictatePage's editor-ready effect consumes both flags on mount.
+      setPage('dictate');
+    }
+  }, []);
 
   useEffect(() => { loadSettings(); }, [loadSettings]);
+
+  // On startup: kick the RAG indexer so the chunks table is populated even
+  // before the user opens the AI Assistant. Knowledge Q&A folded into AIChat,
+  // so the previous "build on Ask page mount" trigger never fired for users
+  // who never visited that route. Now: every app boot drains unchunked
+  // sources in the background (idempotent — kickOnce no-ops if there's
+  // nothing to do, batches yield to retrieval queries so search stays fast).
+  // Gated by the master toggle so users with Knowledge Q&A turned off don't
+  // pay the indexing cost.
+  useEffect(() => {
+    if (!knowledgeQaEnabled) return;
+    void (async () => {
+      try {
+        const { indexerService } = await import('../services/rag/IndexerService');
+        await indexerService.kickOnce();
+      } catch (err) {
+        console.warn('[startup] RAG indexer kick failed (non-fatal):', err);
+      }
+    })();
+  }, [knowledgeQaEnabled]);
 
   // On startup: sync Rust recording state — if Rust thinks it's recording but JS is idle, force-reset
   useEffect(() => {
@@ -133,13 +187,15 @@ export function Layout() {
     const cleanup = window.ironmic.onHotkeyPressed(() => handleRecord());
     return cleanup;
   }, [handleRecord]);
-  // Sync recording pipeline state → visual mic state with success flash
+  // Sync recording pipeline state → visual mic state with success flash.
+  // Granola meeting recording and background note generation also light up
+  // the mic shield so the user can see capture/inference is active.
   useEffect(() => {
     if (successTimerRef.current) clearTimeout(successTimerRef.current);
 
-    if (recordingState === 'recording') {
+    if (recordingState === 'recording' || isGranolaRecording || dictationStatus === 'recording') {
       setMicVisualState('recording');
-    } else if (recordingState === 'processing') {
+    } else if (recordingState === 'processing' || processingMeetings.length > 0 || dictationStatus === 'stopping') {
       setMicVisualState('processing');
     } else if (recordingState === 'idle') {
       // If we were processing, show success briefly
@@ -151,11 +207,12 @@ export function Layout() {
       }
       refresh();
     }
-  }, [recordingState]);
+  }, [recordingState, isGranolaRecording, processingMeetings.length, dictationStatus]);
 
   useEffect(() => {
     if (!aiEnabled && page === 'ai') setPage('home');
-  }, [aiEnabled, page]);
+    if (!knowledgeQaEnabled && page === 'ask') setPage('home');
+  }, [aiEnabled, knowledgeQaEnabled, page]);
 
   // Show a toast when dictation completes on a page that doesn't display the result inline
   useEffect(() => {
@@ -182,55 +239,29 @@ export function Layout() {
         },
       });
     };
-    const emptyHandler = (e: Event) => {
-      const detail = (e as CustomEvent).detail;
-      const isHallucination = detail?.reason === 'hallucination';
+    const emptyHandler = () => {
+      // Always show — silent failures on Windows look identical to "the app froze"
+      // when audio is captured but Whisper returns nothing.  A short toast tells
+      // the user the pipeline ran end-to-end.
       useToastStore.getState().show({
-        message: isHallucination
-          ? `Recording discarded — mic may not be picking up your voice clearly.`
-          : 'No speech detected in recording.',
-        type: 'warning',
-        durationMs: 8000,
-        action: {
-          label: 'Check Mic Settings',
-          onClick: () => {
-            setPage('settings');
-            // Small delay to let settings render, then switch to Input tab
-            setTimeout(() => window.dispatchEvent(new CustomEvent('ironmic:settings-tab', { detail: 'input' })), 100);
-          },
-        },
-      });
-    };
-
-    const lowAudioHandler = () => {
-      useToastStore.getState().show({
-        message: 'Low audio detected — your mic may not be picking up clearly. Check Settings > Input.',
-        type: 'warning',
-        durationMs: 6000,
-        action: {
-          label: 'Check Mic',
-          onClick: () => {
-            setPage('settings');
-            setTimeout(() => window.dispatchEvent(new CustomEvent('ironmic:settings-tab', { detail: 'input' })), 100);
-          },
-        },
+        message: 'No speech detected. Try again — speak a bit louder or check your mic.',
+        type: 'info',
+        durationMs: 5000,
       });
     };
 
     window.addEventListener('ironmic:dictation-complete', handler);
     window.addEventListener('ironmic:dictation-empty', emptyHandler);
-    window.addEventListener('ironmic:dictation-low-audio', lowAudioHandler);
     return () => {
       window.removeEventListener('ironmic:dictation-complete', handler);
       window.removeEventListener('ironmic:dictation-empty', emptyHandler);
-      window.removeEventListener('ironmic:dictation-low-audio', lowAudioHandler);
     };
   }, []);
 
   useEffect(() => {
     const handler = (e: Event) => {
       const target = (e as CustomEvent).detail as string;
-      if (['home', 'main', 'ai', 'dictate', 'listen', 'notes', 'search', 'analytics', 'meetings', 'settings'].includes(target)) {
+      if (['home', 'main', 'ai', 'ask', 'dictate', 'listen', 'search', 'analytics', 'meetings', 'settings'].includes(target)) {
         setPage(target as Page);
       }
     };
@@ -238,10 +269,100 @@ export function Layout() {
     return () => window.removeEventListener('ironmic:navigate', handler);
   }, []);
 
-  const handleNavigate = useCallback((p: string) => setPage(p as Page), []);
+  // ── AI Assistant streaming sink (always-mounted) ──
+  // Subscribes once at Layout level so streaming `ai:output` tokens land in
+  // the store even when <AIChat /> is unmounted (the user navigated away
+  // mid-send). The previous architecture mounted the listener inside AIChat
+  // itself, so tokens fired by the main process during a navigation gap
+  // were dropped on the floor.
+  //
+  // Filtering rule: `ai:output` is shared with other surfaces (Ask,
+  // Knowledge Q&A). We only forward to the chat store when `data.sessionId`
+  // names a session the chat store actually owns — otherwise we let the
+  // other surface handle its own event.
+  //
+  // We intentionally DO NOT clear streaming on `ai:turn-end` here. That
+  // would briefly blank the streaming bubble between turn-end and the
+  // final assistant-message bubble landing. `dispatchSend` clears it
+  // atomically with the message commit.
+  useEffect(() => {
+    const isChatSession = (sessionId: string | undefined): sessionId is string => {
+      if (!sessionId) return false;
+      return useAiChatStore.getState().sessions.some((s) => s.id === sessionId);
+    };
+    const unsubOutput = window.ironmic?.onAiOutput?.((data: any) => {
+      if (data?.type !== 'text' || !data?.content) return;
+      if (!isChatSession(data.sessionId)) return;
+      const store = useAiChatStore.getState();
+      store.setSendPhase(data.sessionId, 'streaming');
+      store.appendStreamingToken(data.sessionId, data.content);
+    });
+    const unsubTurnStart = window.ironmic?.onAiTurnStart?.(() => {
+      // No-op. dispatchSend already set the phase before the IPC; turn-start
+      // would only flap the indicator back to 'sending' once tokens flip it
+      // to 'streaming'. Keep the subscription registered so the channel
+      // doesn't sit unread, but don't update store state from it.
+    });
+    return () => {
+      try { unsubOutput?.(); } catch { /* noop */ }
+      try { unsubTurnStart?.(); } catch { /* noop */ }
+    };
+  }, []);
 
-  const workspaceItems = NAV_ITEMS.filter((n) => n.section === 'workspace');
-  const discoverItems = NAV_ITEMS.filter((n) => n.section === 'discover' && (n.id !== 'ai' || aiEnabled));
+  // ── Whisper readiness banner ──
+  // Surface model-load failures (file missing, feature flag off, build is a
+  // stub) immediately, instead of waiting for the user's first dictation to
+  // bubble a generic "Transcription failed" toast.
+  useEffect(() => {
+    const unsub = window.ironmic?.onWhisperLoadFailed?.((data) => {
+      // Empty message + non-permanent means "clear the banner" (sent after a
+      // successful import reload). Treat that as a dismiss.
+      if (!data.message && !data.permanent) {
+        setWhisperFailure(null);
+        return;
+      }
+      setWhisperFailure(data);
+    });
+    return () => { unsub?.(); };
+  }, []);
+
+  // ── Tray / notification quick actions ──
+  // Tray → Quick Start Dictation / Quick Start Meeting.
+  // We navigate to the right page first, then emit a page-specific event
+  // that the target page listens for (e.g. DictatePage auto-starts recording,
+  // MeetingPage auto-starts a meeting).
+  useEffect(() => {
+    const unsub = window.ironmic?.onQuickAction?.((action) => {
+      if (action === 'start-dictation') {
+        // Same status-gated semantics as the mic shield + global hotkey:
+        // idle → fresh blank note + auto-start, recording → stop, stopping → ignore.
+        handleRecord();
+      } else if (action === 'start-meeting') {
+        setPage('meetings');
+        setTimeout(() => {
+          window.dispatchEvent(new CustomEvent('ironmic:quick-action-meeting'));
+        }, 60);
+      }
+    });
+    return () => { try { unsub?.(); } catch { /* noop */ } };
+  }, [handleRecord]);
+
+  const handleNavigate = useCallback((p: string) => {
+    // The Notes UI lives inside DictatePage (NotesSidebar). WelcomePage's
+    // "Notes" quick action and note search results emit 'notes' — map it
+    // to the actual page id so navigation lands somewhere instead of
+    // silently no-op'ing on an unmatched view.
+    const target = p === 'notes' ? 'dictate' : p;
+    setPage(target as Page);
+  }, []);
+
+  const coreItems = NAV_ITEMS.filter((n) =>
+    n.section === 'core'
+    && (n.id !== 'ai' || aiEnabled)
+    && (n.id !== 'ask' || knowledgeQaEnabled),
+  );
+  const toolItems = NAV_ITEMS.filter((n) => n.section === 'tools');
+  const systemItems = NAV_ITEMS.filter((n) => n.section === 'system');
 
   return (
     <div className="flex h-screen bg-iron-bg">
@@ -271,12 +392,31 @@ export function Layout() {
 
         {/* Nav sections */}
         <nav className="flex-1 overflow-y-auto px-2 space-y-4">
-          <NavSection label="Workspace" items={workspaceItems} page={page} setPage={setPage} expanded={sidebarExpanded} />
-          <NavSection label="Discover" items={discoverItems} page={page} setPage={setPage} expanded={sidebarExpanded} />
+          <NavSection label="Main" items={coreItems} page={page} setPage={setPage} expanded={sidebarExpanded} />
+          <NavSection label="Tools" items={toolItems} page={page} setPage={setPage} expanded={sidebarExpanded} />
         </nav>
 
-        {/* Bottom: collapse toggle */}
-        <div className="px-2 pb-3">
+        {/* Bottom: system nav + Forge toggle + collapse toggle */}
+        <div className="px-2 pb-3 space-y-1">
+          {/* Forge mode entry — hides the main window and shows the floating
+              bar. The Rust engine keeps running so the user can dictate into
+              any focused desktop app. */}
+          <button
+            onClick={() => {
+              (window as any).ironmic?.enterForge?.().catch(() => {});
+            }}
+            className={`w-full flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors text-iron-text-secondary hover:bg-iron-surface-hover hover:text-iron-text ${
+              sidebarExpanded ? '' : 'justify-center'
+            }`}
+            title="Switch to Forge mode (dictate into any app)"
+          >
+            <Hammer className="w-4 h-4" strokeWidth={2.2} />
+            {sidebarExpanded && <span>Forge mode</span>}
+          </button>
+
+          {systemItems.map((item) => (
+            <NavButton key={item.id} item={item} active={page === item.id} onClick={() => setPage(item.id)} expanded={sidebarExpanded} />
+          ))}
           <button
             onClick={() => setSidebarExpanded(!sidebarExpanded)}
             className="w-full flex items-center justify-center py-2 text-iron-text-muted hover:text-iron-text-secondary transition-colors"
@@ -291,54 +431,73 @@ export function Layout() {
       <div className="flex-1 flex flex-col min-w-0">
         {/* Top bar */}
         <div
-          className="flex items-center justify-between px-5 py-2.5 border-b border-iron-border bg-iron-surface/50 backdrop-blur-sm"
+          className="flex items-center justify-between px-5 py-3 border-b border-iron-border bg-iron-surface/50 backdrop-blur-sm"
           style={{ WebkitAppRegion: 'drag' } as React.CSSProperties}
         >
-          {/* Page title */}
-          <div className="flex items-center gap-4" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
-            {page !== 'home' && (() => {
-              const meta = PAGE_META[page];
-              const Icon = meta.icon;
-              return (
-                <div className="flex items-center gap-2">
-                  <Icon className="w-4 h-4 text-iron-text-muted" />
-                  <span className="text-sm font-medium text-iron-text">{meta.label}</span>
-                </div>
-              );
-            })()}
+          <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
             <RecordingIndicator />
           </div>
-          {/* Settings gear */}
-          <button
-            onClick={() => setPage('settings')}
-            title="Settings"
-            className={`p-1.5 rounded-lg transition-colors ${
-              page === 'settings'
-                ? 'bg-iron-accent/10 text-iron-accent-light'
-                : 'text-iron-text-muted hover:text-iron-text-secondary hover:bg-iron-surface-hover'
-            }`}
+          <div style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
+            <QuickSearch />
+          </div>
+        </div>
+
+        {/* Whisper load failure banner — sticky until resolved */}
+        {whisperFailure && (
+          <div
+            className="px-4 py-2 text-xs flex items-center gap-3 bg-red-500/15 border-b border-red-500/30 text-red-800 dark:text-red-200"
             style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
           >
-            <Settings className="w-4 h-4" />
-          </button>
-        </div>
+            <span className="font-medium shrink-0">Dictation unavailable:</span>
+            <span className="flex-1 truncate" title={whisperFailure.message}>{whisperFailure.message}</span>
+            <button
+              onClick={() => setPage('settings')}
+              className="px-2 py-0.5 text-[10px] font-medium rounded bg-red-500/20 hover:bg-red-500/30 transition-colors shrink-0"
+            >
+              Open Settings
+            </button>
+            {!whisperFailure.permanent && (
+              <button
+                onClick={() => setWhisperFailure(null)}
+                className="text-red-800/70 hover:text-red-800 dark:text-red-200/70 dark:hover:text-red-200 shrink-0"
+                title="Dismiss"
+              >
+                ×
+              </button>
+            )}
+          </div>
+        )}
 
         {page === 'main' && <GpuPrompt />}
 
         {/* Content */}
         <div className="flex-1 overflow-hidden">
-          <ContentErrorBoundary onReset={() => setPage('home')}>
-            {page === 'home' && <WelcomePage onNavigate={handleNavigate} />}
-            {page === 'main' && <Timeline />}
-            {page === 'ai' && <AIChat />}
-            {page === 'dictate' && <DictatePage />}
-            {page === 'listen' && <ListenPage />}
-            {page === 'notes' && <NotesPage />}
-            {page === 'search' && <SearchPage />}
-            {page === 'analytics' && <AnalyticsPage />}
-            {page === 'meetings' && <MeetingPage />}
-            {page === 'settings' && <SettingsPanel />}
-          </ContentErrorBoundary>
+          {page === 'home' && <WelcomePage onNavigate={handleNavigate} onQuickDictate={handleRecord} />}
+          {page === 'main' && (
+            <ErrorBoundary label="Timeline">
+              <Timeline />
+            </ErrorBoundary>
+          )}
+          {page === 'ai' && <AIChat />}
+          {page === 'ask' && (
+            <ErrorBoundary label="Ask">
+              <AskPage />
+            </ErrorBoundary>
+          )}
+          {page === 'dictate' && (
+            <ErrorBoundary label="Notes">
+              <DictatePage />
+            </ErrorBoundary>
+          )}
+          {page === 'listen' && <ListenPage />}
+          {page === 'search' && <SearchPage />}
+          {page === 'analytics' && <AnalyticsPage />}
+          {page === 'meetings' && (
+            <ErrorBoundary label="Meetings">
+              <MeetingPage />
+            </ErrorBoundary>
+          )}
+          {page === 'settings' && <SettingsPanel />}
         </div>
       </div>
 
@@ -401,47 +560,6 @@ function NavButton({ item, active, onClick, expanded }: {
       <span className="truncate">{item.label}</span>
     </button>
   );
-}
-
-// ── Error Boundary ──
-
-class ContentErrorBoundary extends Component<{ children: ReactNode; onReset: () => void }, { error: Error | null }> {
-  state = { error: null as Error | null };
-
-  static getDerivedStateFromError(error: Error) {
-    return { error };
-  }
-
-  componentDidCatch(error: Error, info: any) {
-    console.error('[ContentErrorBoundary] Render crash:', error, info?.componentStack);
-  }
-
-  render() {
-    if (this.state.error) {
-      return (
-        <div className="flex flex-col items-center justify-center h-full p-8 text-center">
-          <AlertTriangle className="w-10 h-10 text-iron-warning mb-4" />
-          <h2 className="text-base font-semibold text-iron-text mb-2">Something went wrong</h2>
-          <p className="text-xs text-iron-text-muted mb-1 max-w-md">
-            {this.state.error.message}
-          </p>
-          <p className="text-[10px] text-iron-text-muted mb-4 max-w-md font-mono break-all">
-            {this.state.error.stack?.split('\n')[1]?.trim() || ''}
-          </p>
-          <button
-            onClick={() => {
-              this.setState({ error: null });
-              this.props.onReset();
-            }}
-            className="px-4 py-2 text-xs font-medium bg-iron-accent/10 text-iron-accent-light rounded-lg border border-iron-accent/20 hover:bg-iron-accent/20 transition-colors"
-          >
-            Go to Home
-          </button>
-        </div>
-      );
-    }
-    return this.props.children;
-  }
 }
 
 // ── Mic Shield Button ──

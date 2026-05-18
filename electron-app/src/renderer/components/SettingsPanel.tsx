@@ -1,63 +1,52 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSettingsStore } from '../stores/useSettingsStore';
+import { useSettingsIntentStore } from '../stores/useSettingsIntentStore';
 import { DictionaryManager } from './DictionaryManager';
 import { ModelManager } from './ModelManager';
 import { ModelImportSection, ModelImportBanner } from './ModelImportBanner';
 import { InputSettings } from './InputSettings';
-import { LogsPage } from './LogsPage';
-import { logCapture } from '../services/LogCapture';
 import { DataManager } from './DataManager';
-import { HotkeyRecorder } from './HotkeyRecorder';
+// HotkeyRecorder is no longer used — dictation gesture is hardcoded in
+// main/keyboard-listener.ts. We render `DictationGestureDisplay` (defined
+// below) as a read-only replacement.
+import { getDictationGesture } from '../../shared/dictation-gesture';
+import { prettifyModelId } from '../utils/prettify-model-id';
 import { Toggle, Card } from './ui';
 import {
   Settings, Bot, Volume2, Monitor, Sun, Moon, Shield, Keyboard,
   Cpu, Database, BookOpen, Lock, ClipboardCheck, Eye, EyeOff,
   Clock, AlertTriangle, CheckCircle, Info, Wifi, WifiOff, FileWarning,
   Trash2, HardDrive, Sparkles, RefreshCw, Download, Brain,
-  Mic, Route, Users, Search, Bell, Workflow, Sliders, ScrollText,
+  Mic, Route, Users, Search, Bell, Workflow, Sliders, FlaskConical,
 } from 'lucide-react';
 
-type SettingsTab = 'general' | 'input' | 'speech' | 'ai' | 'models' | 'data' | 'security' | 'voice-ai' | 'input-voice' | 'models-speech' | 'data-security' | 'logs';
+type SettingsTab = 'general' | 'audio' | 'speech' | 'ai' | 'models' | 'data' | 'security' | 'voice-ai';
 
 const TABS: { id: SettingsTab; label: string; icon: typeof Settings }[] = [
   { id: 'general', label: 'General', icon: Settings },
-  { id: 'input-voice', label: 'Input & Voice', icon: Mic },
-  { id: 'models-speech', label: 'Models', icon: Cpu },
-  { id: 'ai', label: 'AI Assistant', icon: Sparkles },
-  { id: 'data-security', label: 'Security', icon: Shield },
-  { id: 'logs', label: 'Logs', icon: ScrollText },
+  { id: 'audio', label: 'Audio', icon: Mic },
+  { id: 'speech', label: 'Speech', icon: Volume2 },
+  { id: 'ai', label: 'AI Assist', icon: Sparkles },
+  { id: 'voice-ai', label: 'Voice AI', icon: Brain },
+  { id: 'models', label: 'Models', icon: Cpu },
+  { id: 'data', label: 'Data', icon: Database },
+  { id: 'security', label: 'Security', icon: Shield },
 ];
 
 export function SettingsPanel() {
   const [tab, setTab] = useState<SettingsTab>('general');
-  const [errorCount, setErrorCount] = useState(0);
 
-  // Track error count for the Logs tab badge
+  // Honor a cross-page intent (e.g. AIChat → "Enable cloud Voice Chat" deep-link).
+  // Read once on mount and consume — focusKey is forwarded to the inner section
+  // through the intent store, which keeps the value alive until the row scrolls
+  // into view (handled inside AIAssistSettings).
   useEffect(() => {
-    const update = () => setErrorCount(logCapture.getCounts().error);
-    update();
-    const unsub = logCapture.subscribe(update);
-    return unsub;
-  }, []);
-
-  // Listen for external tab navigation (e.g. from toast "Check Mic Settings" button)
-  // Map old tab names to new consolidated tabs for backward compat
-  useEffect(() => {
-    const tabRedirects: Record<string, SettingsTab> = {
-      input: 'input-voice',
-      'voice-ai': 'input-voice',
-      speech: 'models-speech',
-      models: 'models-speech',
-      data: 'data-security',
-      security: 'data-security',
-    };
-    const handler = (e: Event) => {
-      const target = (e as CustomEvent).detail as string;
-      const resolved = tabRedirects[target] || target;
-      if (resolved) setTab(resolved as SettingsTab);
-    };
-    window.addEventListener('ironmic:settings-tab', handler);
-    return () => window.removeEventListener('ironmic:settings-tab', handler);
+    const intent = useSettingsIntentStore.getState();
+    if (intent.pendingTab) {
+      setTab(intent.pendingTab);
+      // Don't consume focusKey here — the section consumes after scrolling.
+      useSettingsIntentStore.setState({ pendingTab: null });
+    }
   }, []);
 
   return (
@@ -79,33 +68,25 @@ export function SettingsPanel() {
               }`}
             >
               <Icon className="w-4 h-4" />
-              <span className="flex-1 text-left">{label}</span>
-              {id === 'logs' && errorCount > 0 && (
-                <span className="text-[9px] font-bold text-red-400 bg-red-500/15 px-1.5 py-0.5 rounded-full min-w-[18px] text-center">
-                  {errorCount > 99 ? '99+' : errorCount}
-                </span>
-              )}
+              {label}
             </button>
           ))}
         </nav>
       </div>
 
       {/* Content */}
-      {tab === 'logs' ? (
-        <div className="flex-1 overflow-hidden">
-          <LogsPage />
+      <div className="flex-1 overflow-y-auto">
+        <div className="p-6 max-w-lg mx-auto space-y-6 pb-16">
+          {tab === 'general' && <GeneralSettings />}
+          {tab === 'audio' && <InputSettings />}
+          {tab === 'speech' && <SpeechSettings />}
+          {tab === 'ai' && <AIAssistSettings />}
+          {tab === 'models' && <ModelManager />}
+          {tab === 'voice-ai' && <VoiceAISettings />}
+          {tab === 'data' && <DataSettings />}
+          {tab === 'security' && <SecuritySettings />}
         </div>
-      ) : (
-        <div className="flex-1 overflow-y-auto">
-          <div className="p-6 max-w-2xl mx-auto space-y-6 pb-16">
-            {tab === 'general' && <GeneralSettings />}
-            {tab === 'input-voice' && <InputVoiceSettings />}
-            {tab === 'models-speech' && <ModelsSpeechSettings />}
-            {tab === 'ai' && <AIAssistSettings />}
-            {tab === 'data-security' && <DataSecuritySettings />}
-          </div>
-        </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -115,19 +96,37 @@ export function SettingsPanel() {
 // ═══════════════════════════════════════════
 
 function GeneralSettings() {
-  const { hotkey, llmCleanupEnabled, theme, setHotkey, setLlmCleanup, setTheme } =
+  const { hotkey, llmCleanupEnabled, polishFormatMode, theme, setHotkey, setLlmCleanup, setPolishFormatMode, setTheme } =
     useSettingsStore();
+  // `hotkey` / `setHotkey` retained for backward compat with older settings
+  // payloads; the dictation gesture itself is now hardcoded in
+  // main/keyboard-listener.ts. Keep these in scope so changing the hotkey
+  // recorder (if a user has the old setting screen up via cache) still
+  // round-trips harmlessly.
+  void hotkey;
+  void setHotkey;
 
   return (
     <>
       <SectionHeader icon={Settings} title="General" description="Core preferences and behavior" />
 
-      <HotkeyRecorder value={hotkey} onChange={setHotkey} />
+      <DictationGestureDisplay />
 
       <SettingRow
         title="LLM Text Cleanup"
         description="Polish transcriptions with a local LLM"
         control={<Toggle checked={llmCleanupEnabled} onChange={setLlmCleanup} />}
+      />
+
+      <SettingRow
+        title="Smart formatting"
+        description="Polished notes and meeting summaries are formatted with headings, lists, and bold. Turn off for flat-text output."
+        control={
+          <Toggle
+            checked={polishFormatMode === 'rich'}
+            onChange={(checked) => setPolishFormatMode(checked ? 'rich' : 'plain')}
+          />
+        }
       />
 
       <div className="space-y-1.5">
@@ -167,22 +166,71 @@ interface AIModelOption {
   id: string;
   label: string;
   provider: string;
-  free: boolean;
-  description: string;
+  source?: 'cli' | 'fallback' | 'static' | 'local' | 'curated';
+  billing?: 'free' | 'paid' | 'unknown';
+  description?: string;
+  runIds?: { copilotCli?: string; ghModels?: string };
 }
 
 function AIAssistSettings() {
   const { aiEnabled, setAiEnabled } = useSettingsStore();
   const [provider, setProvider] = useState<string>('copilot');
-  const [model, setModel] = useState<string>('gpt-4.1-mini');
+  const [model, setModel] = useState<string>('');
   const [models, setModels] = useState<AIModelOption[]>([]);
   const [authState, setAuthState] = useState<any>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [refreshingModels, setRefreshingModels] = useState(false);
   const [localModels, setLocalModels] = useState<any[]>([]);
   const [downloadingModel, setDownloadingModel] = useState<string | null>(null);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
+
+  // Cloud opt-ins (relocated from Security & Privacy in v1.8.x). Kept in this
+  // panel so all "what does AI Assist talk to?" controls live together.
+  const [allowCloudPolish, setAllowCloudPolish] = useState(false);
+  const [allowCloudVoiceChat, setAllowCloudVoiceChat] = useState(false);
+  // Knowledge Q&A — Ask page settings. The cloud toggle is forward-looking:
+  // manual-attach in AIChat is governed by the user's explicit provider
+  // pick, but the future automatic-retrieval path (RAG retrieves chunks the
+  // user didn't hand-pick) needs an explicit opt-in. Surfacing it now so the
+  // posture is consistent with polish_allow_cloud / voice_chat_allow_cloud.
+  const [knowledgeQaEnabled, setKnowledgeQaEnabled] = useState(true);
+  const [knowledgeQaAllowCloud, setKnowledgeQaAllowCloud] = useState(false);
+  const [indexStats, setIndexStats] = useState<{ total: number; indexed: number; byType: Record<string, number> } | null>(null);
+  const [pendingFocusKey, setPendingFocusKey] = useState<string | null>(null);
+  const polishToggleRef = useRef<HTMLDivElement | null>(null);
+  const voiceChatToggleRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    // Inherit any focusKey set by the deep-link intent, then clear it from
+    // the global store. Local state survives long enough for the scroll
+    // effect below to fire after the row's ref attaches.
+    const intent = useSettingsIntentStore.getState();
+    if (intent.focusKey) {
+      setPendingFocusKey(intent.focusKey);
+      useSettingsIntentStore.getState().consume();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!pendingFocusKey || !aiEnabled) return;
+    const target =
+      pendingFocusKey === 'voice_chat_allow_cloud' ? voiceChatToggleRef.current :
+      pendingFocusKey === 'polish_allow_cloud' ? polishToggleRef.current :
+      null;
+    if (target) {
+      // Wait one frame for layout to settle, then scroll + flash the border.
+      requestAnimationFrame(() => {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        target.classList.add('ring-2', 'ring-iron-accent', 'rounded-lg');
+        setTimeout(() => {
+          target.classList.remove('ring-2', 'ring-iron-accent', 'rounded-lg');
+          setPendingFocusKey(null);
+        }, 1800);
+      });
+    }
+  }, [pendingFocusKey, aiEnabled]);
 
   useEffect(() => {
     loadAiSettings();
@@ -209,18 +257,128 @@ function AIAssistSettings() {
 
   async function loadAiSettings() {
     const api = window.ironmic;
-    const [prov, mod, auth, allModels, localModelStatus] = await Promise.all([
+    const [prov, mod, auth, allModels, localModelStatus, polishCloud, voiceChatCloud] = await Promise.all([
       api.getSetting('ai_provider'),
       api.getSetting('ai_model'),
       api.aiGetAuthState(),
       api.aiGetModels(),
       api.aiGetLocalModelStatus?.() || Promise.resolve([]),
+      api.getSetting('polish_allow_cloud'),
+      api.getSetting('voice_chat_allow_cloud'),
     ]);
     if (prov) setProvider(prov);
     if (mod) setModel(mod);
     setAuthState(auth);
     setModels(allModels || []);
     if (localModelStatus) setLocalModels(localModelStatus);
+    setAllowCloudPolish(polishCloud === 'true');
+    setAllowCloudVoiceChat(voiceChatCloud === 'true');
+
+    // Knowledge Q&A settings + index stats. Failures are silent — these
+    // settings have safe defaults and the stats card just won't render.
+    try {
+      const [kqEnabled, kqCloud] = await Promise.all([
+        api.getSetting('knowledge_qa_enabled'),
+        api.getSetting('knowledge_qa_allow_cloud'),
+      ]);
+      setKnowledgeQaEnabled(kqEnabled !== 'false'); // default ON
+      setKnowledgeQaAllowCloud(kqCloud === 'true'); // default OFF
+    } catch { /* keep defaults */ }
+    try {
+      const statsJson = await api.ragGetIndexStats?.();
+      if (statsJson) {
+        const parsed = JSON.parse(statsJson);
+        setIndexStats({
+          total: parsed.total_chunks ?? 0,
+          indexed: parsed.indexed_chunks ?? 0,
+          byType: parsed.by_source_type ?? {},
+        });
+      }
+    } catch { /* index card hidden when stats unavailable */ }
+  }
+
+  async function handleKnowledgeQaEnabledToggle(next: boolean) {
+    setKnowledgeQaEnabled(next);
+    await window.ironmic.setSetting('knowledge_qa_enabled', String(next));
+  }
+
+  async function handleKnowledgeQaCloudToggle(next: boolean) {
+    if (next) {
+      const ok = window.confirm(
+        'Allow cloud Knowledge Q&A?\n\n' +
+        'When enabled, the Ask page can send retrieved excerpts of your notes, ' +
+        'dictations, and meetings to the authenticated Claude or Copilot CLI for ' +
+        'higher-quality answers.\n\n' +
+        'This is for the automatic-retrieval Q&A path. Manually attaching content ' +
+        'in AI Chat already goes to whatever provider you have selected — that path ' +
+        'is consent-by-action and is not gated by this toggle.\n\n' +
+        'You can turn this off again at any time.',
+      );
+      if (!ok) return;
+    }
+    setKnowledgeQaAllowCloud(next);
+    await window.ironmic.setSetting('knowledge_qa_allow_cloud', String(next));
+  }
+
+  async function handleRebuildIndex() {
+    const ok = window.confirm(
+      'Rebuild the Knowledge Q&A index?\n\n' +
+      'This deletes every chunk and embedding, then immediately re-chunks ' +
+      'every entry, meeting, and note in the background. Your underlying ' +
+      'content is untouched. Useful if retrieval feels stale or you upgraded ' +
+      'the embedding model.',
+    );
+    if (!ok) return;
+    try {
+      // Wipe the existing chunks/embeddings table first.
+      await window.ironmic.ragRebuildIndex?.();
+      setIndexStats({ total: 0, indexed: 0, byType: {} });
+      // Then immediately kick the renderer-side indexer with `force` so the
+      // user doesn't have to navigate to any page for the rebuild to start.
+      // Indexer batches yield to retrieval queries, so this is safe to fire
+      // and let run in the background.
+      try {
+        const { indexerService } = await import('../services/rag/IndexerService');
+        void indexerService.kickOnce({ force: true });
+      } catch (err) {
+        console.warn('[settings] indexer kick after rebuild failed (non-fatal):', err);
+      }
+    } catch (err) {
+      console.error('[settings] rebuild index failed:', err);
+    }
+  }
+
+  /** Confirm before turning ON either cloud opt-in — they route user content
+   *  off-device. Turning OFF is unconditional. Mirrors the prior pattern from
+   *  the Security panel. */
+  async function handleCloudPolishToggle(next: boolean) {
+    if (next) {
+      const ok = window.confirm(
+        'Allow cloud polishing?\n\n' +
+        'When enabled, IronMic will send your transcript text to the authenticated ' +
+        'Claude or Copilot CLI for higher-quality cleanups. This is the only feature ' +
+        'that sends transcript content off your device.\n\n' +
+        'You can turn this off again at any time.',
+      );
+      if (!ok) return;
+    }
+    setAllowCloudPolish(next);
+    await window.ironmic.setSetting('polish_allow_cloud', String(next));
+  }
+
+  async function handleCloudVoiceChatToggle(next: boolean) {
+    if (next) {
+      const ok = window.confirm(
+        'Allow cloud Voice Chat?\n\n' +
+        'When enabled, the conversational Voice Chat loop may send your raw spoken ' +
+        'transcripts to the authenticated Claude or Copilot CLI. Useful for faster, ' +
+        'higher-quality replies — but each turn auto-sends what you said.\n\n' +
+        'Local Voice Chat (with the on-device LLM) stays available regardless.',
+      );
+      if (!ok) return;
+    }
+    setAllowCloudVoiceChat(next);
+    await window.ironmic.setSetting('voice_chat_allow_cloud', String(next));
   }
 
   async function handleProviderChange(p: string) {
@@ -237,12 +395,30 @@ function AIAssistSettings() {
       }
     } else {
       const providerModels = models.filter((m) => m.provider === p);
-      const defaultModel = providerModels.find((m) => m.free) || providerModels[0];
+      const defaultModel =
+        providerModels.find((m) => m.billing === 'free') || providerModels[0];
       if (defaultModel) {
         setModel(defaultModel.id);
         await window.ironmic.setSetting('ai_model', defaultModel.id);
       }
     }
+  }
+
+  async function handleRefreshModels() {
+    setRefreshingModels(true);
+    try {
+      const fresh = await window.ironmic.aiRefreshModels('copilot');
+      if (Array.isArray(fresh)) {
+        // Replace just the copilot entries; keep claude + local from the
+        // existing aggregated `models` so the dropdown for those providers
+        // doesn't disappear if the user is mid-switch.
+        setModels((prev) => [
+          ...prev.filter((m) => m.provider !== 'copilot'),
+          ...fresh,
+        ]);
+      }
+    } catch { /* ignore — UI shows fallback */ }
+    setRefreshingModels(false);
   }
 
   async function handleModelChange(m: string) {
@@ -328,11 +504,18 @@ function AIAssistSettings() {
                     <span className="font-medium">{label}</span>
                     <span className="block text-[10px] mt-0.5 opacity-70">{sub}</span>
                     {auth && (
-                      <span className={`block text-[10px] mt-1 ${auth.authenticated ? 'text-iron-success' : 'text-iron-warning'}`}>
-                        {value === 'local'
-                          ? (auth.authenticated ? '● Model ready' : '○ Download a model')
-                          : (auth.authenticated ? '● Connected' : auth.installed ? '○ Not logged in' : '○ Not installed')}
-                      </span>
+                      <>
+                        <span className={`block text-[10px] mt-1 ${auth.authenticated ? 'text-iron-success' : 'text-iron-warning'}`}>
+                          {value === 'local'
+                            ? (auth.authenticated ? '● Model ready' : '○ Download a model')
+                            : (auth.authenticated ? '● Connected' : auth.installed ? '○ Not logged in' : '○ Not installed')}
+                        </span>
+                        {value !== 'local' && auth.binaryPath && (
+                          <span className="block text-[9px] mt-0.5 text-iron-text-muted truncate" title={auth.binaryPath}>
+                            {auth.binaryPath}
+                          </span>
+                        )}
+                      </>
                     )}
                   </button>
                 );
@@ -349,40 +532,97 @@ function AIAssistSettings() {
           </div>
 
           {/* Model selection — CLI providers */}
-          {provider !== 'local' && (
-            <div className="space-y-1.5">
-              <label className="text-sm font-medium text-iron-text">Model</label>
-              <p className="text-xs text-iron-text-muted">
-                {provider === 'copilot'
-                  ? 'Select which model GitHub Copilot should use'
-                  : 'Select which Claude model to use'}
-              </p>
-              <div className="space-y-1 mt-2">
-                {providerModels.map((m) => (
-                  <button
-                    key={m.id}
-                    onClick={() => handleModelChange(m.id)}
-                    className={`w-full text-left px-3 py-2.5 rounded-lg text-xs transition-all ${
-                      model === m.id
-                        ? 'bg-iron-accent/15 text-iron-accent-light border border-iron-accent/20'
-                        : 'bg-iron-surface text-iron-text-secondary border border-iron-border hover:border-iron-border-hover'
-                    }`}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <span className="font-medium">{m.label}</span>
-                        {m.free && (
-                          <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-iron-success/15 text-iron-success border border-iron-success/20">Free</span>
+          {provider !== 'local' && (() => {
+            // For Copilot: surface the saved selection as an "orphaned" option
+            // when it's not in the visible list. This keeps the dropdown in
+            // sync with what sendMessage / polish will actually call —
+            // critical post-restart before the user clicks Refresh models.
+            const savedInList = providerModels.some((m) => m.id === model);
+            const orphan =
+              provider === 'copilot' && model && !savedInList
+                ? { id: model, label: prettifyModelId(model), provider: 'copilot' as const, source: undefined, billing: 'unknown' as const, description: 'Last selection — click Refresh models to verify availability' }
+                : null;
+            const visible = orphan ? [orphan, ...providerModels] : providerModels;
+            // Caption classifier: inspect the full list, not just [0].
+            // all 'cli'      -> live subscription
+            // all 'curated'  -> built-in catalog
+            // mixed          -> low-confidence probe + curated supplements
+            let copilotCaption: string | undefined;
+            if (provider === 'copilot') {
+              const sources = new Set(
+                providerModels
+                  .map((m) => m.source)
+                  .filter((s): s is NonNullable<typeof s> => Boolean(s)),
+              );
+              if (providerModels.length === 0) {
+                copilotCaption = 'Built-in catalog — click "Refresh models" to load your subscription';
+              } else if (sources.size === 1 && sources.has('cli')) {
+                copilotCaption = 'From your GitHub Copilot subscription';
+              } else if (sources.size === 1 && sources.has('curated')) {
+                copilotCaption = 'Built-in catalog — click "Refresh models" for your live subscription list';
+              } else if (sources.has('cli') && sources.has('curated')) {
+                copilotCaption = 'Live probe plus built-in fallback entries — click "Refresh models" again to retry';
+              } else {
+                copilotCaption = 'Built-in catalog — click "Refresh models" to load your subscription';
+              }
+            }
+            return (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <label className="text-sm font-medium text-iron-text">Model</label>
+                  {provider === 'copilot' && (
+                    <button
+                      onClick={handleRefreshModels}
+                      disabled={refreshingModels}
+                      className="flex items-center gap-1.5 text-[11px] text-iron-accent-light hover:underline"
+                      title="Query GitHub Copilot for the models your subscription supports"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${refreshingModels ? 'animate-spin' : ''}`} />
+                      {refreshingModels ? 'Loading...' : 'Refresh models'}
+                    </button>
+                  )}
+                </div>
+                <p className="text-xs text-iron-text-muted">
+                  {provider === 'copilot'
+                    ? copilotCaption
+                    : 'Select which Claude model to use'}
+                </p>
+                <div className="space-y-1 mt-2">
+                  {visible.map((m) => {
+                    const isOrphan = orphan && m.id === orphan.id;
+                    const isFree = m.billing === 'free';
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => handleModelChange(m.id)}
+                        className={`w-full text-left px-3 py-2.5 rounded-lg text-xs transition-all ${
+                          model === m.id
+                            ? 'bg-iron-accent/15 text-iron-accent-light border border-iron-accent/20'
+                            : 'bg-iron-surface text-iron-text-secondary border border-iron-border hover:border-iron-border-hover'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <span className="font-medium">{m.label}</span>
+                            {isFree && (
+                              <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-iron-success/15 text-iron-success border border-iron-success/20">Free</span>
+                            )}
+                            {isOrphan && (
+                              <span className="ml-1.5 text-[9px] font-bold uppercase px-1.5 py-0.5 rounded bg-iron-warning/15 text-iron-warning border border-iron-warning/20">Saved</span>
+                            )}
+                          </div>
+                          {model === m.id && <CheckCircle className="w-3.5 h-3.5 text-iron-accent-light" />}
+                        </div>
+                        {m.description && (
+                          <span className="block text-[10px] text-iron-text-muted mt-0.5">{m.description}</span>
                         )}
-                      </div>
-                      {model === m.id && <CheckCircle className="w-3.5 h-3.5 text-iron-accent-light" />}
-                    </div>
-                    <span className="block text-[10px] text-iron-text-muted mt-0.5">{m.description}</span>
-                  </button>
-                ))}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Model selection — Local LLM with download */}
           {provider === 'local' && (
@@ -474,6 +714,133 @@ function AIAssistSettings() {
             </div>
           )}
 
+          {/* Cloud opt-ins — the two AI Assist features that route user
+              content off-device. Co-located here (relocated from Security &
+              Privacy in v1.8.x) so the user has one place to manage them. */}
+          <div ref={polishToggleRef}>
+            <Card
+              variant="default"
+              padding="md"
+              className={allowCloudPolish ? 'border-amber-500/40' : ''}
+            >
+              <div className="space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2 min-w-0 flex-1">
+                    <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-iron-text">Use cloud AI when authenticated (Claude / Copilot)</p>
+                      <p className="text-xs text-iron-text-muted mt-0.5">
+                        Off by default. IronMic processes everything locally. Turning this on
+                        routes polish, meeting summarization, and other AI tasks through the
+                        authenticated Claude or Copilot CLI. Live meeting summaries always
+                        stay local regardless of this setting.
+                      </p>
+                    </div>
+                  </div>
+                  <Toggle checked={allowCloudPolish} onChange={handleCloudPolishToggle} />
+                </div>
+                {allowCloudPolish && (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300">
+                    <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                    <span>
+                      Cloud polish is enabled. Polish runs will use Claude or Copilot when authenticated;
+                      otherwise they fall back to the local LLM. The polish toggle in Notes shows a "via Claude" /
+                      "via Copilot" / "via local" badge so you can confirm where each polish ran.
+                    </span>
+                  </div>
+                )}
+              </div>
+            </Card>
+          </div>
+
+          <div ref={voiceChatToggleRef}>
+            <Card
+              variant="default"
+              padding="md"
+              className={allowCloudVoiceChat ? 'border-amber-500/40' : ''}
+            >
+              <div className="space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2 min-w-0 flex-1">
+                    <Mic className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-iron-text">Allow cloud Voice Chat (Claude / Copilot)</p>
+                      <p className="text-xs text-iron-text-muted mt-0.5">
+                        Off by default. The conversational Voice Chat loop auto-sends each turn the
+                        moment you stop speaking. Local Voice Chat is always available; this opt-in
+                        lets the same loop talk to your authenticated Claude or Copilot CLI.
+                      </p>
+                    </div>
+                  </div>
+                  <Toggle checked={allowCloudVoiceChat} onChange={handleCloudVoiceChatToggle} />
+                </div>
+                {allowCloudVoiceChat && (
+                  <div className="flex items-start gap-2 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[11px] text-amber-300">
+                    <AlertTriangle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                    <span>
+                      Cloud Voice Chat is enabled. Each turn auto-sends to Claude or Copilot when
+                      that provider is selected and authenticated. The overlay shows a "via Claude" /
+                      "via Copilot" badge per turn so you always see where your speech went.
+                    </span>
+                  </div>
+                )}
+              </div>
+            </Card>
+          </div>
+
+          {/* ── Search my IronMic (in AI Assistant) ────────────────────── */}
+          <Card variant="default" padding="md">
+            <div className="space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-2 min-w-0 flex-1">
+                  <Sparkles className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-iron-text">Search my IronMic (in AI Assistant)</p>
+                    <p className="text-xs text-iron-text-muted mt-0.5">
+                      Surfaces a "Search my IronMic" button in the AI Assistant input row.
+                      When toggled on per-chat, each send first retrieves the most relevant
+                      chunks from your notes, dictations, and meetings, and injects them as
+                      context. Turn this master setting off to hide the button entirely.
+                    </p>
+                  </div>
+                </div>
+                <Toggle checked={knowledgeQaEnabled} onChange={handleKnowledgeQaEnabledToggle} />
+              </div>
+            </div>
+          </Card>
+
+          {indexStats && (
+            <Card variant="default" padding="md">
+              <div className="space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2 min-w-0 flex-1">
+                    <Info className="w-4 h-4 text-iron-text-muted mt-0.5 flex-shrink-0" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-iron-text">Index status</p>
+                      <p className="text-xs text-iron-text-muted mt-0.5">
+                        <strong className="text-iron-text-secondary">{indexStats.total.toLocaleString()}</strong>{' '}
+                        chunks indexed
+                        {Object.keys(indexStats.byType).length > 0 && (
+                          <>
+                            {' '}({Object.entries(indexStats.byType).map(([k, v]) => `${v} ${k}`).join(', ')})
+                          </>
+                        )}.
+                        Rebuilding starts from zero on next Ask page visit; safe to do if retrieval
+                        feels stale.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleRebuildIndex}
+                    className="text-xs px-3 py-1.5 rounded-lg border border-iron-border text-iron-text-secondary hover:bg-iron-surface-hover transition-colors flex-shrink-0"
+                  >
+                    Rebuild
+                  </button>
+                </div>
+              </div>
+            </Card>
+          )}
+
           {/* Info card — contextual per provider */}
           <Card variant="default" padding="md">
             <div className="flex items-start gap-2.5">
@@ -491,7 +858,10 @@ function AIAssistSettings() {
                 ) : (
                   <>
                     <p>
-                      AI Assist uses your own CLI tools — <strong className="text-iron-text">GitHub Copilot CLI</strong> (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">copilot</code> or <code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh copilot</code>) or <strong className="text-iron-text">Claude Code CLI</strong> (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">claude</code>).
+                      AI Assist uses your own CLI tools — <strong className="text-iron-text">GitHub CLI</strong> with the GitHub Models extension (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh models run</code>) or <strong className="text-iron-text">Claude Code CLI</strong> (<code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">claude</code>).
+                    </p>
+                    <p className="mt-1.5">
+                      First-time GitHub Copilot setup: <code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh auth login</code> then <code className="text-[10px] bg-iron-surface-active px-1 py-0.5 rounded">gh extension install github/gh-models</code>.
                     </p>
                     <p className="mt-1.5">
                       Your credentials stay on your machine. IronMic never sees or stores your API keys — it calls the CLI directly.
@@ -511,22 +881,39 @@ function AIAssistSettings() {
 // Speech (TTS)
 // ═══════════════════════════════════════════
 
+interface TtsReadiness {
+  ready: boolean;
+  modelPresent: boolean;
+  voicesPresent: boolean;
+  selectedVoicePresent: boolean;
+  selectedVoiceId: string;
+  missingVoices: string[];
+  espeakAvailable: boolean;
+  espeakHint: string | null;
+  modelPath: string;
+  voicesDir: string;
+}
+
 function SpeechSettings() {
   const [autoReadback, setAutoReadback] = useState(false);
   const [voice, setVoice] = useState('af_heart');
   const [speed, setSpeed] = useState(1.0);
   const [voices, setVoices] = useState<any[]>([]);
   const [previewPlaying, setPreviewPlaying] = useState<string | null>(null);
-  const [modelReady, setModelReady] = useState(false);
+  const [readiness, setReadiness] = useState<TtsReadiness | null>(null);
   const [ttsModelDownloaded, setTtsModelDownloaded] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [showImport, setShowImport] = useState(false);
+  const [voicesProgress, setVoicesProgress] = useState<{ id: string; downloaded: number; total: number; status: string } | null>(null);
+  const [voicesProgressCount, setVoicesProgressCount] = useState<{ done: number; total: number }>({ done: 0, total: 15 });
+
+  const modelReady = readiness?.ready ?? false;
 
   useEffect(() => {
     loadTtsSettings();
-    const cleanup = window.ironmic.onModelDownloadProgress((prog: any) => {
+    const cleanupModel = window.ironmic.onModelDownloadProgress((prog: any) => {
       if (prog.model === 'tts-model' || prog.model === 'tts-voices') {
         if (prog.model === 'tts-model') setDownloadProgress(prog.percent);
         if (prog.status === 'complete' && prog.model === 'tts-model') {
@@ -537,24 +924,41 @@ function SpeechSettings() {
         if (prog.status === 'error') { setDownloading(false); setDownloadError(prog.errorDetail || 'TTS model download failed'); setShowImport(true); }
       }
     });
-    return cleanup;
+    const cleanupVoices = (window.ironmic as any).onTtsVoicesProgress?.((prog: any) => {
+      setVoicesProgress(prog);
+      if (prog.status === 'complete' || prog.status === 'verified') {
+        setVoicesProgressCount(c => ({ ...c, done: Math.min(c.total, c.done + 1) }));
+        // After the last voice resolves, refresh readiness so the UI flips green.
+        if (prog.status === 'complete') void loadTtsSettings();
+      }
+    });
+    return () => {
+      cleanupModel();
+      if (typeof cleanupVoices === 'function') cleanupVoices();
+    };
   }, []);
 
   async function loadTtsSettings() {
     const api = window.ironmic;
-    const [rb, v, s, voicesJson, ready, modelsStatus] = await Promise.all([
+    const [rb, v, s, voicesJson, readinessResult, modelsStatus] = await Promise.all([
       api.getSetting('tts_auto_readback'),
       api.getSetting('tts_voice'),
       api.getSetting('tts_speed'),
       api.ttsAvailableVoices(),
-      api.isTtsModelReady(),
+      (api as any).ttsGetReadiness?.(undefined) as Promise<TtsReadiness | undefined> | undefined,
       api.getModelStatus(),
     ]);
     setAutoReadback(rb !== 'false');
-    setModelReady(ready);
+    if (readinessResult) {
+      setReadiness(readinessResult);
+      setVoicesProgressCount({ done: 15 - readinessResult.missingVoices.length, total: 15 });
+    }
     // Check if just the .onnx model file exists (even without voices)
     const ttsStatus = modelsStatus?.files?.['tts-model'] || modelsStatus?.['tts-model'];
-    setTtsModelDownloaded(ready || (ttsStatus?.downloaded === true) || (ttsStatus?.sizeBytes > 0));
+    setTtsModelDownloaded(
+      (readinessResult?.modelPresent ?? false) ||
+      (ttsStatus?.downloaded === true) || (ttsStatus?.sizeBytes > 0)
+    );
     if (v) setVoice(v);
     if (s) setSpeed(parseFloat(s));
     try { setVoices(JSON.parse(voicesJson)); } catch { /* ignore */ }
@@ -614,31 +1018,74 @@ function SpeechSettings() {
         )}
       </SectionHeader>
 
-      <Card variant={ttsModelDownloaded ? 'default' : 'highlighted'} padding="md">
+      <Card variant={modelReady ? 'default' : 'highlighted'} padding="md">
         <div className="flex items-center justify-between">
           <div>
             <p className="text-sm font-medium text-iron-text">Kokoro 82M</p>
             <p className="text-xs text-iron-text-muted mt-0.5">
               {modelReady
-                ? 'Local TTS engine ready (~165 MB)'
+                ? readiness && !readiness.selectedVoicePresent
+                  ? `Ready — selected voice missing, falling back to af_heart`
+                  : 'Local TTS engine ready (~165 MB)'
                 : ttsModelDownloaded
-                ? 'Model imported — voices will download on first use'
+                ? 'Model imported — click Repair to install missing assets'
                 : 'Download the voice model (~165 MB)'}
             </p>
           </div>
-          {ttsModelDownloaded ? (
-            <StatusBadge status={modelReady ? 'success' : 'warning'} label={modelReady ? 'Ready' : 'Imported'} />
+          {modelReady ? (
+            <StatusBadge status="success" label="Ready" />
           ) : downloading ? (
             <span className="text-xs text-iron-text-muted">{downloadProgress}%</span>
           ) : (
             <button onClick={handleDownloadModel} className="px-3 py-1.5 bg-gradient-accent text-white text-xs font-medium rounded-lg hover:shadow-glow transition-all">
-              Download
+              {ttsModelDownloaded ? 'Repair TTS' : 'Download'}
             </button>
           )}
         </div>
+
+        {readiness && (
+          <div className="mt-3 space-y-1.5 text-[11px] text-iron-text-muted">
+            <div className="flex items-center justify-between">
+              <span>Model file</span>
+              <span className={readiness.modelPresent ? 'text-green-400' : 'text-amber-400'}>
+                {readiness.modelPresent ? 'Installed' : `Missing — ${readiness.modelPath}`}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>Voice pack</span>
+              <span className={readiness.voicesPresent && readiness.missingVoices.length === 0 ? 'text-green-400' : readiness.voicesPresent ? 'text-amber-400' : 'text-red-400'}>
+                {15 - readiness.missingVoices.length}/15 installed
+                {readiness.missingVoices.length > 0 && readiness.missingVoices.length <= 4 && (
+                  <span className="ml-1">(missing: {readiness.missingVoices.join(', ')})</span>
+                )}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>espeak-ng phonemizer</span>
+              <span className={readiness.espeakAvailable ? 'text-green-400' : 'text-red-400'}>
+                {readiness.espeakAvailable ? 'Available' : (readiness.espeakHint || 'Not installed')}
+              </span>
+            </div>
+          </div>
+        )}
+
         {downloading && (
           <div className="mt-2 w-full h-1 bg-iron-surface-active rounded-full overflow-hidden">
             <div className="h-full bg-gradient-accent rounded-full transition-all duration-300" style={{ width: `${downloadProgress}%` }} />
+          </div>
+        )}
+        {voicesProgress && voicesProgress.status !== 'complete' && (
+          <div className="mt-2 text-[11px] text-iron-text-muted">
+            <div className="flex items-center justify-between">
+              <span>Voice {voicesProgressCount.done + 1}/{voicesProgressCount.total} — {voicesProgress.id}</span>
+              <span className={voicesProgress.status === 'error' ? 'text-red-400' : ''}>{voicesProgress.status}</span>
+            </div>
+            <div className="mt-1 w-full h-1 bg-iron-surface-active rounded-full overflow-hidden">
+              <div
+                className="h-full bg-gradient-accent rounded-full transition-all duration-300"
+                style={{ width: voicesProgress.total > 0 ? `${Math.min(100, (voicesProgress.downloaded / voicesProgress.total) * 100)}%` : '0%' }}
+              />
+            </div>
           </div>
         )}
         {downloadError && (
@@ -683,14 +1130,14 @@ function SpeechSettings() {
             <p className="text-[10px] font-semibold text-iron-text-muted uppercase tracking-wider mb-1">{lang}</p>
             <div className="grid grid-cols-2 gap-1.5">
               {(langVoices as any[]).map((v: any) => (
-                <div key={v.id} onClick={() => handleVoiceChange(v.id)} className={`flex items-center justify-between px-3 py-2 rounded-lg text-xs transition-all cursor-pointer ${
+                <button key={v.id} onClick={() => handleVoiceChange(v.id)} className={`flex items-center justify-between px-3 py-2 rounded-lg text-xs transition-all ${
                   voice === v.id ? 'bg-iron-accent/10 border border-iron-accent/20 text-iron-accent-light' : 'bg-iron-surface border border-iron-border hover:border-iron-border-hover text-iron-text-secondary'
                 }`}>
                   <span>{v.name}</span>
                   <button onClick={(e) => { e.stopPropagation(); previewVoice(v.id); }} className="p-0.5 rounded hover:bg-iron-surface-hover" title="Preview voice">
                     {previewPlaying === v.id ? <div className="w-3 h-3 border border-iron-accent border-t-transparent rounded-full animate-spin" /> : <Volume2 className="w-3 h-3" />}
                   </button>
-                </div>
+                </button>
               ))}
             </div>
           </div>
@@ -726,6 +1173,7 @@ function SecuritySettings() {
   const [proxyEnabled, setProxyEnabled] = useState(false);
   const [proxyUrl, setProxyUrl] = useState('');
   const [proxySaved, setProxySaved] = useState(false);
+  const [devFeaturesEnabled, setDevFeaturesEnabled] = useState(false);
 
   useEffect(() => {
     loadSecuritySettings();
@@ -733,7 +1181,7 @@ function SecuritySettings() {
 
   async function loadSecuritySettings() {
     const api = window.ironmic;
-    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl] = await Promise.all([
+    const [clip, timeout, exit, aiConfirm, privacy, pEnabled, pUrl, devFeatures] = await Promise.all([
       api.getSetting('security_clipboard_auto_clear'),
       api.getSetting('security_session_timeout'),
       api.getSetting('security_clear_on_exit'),
@@ -741,6 +1189,7 @@ function SecuritySettings() {
       api.getSetting('security_privacy_mode'),
       api.getSetting('proxy_enabled'),
       api.getSetting('proxy_url'),
+      api.getSetting('dev_features_enabled'),
     ]);
     if (clip) setClipboardAutoClear(clip);
     if (timeout) setSessionTimeout(timeout);
@@ -749,6 +1198,7 @@ function SecuritySettings() {
     setPrivacyMode(privacy === 'true');
     setProxyEnabled(pEnabled === 'true');
     if (pUrl) setProxyUrl(pUrl);
+    setDevFeaturesEnabled(devFeatures === 'true');
   }
 
   async function updateSetting(key: string, value: string) {
@@ -770,6 +1220,11 @@ function SecuritySettings() {
           <PostureItem icon={ClipboardCheck} label="Clipboard" detail={clipboardAutoClear === 'off' ? 'Text remains in clipboard until overwritten. Enable auto-clear below.' : `Auto-cleared after ${clipboardAutoClear}`} status={clipboardAutoClear === 'off' ? 'warning' : 'strong'} />
         </div>
       </Card>
+
+      {/* Cloud opt-ins for AI Assist (cloud polish, cloud Voice Chat) live
+          in Settings → AI Assist as of v1.8.x. Co-located with provider /
+          model selection so all "what does AI Assist talk to?" controls
+          are in one place. */}
 
       {/* Proxy Configuration */}
       <Card variant="default" padding="md">
@@ -956,6 +1411,22 @@ function SecuritySettings() {
           </div>
         </div>
       </Card>
+
+      {/* Developer features (last subsection — gated experimental controls) */}
+      <div className="pt-2">
+        <p className="text-xs font-semibold text-iron-text-muted uppercase tracking-wider mb-2">Developer</p>
+        <SettingRow
+          icon={FlaskConical}
+          title="Developer features"
+          description="Exposes legacy and experimental controls (Solo meeting mode, etc.). Off by default."
+          control={
+            <Toggle
+              checked={devFeaturesEnabled}
+              onChange={(v) => { setDevFeaturesEnabled(v); updateSetting('dev_features_enabled', String(v)); }}
+            />
+          }
+        />
+      </div>
     </>
   );
 }
@@ -964,12 +1435,7 @@ function SecuritySettings() {
 // Voice AI (ML Features)
 // ═══════════════════════════════════════════
 
-function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
-  const { getSetting, setSetting } = useSettingsStore();
-  const [vadEnabled, setVadEnabled] = useState(true);
-  const [vadSensitivity, setVadSensitivity] = useState(0.5);
-  const [turnDetectionMode, setTurnDetectionMode] = useState('push-to-talk');
-  const [turnTimeout, setTurnTimeout] = useState(3000);
+function VoiceAISettings() {
   const [voiceRoutingEnabled, setVoiceRoutingEnabled] = useState(false);
   const [meetingModeEnabled, setMeetingModeEnabled] = useState(false);
   const [intentEnabled, setIntentEnabled] = useState(false);
@@ -979,7 +1445,17 @@ function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
   const [workflowConfidence, setWorkflowConfidence] = useState(0.7);
   const [semanticSearchEnabled, setSemanticSearchEnabled] = useState(false);
   const [meetingAutoDetect, setMeetingAutoDetect] = useState(false);
-  const [meetingSummaryPrompt, setMeetingSummaryPrompt] = useState('');
+  // Remote-meeting capture: dual-stream mic + WASAPI loopback so segments can
+  // be tagged "You" / "Remote" at capture time without LLM diarization.
+  // Windows-only in v1; non-Windows users see a disabled toggle with an
+  // explanation pointing at the virtual-loopback setup modal.
+  const [remoteCaptureEnabled, setRemoteCaptureEnabled] = useState(false);
+  // Speaker diarization mode for the remote-meeting loopback stream.
+  // 'off'       → Simple: one row per chunk labeled "Remote" (default, fast)
+  // 'embedding' → Advanced: per-utterance rows with WeSpeaker [Speaker N]
+  //               labels + post-meeting AHC refinement. Slower per chunk.
+  const [diarizationAdvanced, setDiarizationAdvanced] = useState(false);
+  const isWindows = navigator.userAgent.toLowerCase().includes('windows');
 
   useEffect(() => {
     (async () => {
@@ -988,10 +1464,6 @@ function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
       const val = (key: string, fallback: string) =>
         ironmic.getSetting(key).then((v: string | null) => v ?? fallback);
 
-      setVadEnabled((await val('vad_enabled', 'true')) === 'true');
-      setVadSensitivity(parseFloat(await val('vad_sensitivity', '0.5')));
-      setTurnDetectionMode(await val('turn_detection_mode', 'push-to-talk'));
-      setTurnTimeout(parseInt(await val('turn_detection_timeout_ms', '3000'), 10));
       setVoiceRoutingEnabled((await val('voice_routing_enabled', 'false')) === 'true');
       setMeetingModeEnabled((await val('meeting_mode_enabled', 'false')) === 'true');
       setIntentEnabled((await val('intent_classification_enabled', 'false')) === 'true');
@@ -1001,7 +1473,8 @@ function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
       setWorkflowConfidence(parseFloat(await val('ml_workflows_confidence', '0.7')));
       setSemanticSearchEnabled((await val('ml_semantic_search_enabled', 'false')) === 'true');
       setMeetingAutoDetect((await val('meeting_auto_detect_enabled', 'false')) === 'true');
-      setMeetingSummaryPrompt(await val('meeting_summary_prompt', ''));
+      setRemoteCaptureEnabled((await val('meeting_remote_capture_enabled', 'false')) === 'true');
+      setDiarizationAdvanced((await val('meeting_diarization_mode', 'off')) === 'embedding');
     })();
   }, []);
 
@@ -1018,94 +1491,13 @@ function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
 
   return (
     <>
-      {!compactMode && <SectionHeader icon={Brain} title="Voice AI" description="On-device machine learning features" />}
+      <SectionHeader icon={Brain} title="Voice AI" description="On-device machine learning features" />
 
       <Card>
         <div className="p-4 space-y-5">
-          {!compactMode && (
-            <div className="text-xs text-iron-text-muted mb-3">
-              All ML processing runs entirely on your device. No data leaves this machine.
-            </div>
-          )}
-
-          {/* VAD */}
-          <SettingRow
-            icon={Mic}
-            title="Voice Activity Detection"
-            description="Filter silence and noise before transcription for faster processing"
-            control={
-              <Toggle
-                checked={vadEnabled}
-                onChange={(v) => { setVadEnabled(v); update('vad_enabled', String(v)); }}
-              />
-            }
-          />
-          {vadEnabled && (
-            <div className="ml-10 space-y-2">
-              <label className="text-xs text-iron-text-secondary">Sensitivity: {vadSensitivity.toFixed(1)}</label>
-              <input
-                type="range" min="0" max="1" step="0.1"
-                value={vadSensitivity}
-                onChange={(e) => {
-                  const v = parseFloat(e.target.value);
-                  setVadSensitivity(v);
-                  update('vad_sensitivity', String(v));
-                }}
-                className="w-full accent-iron-accent"
-              />
-              <div className="flex justify-between text-[10px] text-iron-text-muted">
-                <span>Less sensitive</span>
-                <span>More sensitive</span>
-              </div>
-            </div>
-          )}
-
-          <div className="border-t border-iron-border" />
-
-          {/* Turn Detection */}
-          <SettingRow
-            icon={Volume2}
-            title="Turn Detection Mode"
-            description="How IronMic detects when you're done speaking"
-            control={
-              <select
-                value={turnDetectionMode}
-                onChange={(e) => {
-                  setTurnDetectionMode(e.target.value);
-                  update('turn_detection_mode', e.target.value);
-                }}
-                className="text-xs bg-iron-surface border border-iron-border rounded px-2 py-1 text-iron-text"
-              >
-                <option value="push-to-talk">Push to Talk</option>
-                <option value="auto-detect">Auto Detect</option>
-                <option value="always-listening">Always Listening</option>
-              </select>
-            }
-          />
-          {turnDetectionMode !== 'push-to-talk' && (
-            <div className="ml-10 space-y-2">
-              <label className="text-xs text-iron-text-secondary">Silence timeout: {(turnTimeout / 1000).toFixed(1)}s</label>
-              <input
-                type="range" min="1000" max="10000" step="500"
-                value={turnTimeout}
-                onChange={(e) => {
-                  const v = parseInt(e.target.value, 10);
-                  setTurnTimeout(v);
-                  update('turn_detection_timeout_ms', String(v));
-                }}
-                className="w-full accent-iron-accent"
-              />
-            </div>
-          )}
-          {turnDetectionMode === 'always-listening' && (
-            <div className="ml-10 p-2 bg-yellow-500/10 rounded text-xs text-yellow-400 flex items-center gap-2">
-              <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0" />
-              Microphone will stay active. A red indicator will be shown at all times.
-            </div>
-          )}
-
-          {!compactMode && (<>
-          <div className="border-t border-iron-border" />
+          <div className="text-xs text-iron-text-muted mb-3">
+            All ML processing runs entirely on your device. No data leaves this machine.
+          </div>
 
           {/* Voice Routing */}
           <SettingRow
@@ -1143,30 +1535,45 @@ function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
               />
             }
           />
-
-          {/* Meeting summary prompt */}
-          <div className="space-y-1.5">
-            <label className="text-sm font-medium text-iron-text">Meeting Summary Prompt</label>
-            <p className="text-xs text-iron-text-muted">
-              Customize the LLM prompt used to summarize meetings. The transcript is appended automatically. Leave blank for the default.
-            </p>
-            <textarea
-              value={meetingSummaryPrompt}
-              onChange={(e) => setMeetingSummaryPrompt(e.target.value)}
-              onBlur={() => update('meeting_summary_prompt', meetingSummaryPrompt)}
-              placeholder="Summarize this meeting transcript. List key decisions and action items."
-              rows={3}
-              className="w-full px-3 py-2 text-xs bg-iron-surface border border-iron-border rounded-lg text-iron-text placeholder:text-iron-text-muted focus:border-iron-accent/30 focus:outline-none resize-y"
+          <SettingRow
+            icon={Users}
+            title="Capture Remote Participants by Default"
+            description={
+              isWindows
+                ? 'Run new meetings in dual-stream mode: your mic AND system audio (the remote participants you hear) are transcribed separately, so the transcript labels "You" vs "Remote" without LLM guessing. Recommended with headphones — speakers can leak remote audio back into your mic.'
+                : 'Available on Windows only in v1. On macOS / Linux, install a virtual loopback driver (BlackHole, VB-CABLE, PulseAudio monitor sink) and pick it as the meeting audio device.'
+            }
+            control={
+              <Toggle
+                checked={remoteCaptureEnabled}
+                disabled={!isWindows}
+                onChange={(v) => { setRemoteCaptureEnabled(v); update('meeting_remote_capture_enabled', String(v)); }}
+              />
+            }
+          />
+          {remoteCaptureEnabled && isWindows && (
+            <SettingRow
+              icon={Users}
+              title="Identify Individual Remote Speakers (Advanced)"
+              description={
+                'Off (Simple, default): all remote audio is labeled "Remote" and appears with the same low latency as your mic stream. ' +
+                'On (Advanced): a local 26 MB WeSpeaker model assigns [Speaker 1], [Speaker 2]… labels to distinguish up to ~20 distinct voices. ' +
+                'Advanced doubles the per-chunk processing cost and is best for meetings where knowing who said what matters more than instant transcript.'
+              }
+              control={
+                <Toggle
+                  checked={diarizationAdvanced}
+                  onChange={(v) => {
+                    setDiarizationAdvanced(v);
+                    update('meeting_diarization_mode', v ? 'embedding' : 'off');
+                    // Mark as explicitly user-chosen so the startup default
+                    // reset (main/index.ts) won't override the choice.
+                    update('meeting_diarization_user_overridden', 'true');
+                  }}
+                />
+              }
             />
-            {meetingSummaryPrompt && (
-              <button
-                onClick={() => { setMeetingSummaryPrompt(''); update('meeting_summary_prompt', ''); }}
-                className="text-[10px] text-iron-accent-light hover:underline"
-              >
-                Reset to default
-              </button>
-            )}
-          </div>
+          )}
 
           <div className="border-t border-iron-border" />
 
@@ -1255,11 +1662,10 @@ function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
               />
             }
           />
-          </>)}
         </div>
       </Card>
 
-      {!compactMode && (
+      {/* Data Management */}
       <Card>
         <div className="p-4 space-y-3">
           <h3 className="text-sm font-medium text-iron-text">ML Data Management</h3>
@@ -1275,7 +1681,6 @@ function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
           </button>
         </div>
       </Card>
-      )}
     </>
   );
 }
@@ -1283,6 +1688,43 @@ function VoiceAISettings({ compactMode }: { compactMode?: boolean } = {}) {
 // ═══════════════════════════════════════════
 // Shared components
 // ═══════════════════════════════════════════
+
+/**
+ * Read-only display of the active dictation gesture. Replaces the legacy
+ * HotkeyRecorder because dictation is now triggered by a low-level keyboard
+ * gesture in main/keyboard-listener.ts (uiohook), not Electron's
+ * globalShortcut. The gesture isn't user-configurable yet — we surface what
+ * it is so the user knows the keys to press.
+ */
+function DictationGestureDisplay() {
+  const gesture = getDictationGesture();
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-2">
+        <Keyboard className="w-4 h-4 text-iron-text-muted" />
+        <label className="text-sm font-medium text-iron-text">Dictation gesture</label>
+      </div>
+      <div className="rounded-xl border border-iron-border bg-iron-surface px-4 py-3 space-y-2">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-xs text-iron-text-muted">Hands-free (tap to start, tap to stop)</div>
+            <div className="text-sm font-semibold text-iron-text mt-0.5">{gesture.handsFree}</div>
+          </div>
+        </div>
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-xs text-iron-text-muted">Push-to-talk (hold to talk, release to paste)</div>
+            <div className="text-sm font-semibold text-iron-text mt-0.5">{gesture.pushToTalk}</div>
+          </div>
+        </div>
+      </div>
+      <p className="text-[11px] text-iron-text-muted">
+        These gestures work both in the main app and in Forge mode. They're handled by a
+        low-level keyboard listener so they can't be remapped here yet.
+      </p>
+    </div>
+  );
+}
 
 function SectionHeader({ icon: Icon, title, description, children }: { icon: typeof Settings; title: string; description: string; children?: React.ReactNode }) {
   return (
@@ -1345,61 +1787,5 @@ function PostureItem({ icon: Icon, label, detail, status }: {
         <p className="text-[11px] text-iron-text-muted mt-0.5">{detail}</p>
       </div>
     </div>
-  );
-}
-
-// ═══════════════════════════════════════════
-// Merged tabs (consolidation wrappers)
-// ═══════════════════════════════════════════
-
-/** Input & Voice: Mic hardware (InputSettings) + Voice AI features with progressive disclosure */
-function InputVoiceSettings() {
-  const [showAdvanced, setShowAdvanced] = useState(false);
-
-  return (
-    <>
-      {/* Mic hardware — from InputSettings component */}
-      <InputSettings />
-
-      {/* Voice Detection — key VAD/turn settings shown inline */}
-      <div className="border-t border-iron-border pt-6 mt-6">
-        <SectionHeader icon={Brain} title="Voice Intelligence" description="Voice activity detection, turn detection, and ML features" />
-
-        {/* Show core voice settings inline, collapse the rest */}
-        <VoiceAISettings compactMode={!showAdvanced} />
-
-        <button
-          onClick={() => setShowAdvanced(!showAdvanced)}
-          className="mt-4 text-xs font-medium text-iron-accent-light hover:underline"
-        >
-          {showAdvanced ? 'Hide advanced ML features' : 'Show advanced ML features'}
-        </button>
-      </div>
-    </>
-  );
-}
-
-/** Models & Speech: All model downloads + TTS voice/speed settings */
-function ModelsSpeechSettings() {
-  return (
-    <>
-      <ModelManager />
-      <div className="border-t border-iron-border pt-6 mt-6">
-        <SectionHeader icon={Volume2} title="Text-to-Speech" description="Voice selection, speed, and TTS model management" />
-        <SpeechSettings />
-      </div>
-    </>
-  );
-}
-
-/** Data & Security: Data management + security posture + privacy settings */
-function DataSecuritySettings() {
-  return (
-    <>
-      <DataSettings />
-      <div className="border-t border-iron-border pt-6 mt-6">
-        <SecuritySettings />
-      </div>
-    </>
   );
 }

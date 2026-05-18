@@ -12,6 +12,12 @@ export interface Entry {
   isPinned: boolean;
   isArchived: boolean;
   tags: string | null; // JSON array string
+  /** Serialized TipTap JSON for the raw side (rich editor state). Null for
+   *  notes that predate v6 or never went through the editor (pure Whisper output). */
+  rawTranscriptJson: string | null;
+  /** Serialized TipTap JSON for the polished side. Null until the user
+   *  hand-edits in polished mode — polish completion writes plaintext only. */
+  polishedTextJson: string | null;
 }
 
 export interface NewEntry {
@@ -19,6 +25,8 @@ export interface NewEntry {
   polishedText: string | null;
   durationSeconds: number | null;
   sourceApp: string | null;
+  rawTranscriptJson?: string | null;
+  polishedTextJson?: string | null;
 }
 
 export interface EntryUpdate {
@@ -26,6 +34,11 @@ export interface EntryUpdate {
   polishedText?: string | null;
   displayMode?: 'raw' | 'polished';
   tags?: string | null;
+  /** Absent → leave column untouched. Setting one of these on a polish update
+   *  would clobber the user's hand-edited rich state — the polish writer must
+   *  omit these fields. */
+  rawTranscriptJson?: string;
+  polishedTextJson?: string;
 }
 
 export interface ListOptions {
@@ -147,6 +160,23 @@ export interface Workflow {
   isDismissed: boolean;
 }
 
+/**
+ * One participant in a meeting (host or joiner). The Rust struct serializes
+ * with `#[serde(rename_all = "camelCase")]` so the JSON shape on the wire
+ * matches this type directly — no conversion needed in the IPC layer.
+ *
+ * Roster is **historical**: entries are NOT removed when a participant
+ * disconnects. Instead, `leftAt` is stamped so transcripts and downstream
+ * consumers can see who attended which portion of the meeting.
+ */
+export interface MeetingParticipant {
+  id: string;
+  displayName: string;
+  isHost: boolean;
+  joinedAt: number;
+  leftAt?: number;
+}
+
 export interface MeetingSession {
   id: string;
   startedAt: string;
@@ -156,6 +186,9 @@ export interface MeetingSession {
   actionItems: string | null;
   totalDurationSeconds: number | null;
   entryIds: string | null;
+  /** Historical roster of host + every joiner (with leftAt timestamps).
+   *  Empty array when the meeting predates the v7 schema migration. */
+  participants?: MeetingParticipant[];
 }
 
 export interface MLModelWeights {
@@ -169,13 +202,125 @@ export type TurnDetectionMode = 'push-to-talk' | 'auto-detect' | 'always-listeni
 export type VoiceRoute = 'dictation' | 'conversation' | 'command' | 'transcription';
 export type VoiceState = 'speech' | 'silence' | 'unknown';
 
-// Helper to parse tags from JSON string
+/** Prefix used to encode a user-visible note title inside the tags field.
+ *  The renderer parses it out in parseTitleTag() and hides it from the
+ *  standard tag-chip list so it doesn't appear as an ordinary tag. */
+export const TITLE_TAG_PREFIX = '__title__:';
+export const NOTEBOOK_TAG_PREFIX = '__notebook__:';
+export const MEETING_TAG_PREFIX = '__meeting__:';
+/** Lifecycle status — 'draft' when a note is being captured / in progress,
+ *  'done' after the user explicitly finalizes it via the Done button. Used
+ *  by NotesSidebar to render a yellow dot on drafts so users can tell at a
+ *  glance which notes still need attention. */
+export const STATUS_TAG_PREFIX = '__status__:';
+export const EMOJI_TAG_PREFIX = '__emoji__:';
+
+export type NoteStatus = 'draft' | 'done';
+
+// Helper to parse tags from JSON string.
+// Filters out internal tag-prefix conventions (titles, notebook assignments,
+// status) so those don't appear as user-visible chips.
 export function parseTags(tags: string | null): string[] {
   if (!tags) return [];
   try {
-    return JSON.parse(tags);
+    const arr = JSON.parse(tags);
+    if (!Array.isArray(arr)) return [];
+    return arr.filter(
+      (s: string) =>
+        typeof s === 'string' &&
+        !s.startsWith(TITLE_TAG_PREFIX) &&
+        !s.startsWith(NOTEBOOK_TAG_PREFIX) &&
+        !s.startsWith(STATUS_TAG_PREFIX) &&
+        !s.startsWith(EMOJI_TAG_PREFIX) &&
+        !s.startsWith('__meeting__:'),
+    );
   } catch {
     return [];
+  }
+}
+
+/** Extract the status tag (draft | done). Entries with no status tag
+ *  default to 'done' — every legacy entry was effectively finalized
+ *  before this convention existed, so treating them as done is correct. */
+export function parseStatusTag(tags: string | null): NoteStatus {
+  if (!tags) return 'done';
+  try {
+    const arr = JSON.parse(tags);
+    if (!Array.isArray(arr)) return 'done';
+    const t = arr.find(
+      (s: string) => typeof s === 'string' && s.startsWith(STATUS_TAG_PREFIX),
+    );
+    if (!t) return 'done';
+    const value = (t as string).slice(STATUS_TAG_PREFIX.length);
+    return value === 'draft' ? 'draft' : 'done';
+  } catch {
+    return 'done';
+  }
+}
+
+/** Extract the embedded title tag (if any) from an entry's tags JSON. */
+export function parseTitleTag(tags: string | null): string | null {
+  if (!tags) return null;
+  try {
+    const arr = JSON.parse(tags);
+    if (!Array.isArray(arr)) return null;
+    const t = arr.find(
+      (s: string) => typeof s === 'string' && s.startsWith(TITLE_TAG_PREFIX),
+    );
+    if (!t) return null;
+    return (t as string).slice(TITLE_TAG_PREFIX.length);
+  } catch {
+    return null;
+  }
+}
+
+export function parseEmojiTag(tags: string | null): string | null {
+  if (!tags) return null;
+  try {
+    const arr = JSON.parse(tags);
+    if (!Array.isArray(arr)) return null;
+    const t = arr.find(
+      (s: string) => typeof s === 'string' && s.startsWith(EMOJI_TAG_PREFIX),
+    );
+    if (!t) return null;
+    return (t as string).slice(EMOJI_TAG_PREFIX.length);
+  } catch {
+    return null;
+  }
+}
+
+/** Extract the linked meeting session id (if any) from an entry's tags JSON.
+ *  Entries auto-generated by the meeting pipeline carry a __meeting__:<id>
+ *  tag that points back to the session — used to make the entry and the
+ *  meeting session behave as a single record (edits propagate both ways). */
+export function parseMeetingTag(tags: string | null): string | null {
+  if (!tags) return null;
+  try {
+    const arr = JSON.parse(tags);
+    if (!Array.isArray(arr)) return null;
+    const t = arr.find(
+      (s: string) => typeof s === 'string' && s.startsWith(MEETING_TAG_PREFIX),
+    );
+    if (!t) return null;
+    return (t as string).slice(MEETING_TAG_PREFIX.length);
+  } catch {
+    return null;
+  }
+}
+
+/** Extract the embedded notebook-id tag (if any) from an entry's tags JSON. */
+export function parseNotebookTag(tags: string | null): string | null {
+  if (!tags) return null;
+  try {
+    const arr = JSON.parse(tags);
+    if (!Array.isArray(arr)) return null;
+    const t = arr.find(
+      (s: string) => typeof s === 'string' && s.startsWith(NOTEBOOK_TAG_PREFIX),
+    );
+    if (!t) return null;
+    return (t as string).slice(NOTEBOOK_TAG_PREFIX.length);
+  } catch {
+    return null;
   }
 }
 

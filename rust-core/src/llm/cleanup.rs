@@ -8,8 +8,52 @@ use crate::llm::chat::{ChatMessage, ChatModel};
 #[cfg(any(feature = "llm", feature = "llm-bin"))]
 use crate::llm::prompts;
 
-/// Default model filename.
-const DEFAULT_MODEL_FILENAME: &str = "mistral-7b-instruct-q4_k_m.gguf";
+/// Default model filename — Phi-3 Mini Q2_K is the bundled default LLM.
+const DEFAULT_MODEL_FILENAME: &str = "Phi-3-mini-4k-instruct-Q2_K.gguf";
+
+/// Total KV cache size used when creating a llama context. The prompt plus all
+/// generated tokens must fit inside this budget.
+#[allow(dead_code)] // referenced only by the feature-gated llm/llm-bin paths
+const N_CTX_DEFAULT: u32 = 4096;
+
+/// Minimum number of tokens we insist on reserving for the model's reply. If
+/// the prompt is so long that fewer than this many tokens are free, we refuse
+/// the request with a user-actionable error rather than producing a one-word
+/// reply or undefined behavior.
+#[allow(dead_code)] // referenced only by the feature-gated llm/llm-bin paths
+const MIN_REPLY_BUDGET: u32 = 64;
+
+/// Clamp the caller's requested `max_tokens` against the residual context
+/// window after the prompt is tokenized.
+///
+/// Returns `Ok(effective_max_tokens)` where `effective <= max_tokens` and
+/// `n_tokens + effective <= N_CTX_DEFAULT`. Returns a friendly `Err` when the
+/// prompt alone leaves less than `MIN_REPLY_BUDGET` tokens of headroom.
+///
+/// Kept module-private and unit-tested below so the budget arithmetic has a
+/// deterministic surface independent of the live LLM.
+#[allow(dead_code)] // referenced only by the feature-gated llm/llm-bin paths
+fn compute_effective_max_tokens(
+    n_tokens: usize,
+    max_tokens: u32,
+) -> Result<u32, IronMicError> {
+    let n_tokens_u32 = u32::try_from(n_tokens).map_err(|_| {
+        IronMicError::Llm(format!("Prompt token count {n_tokens} exceeds u32::MAX"))
+    })?;
+    // Subtraction (rather than `n_tokens_u32 + MIN_REPLY_BUDGET > N_CTX_DEFAULT`)
+    // so an unforeseen growth in either constant can't add-overflow. Both
+    // right-hand constants are compile-time and bounded, so the subtraction is
+    // always safe.
+    if n_tokens_u32 > N_CTX_DEFAULT - MIN_REPLY_BUDGET {
+        return Err(IronMicError::Llm(format!(
+            "Prompt is too long for the local model: {n_tokens} tokens used out of {N_CTX_DEFAULT} context \
+             (need at least {MIN_REPLY_BUDGET} free for a reply). \
+             Trim attached context, retrieved chunks, or older history."
+        )));
+    }
+    let reserved = N_CTX_DEFAULT - n_tokens_u32;
+    Ok(max_tokens.min(reserved))
+}
 
 /// Resolve the default model path.
 pub fn default_model_path() -> std::path::PathBuf {
@@ -197,7 +241,7 @@ impl LlmEngine {
         })?;
 
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(4096))
+            .with_n_ctx(NonZeroU32::new(N_CTX_DEFAULT))
             .with_n_threads(self.config.n_threads as i32)
             .with_n_threads_batch(self.config.n_threads as i32);
 
@@ -214,19 +258,37 @@ impl LlmEngine {
             return Ok(String::new());
         }
 
-        // Create batch and add prompt tokens
-        let mut batch = LlamaBatch::new(ctx.n_batch() as usize, 1);
-        let last_idx = (n_tokens - 1) as i32;
-
-        for (i, &token) in tokens.iter().enumerate() {
-            let is_last = i as i32 == last_idx;
-            batch.add(token, i as i32, &[0], is_last)
-                .map_err(|e| IronMicError::Llm(format!("Batch add failed: {e}")))?;
+        // Bound generation against the context window. Fails fast with a
+        // user-actionable error when the prompt alone fills the context.
+        let effective_max_tokens = compute_effective_max_tokens(n_tokens, max_tokens)?;
+        if effective_max_tokens < max_tokens {
+            tracing::info!(
+                n_tokens,
+                requested_max_tokens = max_tokens,
+                effective_max_tokens,
+                "LLM budget clamped"
+            );
         }
 
-        // Decode the prompt
-        ctx.decode(&mut batch)
-            .map_err(|e| IronMicError::Llm(format!("Prompt decode failed: {e}")))?;
+        // Chunked prefill: llama.cpp's batch capacity (`n_batch`, default 2048)
+        // is independent of `n_ctx`. A long prompt that fits in 4096 ctx but
+        // exceeds 2048 batch needs to be fed in multiple decode passes.
+        let n_batch = ctx.n_batch() as usize;
+        let mut batch = LlamaBatch::new(n_batch, 1);
+        let last_idx = n_tokens - 1;
+        let mut pos: i32 = 0;
+        for chunk in tokens.chunks(n_batch) {
+            batch.clear();
+            for (i, &token) in chunk.iter().enumerate() {
+                let absolute = pos as usize + i;
+                let is_last = absolute == last_idx;
+                batch.add(token, absolute as i32, &[0], is_last)
+                    .map_err(|e| IronMicError::Llm(format!("Batch add failed: {e}")))?;
+            }
+            ctx.decode(&mut batch)
+                .map_err(|e| IronMicError::Llm(format!("Prompt decode failed: {e}")))?;
+            pos += chunk.len() as i32;
+        }
 
         // Set up sampler with temperature
         let sampler = LlamaSampler::chain_simple([
@@ -237,9 +299,16 @@ impl LlmEngine {
 
         // Generate tokens
         let mut output = String::new();
-        let mut n_cur = n_tokens as i32;
+        let mut n_cur = pos;
 
-        for _ in 0..max_tokens {
+        for _ in 0..effective_max_tokens {
+            // Belt-and-braces: compute_effective_max_tokens already caps the
+            // loop so this never trips today, but guards against future
+            // refactors that decouple the loop bound from n_ctx.
+            if n_cur as u32 >= N_CTX_DEFAULT {
+                break;
+            }
+
             let new_token = sampler.sample(&ctx, -1);
 
             // Check for end of generation
@@ -465,6 +534,48 @@ mod tests {
     }
 
     #[test]
+    fn compute_effective_max_tokens_no_clamp() {
+        // Prompt is short — caller's request fits entirely in residual context.
+        let r = compute_effective_max_tokens(100, 2048).expect("should clamp ok");
+        assert_eq!(r, 2048);
+    }
+
+    #[test]
+    fn compute_effective_max_tokens_clamps_mid_range() {
+        // 4096 - 3500 = 596 residual; caller wants 2048, gets clamped to 596.
+        let r = compute_effective_max_tokens(3500, 2048).expect("should clamp ok");
+        assert_eq!(r, N_CTX_DEFAULT - 3500);
+        assert_eq!(r, 596);
+    }
+
+    #[test]
+    fn compute_effective_max_tokens_rejects_over_context() {
+        // 4050 prompt tokens leaves only 46 free, below MIN_REPLY_BUDGET (64).
+        let err = compute_effective_max_tokens(4050, 2048).expect_err("should reject");
+        let msg = format!("{err}");
+        assert!(msg.contains("Prompt is too long"), "msg = {msg}");
+        assert!(msg.contains("4050"), "msg = {msg}");
+    }
+
+    #[test]
+    fn compute_effective_max_tokens_boundary() {
+        // Exactly at the boundary: N_CTX_DEFAULT - MIN_REPLY_BUDGET tokens
+        // used. Headroom equals MIN_REPLY_BUDGET — the lowest accepted value.
+        let n = (N_CTX_DEFAULT - MIN_REPLY_BUDGET) as usize;
+        let r = compute_effective_max_tokens(n, 2048).expect("boundary should be ok");
+        assert_eq!(r, MIN_REPLY_BUDGET);
+    }
+
+    #[test]
+    fn compute_effective_max_tokens_one_over_boundary() {
+        // One token past the boundary: residual would be MIN_REPLY_BUDGET - 1,
+        // which violates the floor.
+        let n = (N_CTX_DEFAULT - MIN_REPLY_BUDGET + 1) as usize;
+        let err = compute_effective_max_tokens(n, 2048).expect_err("should reject");
+        assert!(format!("{err}").contains("Prompt is too long"));
+    }
+
+    #[test]
     fn engine_not_loaded_initially() {
         let engine = LlmEngine::with_defaults();
         assert!(!engine.is_loaded());
@@ -535,7 +646,7 @@ mod tests {
         let engine = LlmEngine::with_defaults();
         let shared = SharedLlmEngine::new(engine);
         let path = shared.model_path();
-        assert!(path.ends_with("models/mistral-7b-instruct-q4_k_m.gguf"));
+        assert!(path.ends_with("models/Phi-3-mini-4k-instruct-Q2_K.gguf"));
         assert!(path.is_absolute());
     }
 

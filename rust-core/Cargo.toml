@@ -1,6 +1,6 @@
 [package]
 name = "ironmic-core"
-version = "1.6.0"
+version = "1.9.1"
 edition = "2021"
 description = "IronMic – fully-local voice transcription and text-to-speech, Rust native core"
 authors = ["IronMic Contributors"]
@@ -18,6 +18,30 @@ metal = ["whisper", "whisper-rs/metal"]
 llm = ["dep:llama-cpp-2"]
 llm-bin = ["dep:llama-cpp-2"]
 tts = ["dep:ort", "dep:ndarray"]
+# speaker-diarization: WeSpeaker ResNet34 ONNX inference for acoustic speaker
+# embeddings on loopback transcript segments. Reuses the existing `ort` +
+# `ndarray` deps already pulled in by `tts` and (transitively) `engine-multi`
+# — no new third-party crates. The runtime ORT shared library
+# (onnxruntime.dll / libonnxruntime.dylib / libonnxruntime.so) must be
+# bundled by electron-builder for packaged builds. Non-feature builds
+# export a stub that returns `Unsupported`; the meeting recorder falls
+# through to "Remote" labels gracefully.
+speaker-diarization = ["dep:ort", "dep:ndarray"]
+# engine-multi: Moonshine ONNX backend via transcribe-rs.
+# Adds the alternative transcription engine that runs on ONNX Runtime's
+# MLAS / DirectML kernels — no BLAS dependency, ~16x faster than whisper.cpp
+# on a Windows VDI without GPU acceleration. transcribe-rs's "onnx" feature
+# pulls in the same `ort = "=2.0.0-rc.12"` and `ndarray = "0.17"` we already
+# use for the Kokoro TTS pipeline, so there is no version conflict. We
+# deliberately omit transcribe-rs's "whisper-cpp" feature because IronMic
+# already links whisper.cpp via the existing `whisper-rs` crate; pulling
+# in a second whisper.cpp would create duplicate symbols.
+engine-multi = ["dep:transcribe-rs"]
+# forge: synthetic keystroke / paste-anywhere support for Forge mode.
+# Pulls in `enigo` for cross-platform input simulation. On Linux this requires
+# libxdo (X11) at link time; document in CLAUDE.md. macOS additionally needs
+# Accessibility permission at runtime — see keystroke::macos.
+forge = ["dep:enigo"]
 
 [[bin]]
 name = "ironmic-llm"
@@ -40,10 +64,41 @@ arboard = "3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
+# base64 already lands transitively (ort, transcribe-rs); making it a direct
+# dep so listSegmentEmbeddings can encode raw f32 embedding bytes as JSON
+# without pulling in serde adapters.
+base64 = "0.22"
 whisper-rs = { version = "0.13", optional = true }
 llama-cpp-2 = { version = "0.1", optional = true }
 ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
 ndarray = { version = "0.17", optional = true }
+transcribe-rs = { version = "0.3", features = ["onnx"], optional = true }
+enigo = { version = "0.6", optional = true }
+
+# Native WASAPI loopback capture for the dual-stream meeting recorder.
+# Windows-only — cpal's WASAPI host does not expose AUDCLNT_STREAMFLAGS_LOOPBACK,
+# so we drive IAudioClient directly via the windows crate. The feature list is
+# kept fine-grained on purpose; see CLAUDE.md and the loopback_windows module
+# for the WASAPI lifecycle details (COM init, event-driven pump,
+# AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED rebuild,
+# IMMNotificationClient for default-device changes).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_Media_Audio",
+  "Win32_Media_KernelStreaming",
+  "Win32_Media_Multimedia",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_Foundation",
+  # CreateEventW's `lpEventAttributes` is `Option<*const SECURITY_ATTRIBUTES>`,
+  # and `windows = "0.58"` gates the function on `Win32_Security`. Without
+  # this feature, `use windows::Win32::System::Threading::CreateEventW`
+  # is gated out and the import fails to resolve.
+  "Win32_Security",
+] }
 
 [build-dependencies]
 napi-build = { version = "2", optional = true }

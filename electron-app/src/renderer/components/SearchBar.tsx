@@ -13,7 +13,7 @@ export function SearchBar({ query, onQueryChange }: SearchBarProps) {
         type="text"
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}
-        placeholder="Search dictations... (use Search page for all content)"
+        placeholder="Search dictations..."
         className="w-full pl-9 pr-8 py-2 text-sm bg-iron-bg border border-iron-border rounded-lg text-iron-text placeholder:text-iron-text-muted transition-all hover:border-iron-border-hover focus:outline-none focus:border-iron-accent/50 focus:shadow-glow"
       />
       {query && (

@@ -1,11 +1,10 @@
 import { create } from 'zustand';
 import { useTtsStore } from './useTtsStore';
-import { useEntryStore } from './useEntryStore';
 import { useAiChatStore } from './useAiChatStore';
 import { useToastStore } from './useToastStore';
-import { vadService } from '../services/tfjs/VADService';
-import { audioBridge } from '../services/tfjs/AudioBridge';
 import type { PipelineState, TranscriptionResult, VoiceState } from '../types';
+import { correctTranscript } from '../../shared/transcript-correction';
+import { getCachedDictionary } from './dictionaryCache';
 
 interface RecordingStore {
   state: PipelineState;
@@ -70,28 +69,6 @@ async function handleRecordingAction(
       try { await useTtsStore.getState().stop(); } catch { /* ignore */ }
       set({ state: 'recording', error: null, voiceState: 'unknown', vadActive: false });
 
-      // Start VAD alongside recording (non-blocking — VAD failure is not fatal)
-      try {
-        const vadEnabled = await api.getSetting('vad_enabled');
-        if (vadEnabled !== 'false') {
-          const sensitivity = parseFloat((await api.getSetting('vad_sensitivity')) || '0.5');
-          vadService.setSensitivity(sensitivity);
-          await vadService.start();
-          set({ vadActive: true });
-          // Subscribe to real-time voice state for UI indicator
-          vadService.onVoiceStateChange((voiceState) => {
-            set({ voiceState });
-          });
-        }
-      } catch (vadErr) {
-        console.warn('[recording] VAD failed to start (non-fatal):', vadErr);
-      }
-
-      // Start AudioBridge recording buffer (captures from user's selected mic)
-      if (audioBridge.isActive()) {
-        audioBridge.startRecording();
-      }
-
       try {
         await api.startRecording();
       } catch (startErr: any) {
@@ -120,56 +97,37 @@ async function handleRecordingAction(
 
   // ── STOP RECORDING + PROCESS ──
   if (state === 'recording') {
-    const entryStore = useEntryStore.getState();
-
     try {
-      set({ state: 'processing', voiceState: 'unknown' });
+      set({ state: 'processing', voiceState: 'unknown', vadActive: false });
 
-      // Show pending entry immediately in the timeline
-      entryStore.setPendingEntry({
-        stage: 'transcribing',
-        startedAt: Date.now(),
-      });
-
-      // Stop VAD and check speech detection
-      const vadResult = vadService.isActive() ? vadService.stop() : null;
-      set({ vadActive: false });
-
-      if (vadResult && !vadResult.hasSufficientSpeech) {
-        console.warn(`[recording] VAD: insufficient speech (${vadResult.totalSpeechMs}ms) — proceeding anyway (Whisper will decide)`);
-        window.dispatchEvent(new CustomEvent('ironmic:dictation-low-audio', {
-          detail: { speechMs: vadResult.totalSpeechMs },
-        }));
-      }
-
-      // Get audio from AudioBridge (user's selected mic) with cpal fallback
       let audioBuffer: Buffer;
-      const bridgeResult = audioBridge.isRecording() ? audioBridge.stopRecording() : null;
-
-      if (bridgeResult?.buffer && bridgeResult.durationSeconds > 0.5) {
-        audioBuffer = bridgeResult.buffer;
-        console.log(`[recording] Using AudioBridge audio (${bridgeResult.durationSeconds.toFixed(2)}s from selected mic)`);
-        try { await api.stopRecording(); } catch { /* ignore */ }
-      } else {
-        console.warn('[recording] AudioBridge buffer empty/short, falling back to Rust cpal audio');
-        try {
-          audioBuffer = await api.stopRecording();
-        } catch (stopErr: any) {
-          console.error('[recording] Stop failed, force-resetting:', stopErr);
-          try { await api.resetRecording(); } catch { /* last resort */ }
-          entryStore.setPendingEntry(null);
-          set({ state: 'idle', error: null });
-          showErrorToast('Recording stopped unexpectedly.', 'The recording was reset. Please try again.');
-          return;
-        }
+      try {
+        audioBuffer = await api.stopRecording();
+      } catch (stopErr: any) {
+        // If stop fails, force-reset to recover
+        console.error('[recording] Stop failed, force-resetting:', stopErr);
+        try { await api.resetRecording(); } catch { /* last resort */ }
+        set({ state: 'idle', error: null });
+        showErrorToast('Recording stopped unexpectedly.', 'The recording was reset. Please try again.');
+        return;
       }
 
-      // ── STAGE 1: Transcription ──
       let rawTranscript: string;
       try {
         rawTranscript = await api.transcribe(audioBuffer);
+        // Fuzzy post-correction against the user's custom dictionary.
+        // Catches Moonshine misses (no vocabulary API in transcribe-rs)
+        // and back-stops Whisper (initial_prompt biases sampling but
+        // isn't 100%). Empty dictionary returns the input unchanged.
+        try {
+          const dict = await getCachedDictionary();
+          if (dict.length > 0 && rawTranscript) {
+            rawTranscript = correctTranscript(rawTranscript, dict);
+          }
+        } catch (corrErr) {
+          console.warn('[recording] dictionary correction failed:', corrErr);
+        }
       } catch (transcribeErr: any) {
-        entryStore.setPendingEntry(null);
         set({ state: 'idle', error: transcribeErr.message });
         showErrorToast(
           'Transcription failed.',
@@ -183,65 +141,51 @@ async function handleRecordingAction(
         return;
       }
 
-      // Filter Whisper hallucinations
-      const HALLUCINATIONS = [
-        'thank you', 'thanks for watching', 'thanks for listening',
-        'subscribe', 'like and subscribe', 'see you next time',
-        'bye', 'goodbye', 'you', 'the end',
-        'thanks', 'thank you for watching',
-      ];
-      const cleaned = rawTranscript.trim().toLowerCase().replace(/[.!?,]/g, '');
-      const isHallucination = HALLUCINATIONS.includes(cleaned);
-
-      if (!rawTranscript.trim() || rawTranscript.trim().startsWith('[stub') || isHallucination) {
-        if (isHallucination) {
-          console.warn(`[recording] Filtered Whisper hallucination: "${rawTranscript.trim()}"`);
-        }
-        entryStore.setPendingEntry(null);
-        set({ state: 'idle', lastResult: null, error: null });
-        window.dispatchEvent(new CustomEvent('ironmic:dictation-empty', {
-          detail: isHallucination ? { reason: 'hallucination', text: rawTranscript.trim() } : undefined,
-        }));
+      // If the native addon returned a stub response, Whisper was not compiled
+      // into this build. Surface a clear error so the user knows why nothing happens.
+      if (rawTranscript.trim().startsWith('[stub')) {
+        set({ state: 'idle', error: 'Whisper engine not available in this build' });
+        showErrorToast(
+          'Transcription engine missing.',
+          'This build does not include Whisper support. Reinstall the latest release from GitHub.',
+        );
         return;
       }
 
-      // Transcription done — show it immediately in the pending card
-      entryStore.updatePendingEntry({
-        stage: 'complete',
-        rawTranscript,
-      });
+      // If nothing was heard, skip everything
+      if (!rawTranscript.trim()) {
+        // eslint-disable-next-line no-console
+        console.warn('[ironmic:dictation] empty single-shot transcript — Whisper returned no text', { audioBytes: audioBuffer.length });
+        set({ state: 'idle', lastResult: null, error: null });
+        window.dispatchEvent(new CustomEvent('ironmic:dictation-empty'));
+        return;
+      }
 
-      // Build sourceApp
-      if (sourceApp === 'ai-chat') {
-        if (!useAiChatStore.getState().activeSessionId) {
-          useAiChatStore.getState().createSession(null);
+      // LLM cleanup. Use the detailed variant so we get the rich projection
+      // (jsonString) for polished_text_json alongside the plain projection
+      // for polished_text. Both columns are written atomically below; the
+      // NoteEditor's "fetch latest entry on idle" listener depends on the
+      // jsonString being present BEFORE pipeline-state-changed 'idle' fires
+      // (it uses the rich fragment for append-into-open-note).
+      const cleanupEnabled = await api.getSetting('llm_cleanup_enabled');
+      let polishedText: string | null = null;
+      let polishedTextJson: string | null = null;
+
+      if (cleanupEnabled === 'true' && rawTranscript.trim()) {
+        try {
+          const detailed = await (window as any).ironmic.polishTextDetailed(rawTranscript);
+          polishedText = detailed.plainText;
+          polishedTextJson = detailed.jsonString;
+        } catch {
+          // LLM polish is optional — continue without it
         }
-        window.dispatchEvent(new CustomEvent('ironmic:ai-dictation', { detail: rawTranscript }));
-      }
-      let resolvedSourceApp = sourceApp;
-      if (sourceApp === 'ai-chat') {
-        const sessionId = useAiChatStore.getState().activeSessionId;
-        if (sessionId) resolvedSourceApp = `ai-chat:${sessionId}`;
       }
 
-      // Save entry to DB with raw transcript only (no auto-polish)
-      let savedEntryId: string | null = null;
-      try {
-        const saved = await api.createEntry({
-          rawTranscript,
-          polishedText: undefined,
-          durationSeconds: undefined,
-          sourceApp: resolvedSourceApp ?? undefined,
-        } as any);
-        savedEntryId = saved?.id ?? null;
-        entryStore.updatePendingEntry({ entryId: savedEntryId ?? undefined });
-      } catch (saveErr: any) {
-        console.error('[recording] Failed to save entry:', saveErr);
-      }
+      const finalText = polishedText || rawTranscript;
 
-      // Copy raw transcript to clipboard
+      // Copy to clipboard, with optional auto-clear
       try {
-        await api.copyToClipboard(rawTranscript);
+        await api.copyToClipboard(finalText);
         const autoClear = await api.getSetting('security_clipboard_auto_clear');
         if (autoClear && autoClear !== 'off') {
           const seconds = parseInt(autoClear);
@@ -251,39 +195,66 @@ async function handleRecordingAction(
         }
       } catch { /* clipboard is nice-to-have */ }
 
+      // If recorded from the AI tab, ensure a session exists before saving
+      if (sourceApp === 'ai-chat') {
+        if (!useAiChatStore.getState().activeSessionId) {
+          useAiChatStore.getState().createSession(null);
+        }
+        window.dispatchEvent(new CustomEvent('ironmic:ai-dictation', { detail: finalText }));
+      }
+
+      // Build sourceApp — include session ID for AI entries
+      let resolvedSourceApp = sourceApp;
+      if (sourceApp === 'ai-chat') {
+        const sessionId = useAiChatStore.getState().activeSessionId;
+        if (sessionId) resolvedSourceApp = `ai-chat:${sessionId}`;
+      }
+
+      // Save entry. We MUST await this before the 'idle' state transition at
+      // the bottom of this handler — the NoteEditor's pipeline-state listener
+      // races against the DB write and reads polished_text_json non-null
+      // depends on this entry being persisted first.
+      let savedEntryId: string | null = null;
+      try {
+        const saved = await api.createEntry({
+          rawTranscript,
+          polishedText: polishedText ?? undefined,
+          polishedTextJson: polishedTextJson ?? undefined,
+          durationSeconds: undefined,
+          sourceApp: resolvedSourceApp ?? undefined,
+        } as any);
+        savedEntryId = saved?.id ?? null;
+      } catch (saveErr: any) {
+        console.error('[recording] Failed to save entry:', saveErr);
+        // Don't fail the whole flow — text is already in clipboard
+      }
+
       // Auto read-back if enabled
       try {
         const autoReadback = await api.getSetting('tts_auto_readback');
-        if (autoReadback === 'true' && rawTranscript.trim()) {
-          await useTtsStore.getState().synthesizeAndPlay(rawTranscript);
+        if (autoReadback === 'true' && finalText.trim()) {
+          await useTtsStore.getState().synthesizeAndPlay(finalText);
         }
       } catch { /* TTS is optional */ }
 
-      // Notify the app that dictation completed — includes sourceApp for page routing
+      // Notify the app that dictation completed
       window.dispatchEvent(new CustomEvent('ironmic:dictation-complete', {
         detail: {
-          text: rawTranscript,
+          text: finalText,
           sourceApp: resolvedSourceApp || null,
           entryId: savedEntryId,
-          preview: rawTranscript.length > 80 ? rawTranscript.slice(0, 80) + '...' : rawTranscript,
+          preview: finalText.length > 80 ? finalText.slice(0, 80) + '...' : finalText,
         },
       }));
 
       set({
         state: 'idle',
-        lastResult: { rawTranscript, polishedText: null, durationSeconds: 0 },
+        lastResult: { rawTranscript, polishedText, durationSeconds: 0 },
         error: null,
       });
-
-      // Keep the pending card visible briefly, then clear and refresh timeline
-      setTimeout(() => {
-        useEntryStore.getState().setPendingEntry(null);
-        useEntryStore.getState().refresh();
-      }, 2000);
     } catch (err: any) {
       // Catch-all: force-reset Rust side to ensure we're not stuck
       try { await api.resetRecording(); } catch { /* ignore */ }
-      entryStore.setPendingEntry(null);
       set({ state: 'idle', error: err.message || 'Processing failed' });
       showErrorToast('Something went wrong during processing.', err.message);
     }

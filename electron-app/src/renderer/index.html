@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; media-src 'self' blob:;" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; connect-src 'self' blob:;" />
     <title>IronMic</title>
   </head>
   <body>
@@ -18,38 +18,6 @@
       } catch {}
     </script>
     <div id="root"></div>
-    <!-- Global crash overlay — catches errors even if React dies -->
-    <div id="crash-overlay" style="display:none; position:fixed; inset:0; z-index:99999; background:#1a1a2e; color:#e0e0e0; font-family:monospace; padding:40px; overflow-y:auto;">
-      <h1 style="color:#ff6b6b; font-size:18px; margin:0 0 8px 0;">IronMic crashed</h1>
-      <p style="color:#888; font-size:12px; margin:0 0 16px 0;">The error below may help diagnose the issue. You can copy this text.</p>
-      <pre id="crash-details" style="background:#111; padding:16px; border-radius:8px; font-size:11px; line-height:1.6; white-space:pre-wrap; word-break:break-all; color:#ff9999; max-height:60vh; overflow-y:auto;"></pre>
-      <div style="margin-top:16px; display:flex; gap:8px;">
-        <button onclick="document.getElementById('crash-overlay').style.display='none'" style="padding:8px 16px; background:#333; color:#ddd; border:1px solid #555; border-radius:6px; font-size:12px; cursor:pointer;">Dismiss</button>
-        <button onclick="navigator.clipboard.writeText(document.getElementById('crash-details').textContent)" style="padding:8px 16px; background:#333; color:#ddd; border:1px solid #555; border-radius:6px; font-size:12px; cursor:pointer;">Copy Error</button>
-        <button onclick="location.reload()" style="padding:8px 16px; background:#1e6fff; color:#fff; border:none; border-radius:6px; font-size:12px; cursor:pointer;">Reload App</button>
-      </div>
-    </div>
-    <script>
-      // Global error handlers — catches everything including React crashes, module load failures, etc.
-      var crashLog = [];
-      function showCrash(msg) {
-        crashLog.push(new Date().toISOString() + ' ' + msg);
-        var overlay = document.getElementById('crash-overlay');
-        var details = document.getElementById('crash-details');
-        if (overlay && details) {
-          details.textContent = crashLog.join('\n\n');
-          overlay.style.display = 'block';
-        }
-      }
-      window.addEventListener('error', function(e) {
-        showCrash('[ERROR] ' + e.message + '\n  at ' + (e.filename || '?') + ':' + (e.lineno || '?') + ':' + (e.colno || '?') + (e.error && e.error.stack ? '\n\nStack:\n' + e.error.stack : ''));
-      });
-      window.addEventListener('unhandledrejection', function(e) {
-        var reason = e.reason;
-        var msg = reason instanceof Error ? reason.message + '\n\nStack:\n' + reason.stack : String(reason);
-        showCrash('[UNHANDLED REJECTION] ' + msg);
-      });
-    </script>
     <script type="module" src="./main.tsx"></script>
   </body>
 </html>

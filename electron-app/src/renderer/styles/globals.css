@@ -259,6 +259,24 @@
   content: attr(data-placeholder);
 }
 
+/* Hide the empty-doc placeholder while the live draft hypothesis is showing.
+ * Triggered by a class on the editor wrapper set from React state. */
+.has-draft-hypothesis .ProseMirror p.is-editor-empty:first-child::before {
+  content: none;
+}
+
+/* TTS read-back: highlights the currently-spoken word in place. Driven by
+ * TtsHighlightExtension which wraps the active word in an inline decoration.
+ * Color matches the Listen page / Timeline highlight (iron-accent blue) for
+ * visual consistency across the three TTS surfaces. */
+.ProseMirror .tts-active-word {
+  background-color: rgb(var(--iron-accent) / 0.2);
+  color: rgb(var(--iron-accent-light));
+  border-radius: 3px;
+  padding: 0 2px;
+  transition: background-color 80ms linear;
+}
+
 /* Headings */
 .ProseMirror h1 { font-size: 1.875rem; font-weight: 700; margin-bottom: 1rem; margin-top: 2rem; color: rgb(var(--iron-text)); line-height: 1.2; }
 .ProseMirror h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem; margin-top: 1.5rem; color: rgb(var(--iron-text)); line-height: 1.25; }
@@ -379,4 +397,165 @@
 .ProseMirror .selection,
 .ProseMirror *::selection {
   background: var(--iron-selection-bg);
+}
+
+/* ═══════════════════════════════════════════
+   .prose — rich-content containers rendered via dangerouslySetInnerHTML
+   (MeetingNotesPanel summary preview, MeetingDetailPage user-notes pane,
+   etc.). The codebase originally referenced Tailwind Typography's `prose`
+   classes but the plugin was never installed, so headings/lists/bold
+   appeared as flat text. These rules mirror the .ProseMirror styling
+   above so the side-panel preview matches the editor pane exactly.
+   ═══════════════════════════════════════════ */
+
+.prose h1 { font-size: 1.875rem; font-weight: 700; margin-bottom: 1rem; margin-top: 2rem; color: rgb(var(--iron-text)); line-height: 1.2; }
+.prose h2 { font-size: 1.5rem; font-weight: 700; margin-bottom: 0.75rem; margin-top: 1.5rem; color: rgb(var(--iron-text)); line-height: 1.25; }
+.prose h3 { font-size: 1.25rem; font-weight: 600; margin-bottom: 0.5rem; margin-top: 1.25rem; color: rgb(var(--iron-text)); line-height: 1.3; }
+.prose h1:first-child,
+.prose h2:first-child,
+.prose h3:first-child { margin-top: 0; }
+
+.prose p { margin-bottom: 0.75rem; line-height: 1.75; }
+.prose strong { font-weight: 700; color: rgb(var(--iron-text)); }
+.prose em { font-style: italic; }
+.prose u { text-decoration: underline; text-underline-offset: 3px; }
+.prose s { text-decoration: line-through; color: var(--iron-strikethrough); }
+
+.prose a {
+  color: var(--iron-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.prose a:hover { color: var(--iron-link-hover); }
+
+.prose ul { list-style-type: disc; padding-left: 1.5rem; margin-bottom: 0.75rem; }
+.prose ol { list-style-type: decimal; padding-left: 1.5rem; margin-bottom: 0.75rem; }
+.prose li { margin-bottom: 0.25rem; line-height: 1.7; }
+.prose li p { margin-bottom: 0; }
+
+.prose ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0;
+}
+.prose ul[data-type="taskList"] li {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.prose ul[data-type="taskList"] li[data-checked="true"] > p {
+  text-decoration: line-through;
+  color: var(--iron-task-checked);
+}
+
+.prose blockquote {
+  border-left: 3px solid var(--iron-blockquote-border);
+  padding-left: 16px;
+  margin: 16px 0;
+  color: var(--iron-blockquote-text);
+  font-style: italic;
+}
+
+.prose code {
+  background: var(--iron-code-bg);
+  border: 1px solid var(--iron-code-border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 0.875em;
+  color: var(--iron-code-color);
+}
+
+.prose pre {
+  background: var(--iron-pre-bg);
+  border: 1px solid var(--iron-pre-border);
+  border-radius: 8px;
+  padding: 16px;
+  margin: 16px 0;
+  overflow-x: auto;
+}
+.prose pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--iron-pre-text);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.prose hr {
+  border: none;
+  border-top: 1px solid var(--iron-hr);
+  margin: 24px 0;
+}
+
+.prose mark {
+  background: var(--iron-highlight);
+  border-radius: 2px;
+  padding: 1px 2px;
+  color: inherit;
+}
+
+/* Tables — meeting-summary action items render as | Owner | Item | Due | */
+.prose table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+  font-size: 0.9em;
+}
+.prose th, .prose td {
+  border: 1px solid var(--iron-border, rgba(0,0,0,0.15));
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+}
+.prose thead th {
+  background: var(--iron-surface, rgba(0,0,0,0.04));
+  font-weight: 600;
+  color: rgb(var(--iron-text));
+}
+
+/* Same table rules apply inside .ProseMirror so the editor matches the
+   prose-rendered side panel. Defined here (one place) instead of duplicating
+   above because the .ProseMirror block above predates table support. */
+.ProseMirror table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+  font-size: 0.9em;
+}
+.ProseMirror th, .ProseMirror td {
+  border: 1px solid var(--iron-border, rgba(0,0,0,0.15));
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  position: relative;
+}
+.ProseMirror thead th {
+  background: var(--iron-surface, rgba(0,0,0,0.04));
+  font-weight: 600;
+  color: rgb(var(--iron-text));
+}
+
+/* ── AI Chat dictation overlay colors ─────────────────────────────────────────
+   Committed (finalized) and draft (in-flight hypothesis) text painted over the
+   textarea. Intentionally matches the Forge bar's forge-preview-* palette so
+   both surfaces feel consistent.
+   Light mode: near-black committed, medium-grey draft.
+   Dark mode:  near-white committed, clearly-visible-but-softer draft.          */
+.ai-chat-dictation-committed {
+  color: rgba(0, 0, 0, 0.86);
+}
+.ai-chat-dictation-draft {
+  color: rgba(0, 0, 0, 0.50);
+  font-style: italic;
+}
+.dark .ai-chat-dictation-committed {
+  color: rgba(255, 255, 255, 0.92);
+}
+.dark .ai-chat-dictation-draft {
+  color: rgba(255, 255, 255, 0.65);
+  font-style: italic;
 }

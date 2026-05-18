@@ -18,11 +18,14 @@ import https from 'https';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { pipeline } from 'stream/promises';
 import { BrowserWindow, net, session, dialog } from 'electron';
-import { execSync } from 'child_process';
+import { execSync, spawnSync } from 'child_process';
 import {
   MODEL_URLS, MODEL_FALLBACK_URLS, MODEL_FILES, MODEL_CHECKSUMS,
-  MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS, TFJS_MODELS,
+  MODEL_PARTS, MODELS_BASE_URL, TTS_VOICE_IDS, TTS_VOICES, TtsVoiceMeta,
+  KOKORO_DEFAULT_VOICE_ID, KOKORO_ONNX_SHA256, getEspeakInstallHint,
+  TFJS_MODELS, TRANSCRIPTION_ENGINES,
 } from '../shared/constants';
 
 /**
@@ -76,17 +79,16 @@ function resolveProxyUrl(): string | null {
 
 /**
  * Configure Electron's session proxy for net.request calls.
- * Must be called before downloads when proxy is configured.
+ * Only touches the session when a proxy is explicitly configured by the user
+ * or the environment — calling setProxy({mode:'system'}) unconditionally can
+ * stall for many seconds on Windows boxes that rely on WPAD auto-detection
+ * and have no proxy, which looks to users like the download is broken.
  */
 async function applySessionProxy(): Promise<void> {
   const proxyUrl = resolveProxyUrl();
-  if (proxyUrl) {
-    console.log(`[model-downloader] Configuring proxy: ${proxyUrl}`);
-    await session.defaultSession.setProxy({ proxyRules: proxyUrl });
-  } else {
-    // Use system proxy detection (Electron/Chromium auto-detects PAC, WPAD, etc.)
-    await session.defaultSession.setProxy({ mode: 'system' });
-  }
+  if (!proxyUrl) return;
+  console.log(`[model-downloader] Configuring proxy: ${proxyUrl}`);
+  await session.defaultSession.setProxy({ proxyRules: proxyUrl });
 }
 
 /** Max retries before falling back to HuggingFace */
@@ -119,26 +121,184 @@ export function getModelsStatus() {
   return result;
 }
 
-export function isTtsModelReady(): boolean {
-  if (!isModelDownloaded('tts-model')) return false;
+/**
+ * Check whether all model files required by a transcription engine are present.
+ *
+ * Moonshine engines need three files (encoder + decoder + tokenizer); Whisper
+ * engines need one. Returns false on the first missing file; the UI can use
+ * this to gate the engine selector dropdown ("Download required" badge).
+ */
+export function isTranscriptionEngineReady(engineId: string): boolean {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta) return false;
+  return meta.modelFileKeys.every((key) => isModelDownloaded(key));
+}
+
+/**
+ * Download every file required by a transcription engine, sequentially.
+ *
+ * For Moonshine variants, this fetches encoder + decoder + tokenizer into
+ * `models/<engine-id>/`. Idempotent — already-downloaded files are skipped.
+ * Throws on the first failure.
+ */
+export async function downloadTranscriptionEngine(
+  engineId: string,
+  window: BrowserWindow | null,
+): Promise<void> {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta) {
+    throw new Error(`Unknown transcription engine: ${engineId}`);
+  }
+  let anyDownloaded = false;
+  for (const key of meta.modelFileKeys) {
+    if (isModelDownloaded(key)) {
+      console.log(`[model-downloader] ${key} already present, skipping`);
+      continue;
+    }
+    anyDownloaded = true;
+    console.log(`[model-downloader] Downloading ${key} for engine '${engineId}'`);
+    await downloadModel(key, window);
+  }
+  console.log(`[model-downloader] Engine '${engineId}' fully downloaded`);
+  // If all files were already present (no actual download happened), the
+  // per-file progress events were never sent — so send a synthetic 'complete'
+  // now so the renderer's progress listener fires and refreshes model state.
+  if (!anyDownloaded && window && !window.isDestroyed()) {
+    window.webContents.send('ironmic:model-download-progress', {
+      model: engineId,
+      downloaded: 1,
+      total: 1,
+      status: 'complete',
+      percent: 100,
+    });
+  }
+}
+
+/**
+ * Structured readiness for the Kokoro TTS pipeline. `ready` requires only the
+ * model + default voice + espeak-ng so the engine can synthesize at all; the
+ * other fields let Settings distinguish "ready with fallback" from "all
+ * selected voices installed" and surface precise repair steps.
+ */
+export interface TtsReadiness {
+  ready: boolean;
+  modelPresent: boolean;
+  voicesPresent: boolean;        // af_heart.bin specifically
+  selectedVoicePresent: boolean; // current `tts_voice` setting (af_heart by default)
+  selectedVoiceId: string;
+  missingVoices: string[];       // voice IDs from TTS_VOICES absent on disk
+  espeakAvailable: boolean;
+  espeakHint: string | null;     // platform install hint when not available
+  modelPath: string;
+  voicesDir: string;
+}
+
+let cachedEspeakAvailable: boolean | null = null;
+
+/** Reset the cached espeak probe — call after a successful Repair so a freshly
+ *  installed espeak-ng is picked up without an app restart. */
+export function invalidateEspeakCache(): void {
+  cachedEspeakAvailable = null;
+}
+
+/**
+ * Cross-platform check for espeak-ng on PATH.
+ * Packaged Electron apps don't inherit the user's login-shell PATH, so the
+ * env-hydration step prepends common Homebrew/local-bin locations on macOS
+ * and explicitly probes the default install dir on Windows.
+ */
+function checkEspeakAvailable(): boolean {
+  if (cachedEspeakAvailable !== null) return cachedEspeakAvailable;
+
+  const hydratedPath = (() => {
+    const current = process.env.PATH || '';
+    if (process.platform === 'darwin') {
+      const macExtra = ['/opt/homebrew/bin', '/usr/local/bin'].filter(p => !current.split(':').includes(p));
+      return macExtra.length ? `${macExtra.join(':')}:${current}` : current;
+    }
+    return current;
+  })();
+
+  try {
+    const result = spawnSync('espeak-ng', ['--version'], {
+      env: { ...process.env, PATH: hydratedPath },
+      timeout: 3000,
+    });
+    if (result.status === 0) {
+      cachedEspeakAvailable = true;
+      return true;
+    }
+  } catch { /* spawn failed entirely — fall through */ }
+
+  // Windows fallback: probe the default installer location directly.
+  if (process.platform === 'win32') {
+    const programFiles = process.env['ProgramFiles'] || 'C:\\Program Files';
+    const candidate = path.join(programFiles, 'eSpeak NG', 'espeak-ng.exe');
+    if (fs.existsSync(candidate)) {
+      cachedEspeakAvailable = true;
+      return true;
+    }
+  }
+
+  cachedEspeakAvailable = false;
+  return false;
+}
+
+/**
+ * Get current TTS readiness. Synchronous and side-effect-free aside from the
+ * cached espeak probe — safe to call from any IPC handler or store hook.
+ */
+export function getTtsReadiness(selectedVoiceId?: string): TtsReadiness {
   const voicesDir = path.join(resolveModelsDir(), 'voices');
-  const defaultVoice = path.join(voicesDir, 'af_heart.bin');
-  return fs.existsSync(defaultVoice);
+  const modelPath = getModelPath('tts-model');
+  const modelPresent = fs.existsSync(modelPath);
+  const voicesPresent = fs.existsSync(path.join(voicesDir, `${KOKORO_DEFAULT_VOICE_ID}.bin`));
+
+  const missingVoices = TTS_VOICES
+    .filter(v => !fs.existsSync(path.join(voicesDir, `${v.id}.bin`)))
+    .map(v => v.id);
+
+  const selected = (selectedVoiceId && selectedVoiceId.trim()) || KOKORO_DEFAULT_VOICE_ID;
+  const selectedVoicePresent = fs.existsSync(path.join(voicesDir, `${selected}.bin`));
+
+  const espeakAvailable = checkEspeakAvailable();
+
+  return {
+    ready: modelPresent && voicesPresent && espeakAvailable,
+    modelPresent,
+    voicesPresent,
+    selectedVoicePresent,
+    selectedVoiceId: selected,
+    missingVoices,
+    espeakAvailable,
+    espeakHint: espeakAvailable ? null : getEspeakInstallHint(),
+    modelPath,
+    voicesDir,
+  };
+}
+
+/**
+ * Thin compatibility wrapper for legacy call sites. Prefer getTtsReadiness().
+ * @deprecated Use getTtsReadiness() and inspect the structured fields.
+ */
+export function isTtsModelReady(): boolean {
+  return getTtsReadiness().ready;
 }
 
 /**
  * Ensure bundled TTS voices are copied to the models directory.
  * Voices are bundled in the installer at process.resourcesPath/models/voices/.
- * In production, we copy them to userData/models/voices/ on first launch.
+ * On first launch we copy them into userData/models/voices/.
+ *
+ * Synchronous, bundled-copy ONLY — never makes network requests. The download
+ * fallback lives in repairTtsVoices() which is invoked only by user action.
  */
 export function ensureBundledVoices(): void {
   const destVoicesDir = path.join(resolveModelsDir(), 'voices');
-  const defaultVoice = path.join(destVoicesDir, 'af_heart.bin');
+  const defaultVoice = path.join(destVoicesDir, `${KOKORO_DEFAULT_VOICE_ID}.bin`);
 
-  // Already copied
   if (fs.existsSync(defaultVoice)) return;
 
-  // In production, voices are bundled in resources
   if (process.resourcesPath) {
     const bundledDir = path.join(process.resourcesPath, 'models', 'voices');
     if (fs.existsSync(bundledDir)) {
@@ -154,6 +314,350 @@ export function ensureBundledVoices(): void {
       console.log(`[model-downloader] Copied ${files.length} bundled voices`);
     }
   }
+}
+
+/**
+ * Download or cross-copy any TTS voices missing from the active models dir.
+ *
+ * Order of attempts per voice:
+ *  1. Bundled copy — already handled by ensureBundledVoices() at startup.
+ *  2. Cross-copy from the userData voices dir (covers dev clones where the
+ *     developer has run a packaged build on the same machine).
+ *  3. Atomic download from Hugging Face with SHA-256 + size verification.
+ *
+ * Atomic per voice: each file lands at `voicesDir/<id>.bin.tmp`, gets hashed,
+ * size-checked, and renamed only on full success. Partial/corrupt downloads
+ * never replace a working voice file. Emits per-voice progress events on
+ * `'ironmic:tts-voices-progress'` so Settings can show a per-voice bar.
+ *
+ * Privacy: this is the ONLY TTS asset path that touches the network, and it
+ * is invoked only from downloadTtsModel (Settings → Repair) — never at
+ * startup, never from import handlers.
+ */
+export async function repairTtsVoices(
+  window: BrowserWindow | null,
+): Promise<{ source: 'noop' | 'userData-crosscopy' | 'downloaded' | 'mixed'; downloaded: string[]; crossCopied: string[] }> {
+  const voicesDir = path.join(resolveModelsDir(), 'voices');
+  fs.mkdirSync(voicesDir, { recursive: true });
+
+  const sendProgress = (payload: {
+    id: string;
+    downloaded: number;
+    total: number;
+    status: 'downloading' | 'verifying' | 'verified' | 'error' | 'complete';
+    error?: string;
+  }) => {
+    if (window && !window.isDestroyed()) {
+      window.webContents.send('ironmic:tts-voices-progress', payload);
+    }
+  };
+
+  // Userdata cross-copy source for dev mode (when IRONMIC_MODELS_DIR points at
+  // rust-core/models/ but the user has run a packaged build that copied voices
+  // into ~/Library/Application Support/IronMic/models/voices/).
+  function userDataVoicesDir(): string | null {
+    const fromEnv = process.env.IRONMIC_MODELS_DIR;
+    if (process.platform === 'darwin') {
+      const home = process.env.HOME;
+      if (!home) return null;
+      const candidate = path.join(home, 'Library', 'Application Support', 'IronMic', 'models', 'voices');
+      if (candidate === path.join(fromEnv || '', 'voices')) return null;
+      return fs.existsSync(candidate) ? candidate : null;
+    }
+    if (process.platform === 'win32') {
+      const appData = process.env.APPDATA;
+      if (!appData) return null;
+      const candidate = path.join(appData, 'IronMic', 'models', 'voices');
+      if (candidate === path.join(fromEnv || '', 'voices')) return null;
+      return fs.existsSync(candidate) ? candidate : null;
+    }
+    const home = process.env.HOME;
+    if (!home) return null;
+    const candidate = path.join(home, '.config', 'IronMic', 'models', 'voices');
+    if (candidate === path.join(fromEnv || '', 'voices')) return null;
+    return fs.existsSync(candidate) ? candidate : null;
+  }
+
+  const crossCopySrc = userDataVoicesDir();
+  const downloaded: string[] = [];
+  const crossCopied: string[] = [];
+
+  for (const voice of TTS_VOICES) {
+    const destPath = path.join(voicesDir, `${voice.id}.bin`);
+
+    // Already present + correct size? Skip silently.
+    if (fs.existsSync(destPath)) {
+      try {
+        if (fs.statSync(destPath).size === voice.sizeBytes) continue;
+        fs.unlinkSync(destPath);
+      } catch { /* fall through to re-acquire */ }
+    }
+
+    // 1. Cross-copy from userData if available.
+    if (crossCopySrc) {
+      const src = path.join(crossCopySrc, `${voice.id}.bin`);
+      if (fs.existsSync(src)) {
+        try {
+          const stats = fs.statSync(src);
+          if (stats.size === voice.sizeBytes) {
+            fs.copyFileSync(src, destPath);
+            crossCopied.push(voice.id);
+            sendProgress({ id: voice.id, downloaded: voice.sizeBytes, total: voice.sizeBytes, status: 'complete' });
+            continue;
+          }
+        } catch { /* fall through to download */ }
+      }
+    }
+
+    // 2. Download from Hugging Face — atomic with SHA-256 verify.
+    const tmpPath = `${destPath}.tmp`;
+    try {
+      sendProgress({ id: voice.id, downloaded: 0, total: voice.sizeBytes, status: 'downloading' });
+      await downloadFile(
+        voice.url,
+        tmpPath,
+        (down, total, status) => {
+          if (status === 'downloading') {
+            sendProgress({ id: voice.id, downloaded: down, total: total || voice.sizeBytes, status: 'downloading' });
+          }
+        },
+      );
+
+      sendProgress({ id: voice.id, downloaded: voice.sizeBytes, total: voice.sizeBytes, status: 'verifying' });
+      const tmpStat = fs.statSync(tmpPath);
+      if (tmpStat.size !== voice.sizeBytes) {
+        throw new Error(`Size mismatch: expected ${voice.sizeBytes} bytes, got ${tmpStat.size}`);
+      }
+      const actualHash = await hashFile(tmpPath);
+      if (actualHash !== voice.sha256) {
+        throw new Error(`SHA-256 mismatch: expected ${voice.sha256}, got ${actualHash}`);
+      }
+
+      fs.renameSync(tmpPath, destPath);
+      downloaded.push(voice.id);
+      sendProgress({ id: voice.id, downloaded: voice.sizeBytes, total: voice.sizeBytes, status: 'verified' });
+      sendProgress({ id: voice.id, downloaded: voice.sizeBytes, total: voice.sizeBytes, status: 'complete' });
+    } catch (err: any) {
+      cleanupTemp(tmpPath);
+      const message = err?.message || String(err);
+      console.error(`[model-downloader] Voice ${voice.id} failed: ${message}`);
+      sendProgress({ id: voice.id, downloaded: 0, total: voice.sizeBytes, status: 'error', error: message });
+      throw new Error(`Failed to acquire TTS voice '${voice.id}': ${message}`);
+    }
+  }
+
+  if (downloaded.length === 0 && crossCopied.length === 0) {
+    return { source: 'noop', downloaded, crossCopied };
+  }
+  if (downloaded.length === 0) return { source: 'userData-crosscopy', downloaded, crossCopied };
+  if (crossCopied.length === 0) return { source: 'downloaded', downloaded, crossCopied };
+  return { source: 'mixed', downloaded, crossCopied };
+}
+
+/**
+ * Status returned by {@link ensureBundledMoonshineBase}. The values are
+ * stable strings so the main process can log a single line and the UI
+ * (renderer) can branch on them later without re-deriving state.
+ */
+export type MoonshineBundleStatus =
+  | 'copied'             // user-data was missing/incomplete; freshly copied from resources
+  | 'already-present'    // all 3 files exist in user-data and are non-empty
+  | 'incomplete-bundle'  // resources/models/moonshine-base exists but is missing files
+  | 'bundle-missing';    // dev mode or unpackaged run — no bundled directory at all
+
+export type BundledLlmStatus =
+  | 'copied'          // model copied from app resources to user-data
+  | 'already-present' // model exists in user-data and is non-empty (≥ 1.2 GB)
+  | 'source-missing'; // no bundled copy (dev mode or unpackaged) — user must download
+
+const BUNDLED_LLM_FILENAME = 'Phi-3-mini-4k-instruct-Q2_K.gguf';
+const BUNDLED_LLM_MIN_BYTES = 1_200_000_000;
+
+/**
+ * Ensure the bundled Phi-3 Mini Q2_K model is copied to the models directory.
+ *
+ * Phi-3 Mini Q2_K ships with the installer (electron-builder.config.js
+ * extraResources). On first launch we copy it from process.resourcesPath/models/
+ * to the writable userData models dir so the LLM subprocess can open it.
+ *
+ * Size-aware: a file present but smaller than 1.2 GB is treated as corrupted
+ * and re-copied. This catches partial writes from interrupted installs.
+ */
+export function ensureBundledLlm(): BundledLlmStatus {
+  const destPath = path.join(resolveModelsDir(), BUNDLED_LLM_FILENAME);
+
+  // Check if a valid copy already exists in user-data.
+  if (fs.existsSync(destPath)) {
+    try {
+      if (fs.statSync(destPath).size >= BUNDLED_LLM_MIN_BYTES) return 'already-present';
+    } catch { /* fall through to re-copy */ }
+    // File exists but too small — remove the corrupted copy before re-copying.
+    try { fs.unlinkSync(destPath); } catch { /* ignore */ }
+  }
+
+  // Dev mode: no resourcesPath, model lives in rust-core/models directly.
+  if (!process.resourcesPath) return 'source-missing';
+
+  const srcPath = path.join(process.resourcesPath, 'models', BUNDLED_LLM_FILENAME);
+  if (!fs.existsSync(srcPath)) return 'source-missing';
+  try {
+    if (fs.statSync(srcPath).size < BUNDLED_LLM_MIN_BYTES) return 'source-missing';
+  } catch { return 'source-missing'; }
+
+  fs.mkdirSync(resolveModelsDir(), { recursive: true });
+  fs.copyFileSync(srcPath, destPath);
+  console.log(`[model-downloader] Copied bundled Phi-3 Mini Q2_K to ${destPath}`);
+  return 'copied';
+}
+
+const MOONSHINE_FILES = ['encoder_model.onnx', 'decoder_model_merged.onnx', 'tokenizer.json'];
+
+function allFilesPresent(dir: string): boolean {
+  for (const f of MOONSHINE_FILES) {
+    const p = path.join(dir, f);
+    if (!fs.existsSync(p)) return false;
+    try {
+      if (fs.statSync(p).size === 0) return false;
+    } catch {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Ensure bundled Moonshine Base ONNX files are copied to the models directory.
+ *
+ * Moonshine Base is the default transcription engine and ships with the
+ * installer (see electron-builder.config.js extraResources). On first launch
+ * we copy the three files from process.resourcesPath/models/moonshine-base/
+ * to the writable userData models dir so the Rust loader (which reads from
+ * IRONMIC_MODELS_DIR) can open them.
+ *
+ * Idempotent and re-entrant: returns a {@link MoonshineBundleStatus} so the
+ * caller can log exactly what happened. Verifies *all three* files are present
+ * and non-empty in user data; checking only the decoder sentinel hid partial
+ * directories that then failed at engine load time.
+ */
+export function ensureBundledMoonshineBase(): MoonshineBundleStatus {
+  const destDir = path.join(resolveModelsDir(), 'moonshine-base');
+  if (allFilesPresent(destDir)) return 'already-present';
+
+  // Dev mode: no resourcesPath, files come from rust-core/models directly.
+  if (!process.resourcesPath) return 'bundle-missing';
+
+  const bundledDir = path.join(process.resourcesPath, 'models', 'moonshine-base');
+  if (!fs.existsSync(bundledDir)) return 'bundle-missing';
+  if (!allFilesPresent(bundledDir)) return 'incomplete-bundle';
+
+  fs.mkdirSync(destDir, { recursive: true });
+  let copied = 0;
+  for (const file of MOONSHINE_FILES) {
+    const src = path.join(bundledDir, file);
+    const dest = path.join(destDir, file);
+    // Re-copy if missing OR present-but-empty (covers a previous half-write).
+    let needsCopy = !fs.existsSync(dest);
+    if (!needsCopy) {
+      try { needsCopy = fs.statSync(dest).size === 0; } catch { needsCopy = true; }
+    }
+    if (!needsCopy) continue;
+    fs.copyFileSync(src, dest);
+    copied += 1;
+  }
+  if (copied > 0) {
+    console.log(`[model-downloader] Copied ${copied} bundled Moonshine Base files to ${destDir}`);
+  }
+  return 'copied';
+}
+
+/**
+ * Filename of the WeSpeaker ResNet34 speaker-embedding ONNX. Mirrors
+ * `MODEL_FILENAME` in `rust-core/src/speaker/wespeaker.rs`. The upstream
+ * Hugging Face repo `hbredin/wespeaker-voxceleb-resnet34-LM` publishes
+ * the ONNX as `speaker-embedding.onnx` (not the WeSpeaker upstream's
+ * `voxceleb_resnet34_LM.onnx`); keeping the bundled filename identical
+ * means no rename on copy.
+ */
+const WESPEAKER_FILENAME = 'speaker-embedding.onnx';
+
+/**
+ * Status of the WeSpeaker first-launch copy. Mirrors
+ * {@link MoonshineBundleStatus} so the caller can branch on the same shape.
+ */
+export type WeSpeakerBundleStatus =
+  | 'already-present'
+  | 'copied'
+  | 'bundle-missing';
+
+/**
+ * Mirror of `ensureBundledMoonshineBase` for the speaker-embedding ONNX.
+ * On packaged builds copies `voxceleb_resnet34_LM.onnx` from
+ * `process.resourcesPath/models/speaker-embedding/` into the writable
+ * user-data models dir on first launch — same offline-safe path the
+ * Moonshine bundle uses.
+ *
+ * Returns `'bundle-missing'` in dev mode (no resourcesPath) and on
+ * packaged builds that did not ship the ONNX (the electron-builder glob
+ * filter `*.onnx` silently skips when the file is absent, so this is the
+ * expected path until the maintainer downloads the artifact). The
+ * meeting recorder then falls through to the legacy text-LLM diarization
+ * at meeting stop, and the M2.5b readiness check keeps
+ * `meeting_diarization_mode = 'off'`.
+ */
+export function ensureBundledWeSpeaker(): WeSpeakerBundleStatus {
+  const destDir = path.join(resolveModelsDir(), 'speaker-embedding');
+  const destFile = path.join(destDir, WESPEAKER_FILENAME);
+  if (fs.existsSync(destFile)) {
+    try {
+      if (fs.statSync(destFile).size > 0) return 'already-present';
+    } catch { /* fall through to re-copy */ }
+  }
+
+  if (!process.resourcesPath) return 'bundle-missing';
+
+  const bundledDir = path.join(
+    process.resourcesPath,
+    'models',
+    'speaker-embedding',
+  );
+  const bundledFile = path.join(bundledDir, WESPEAKER_FILENAME);
+  if (!fs.existsSync(bundledFile)) return 'bundle-missing';
+  try {
+    if (fs.statSync(bundledFile).size === 0) return 'bundle-missing';
+  } catch {
+    return 'bundle-missing';
+  }
+
+  fs.mkdirSync(destDir, { recursive: true });
+  fs.copyFileSync(bundledFile, destFile);
+  console.log(
+    `[model-downloader] Copied bundled WeSpeaker model to ${destFile}`,
+  );
+
+  // Also copy the LICENSE / model-card alongside if present, so the
+  // user-data dir carries the attribution required by CC-BY 4.0.
+  for (const aux of ['LICENSE', 'LICENSE.txt', 'README.md']) {
+    const srcAux = path.join(bundledDir, aux);
+    const destAux = path.join(destDir, aux);
+    if (fs.existsSync(srcAux) && !fs.existsSync(destAux)) {
+      try { fs.copyFileSync(srcAux, destAux); } catch { /* best-effort */ }
+    }
+  }
+
+  return 'copied';
+}
+
+/**
+ * True when the packaged app shipped with all 3 Moonshine Base files in
+ * `process.resourcesPath/models/moonshine-base/`. False in dev mode and on
+ * installers that lost their bundled copy. The renderer uses this to decide
+ * whether "Delete" should read "Restore bundled copy" instead.
+ */
+export function isMoonshineBundleAvailable(): boolean {
+  if (!process.resourcesPath) return false;
+  const bundledDir = path.join(process.resourcesPath, 'models', 'moonshine-base');
+  if (!fs.existsSync(bundledDir)) return false;
+  return allFilesPresent(bundledDir);
 }
 
 /** Validate a URL is HTTPS and points to an allowed domain */
@@ -607,7 +1111,12 @@ export async function downloadModel(
     const expectedHash = MODEL_CHECKSUMS[model];
     const fallbackUrl = MODEL_FALLBACK_URLS[model];
 
+    // Ensure both the models root and the *parent dir of destPath* exist.
+    // The latter matters for models like Moonshine that live in a
+    // subdirectory (e.g. `moonshine-base/encoder_model.onnx`) — without
+    // this, createWriteStream throws ENOENT on the missing subdir.
     fs.mkdirSync(resolveModelsDir(), { recursive: true });
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
 
     console.log(`[model-downloader] Starting download: ${model}`);
     console.log(`[model-downloader] Destination: ${destPath}`);
@@ -645,17 +1154,23 @@ export async function downloadModel(
 }
 
 /**
- * Download TTS model (ONNX). Voices are bundled in the installer.
+ * Download / repair the full TTS asset set.
+ *
+ * Steps (idempotent):
+ *  1. Copy any bundled voices that haven't been copied yet (no network).
+ *  2. Repair missing voices via cross-copy from userData or HF download.
+ *  3. Download the Kokoro ONNX if not present.
+ *
+ * Invoked only when the user explicitly clicks "Repair TTS" or
+ * "Download TTS model" in Settings — never at startup.
  */
 export async function downloadTtsModel(window: BrowserWindow | null): Promise<void> {
-  // Ensure bundled voices are in place
   ensureBundledVoices();
+  await repairTtsVoices(window);
 
-  // Download the ONNX model if not present
   if (!isModelDownloaded('tts-model')) {
     await downloadModel('tts-model', window);
   } else {
-    // Already downloaded, signal complete
     if (window && !window.isDestroyed()) {
       window.webContents.send('ironmic:model-download-progress', {
         model: 'tts-model', downloaded: 1, total: 1, status: 'complete', percent: 100,
@@ -799,7 +1314,8 @@ const IMPORTABLE_FILES: Record<string, { modelId: string; label: string; downloa
   'mistral-7b-instruct-v0.2.Q4_K_M.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
   'mistral-7b-instruct-q4_k_m.gguf': { modelId: 'llm', label: 'Mistral 7B Instruct Q4', downloadUrl: 'https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf' },
   'Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf': { modelId: 'llm-chat-llama3', label: 'Llama 3.1 8B Instruct', downloadUrl: 'https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf' },
-  'Phi-3-mini-4k-instruct-q4.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini', downloadUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf' },
+  'Phi-3-mini-4k-instruct-Q2_K.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini (Q2_K — bundled default)', downloadUrl: 'https://huggingface.co/bartowski/Phi-3-mini-4k-instruct-GGUF/resolve/main/Phi-3-mini-4k-instruct-Q2_K.gguf' },
+  'Phi-3-mini-4k-instruct-q4.gguf': { modelId: 'llm-chat-phi3', label: 'Phi-3 Mini (Q4)', downloadUrl: 'https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf' },
   // TTS — single file on GitHub Releases
   'kokoro-v1.0-fp16.onnx': { modelId: 'tts-model', label: 'Kokoro 82M TTS', downloadUrl: `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx` },
   'model_fp16.onnx': { modelId: 'tts-model', label: 'Kokoro 82M TTS', downloadUrl: `${MODELS_BASE_URL}/kokoro-v1.0-fp16.onnx` },
@@ -814,6 +1330,65 @@ interface ImportableModelInfo {
   downloaded: boolean;
   /** If the model is multi-part on GitHub, these are the individual part URLs */
   parts?: { filename: string; url: string }[];
+  /**
+   * Marks Moonshine engines, which import as a *set* of 3 files (encoder +
+   * decoder + tokenizer) rather than a single file or numeric .partN chunks.
+   * The renderer routes these to importMoonshineEngine() instead of the
+   * generic single/multi-part import.
+   */
+  isMoonshine?: boolean;
+}
+
+/**
+ * True when `filename` matches one of the known Kokoro ONNX keys in
+ * IMPORTABLE_FILES. Used by the import paths as the fast-accept gate before
+ * falling back to hash and structural checks.
+ */
+export function isKokoroOnnxFilename(filename: string): boolean {
+  const entry = IMPORTABLE_FILES[filename];
+  return !!entry && entry.modelId === 'tts-model';
+}
+
+/**
+ * Layered validation for an `.onnx` file claimed to be a Kokoro TTS model.
+ *
+ *   1. Fast accept on filename match.
+ *   2. Hash accept on SHA-256 match against the canonical Kokoro hash.
+ *   3. Structural validate via the dedicated napi export — opens a one-shot
+ *      ort::Session in Rust without touching the global TTS_ENGINE.
+ *
+ * Throws with a consistent rejection message on miss across all three layers.
+ * Never mutates the live model directory; callers handle the rename.
+ */
+async function validateKokoroOnnx(sourcePath: string): Promise<{ acceptedBy: 'filename' | 'hash' | 'structural' }> {
+  const sourceFilename = path.basename(sourcePath);
+  if (isKokoroOnnxFilename(sourceFilename)) return { acceptedBy: 'filename' };
+
+  // Hash check — bail fast for tiny stub files.
+  const stats = fs.statSync(sourcePath);
+  if (stats.size >= 1024 * 1024) {
+    const sha = await hashFile(sourcePath);
+    if (sha === KOKORO_ONNX_SHA256) return { acceptedBy: 'hash' };
+  }
+
+  // Structural validate via the Rust addon. Lazy require because the addon
+  // pulls in heavy native deps and this module is imported from many places.
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { native } = require('./native-bridge');
+    if (native?.addon?.ttsValidateModelFile) {
+      native.addon.ttsValidateModelFile(sourcePath);
+      return { acceptedBy: 'structural' };
+    }
+  } catch (err: any) {
+    throw new Error(
+      `This doesn't look like a Kokoro TTS model. ${err?.message || err || 'Structural validation failed.'}`
+    );
+  }
+
+  throw new Error(
+    "This doesn't look like a Kokoro TTS model. Expected kokoro-v1.0-fp16.onnx (or a renamed copy with matching contents)."
+  );
 }
 
 /** Get the list of importable models with their download URLs (for UI display) */
@@ -849,6 +1424,29 @@ export function getImportableModels(): ImportableModelInfo[] {
       parts,
     });
   }
+
+  // Moonshine engines aren't in IMPORTABLE_FILES because each engine ships as
+  // 3 separate files (encoder + decoder + tokenizer). Surface them here with
+  // parts[] populated so the UI can render the 3 download links and route to
+  // the dedicated importMoonshineEngine() handler.
+  for (const meta of TRANSCRIPTION_ENGINES) {
+    if (meta.family !== 'moonshine') continue;
+    const downloaded = isTranscriptionEngineReady(meta.id);
+    const parts = meta.modelFileKeys.map((key) => ({
+      filename: MODEL_FILES[key] ?? key,
+      url: MODEL_URLS[key] ?? '',
+    }));
+    result.push({
+      modelId: meta.id,
+      label: meta.label,
+      filename: `${meta.id}/ (3 files)`,
+      downloadUrl: '',
+      downloaded,
+      parts,
+      isMoonshine: true,
+    });
+  }
+
   return result;
 }
 
@@ -878,13 +1476,23 @@ export async function importModelFile(
 
   const sourcePath = result.filePaths[0];
   const sourceFilename = path.basename(sourcePath);
+  const ext = path.extname(sourceFilename).toLowerCase();
 
   // Try to match the filename to a known model
   const match = IMPORTABLE_FILES[sourceFilename];
   if (!match) {
-    // Try fuzzy matching — check if filename contains a known pattern
+    // For .onnx files, route through layered Kokoro validation instead of
+    // accepting any unknown ONNX as a TTS model — that previously let arbitrary
+    // ONNX files clobber the canonical kokoro-v1.0-fp16.onnx path.
+    if (ext === '.onnx') {
+      await validateKokoroOnnx(sourcePath);
+      return await copyModelFile(sourcePath, 'tts-model', 'Kokoro 82M TTS');
+    }
+
+    // Try fuzzy matching for non-ONNX formats — check if filename contains a known pattern
     let fuzzyMatch: { modelId: string; label: string; downloadUrl: string } | null = null;
     for (const [knownFile, info] of Object.entries(IMPORTABLE_FILES)) {
+      if (info.modelId === 'tts-model') continue; // ONNX path handled above
       if (sourceFilename.toLowerCase().includes(knownFile.toLowerCase().replace(/\.[^.]+$/, ''))) {
         fuzzyMatch = info;
         break;
@@ -899,6 +1507,12 @@ export async function importModelFile(
     return await copyModelFile(sourcePath, fuzzyMatch.modelId, fuzzyMatch.label);
   }
 
+  if (match.modelId === 'tts-model') {
+    // Even named-canonically files get the structural sanity check — protects
+    // against name collisions where a non-Kokoro .onnx happens to share the
+    // canonical filename. validateKokoroOnnx fast-accepts the real one.
+    await validateKokoroOnnx(sourcePath);
+  }
   return await copyModelFile(sourcePath, match.modelId, match.label);
 }
 
@@ -917,22 +1531,35 @@ async function copyModelFile(
 
   const destPath = path.join(modelsDir, destFilename);
 
+  // Same-source guard: piping a file onto itself truncates the source mid-read.
+  // When the user re-imports the canonical file from inside IRONMIC_MODELS_DIR,
+  // there is nothing to do.
+  if (path.resolve(sourcePath) === path.resolve(destPath)) {
+    console.log(`[model-import] Source equals destination, no copy needed: ${destPath}`);
+    return { modelId, label };
+  }
+
   // Verify the source file exists and has reasonable size
   const stats = fs.statSync(sourcePath);
   if (stats.size < 1024) {
     throw new Error(`File is too small (${stats.size} bytes) — this doesn't look like a valid model file.`);
   }
 
-  // Copy the file (streaming to handle large files)
   console.log(`[model-import] Copying ${label} (${(stats.size / 1048576).toFixed(0)} MB) to ${destPath}`);
-  await new Promise<void>((resolve, reject) => {
-    const readStream = fs.createReadStream(sourcePath);
-    const writeStream = fs.createWriteStream(destPath);
-    readStream.pipe(writeStream);
-    writeStream.on('finish', resolve);
-    writeStream.on('error', reject);
-    readStream.on('error', reject);
-  });
+  await pipeline(
+    fs.createReadStream(sourcePath),
+    fs.createWriteStream(destPath),
+  );
+
+  // Verify the post-copy size matches — catches truncated streams that the
+  // pipeline didn't flag. A short copy here is a confusing runtime failure
+  // later, much better to fail fast at import time.
+  const destStats = fs.statSync(destPath);
+  if (destStats.size !== stats.size) {
+    throw new Error(
+      `Copy verification failed: source ${stats.size} bytes, destination ${destStats.size} bytes at ${destPath}`
+    );
+  }
 
   console.log(`[model-import] Successfully imported: ${label}`);
   return { modelId, label };
@@ -1091,16 +1718,27 @@ export async function importModelFromPath(
   sectionFilter: string,
 ): Promise<{ modelId: string; label: string }> {
   const sourceFilename = path.basename(filePath);
+  const sourceExt = path.extname(sourceFilename).toLowerCase();
 
   // Try to match the filename to a known model
   const match = IMPORTABLE_FILES[sourceFilename];
   if (match) {
+    if (match.modelId === 'tts-model') await validateKokoroOnnx(filePath);
     return await copyModelFile(filePath, match.modelId, match.label);
+  }
+
+  // Any unknown .onnx targets the TTS slot — gate it through layered validation
+  // BEFORE fuzzy-matching so a renamed garbage ONNX can't slide through to the
+  // canonical Kokoro destination.
+  if (sourceExt === '.onnx' || sectionFilter === 'tts') {
+    await validateKokoroOnnx(filePath);
+    return await copyModelFile(filePath, 'tts-model', 'Kokoro 82M TTS');
   }
 
   // Try fuzzy matching
   let fuzzyMatch: { modelId: string; label: string; downloadUrl: string } | null = null;
   for (const [knownFile, info] of Object.entries(IMPORTABLE_FILES)) {
+    if (info.modelId === 'tts-model') continue; // ONNX path handled above
     if (sourceFilename.toLowerCase().includes(knownFile.toLowerCase().replace(/\.[^.]+$/, ''))) {
       fuzzyMatch = info;
       break;
@@ -1130,4 +1768,104 @@ export async function importModelFromPath(
   }
 
   return await copyModelFile(filePath, modelId, label);
+}
+
+/**
+ * Import a Moonshine engine (3 files: encoder + decoder + tokenizer).
+ *
+ * Moonshine ships as a directory of three artifacts that must be co-located.
+ * The user downloads them from HuggingFace (links shown in the import UI),
+ * then picks all three at once in a multi-select dialog. We classify each
+ * file by name and copy it to the engine's subdirectory (e.g.
+ * `models/moonshine-base/encoder_model.onnx`). The destination filenames are
+ * canonicalized so the Rust loader finds them regardless of how the user
+ * named the source files.
+ *
+ * Returns null if the dialog was cancelled. Throws with a clear message if
+ * the selection is missing one of the three roles or contains the wrong
+ * count.
+ */
+export async function importMoonshineEngine(
+  window: BrowserWindow | null,
+  engineId: string,
+): Promise<{ modelId: string; label: string; fileCount: number } | null> {
+  const meta = TRANSCRIPTION_ENGINES.find((e) => e.id === engineId);
+  if (!meta || meta.family !== 'moonshine') {
+    throw new Error(`Not a Moonshine engine: ${engineId}`);
+  }
+
+  const dialogWindow = window || BrowserWindow.getFocusedWindow();
+  const result = await dialog.showOpenDialog(dialogWindow!, {
+    title: `Import ${meta.label}`,
+    message:
+      'Select all 3 files: the encoder .onnx, the decoder .onnx, and tokenizer.json',
+    filters: [
+      { name: 'Moonshine files', extensions: ['onnx', 'json'] },
+      { name: 'All Files', extensions: ['*'] },
+    ],
+    properties: ['openFile', 'multiSelections'],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  // Classify each picked file by filename. Encoder/decoder distinction relies
+  // on the substring — both end in .onnx, so we can't use extension alone.
+  let encoderSrc: string | null = null;
+  let decoderSrc: string | null = null;
+  let tokenizerSrc: string | null = null;
+
+  for (const p of result.filePaths) {
+    const lower = path.basename(p).toLowerCase();
+    if (lower.endsWith('.json') && lower.includes('tokenizer')) {
+      tokenizerSrc = p;
+    } else if (lower.endsWith('.onnx') && lower.includes('encoder')) {
+      encoderSrc = p;
+    } else if (lower.endsWith('.onnx') && lower.includes('decoder')) {
+      decoderSrc = p;
+    }
+  }
+
+  const missing: string[] = [];
+  if (!encoderSrc) missing.push('encoder_model.onnx');
+  if (!decoderSrc) missing.push('decoder_model_merged.onnx');
+  if (!tokenizerSrc) missing.push('tokenizer.json');
+  if (missing.length > 0) {
+    throw new Error(
+      `Could not identify all 3 Moonshine files in your selection. Missing: ${missing.join(', ')}.\n\n` +
+        `File names must contain "encoder", "decoder", or "tokenizer" so we can route each one correctly. ` +
+        `Download them from the links in the import section above.`,
+    );
+  }
+
+  // Final destination paths (canonical names so the Rust loader finds them).
+  const modelsDir = resolveModelsDir();
+  const engineDir = path.join(modelsDir, engineId);
+  fs.mkdirSync(engineDir, { recursive: true });
+
+  const copies: Array<{ src: string; dest: string }> = [
+    { src: encoderSrc!, dest: path.join(engineDir, 'encoder_model.onnx') },
+    { src: decoderSrc!, dest: path.join(engineDir, 'decoder_model_merged.onnx') },
+    { src: tokenizerSrc!, dest: path.join(engineDir, 'tokenizer.json') },
+  ];
+
+  for (const { src, dest } of copies) {
+    const stats = fs.statSync(src);
+    if (stats.size < 256) {
+      throw new Error(`File ${path.basename(src)} is too small (${stats.size} bytes) — likely truncated.`);
+    }
+    await new Promise<void>((resolve, reject) => {
+      const rs = fs.createReadStream(src);
+      const ws = fs.createWriteStream(dest);
+      rs.pipe(ws);
+      ws.on('finish', resolve);
+      ws.on('error', reject);
+      rs.on('error', reject);
+    });
+    console.log(`[model-import] Moonshine: copied ${path.basename(src)} → ${dest}`);
+  }
+
+  console.log(`[model-import] Successfully imported ${meta.label} (${copies.length} files)`);
+  return { modelId: engineId, label: meta.label, fileCount: copies.length };
 }

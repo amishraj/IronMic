@@ -11,21 +11,83 @@ echo "  IronMic — Full Build Pipeline"
 echo "=========================================="
 echo ""
 
-# Step 1: Build Rust
-echo "[1/3] Building Rust native addon..."
+# Step 1: Stage Moonshine Base + verify presence.
+# The default transcription engine MUST ship in the installer. We run
+# download-models.sh (idempotent — skips files already on disk) and then
+# verify each of the three required filenames exists with non-zero size.
+# Without this guarantee, electron-builder silently skips a missing
+# `extraResources` `from` directory and produces a Moonshine-less installer.
+echo "[1/4] Staging Moonshine Base + WeSpeaker for bundling..."
+# --include-wespeaker pulls the 26 MB speaker-embedding ONNX into
+# electron-app/resources/models/speaker-embedding/ so electron-builder's
+# extraResources glob can pick it up. Speaker diarization (M2) needs this
+# file; without it the M2.5b runtime readiness check keeps
+# meeting_diarization_mode = 'off' and meetings degrade to the legacy
+# text-LLM diarization at stop.
+./scripts/download-models.sh --include-wespeaker
+MOONSHINE_DIR="$ROOT/rust-core/models/moonshine-base"
+REQUIRED_FILES=(
+    "encoder_model.onnx"
+    "decoder_model_merged.onnx"
+    "tokenizer.json"
+)
+for f in "${REQUIRED_FILES[@]}"; do
+    full="$MOONSHINE_DIR/$f"
+    if [ ! -s "$full" ]; then
+        echo ""
+        echo "ERROR: required Moonshine file is missing or empty:"
+        echo "       $full"
+        echo "       The packaged installer would ship without a working default"
+        echo "       transcription engine. Aborting before electron-builder runs."
+        echo ""
+        echo "       Re-run scripts/download-models.sh and check the network."
+        exit 1
+    fi
+done
+echo "  All 3 Moonshine Base files present in $MOONSHINE_DIR"
+echo ""
+
+# Step 1b: Verify Phi-3 Mini Q2_K (bundled default LLM).
+PHI3_FILE="$ROOT/rust-core/models/Phi-3-mini-4k-instruct-Q2_K.gguf"
+phi3_bytes=$(wc -c < "$PHI3_FILE" 2>/dev/null | tr -d ' ' || echo 0)
+if [ "$phi3_bytes" -lt 1200000000 ]; then
+    echo ""
+    echo "ERROR: Phi-3 Mini Q2_K model is missing or truncated ($phi3_bytes bytes)."
+    echo "       The packaged installer would ship without a bundled default LLM."
+    echo "       Re-run scripts/download-models.sh and check the network."
+    echo ""
+    exit 1
+fi
+echo "  Phi-3 Q2_K present: $(du -h "$PHI3_FILE" | cut -f1)"
+echo ""
+
+# Step 2: Build Rust
+echo "[2/4] Building Rust native addon..."
 ./scripts/build-rust.sh
 echo ""
 
-# Step 2: Build Electron
-echo "[2/3] Building Electron app..."
+# Step 3: Build Electron
+echo "[3/4] Building Electron app..."
 cd electron-app
 npm install
 npm run build
 cd ..
 echo ""
 
-# Step 3: Package
-echo "[3/3] Packaging installer..."
+# Step 3b: Verify the models manifest. Re-hashes every bundled model
+# file against resources/models/models-manifest.json and confirms
+# CC-BY-licensed entries are attributed in THIRD_PARTY_NOTICES.md.
+# Optional entries (e.g. WeSpeaker for speaker diarization) only emit a
+# warning when missing — the M2.5b runtime readiness check handles the
+# degraded case at first launch.
+echo "[3b/4] Verifying models manifest..."
+cd electron-app
+npm run verify-models
+cd ..
+echo ""
+
+# Step 4: Package
+echo "[4/4] Packaging installer..."
 cd electron-app
 npx electron-builder --config electron-builder.config.js
 cd ..

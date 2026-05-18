@@ -11,7 +11,6 @@
  */
 
 import { vadService, type VoiceState } from './VADService';
-import { audioBridge } from './AudioBridge';
 import { generateStructuredNotes, structuredToMarkdown, type MeetingTemplate, type StructuredMeetingOutput } from './MeetingTemplateEngine';
 
 export type MeetingState = 'idle' | 'listening' | 'processing' | 'ended';
@@ -37,23 +36,6 @@ type MeetingStateCallback = (state: MeetingState) => void;
 
 // Constants for meeting detection
 const MEETING_END_SILENCE_MS = 30000; // 30s silence = meeting over
-
-const DEFAULT_MEETING_PROMPT = 'Summarize this meeting transcript. List key decisions and action items.';
-
-/** Get the user's custom meeting summary prompt, or the default. */
-async function getMeetingSummaryPrompt(): Promise<string> {
-  try {
-    const custom = await (window as any).ironmic?.getSetting?.('meeting_summary_prompt');
-    if (custom && custom.trim()) return custom.trim();
-  } catch { /* setting not available */ }
-  return DEFAULT_MEETING_PROMPT;
-}
-
-/** Check if a polishText result is a stub passthrough (contains the prompt). */
-function isStubResult(result: string, prompt: string): boolean {
-  // If the result starts with the prompt text, the LLM is a passthrough stub
-  return result.startsWith(prompt.slice(0, 30));
-}
 const MIN_MEETING_DURATION_MS = 60000; // Minimum 1 min to count as a meeting
 const ENERGY_WINDOW_MS = 2000; // Window for speaker energy analysis
 
@@ -120,16 +102,6 @@ export class MeetingDetector {
     this.speakerEnergyHistory = [];
     this.estimatedSpeakerCount = 1;
     this.currentSegmentStart = 0;
-
-    // Start audio capture via AudioBridge (uses user's selected mic)
-    try {
-      if (!audioBridge.isActive()) {
-        await audioBridge.startStream();
-      }
-      audioBridge.startRecording();
-    } catch (err) {
-      console.warn('[MeetingDetector] Failed to start audio capture:', err);
-    }
 
     // Subscribe to VAD for speech/silence tracking
     this.unsubVAD = vadService.onVoiceStateChange((voiceState: VoiceState) => {
@@ -231,128 +203,83 @@ export class MeetingDetector {
 
     const totalDurationMs = Date.now() - this.startTime;
 
-    // Get recorded audio from AudioBridge and transcribe it
-    const bridgeResult = audioBridge.isRecording() ? audioBridge.stopRecording() : null;
-    let fullTranscript = '';
-
-    if (bridgeResult?.buffer && bridgeResult.durationSeconds > 0.5) {
-      try {
-        const ironmic = (window as any).ironmic;
-        if (ironmic?.transcribe) {
-          console.log(`[MeetingDetector] Transcribing ${bridgeResult.durationSeconds.toFixed(1)}s of meeting audio...`);
-          fullTranscript = await ironmic.transcribe(bridgeResult.buffer);
-          console.log(`[MeetingDetector] Transcription: ${fullTranscript.length} chars`);
-          // Add as a single segment
-          this.segments.push({
-            speakerLabel: 'Speaker 1',
-            startMs: 0,
-            endMs: totalDurationMs,
-            transcript: fullTranscript,
-          });
-        }
-      } catch (err) {
-        console.warn('[MeetingDetector] Transcription failed:', err);
-      }
-    } else {
-      // Fall back to any segments added externally
-      fullTranscript = this.segments
-        .map((s) => `${s.speakerLabel}: ${s.transcript || ''}`)
-        .join('\n');
-    }
+    // Build full transcript from segments
+    const fullTranscript = this.segments
+      .map((s) => `${s.speakerLabel}: ${s.transcript || ''}`)
+      .join('\n');
 
     let summary: string | undefined;
     let actionItems: string[] | undefined;
     let structuredOutput: StructuredMeetingOutput | undefined;
 
-    // Save raw transcript and end meeting FIRST — don't block on LLM
-    const ironmic = (window as any).ironmic;
-    if (ironmic?.meetingEnd && this.sessionId) {
-      try {
-        await ironmic.meetingEnd(
-          this.sessionId,
-          this.estimatedSpeakerCount,
-          undefined, // summary — will be added later if LLM works
-          undefined,
-          totalDurationMs / 1000,
-          undefined,
-        );
-        if (fullTranscript && ironmic?.meetingSetRawTranscript) {
-          await ironmic.meetingSetRawTranscript(this.sessionId, fullTranscript);
-        }
-      } catch (err) {
-        console.warn('[MeetingDetector] Failed to save meeting:', err);
-      }
-    }
-
-    // Now try LLM summarization with a timeout — don't block the UI
-    if (fullTranscript.length > 20) {
-      const LLM_TIMEOUT_MS = 30000; // 30s max wait for LLM
-
-      const withTimeout = <T,>(promise: Promise<T>, ms: number): Promise<T | null> =>
-        Promise.race([promise, new Promise<null>(resolve => setTimeout(() => resolve(null), ms))]);
-
+    if (this.segments.length > 0 && fullTranscript.length > 20) {
       try {
         if (this.template) {
-          const templateResult = await withTimeout(generateStructuredNotes(this.template, fullTranscript), LLM_TIMEOUT_MS);
-          if (templateResult) {
-            structuredOutput = templateResult;
-            summary = structuredToMarkdown(structuredOutput);
-            const actionSection = structuredOutput.sections.find(s => s.key === 'action_items' || s.key === 'next_steps');
-            if (actionSection && actionSection.content !== 'None mentioned') {
-              actionItems = actionSection.content
+          // Use template engine for structured output
+          structuredOutput = await generateStructuredNotes(this.template, fullTranscript);
+          summary = structuredToMarkdown(structuredOutput);
+
+          // Extract action items from structured sections
+          const actionSection = structuredOutput.sections.find(s => s.key === 'action_items' || s.key === 'next_steps');
+          if (actionSection && actionSection.content !== 'None mentioned') {
+            actionItems = actionSection.content
+              .split('\n')
+              .map((l: string) => l.replace(/^[-*•]\s*/, '').trim())
+              .filter((l: string) => l.length > 0);
+          }
+        } else {
+          // No template — use generic summary prompt via generateText
+          // (the dedicated non-polish transport; polishText baked in
+          // cleanup-prompt instructions that conflicted with summarization).
+          const ironmic = (window as any).ironmic;
+          if (ironmic?.generateText) {
+            const systemPrompt = 'Summarize the meeting transcript the user provides. List key decisions and action items.';
+            const generated = await ironmic.generateText(systemPrompt, fullTranscript, {
+              maxTokens: 1024,
+              temperature: 0.2,
+            });
+            const result = generated.text;
+            summary = result;
+
+            const actionMatch = result.match(/action\s*items?:?\s*([\s\S]*?)(?:$|\n\n)/i);
+            if (actionMatch) {
+              actionItems = actionMatch[1]
                 .split('\n')
                 .map((l: string) => l.replace(/^[-*•]\s*/, '').trim())
                 .filter((l: string) => l.length > 0);
             }
-          } else {
-            console.warn('[MeetingDetector] Template LLM timed out — use "Summarize Now" later');
-          }
-        } else {
-          let llmWorked = false;
-          const promptText = await getMeetingSummaryPrompt();
-
-          if (ironmic?.polishText) {
-            const summaryPrompt = `${promptText}\n\n${fullTranscript}`;
-            const result = await withTimeout(ironmic.polishText(summaryPrompt), LLM_TIMEOUT_MS);
-            if (result && typeof result === 'string' && !isStubResult(result, promptText)) {
-              summary = result;
-              llmWorked = true;
-              const actionMatch = result.match(/action\s*items?:?\s*([\s\S]*?)(?:$|\n\n)/i);
-              if (actionMatch) {
-                actionItems = actionMatch[1]
-                  .split('\n')
-                  .map((l: string) => l.replace(/^[-*•]\s*/, '').trim())
-                  .filter((l: string) => l.length > 0);
-              }
-            }
-          }
-
-          if (!llmWorked) {
-            summary = fullTranscript;
-            actionItems = undefined;
-            console.log('[MeetingDetector] LLM unavailable or timed out — use "Summarize Now" later');
           }
         }
       } catch (err) {
         console.warn('[MeetingDetector] Summary generation failed:', err);
-        summary = fullTranscript;
       }
+    }
 
-      // Update the session with summary if LLM produced one
-      if (summary && ironmic?.meetingEnd && this.sessionId) {
-        try {
-          await ironmic.meetingEnd(
+    // Save to storage
+    const ironmic = (window as any).ironmic;
+    if (ironmic?.meetingEnd && this.sessionId) {
+      try {
+        const entryIds = this.segments
+          .filter((s) => s.transcript)
+          .map((_, i) => `seg-${i}`)
+          .join(',');
+        await ironmic.meetingEnd(
+          this.sessionId,
+          this.estimatedSpeakerCount,
+          summary,
+          actionItems ? JSON.stringify(actionItems) : undefined,
+          totalDurationMs / 1000,
+          entryIds || undefined,
+        );
+        // Save structured output separately if template was used
+        if (structuredOutput && ironmic?.meetingSetStructuredOutput) {
+          await ironmic.meetingSetStructuredOutput(
             this.sessionId,
-            this.estimatedSpeakerCount,
-            summary,
-            actionItems ? JSON.stringify(actionItems) : undefined,
-            totalDurationMs / 1000,
-            undefined,
+            JSON.stringify(structuredOutput),
           );
-          if (structuredOutput && ironmic?.meetingSetStructuredOutput) {
-            await ironmic.meetingSetStructuredOutput(this.sessionId, JSON.stringify(structuredOutput));
-          }
-        } catch { /* already saved base session above */ }
+        }
+      } catch (err) {
+        console.warn('[MeetingDetector] Failed to save meeting:', err);
       }
     }
 
@@ -367,6 +294,7 @@ export class MeetingDetector {
     };
 
     this.setState('ended');
+    // Reset after a brief delay
     setTimeout(() => {
       this.sessionId = null;
       this.segments = [];

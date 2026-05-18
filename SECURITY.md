@@ -167,7 +167,7 @@ Prompt text is never written to console logs. Logs show only metadata (provider 
 | `contextIsolation` | `true` | Renderer cannot access Node.js APIs directly |
 | `nodeIntegration` | `false` | No `require()` or `process` in renderer |
 | `sandbox` | `true` | Renderer runs in Chromium's sandbox |
-| `preload` | Typed IPC bridge | Only ~65 specific IPC channels exposed |
+| `preload` | Typed IPC bridge | Only ~60 specific IPC channels exposed |
 
 The renderer communicates with the main process exclusively through a typed `contextBridge` API. There is no direct filesystem, network, or process access from the renderer.
 

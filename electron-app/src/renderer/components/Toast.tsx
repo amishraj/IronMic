@@ -1,16 +1,14 @@
 import { useToastStore, type Toast as ToastItem } from '../stores/useToastStore';
-import { AlertCircle, AlertTriangle, CheckCircle, Info, X } from 'lucide-react';
+import { AlertCircle, CheckCircle, Info, X } from 'lucide-react';
 
 const icons = {
   error: AlertCircle,
-  warning: AlertTriangle,
   info: Info,
   success: CheckCircle,
 };
 
 const styles = {
   error: 'bg-iron-danger/10 border-iron-danger/30 text-iron-danger',
-  warning: 'bg-yellow-500/10 border-yellow-500/30 text-yellow-400',
   info: 'bg-iron-accent/10 border-iron-accent/30 text-iron-accent-light',
   success: 'bg-iron-success/10 border-iron-success/30 text-iron-success',
 };

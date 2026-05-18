@@ -33,7 +33,7 @@ fn build_cleanup_prompt_empty_input() {
 #[test]
 fn default_config() {
     let config = LlmConfig::default();
-    assert!(config.model_path.ends_with("models/mistral-7b-instruct-q4_k_m.gguf"));
+    assert!(config.model_path.ends_with("models/Phi-3-mini-4k-instruct-Q2_K.gguf"));
     assert!(config.model_path.is_absolute());
     assert_eq!(config.max_tokens, 2048);
     assert!(config.temperature > 0.0 && config.temperature < 1.0);
@@ -104,7 +104,7 @@ fn engine_model_exists_with_bad_path() {
 fn engine_model_path() {
     let engine = LlmEngine::with_defaults();
     let path = engine.model_path();
-    assert!(path.ends_with("models/mistral-7b-instruct-q4_k_m.gguf"));
+    assert!(path.ends_with("models/Phi-3-mini-4k-instruct-Q2_K.gguf"));
     assert!(path.is_absolute());
 }
 
@@ -132,7 +132,7 @@ fn shared_engine_model_path() {
     let engine = LlmEngine::with_defaults();
     let shared = SharedLlmEngine::new(engine);
     let path = shared.model_path();
-    assert!(path.ends_with("models/mistral-7b-instruct-q4_k_m.gguf"));
+    assert!(path.ends_with("models/Phi-3-mini-4k-instruct-Q2_K.gguf"));
     assert!(path.is_absolute());
 }
 

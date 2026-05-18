@@ -3,8 +3,7 @@
  * Options: Copy as Markdown, Rich Text, Plain Text, Save as File.
  */
 
-import { useState, useRef, useEffect, useCallback } from 'react';
-import { createPortal } from 'react-dom';
+import { useState, useRef, useEffect } from 'react';
 import { Share2, FileText, FileCode, Type, Save, Check, X } from 'lucide-react';
 
 interface ShareMenuProps {
@@ -21,41 +20,19 @@ interface ShareMenuProps {
 export function ShareMenu({ entryId, meetingId, text, rawText }: ShareMenuProps) {
   const [open, setOpen] = useState(false);
   const [status, setStatus] = useState<'idle' | 'success' | 'error'>('idle');
-  const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
-  const [menuPos, setMenuPos] = useState({ top: 0, left: 0 });
-
-  // Position the portal dropdown relative to the button
-  const updatePosition = useCallback(() => {
-    if (!buttonRef.current) return;
-    const rect = buttonRef.current.getBoundingClientRect();
-    setMenuPos({
-      top: rect.bottom + 4,
-      left: rect.right - 208, // 208px = w-52 (13rem)
-    });
-  }, []);
 
   // Close on outside click
   useEffect(() => {
     if (!open) return;
-    updatePosition();
     const handler = (e: MouseEvent) => {
-      if (
-        menuRef.current && !menuRef.current.contains(e.target as Node) &&
-        buttonRef.current && !buttonRef.current.contains(e.target as Node)
-      ) {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
         setOpen(false);
       }
     };
-    // Close on scroll (parent containers)
-    const scrollHandler = () => setOpen(false);
     document.addEventListener('mousedown', handler);
-    window.addEventListener('scroll', scrollHandler, true);
-    return () => {
-      document.removeEventListener('mousedown', handler);
-      window.removeEventListener('scroll', scrollHandler, true);
-    };
-  }, [open, updatePosition]);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
 
   // Auto-clear success status
   useEffect(() => {
@@ -138,9 +115,8 @@ export function ShareMenu({ entryId, meetingId, text, rawText }: ShareMenuProps)
   }
 
   return (
-    <>
+    <div ref={menuRef} className="relative">
       <button
-        ref={buttonRef}
         onClick={() => setOpen(!open)}
         className="p-1.5 rounded-lg text-iron-text-muted hover:text-iron-text hover:bg-iron-surface-hover transition-colors"
         title="Share / Export"
@@ -154,12 +130,8 @@ export function ShareMenu({ entryId, meetingId, text, rawText }: ShareMenuProps)
         )}
       </button>
 
-      {open && createPortal(
-        <div
-          ref={menuRef}
-          className="fixed z-[9999] w-52 py-1 bg-iron-surface border border-iron-border rounded-xl shadow-xl"
-          style={{ top: menuPos.top, left: menuPos.left }}
-        >
+      {open && (
+        <div className="absolute right-0 top-full mt-1 z-50 w-52 py-1 bg-iron-surface border border-iron-border rounded-xl shadow-xl">
           <button
             onClick={handleCopyRichText}
             className="w-full flex items-center gap-2.5 px-3 py-2 text-xs text-iron-text-secondary hover:bg-iron-surface-hover hover:text-iron-text transition-colors"
@@ -189,9 +161,8 @@ export function ShareMenu({ entryId, meetingId, text, rawText }: ShareMenuProps)
             <Save className="w-3.5 h-3.5" />
             Save as File...
           </button>
-        </div>,
-        document.body,
+        </div>
       )}
-    </>
+    </div>
   );
 }

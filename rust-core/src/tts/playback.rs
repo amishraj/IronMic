@@ -7,6 +7,20 @@ use tracing::{debug, error, info};
 
 use crate::error::IronMicError;
 
+/// Silence prepended to the very first chunk of a TTS session to absorb the
+/// WASAPI shared-mode cold-start gap on Windows, where a freshly opened cpal
+/// stream's first ~50–300 ms of audio is dropped or attenuated while the audio
+/// engine settles. Off-Windows this is 0 — CoreAudio / ALSA do not have the
+/// same cold-start, and adding a leading pause there would be a regression.
+///
+/// Used by `play_internal` to pad chunk-1 audio AND by the napi `synthesize_text`
+/// caller to offset chunk-1 word timestamps + reported duration by the same
+/// amount so the highlight cursor stays aligned with the spoken word.
+#[cfg(windows)]
+pub const TTS_LEADING_SILENCE_MS: u64 = 250;
+#[cfg(not(windows))]
+pub const TTS_LEADING_SILENCE_MS: u64 = 0;
+
 /// Playback state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -83,6 +97,20 @@ impl SecureAudioBuffer {
         let b = self.data.get(idx + 1).copied().unwrap_or(a);
         a + (b - a) * frac
     }
+
+    /// Reserve additional capacity so subsequent extends in streaming mode
+    /// don't reallocate the Vec (would still be safe under our mutex, just
+    /// wasted CPU). No-op if capacity already sufficient.
+    pub fn reserve(&mut self, additional: usize) {
+        self.data.reserve(additional);
+    }
+
+    /// Append samples to the buffer. Safe under the engine's buffer mutex —
+    /// the cpal callback acquires the same mutex per tick, so reads and
+    /// writes are serialized.
+    pub fn extend_samples(&mut self, samples: &[f32]) {
+        self.data.extend_from_slice(samples);
+    }
 }
 
 impl Drop for SecureAudioBuffer {
@@ -100,8 +128,16 @@ pub struct PlaybackEngine {
     position: Arc<AtomicUsize>,
     /// Playback speed multiplier (stored as speed * 1000 for atomic storage).
     speed_x1000: Arc<AtomicUsize>,
-    /// The audio buffer currently being played.
+    /// The audio buffer currently being played. Vec inside the buffer can grow
+    /// at runtime (see `append_samples`); the cpal callback locks the same
+    /// mutex on each tick so concurrent reads are serialized with extends.
     buffer: Arc<Mutex<Option<SecureAudioBuffer>>>,
+    /// True once no more samples will be appended — the cpal callback gates
+    /// its end-of-buffer auto-stop on this. While false, hitting EOF outputs
+    /// silence and the callback waits for more samples to arrive (streaming).
+    /// Initialized to true on `play()` so single-shot playback (no streaming)
+    /// retains the previous auto-stop behavior unchanged.
+    streaming_complete: Arc<std::sync::atomic::AtomicBool>,
     /// The active cpal output stream.
     stream: Option<Stream>,
 }
@@ -122,6 +158,7 @@ impl PlaybackEngine {
             position: Arc::new(AtomicUsize::new(0)),
             speed_x1000: Arc::new(AtomicUsize::new(1000)), // 1.0x
             buffer: Arc::new(Mutex::new(None)),
+            streaming_complete: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             stream: None,
         }
     }
@@ -154,11 +191,50 @@ impl PlaybackEngine {
     }
 
     /// Load audio samples and start playback.
+    ///
+    /// Single-shot mode (this method): the callback auto-stops when the
+    /// cursor reaches the end of the buffer. Use `play_streaming` instead
+    /// to keep the stream alive while more samples are being synthesized
+    /// in the background.
     pub fn play(&mut self, samples: Vec<f32>, sample_rate: u32) -> Result<(), IronMicError> {
+        self.play_internal(samples, sample_rate, /* streaming = */ false)
+    }
+
+    /// Start playback in streaming mode — the cpal callback will NOT
+    /// auto-stop on EOF. Use `append_samples` to feed more audio as it's
+    /// produced, then `mark_streaming_complete` to release the auto-stop
+    /// gate when the last chunk has been appended.
+    pub fn play_streaming(&mut self, samples: Vec<f32>, sample_rate: u32) -> Result<(), IronMicError> {
+        self.play_internal(samples, sample_rate, /* streaming = */ true)
+    }
+
+    fn play_internal(&mut self, samples: Vec<f32>, sample_rate: u32, streaming: bool) -> Result<(), IronMicError> {
         // Stop any current playback
         self.stop();
 
-        let buffer = SecureAudioBuffer::new(samples, sample_rate);
+        // Prepend leading silence to absorb the audio device's cold-start gap.
+        // Off Windows TTS_LEADING_SILENCE_MS is 0 and the input vec moves
+        // through untouched (no allocation, no behavior change).
+        let pad = if !samples.is_empty() && sample_rate > 0 {
+            (sample_rate as u64 * TTS_LEADING_SILENCE_MS / 1000) as usize
+        } else {
+            0
+        };
+        let buffer_samples = if pad > 0 {
+            let mut padded = Vec::with_capacity(pad + samples.len());
+            padded.resize(pad, 0.0);
+            padded.extend(samples);
+            padded
+        } else {
+            samples
+        };
+        let mut buffer = SecureAudioBuffer::new(buffer_samples, sample_rate);
+        // Reserve generous capacity so subsequent append_samples calls in
+        // streaming mode don't reallocate the Vec (which would be safe under
+        // the mutex but is wasted work).
+        if streaming {
+            buffer.reserve(buffer.len() * 16);
+        }
         let buffer_len = buffer.len();
 
         if buffer.is_empty() {
@@ -169,11 +245,14 @@ impl PlaybackEngine {
             samples = buffer_len,
             sample_rate,
             duration = buffer.duration_seconds(),
+            streaming,
             "Starting TTS playback"
         );
 
         *self.buffer.lock().unwrap() = Some(buffer);
         self.position.store(0, Ordering::SeqCst);
+        self.streaming_complete
+            .store(!streaming, std::sync::atomic::Ordering::SeqCst);
         self.state
             .store(PlaybackState::Playing as u8, Ordering::SeqCst);
 
@@ -214,6 +293,7 @@ impl PlaybackEngine {
         let position = Arc::clone(&self.position);
         let speed_x1000 = Arc::clone(&self.speed_x1000);
         let buffer_ref = Arc::clone(&self.buffer);
+        let streaming_complete = Arc::clone(&self.streaming_complete);
 
         // Floating-point read cursor for speed control
         let cursor = Arc::new(Mutex::new(0.0f64));
@@ -258,8 +338,14 @@ impl PlaybackEngine {
                         let pos = (*cur as usize).min(audio_buf.len());
                         position.store(pos, Ordering::SeqCst);
 
-                        // Auto-stop at end
-                        if *cur >= total {
+                        // Auto-stop at end ONLY when streaming is complete
+                        // (single-shot mode initializes streaming_complete=true,
+                        // so the previous behavior is preserved). When streaming
+                        // is still in progress and we hit EOF, output continues
+                        // as silence and the cursor waits for more samples.
+                        if *cur >= total
+                            && streaming_complete.load(std::sync::atomic::Ordering::SeqCst)
+                        {
                             state.store(PlaybackState::Idle as u8, Ordering::SeqCst);
                         }
                     } else {
@@ -279,6 +365,41 @@ impl PlaybackEngine {
 
         self.stream = Some(stream);
         Ok(())
+    }
+
+    /// Append samples to the currently-playing streaming buffer. The cpal
+    /// callback's mutex serializes this with reads, so the Vec can grow
+    /// safely under it. No-op (returns Ok) if not currently in streaming
+    /// playback — chunks that arrive after the user has stopped should
+    /// silently drop, not error.
+    pub fn append_samples(&self, samples: Vec<f32>) -> Result<(), IronMicError> {
+        if self.state() == PlaybackState::Idle {
+            return Ok(());
+        }
+        let mut buf_guard = self.buffer.lock().unwrap();
+        if let Some(ref mut audio_buf) = *buf_guard {
+            audio_buf.extend_samples(&samples);
+        }
+        // Zero our local copy of `samples` once it's been copied into the
+        // buffer (the buffer itself zeroes on drop — privacy invariant).
+        let mut s = samples;
+        s.fill(0.0);
+        Ok(())
+    }
+
+    /// Mark the streaming buffer as complete. The cpal callback's auto-stop
+    /// gate releases — once the cursor reaches end-of-buffer it transitions
+    /// to Idle. Calling this on a non-streaming playback is a harmless no-op.
+    pub fn mark_streaming_complete(&self) {
+        self.streaming_complete
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Total number of samples currently in the streaming buffer. Used by
+    /// the napi layer to compute cumulative duration without taking the
+    /// playback lock for an extended read.
+    pub fn buffer_sample_count(&self) -> usize {
+        self.buffer.lock().unwrap().as_ref().map(|b| b.len()).unwrap_or(0)
     }
 
     pub fn pause(&mut self) {

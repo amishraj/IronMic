@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; connect-src 'self' blob:;" />
+    <title>IronMic Forge</title>
+  </head>
+  <body>
+    <script>
+      // The main process resolves the theme to a definitive 'light' or
+      // 'dark' (via Electron's nativeTheme + the user's setting in SQLite)
+      // and passes it via URL query when creating this window. We just
+      // apply it — no system resolution, no matchMedia race, no
+      // localStorage dependency. The runtime IPC listener in ForgeApp.tsx
+      // handles any subsequent flips.
+      (function() {
+        try {
+          var fromUrl = new URLSearchParams(window.location.search).get('theme');
+          var dark = fromUrl === 'dark';
+          document.documentElement.classList.toggle('dark', dark);
+        } catch (e) { /* ignore — defaults to light */ }
+      })();
+      document.documentElement.dataset.forge = 'true';
+    </script>
+    <div id="root"></div>
+    <script type="module" src="./forge-main.tsx"></script>
+  </body>
+</html>

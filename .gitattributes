@@ -1,0 +1,3 @@
+rust-core/models/moonshine-base/decoder_model_merged.onnx !text !filter !merge !diff
+rust-core/models/moonshine-base/encoder_model.onnx !text !filter !merge !diff
+rust-core/models/moonshine-base/tokenizer.json !text !filter !merge !diff

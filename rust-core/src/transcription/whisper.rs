@@ -5,6 +5,7 @@ use tracing::{info, warn};
 
 use crate::error::IronMicError;
 use crate::transcription::dictionary::Dictionary;
+use crate::transcription::engine::TranscriptSegmentDto;
 
 /// Default model filename.
 const DEFAULT_MODEL_FILENAME: &str = "whisper-large-v3-turbo.bin";
@@ -116,7 +117,16 @@ impl Default for WhisperConfig {
             model_path: default_model_path(),
             language: Some("en".to_string()),
             translate: false,
-            n_threads: num_cpus(),
+            // Cap at 2 threads by default. Corporate VDIs advertise many vCPUs
+            // but those cores are heavily time-shared; whisper.cpp launching
+            // more threads than ~2 causes extreme context-switch thrashing on
+            // the first inference call (which also maps the model into memory),
+            // producing multi-minute hangs on Windows that surface as
+            // "[whisper.raw] null/timeout" in the DevTools log. On a real
+            // desktop CPU users can raise this in Settings → Audio → Whisper
+            // Threads (up to 16). The default is intentionally conservative
+            // because too-many-threads hurts; too-few-threads is just slow.
+            n_threads: num_cpus().min(2),
             use_gpu: false,
         }
     }
@@ -197,6 +207,14 @@ impl WhisperEngine {
         {
             self._loaded
         }
+    }
+
+    /// Override the number of CPU threads used for inference.
+    ///
+    /// Must be called BEFORE `load_model()`. Has no effect once the model is
+    /// already loaded (callers should check `is_loaded()` first).
+    pub fn set_n_threads(&mut self, n: u32) {
+        self.config.n_threads = n.clamp(1, 16);
     }
 
     /// Change the active model. Unloads the current model — call load_model() after.
@@ -296,6 +314,15 @@ impl WhisperEngine {
                 use_gpu = self.config.use_gpu,
                 "Whisper model loaded successfully"
             );
+
+            // Surface whisper.cpp's CPU-feature detection (AVX/AVX2/AVX512/F16C/
+            // FMA/NEON/Metal/CUDA/...) on first model load. On corporate
+            // Windows VDI / HVCI hosts, whisper.cpp can build with AVX-512
+            // forced and then silently fail or produce empty transcripts at
+            // inference time (see whisper.cpp #2928, #2175). Logging the
+            // detected flags makes it cheap to confirm or rule out.
+            let sysinfo = whisper_rs::print_system_info();
+            info!(target: "ironmic::whisper::sysinfo", system_info = %sysinfo, "whisper.cpp system info");
         }
 
         #[cfg(not(feature = "whisper"))]
@@ -309,6 +336,28 @@ impl WhisperEngine {
 
     /// Transcribe PCM audio samples to text.
     pub fn transcribe(&self, samples: &[f32]) -> Result<String, IronMicError> {
+        self.transcribe_with_context(samples, /* short_chunk */ false, &[])
+    }
+
+    /// Transcribe a short (< 5s) PCM audio chunk to text. Forces single-segment
+    /// output, which gives Whisper a clearer hint that the entire buffer is
+    /// one continuous utterance and stops it from trying to find segment
+    /// boundaries inside ~40k samples. Used by the dictation streamer's
+    /// 2.5s chunk loop. **Do not call from meeting recording (10–60s chunks).**
+    pub fn transcribe_short(&self, samples: &[f32]) -> Result<String, IronMicError> {
+        self.transcribe_with_context(samples, /* short_chunk */ true, &[])
+    }
+
+    /// Transcribe PCM samples with per-call context terms (e.g. meeting
+    /// participant names) layered on top of the stored dictionary in the
+    /// `initial_prompt`. Does not mutate the stored `Dictionary` — the merged
+    /// prompt lives only on this call's `FullParams`.
+    pub fn transcribe_with_context(
+        &self,
+        samples: &[f32],
+        short_chunk: bool,
+        extra_terms: &[String],
+    ) -> Result<String, IronMicError> {
         if samples.is_empty() {
             return Err(IronMicError::Processing(
                 "No audio samples to transcribe".into(),
@@ -317,17 +366,18 @@ impl WhisperEngine {
 
         #[cfg(feature = "whisper")]
         {
-            self.transcribe_with_whisper(samples)
+            self.transcribe_with_whisper(samples, short_chunk, extra_terms)
         }
 
         #[cfg(not(feature = "whisper"))]
         {
+            let _ = (short_chunk, extra_terms);
             self.transcribe_stub(samples)
         }
     }
 
     #[cfg(feature = "whisper")]
-    fn transcribe_with_whisper(&self, samples: &[f32]) -> Result<String, IronMicError> {
+    fn transcribe_with_whisper(&self, samples: &[f32], short_chunk: bool, extra_terms: &[String]) -> Result<String, IronMicError> {
         use whisper_rs::FullParams;
         use whisper_rs::SamplingStrategy;
 
@@ -345,15 +395,44 @@ impl WhisperEngine {
         params.set_suppress_blank(true);
         params.set_suppress_non_speech_tokens(true);
 
+        // ── Hardening for the audio paths that surfaced as Windows-only
+        // "I dictate, nothing appears" failures. Each setting cites a real
+        // upstream issue or known whisper.cpp default that bites us:
+        //
+        // - temperature_inc=0.0 disables Whisper's temperature-fallback path.
+        //   Default is 0.2, which on low-confidence segments emits hallucinated
+        //   text the sanitizer then drops to ''. Greedy + no fallback = stable.
+        // - no_speech_thold=0.3 (default 0.6) makes the "all silence"
+        //   classifier less trigger-happy on Windows mics that lack the AGC
+        //   macOS CoreAudio applies. Cite whisper.cpp #1724, Buzz #1109.
+        // - no_context=true and detect_language=false are belt-and-braces.
+        //   Defaults already favor us in whisper-rs 0.13.2 (fresh state per
+        //   call + language defaults to Some("en")), but if either side ever
+        //   drifts in an upgrade these explicit sets keep behavior pinned.
+        params.set_temperature(0.0);
+        params.set_temperature_inc(0.0);
+        params.set_no_speech_thold(0.3);
+        params.set_no_context(true);
+        params.set_detect_language(false);
+
+        // Force single-segment output for very short chunks (2.5s dictation
+        // streamer). MUST NOT be set for meeting chunks (10–60s) — those
+        // legitimately need Whisper to find segment boundaries.
+        if short_chunk {
+            params.set_single_segment(true);
+        }
+
         if let Some(ref lang) = self.config.language {
             params.set_language(Some(lang));
         }
         params.set_translate(self.config.translate);
 
-        if let Some(prompt) = self.dictionary.build_whisper_prompt() {
-            params.set_initial_prompt(&prompt);
+        let prompt_owned = self.dictionary.build_whisper_prompt_with_extras(extra_terms);
+        if let Some(prompt) = prompt_owned.as_deref() {
+            params.set_initial_prompt(prompt);
             info!(
                 word_count = self.dictionary.len(),
+                extras = extra_terms.len(),
                 "Applied dictionary prompt for word boosting"
             );
         }
@@ -391,6 +470,116 @@ impl WhisperEngine {
         );
 
         Ok(transcript)
+    }
+
+    /// Transcribe and return per-segment timing (start/end in ms relative to
+    /// the start of `samples`). Used by the dual-stream meeting recorder to
+    /// slice loopback audio for per-speaker embedding before the chunk
+    /// buffer is zeroed.
+    ///
+    /// Implementation mirrors `transcribe_with_whisper` but iterates Whisper's
+    /// segment boundaries instead of concatenating the text. `single_segment`
+    /// is intentionally NOT set even for short chunks — segment boundaries
+    /// are the whole point of this entry point.
+    ///
+    /// `no_speech_prob` is left `None` — whisper-rs 0.13 does not expose
+    /// `whisper_full_get_segment_no_speech_prob`. Callers fall back to
+    /// duration + RMS gating.
+    pub fn transcribe_with_segments(
+        &self,
+        samples: &[f32],
+        _short_chunk: bool,
+        extra_terms: &[String],
+    ) -> Result<Vec<TranscriptSegmentDto>, IronMicError> {
+        if samples.is_empty() {
+            return Err(IronMicError::Processing(
+                "No audio samples to transcribe".into(),
+            ));
+        }
+
+        #[cfg(feature = "whisper")]
+        {
+            use whisper_rs::FullParams;
+            use whisper_rs::SamplingStrategy;
+
+            let ctx = self.ctx.as_ref().ok_or_else(|| {
+                IronMicError::Audio("Whisper model not loaded. Call load_model() first.".into())
+            })?;
+
+            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+            params.set_n_threads(self.config.n_threads as i32);
+            params.set_print_special(false);
+            params.set_print_progress(false);
+            params.set_print_realtime(false);
+            params.set_print_timestamps(false);
+            params.set_suppress_blank(true);
+            params.set_suppress_non_speech_tokens(true);
+            params.set_temperature(0.0);
+            params.set_temperature_inc(0.0);
+            params.set_no_speech_thold(0.3);
+            params.set_no_context(true);
+            params.set_detect_language(false);
+
+            if let Some(ref lang) = self.config.language {
+                params.set_language(Some(lang));
+            }
+            params.set_translate(self.config.translate);
+
+            let prompt_owned = self.dictionary.build_whisper_prompt_with_extras(extra_terms);
+            if let Some(prompt) = prompt_owned.as_deref() {
+                params.set_initial_prompt(prompt);
+            }
+
+            let mut state = ctx.create_state().map_err(|e| {
+                IronMicError::Audio(format!("Failed to create Whisper state: {e}"))
+            })?;
+            state.full(params, samples).map_err(|e| {
+                IronMicError::Audio(format!("Whisper transcription failed: {e}"))
+            })?;
+
+            let num_segments = state.full_n_segments().map_err(|e| {
+                IronMicError::Audio(format!("Failed to get segment count: {e}"))
+            })?;
+
+            // Cap end_ms at the clip's actual duration. Whisper sometimes
+            // reports t1 slightly past the end on the final segment; clamping
+            // keeps PCM slice math safe in the caller.
+            let clip_end_ms = ((samples.len() as f64 / 16_000.0) * 1000.0).round() as u32;
+
+            let mut out: Vec<TranscriptSegmentDto> = Vec::with_capacity(num_segments as usize);
+            for i in 0..num_segments {
+                let text = state.full_get_segment_text(i).unwrap_or_default();
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Whisper t-units are centiseconds (1 unit = 10 ms).
+                let t0 = state.full_get_segment_t0(i).unwrap_or(0).max(0) as u64 * 10;
+                let t1 = state.full_get_segment_t1(i).unwrap_or(0).max(0) as u64 * 10;
+                let start_ms = (t0 as u32).min(clip_end_ms);
+                let end_ms = (t1 as u32).min(clip_end_ms).max(start_ms);
+                out.push(TranscriptSegmentDto {
+                    text: trimmed.to_string(),
+                    start_ms,
+                    end_ms,
+                    no_speech_prob: None,
+                });
+            }
+            Ok(out)
+        }
+
+        #[cfg(not(feature = "whisper"))]
+        {
+            let _ = extra_terms;
+            let text = self.transcribe_stub(samples)?;
+            let end_ms = ((samples.len() as f64 / 16_000.0) * 1000.0).round() as u32;
+            Ok(vec![TranscriptSegmentDto {
+                text,
+                start_ms: 0,
+                end_ms,
+                no_speech_prob: None,
+            }])
+        }
     }
 
     #[cfg(not(feature = "whisper"))]
@@ -443,6 +632,12 @@ impl SharedWhisperEngine {
         engine.transcribe(samples)
     }
 
+    /// Short-chunk transcription path. See `WhisperEngine::transcribe_short`.
+    pub fn transcribe_short(&self, samples: &[f32]) -> Result<String, IronMicError> {
+        let engine = self.inner.lock().unwrap();
+        engine.transcribe_short(samples)
+    }
+
     pub fn dictionary(&self) -> Dictionary {
         let engine = self.inner.lock().unwrap();
         engine.dictionary().clone()
@@ -456,6 +651,17 @@ impl SharedWhisperEngine {
     pub fn remove_dictionary_word(&self, word: &str) -> bool {
         let engine = self.inner.lock().unwrap();
         engine.dictionary().remove_word(word)
+    }
+
+    /// Override thread count before loading the model.
+    ///
+    /// No-op if the engine is already loaded. Call this from Electron before
+    /// `loadWhisperModel()` to apply a user-configured `whisper_threads` setting.
+    pub fn set_n_threads(&self, n: u32) {
+        let mut engine = self.inner.lock().unwrap();
+        if !engine.is_loaded() {
+            engine.set_n_threads(n);
+        }
     }
 
     pub fn model_path(&self) -> PathBuf {

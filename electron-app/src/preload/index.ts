@@ -13,7 +13,52 @@ const api = {
 
   // Transcription
   transcribe: (audioBuffer: Buffer) => ipcRenderer.invoke('ironmic:transcribe', audioBuffer),
-  polishText: (rawText: string) => ipcRenderer.invoke('ironmic:polish-text', rawText),
+  polishText: (rawText: string, opts?: { requireModel?: boolean }) =>
+    ipcRenderer.invoke('ironmic:polish-text', rawText, opts),
+  // Detailed variant for the toggle-driven polish UI: returns the full
+  // projection set so callers that persist entries can store both
+  // polished_text (plain) and polished_text_json (rich) atomically.
+  //
+  //   - markdown:    raw LLM output (verbatim, for export / round-trip)
+  //   - plainText:   markdown stripped (FTS / TTS / clipboard / exports)
+  //   - html:        sanitize-html-approved (safe for dangerouslySetInnerHTML)
+  //   - jsonString:  JSON.stringify of ProseMirror JSON (parse for setContent)
+  //   - providerUsed: 'claude' | 'copilot' | 'local' for the "via X" badge
+  //   - text:        legacy field equal to plainText, kept for back-compat
+  polishTextDetailed: (rawText: string, opts?: { requireModel?: boolean }) =>
+    ipcRenderer.invoke('ironmic:polish-text-detailed', rawText, opts),
+  // Strictly local-only polish — bypasses polish_allow_cloud. For callers
+  // that must never route to a cloud provider (e.g. AI meeting-title
+  // generation) regardless of the user's polish setting.
+  polishTextLocal: (rawText: string, opts?: { requireModel?: boolean }) =>
+    ipcRenderer.invoke('ironmic:polish-text-local', rawText, opts),
+  // Generic LLM transport. Caller owns the system prompt (no cleanup prompt
+  // is layered on top). Use this for meeting summarization, template
+  // generation, intent classification fallback, meeting detection — anything
+  // that ISN'T a polish pass. Returns { text, providerUsed }.
+  // opts: maxTokens (clamped 1..4096), temperature (clamped 0..1), forceLocal.
+  generateText: (
+    systemPrompt: string,
+    userPrompt: string,
+    opts?: { maxTokens?: number; temperature?: number; forceLocal?: boolean },
+  ) => ipcRenderer.invoke('ironmic:generate-text', systemPrompt, userPrompt, opts),
+  // Same as generateText but with forceLocal pinned on. For callers (e.g.
+  // AI title generation) that must never touch cloud regardless of user setting.
+  generateTextLocal: (
+    systemPrompt: string,
+    userPrompt: string,
+    opts?: { maxTokens?: number; temperature?: number },
+  ) => ipcRenderer.invoke('ironmic:generate-text-local', systemPrompt, userPrompt, opts),
+  // Markdown → { plainText, html, jsonString } projections from the main-side
+  // sanitization pipeline. Renderer never imports the pipeline directly.
+  // jsonString is JSON.stringify(ProseMirror JSON) — caller does JSON.parse
+  // when feeding the editor.
+  convertMarkdown: (md: string) =>
+    ipcRenderer.invoke('ironmic:convert-markdown', md) as Promise<{
+      plainText: string;
+      html: string;
+      jsonString: string;
+    }>,
 
   // Entries
   createEntry: (entry: any) => ipcRenderer.invoke('ironmic:create-entry', entry),
@@ -27,19 +72,82 @@ const api = {
   deleteEntriesOlderThan: (days: number) => ipcRenderer.invoke('ironmic:delete-entries-older-than', days),
   runAutoCleanup: () => ipcRenderer.invoke('ironmic:run-auto-cleanup'),
 
+  // ── Knowledge Q&A — orchestrator API for the Ask page ──
+  knowledgeAskStart: (query: string, options: any) =>
+    ipcRenderer.invoke('ironmic:knowledge-ask-start', query, options),
+  knowledgeAskCancel: () => ipcRenderer.invoke('ironmic:knowledge-ask-cancel'),
+  /** Subscribe to phase events (retrieving / retrieved / route-resolved /
+   *  streaming / done / error). Returns an unsubscribe function. The
+   *  streaming token text itself rides the existing onAiOutput channel —
+   *  this event stream is for phase + sources + final-state notifications. */
+  onKnowledgeAskEvent: (callback: (evt: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('ironmic:knowledge-ask-event', handler);
+    return () => ipcRenderer.removeListener('ironmic:knowledge-ask-event', handler);
+  },
+  /** Index admin — called by IndexerService on app boot to backfill chunks
+   *  for content created before v13, and from Settings for manual rebuild. */
+  ragIndexBackfill: (sourceType: string, batchSize: number) =>
+    ipcRenderer.invoke('ironmic:rag-index-backfill', sourceType, batchSize),
+  ragGetIndexStats: () => ipcRenderer.invoke('ironmic:rag-get-index-stats'),
+  ragRebuildIndex: () => ipcRenderer.invoke('ironmic:rag-rebuild-index'),
+  ragChunkEntry: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-entry', id),
+  ragChunkMeeting: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-meeting', id),
+  ragChunkUserNote: (id: string) => ipcRenderer.invoke('ironmic:rag-chunk-user-note', id),
+  /** Classify a free-text query into a Knowledge Q&A intent (Temporal /
+   *  SingleDoc / CrossDoc / Topic) with date / speaker / source-type filters
+   *  pre-computed. Returns a JSON string. Used by AI Chat's Search-mode
+   *  toggle to scope retrieval (e.g. "yesterday" ⇒ date_from/date_to). */
+  ragClassifyIntent: (query: string) => ipcRenderer.invoke('ironmic:rag-classify-intent', query),
+  /** Hybrid FTS5 + (optional) vector retrieval over the indexed chunks.
+   *  queryEmbedding is the BgeEmbedder output as Uint8Array, or an empty
+   *  buffer for FTS5-only mode. optionsJson encodes {model_version, k,
+   *  filters, skip_archived}. Returns a JSON string with the top-k hits
+   *  ready for citation rendering. */
+  ragRetrieveHybrid: (query: string, queryEmbedding: Uint8Array, optionsJson: string) =>
+    ipcRenderer.invoke('ironmic:rag-retrieve-hybrid', query, queryEmbedding, optionsJson),
+
+  // ── User Notes (Slice 0 of Knowledge Q&A — SQLite-backed, replaces localStorage) ──
+  // The renderer-side useNotesStore wraps these with an optimistic in-memory cache
+  // + per-id serial write queue so the public store interface stays synchronous.
+  userNotesCreate: (note: any) => ipcRenderer.invoke('ironmic:user-notes-create', note),
+  userNotesGet: (id: string) => ipcRenderer.invoke('ironmic:user-notes-get', id),
+  userNotesUpdate: (id: string, updates: any) =>
+    ipcRenderer.invoke('ironmic:user-notes-update', id, updates),
+  userNotesDelete: (id: string) => ipcRenderer.invoke('ironmic:user-notes-delete', id),
+  userNotesList: (opts: { notebookId?: string; search?: string; limit: number; offset: number }) =>
+    ipcRenderer.invoke('ironmic:user-notes-list', opts),
+  /** One-shot localStorage → SQLite import. payloadJson = JSON-encoded
+   *  `{notes: [...], notebooks: [...]}`. Idempotent (INSERT OR IGNORE inside). */
+  userNotesBulkImport: (payloadJson: string) =>
+    ipcRenderer.invoke('ironmic:user-notes-bulk-import', payloadJson),
+  userNotebooksCreate: (name: string, color: string) =>
+    ipcRenderer.invoke('ironmic:user-notebooks-create', name, color),
+  userNotebooksRename: (id: string, name: string) =>
+    ipcRenderer.invoke('ironmic:user-notebooks-rename', id, name),
+  userNotebooksDelete: (id: string) => ipcRenderer.invoke('ironmic:user-notebooks-delete', id),
+  userNotebooksList: () => ipcRenderer.invoke('ironmic:user-notebooks-list'),
+
   tagUntaggedEntries: (sourceApp: string) => ipcRenderer.invoke('ironmic:tag-untagged-entries', sourceApp),
 
   // Dictionary
   addWord: (word: string) => ipcRenderer.invoke('ironmic:add-word', word),
   removeWord: (word: string) => ipcRenderer.invoke('ironmic:remove-word', word),
   listDictionary: () => ipcRenderer.invoke('ironmic:list-dictionary'),
+  refreshTranscriptionDictionary: () =>
+    ipcRenderer.invoke('ironmic:refresh-transcription-dictionary'),
+  /** Subscribe to dictionary-mutation events so the renderer can refresh
+   *  any cached term lists used for transcript post-correction. Returns a
+   *  cleanup function. */
+  onDictionaryChanged: (callback: () => void) => {
+    const handler = () => callback();
+    ipcRenderer.on('ironmic:dictionary-changed', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictionary-changed', handler);
+  },
 
   // Settings
   getSetting: (key: string) => ipcRenderer.invoke('ironmic:get-setting', key),
   setSetting: (key: string, value: string) => ipcRenderer.invoke('ironmic:set-setting', key, value),
-
-  // Diagnostics
-  getMainErrors: () => ipcRenderer.invoke('ironmic:get-main-errors'),
 
   // Clipboard
   copyToClipboard: (text: string) => ipcRenderer.invoke('ironmic:copy-to-clipboard', text),
@@ -59,6 +167,12 @@ const api = {
   isGpuEnabled: () => ipcRenderer.invoke('ironmic:is-gpu-enabled'),
   setGpuEnabled: (enabled: boolean) => ipcRenderer.invoke('ironmic:set-gpu-enabled', enabled),
 
+  // Multi-engine transcription (Phase 1) — Moonshine + Whisper selection
+  listTranscriptionEngines: () => ipcRenderer.invoke('ironmic:list-transcription-engines'),
+  getTranscriptionEngine: () => ipcRenderer.invoke('ironmic:get-transcription-engine'),
+  downloadTranscriptionEngine: (engineId: string) => ipcRenderer.invoke('ironmic:download-transcription-engine', engineId),
+  isTranscriptionEngineReady: (engineId: string) => ipcRenderer.invoke('ironmic:is-transcription-engine-ready', engineId),
+
   // TTS
   synthesizeText: (text: string) => ipcRenderer.invoke('ironmic:synthesize-text', text),
   ttsPlay: () => ipcRenderer.invoke('ironmic:tts-play'),
@@ -70,9 +184,18 @@ const api = {
   ttsSetVoice: (voiceId: string) => ipcRenderer.invoke('ironmic:tts-set-voice', voiceId),
   ttsAvailableVoices: () => ipcRenderer.invoke('ironmic:tts-available-voices'),
   ttsLoadModel: () => ipcRenderer.invoke('ironmic:tts-load-model'),
+  ttsGetStreamState: () => ipcRenderer.invoke('ironmic:tts-get-stream-state'),
   isTtsModelReady: () => ipcRenderer.invoke('ironmic:is-tts-model-ready'),
+  ttsGetReadiness: (voiceId?: string) => ipcRenderer.invoke('ironmic:tts-get-readiness', voiceId),
   ttsIsLoaded: () => ipcRenderer.invoke('ironmic:tts-is-loaded'),
   ttsToggle: () => ipcRenderer.invoke('ironmic:tts-toggle'),
+  /** Per-voice progress events from the Settings → Repair flow.
+   *  payload: { id, downloaded, total, status: 'downloading'|'verifying'|'verified'|'error'|'complete', error? } */
+  onTtsVoicesProgress: (callback: (payload: any) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:tts-voices-progress', handler);
+    return () => ipcRenderer.removeListener('ironmic:tts-voices-progress', handler);
+  },
 
   // Analytics
   analyticsRecomputeToday: () => ipcRenderer.invoke('ironmic:analytics-recompute-today'),
@@ -93,10 +216,18 @@ const api = {
   aiGetAuthState: () => ipcRenderer.invoke('ai:get-auth-state'),
   aiRefreshAuth: (provider?: string) => ipcRenderer.invoke('ai:refresh-auth', provider),
   aiPickProvider: () => ipcRenderer.invoke('ai:pick-provider'),
-  aiSendMessage: (prompt: string, provider: string, model?: string) => ipcRenderer.invoke('ai:send-message', prompt, provider, model),
+  aiSendMessage: (
+    prompt: string,
+    provider: string,
+    model?: string,
+    sessionId?: string | null,
+    priorMessages?: Array<{ role: string; content: string }>,
+  ) => ipcRenderer.invoke('ai:send-message', prompt, provider, model, sessionId, priorMessages),
   aiGetModels: (provider?: string) => ipcRenderer.invoke('ai:get-models', provider),
+  aiRefreshModels: (provider?: string, opts?: { force?: boolean }) =>
+    ipcRenderer.invoke('ai:refresh-models', provider, opts),
   aiCancel: () => ipcRenderer.invoke('ai:cancel'),
-  aiResetSession: () => ipcRenderer.invoke('ai:reset-session'),
+  aiResetSession: (sessionId?: string | null) => ipcRenderer.invoke('ai:reset-session', sessionId),
   aiGetLocalModelStatus: () => ipcRenderer.invoke('ai:local-model-status'),
   onAiOutput: (callback: (data: any) => void) => {
     const handler = (_event: any, data: any) => callback(data);
@@ -130,6 +261,27 @@ const api = {
     ipcRenderer.invoke('ironmic:notification-get-interactions', sinceDate),
   notificationGetUnreadCount: () => ipcRenderer.invoke('ironmic:notification-get-unread-count'),
   notificationDeleteOld: (days: number) => ipcRenderer.invoke('ironmic:notification-delete-old', days),
+
+  // ── AI Chat Persistence (v1.8.x) ──
+  // All return JSON strings (or "null" / void) — caller parses.
+  aiChatCreateSession: (id: string | null, title: string, provider: string | null, createdAt?: string, updatedAt?: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-create-session', id, title, provider, createdAt, updatedAt),
+  aiChatListSessions: (limit: number, offset: number, includeArchived: boolean) =>
+    ipcRenderer.invoke('ironmic:ai-chat-list-sessions', limit, offset, includeArchived),
+  aiChatGetSession: (id: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-get-session', id),
+  aiChatRenameSession: (id: string, title: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-rename-session', id, title),
+  aiChatPinSession: (id: string, pinned: boolean) =>
+    ipcRenderer.invoke('ironmic:ai-chat-pin-session', id, pinned),
+  aiChatArchiveSession: (id: string, archived: boolean) =>
+    ipcRenderer.invoke('ironmic:ai-chat-archive-session', id, archived),
+  aiChatDeleteSession: (id: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-delete-session', id),
+  aiChatAppendMessage: (sessionId: string, role: string, content: string, provider: string | null, id?: string, createdAt?: string) =>
+    ipcRenderer.invoke('ironmic:ai-chat-append-message', sessionId, role, content, provider, id, createdAt),
+  aiChatSearchSessions: (query: string, limit: number) =>
+    ipcRenderer.invoke('ironmic:ai-chat-search-sessions', query, limit),
 
   // ── ML Features: Action Log ──
   logAction: (actionType: string, metadataJson?: string) =>
@@ -190,9 +342,93 @@ const api = {
   meetingDelete: (id: string) => ipcRenderer.invoke('ironmic:meeting-delete', id),
   meetingCreateWithTemplate: (templateId: string | null, detectedApp: string | null) => ipcRenderer.invoke('ironmic:meeting-create-with-template', templateId, detectedApp),
   meetingSetStructuredOutput: (id: string, structuredOutput: string) => ipcRenderer.invoke('ironmic:meeting-set-structured-output', id, structuredOutput),
-  meetingSetRawTranscript: (id: string, rawTranscript: string) => ipcRenderer.invoke('ironmic:meeting-set-raw-transcript', id, rawTranscript),
-  meetingRename: (id: string, name: string) => ipcRenderer.invoke('ironmic:meeting-rename', id, name),
-  meetingSearch: (query: string, limit: number) => ipcRenderer.invoke('ironmic:meeting-search', query, limit),
+  meetingGetParticipants: (id: string) => ipcRenderer.invoke('ironmic:meeting-get-participants', id),
+
+  // ── Meeting Recording (Granola-style chunk loop) ──
+  meetingStartRecording: (
+    sessionId: string,
+    deviceName?: string | null,
+    chunkIntervalS?: number,
+    hostDisplayName?: string | null,
+    /**
+     * Remote-meeting capture: when `enabled`, the recorder runs the dual-
+     * stream pipeline (mic + WASAPI loopback) and tags each segment with
+     * its source ('mic' = "You", 'loopback' = "Remote"). `loopbackDevice`
+     * is 'system_default' (Windows default speakers) or 'device:<id>' for
+     * a specific render endpoint. Pass `null` to defer to the global
+     * `meeting_remote_capture_enabled` setting.
+     */
+    remoteCaptureOpts?: { enabled?: boolean; loopbackDevice?: string | null } | null,
+  ) =>
+    ipcRenderer.invoke('ironmic:meeting-start-recording', sessionId, deviceName, chunkIntervalS, hostDisplayName, remoteCaptureOpts),
+  meetingStopRecording: () => ipcRenderer.invoke('ironmic:meeting-stop-recording'),
+  meetingGetCurrentSummary: (): Promise<{ summary: string; insufficient: boolean }> =>
+    ipcRenderer.invoke('ironmic:meeting-get-current-summary'),
+  /** Toggle self-mute during an active meeting. Backend is the source of
+   *  truth — the renderer should mirror state via onMeetingRecordingState
+   *  rather than flipping its store optimistically. */
+  meetingSetMicMuted: (sessionId: string, muted: boolean) =>
+    ipcRenderer.invoke('ironmic:meeting-set-mic-muted', sessionId, muted),
+
+  // ── Streaming dictation (near-real-time) ──
+  // `source` tags the stream so each consumer (Notes, Forge, AI Chat) only
+  // reacts to its own events. Defaults to 'notes' in main if omitted.
+  dictationStreamStart: (opts?: { source?: 'notes' | 'forge' | 'ai-chat' }) =>
+    ipcRenderer.invoke('ironmic:dictation-stream-start', opts),
+  dictationStreamStop: () => ipcRenderer.invoke('ironmic:dictation-stream-stop'),
+  onDictationStreamChunk: (callback: (payload: { index: number; text: string; isFinal: boolean; source: 'notes' | 'forge' | 'ai-chat' }) => void) => {
+    const handler = (_e: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:dictation-stream-chunk', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-chunk', handler);
+  },
+  /** Live hypothesis from the Moonshine session path — replaces, does not append.
+   *  Not persisted; cleared when a committed chunk arrives or recording stops. */
+  onDictationStreamDraft: (callback: (payload: { hypothesis: string; source: 'notes' | 'forge' | 'ai-chat' }) => void) => {
+    const handler = (_e: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:dictation-stream-draft', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-draft', handler);
+  },
+  onDictationStreamState: (callback: (state: { status: string; startedAt: number | null; chunkCount: number; source: 'notes' | 'forge' | 'ai-chat'; engine?: 'moonshine-session' | 'moonshine-chunked' | 'whisper-chunked' | 'unknown' }) => void) => {
+    const handler = (_e: any, s: any) => callback(s);
+    ipcRenderer.on('ironmic:dictation-stream-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-state', handler);
+  },
+  /** Voice Chat hands-free signal: fired when the streaming session detects
+   *  a silence-driven commit for an `ai-chat` source with non-empty text.
+   *  The renderer should auto-send the payload `text` (do NOT read React
+   *  state — chunk events are async and may not have flushed). */
+  onDictationStreamEndOfTurn: (callback: (payload: { source: 'ai-chat'; text: string }) => void) => {
+    const handler = (_e: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:dictation-stream-end-of-turn', handler);
+    return () => ipcRenderer.removeListener('ironmic:dictation-stream-end-of-turn', handler);
+  },
+  /** Notify the main-process LiveSummarizer that the user typed new notes.
+   *  Fire-and-forget — the summarizer will re-read the persisted notes and
+   *  debounce a re-summary. Caller should persist via meetingSetStructuredOutput FIRST. */
+  notifyMeetingUserNotesChanged: (sessionId: string) =>
+    ipcRenderer.send('ironmic:meeting-user-notes-changed', sessionId),
+
+  // ── Meeting Room (LAN multi-user collaboration) ──
+  meetingRoomHostStart: (sessionId: string, hostName: string, templateId?: string | null) =>
+    ipcRenderer.invoke('ironmic:meeting-room-host-start', sessionId, hostName, templateId),
+  meetingRoomHostStop: () => ipcRenderer.invoke('ironmic:meeting-room-host-stop'),
+  meetingRoomHostInfo: () => ipcRenderer.invoke('ironmic:meeting-room-host-info'),
+  meetingRoomJoin: (opts: { hostIp: string; hostPort: number; roomCode: string; displayName: string; deviceName?: string | null }) =>
+    ipcRenderer.invoke('ironmic:meeting-room-join', opts),
+  meetingRoomLeave: () => ipcRenderer.invoke('ironmic:meeting-room-leave'),
+  meetingRoomLeaveTransport: () => ipcRenderer.invoke('ironmic:meeting-room-leave-transport'),
+  meetingRoomBroadcastFinalSummary: (sessionId: string, summary: string) =>
+    ipcRenderer.invoke('ironmic:meeting-room-broadcast-final-summary', sessionId, summary),
+  meetingRoomParticipantFinalized: () =>
+    ipcRenderer.invoke('ironmic:meeting-room-participant-finalized'),
+  meetingSetTitle: (sessionId: string, title: string | null) =>
+    ipcRenderer.invoke('ironmic:meeting-set-title', sessionId, title),
+  meetingGetMaxSequence: () => ipcRenderer.invoke('ironmic:meeting-get-max-sequence'),
+
+  // ── Transcript Segments ──
+  listTranscriptSegments: (sessionId: string) => ipcRenderer.invoke('ironmic:list-transcript-segments', sessionId),
+  updateSegmentSpeaker: (id: string, speakerLabel: string) => ipcRenderer.invoke('ironmic:update-segment-speaker', id, speakerLabel),
+  assembleFullTranscript: (sessionId: string) => ipcRenderer.invoke('ironmic:assemble-full-transcript', sessionId),
 
   // ── Audio Input ──
   listAudioDevices: () => ipcRenderer.invoke('ironmic:list-audio-devices'),
@@ -218,11 +454,18 @@ const api = {
   // ── TF.js Infrastructure ──
   getModelsDir: () => ipcRenderer.invoke('ironmic:get-models-dir'),
 
+  // ── Model management (delete / redownload / disk usage / open folder) ──
+  openModelsDirectory: () => ipcRenderer.invoke('ironmic:open-models-directory'),
+  getEngineDiskUsage: (engineId: string) => ipcRenderer.invoke('ironmic:get-engine-disk-usage', engineId),
+  deleteEngineFiles: (engineId: string) => ipcRenderer.invoke('ironmic:delete-engine-files', engineId),
+  redownloadEngine: (engineId: string) => ipcRenderer.invoke('ironmic:redownload-engine', engineId),
+
   // Manual model import
   importModel: () => ipcRenderer.invoke('ironmic:import-model'),
   getImportableModels: () => ipcRenderer.invoke('ironmic:get-importable-models'),
   importModelFromPath: (filePath: string, sectionFilter: string) => ipcRenderer.invoke('ironmic:import-model-from-path', filePath, sectionFilter),
   importMultiPartModel: () => ipcRenderer.invoke('ironmic:import-multi-part-model'),
+  importMoonshineEngine: (engineId: string) => ipcRenderer.invoke('ironmic:import-moonshine-engine', engineId),
   openExternal: (url: string) => ipcRenderer.invoke('ironmic:open-external', url),
 
   // Events from main process
@@ -250,9 +493,236 @@ const api = {
     ipcRenderer.on('ironmic:workflow-discovered', handler);
     return () => ipcRenderer.removeListener('ironmic:workflow-discovered', handler);
   },
+
+  // ── Meeting Recording Events (main → renderer) ──
+  onMeetingSegmentReady: (callback: (segment: any) => void) => {
+    const handler = (_event: any, segment: any) => callback(segment);
+    ipcRenderer.on('ironmic:meeting-segment-ready', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-segment-ready', handler);
+  },
+  onMeetingDraftReady: (
+    callback: (payload: { sessionId: string | null; hypothesis: string; startMs: number }) => void,
+  ) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-draft-ready', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-draft-ready', handler);
+  },
+  onMeetingRecordingState: (callback: (state: any) => void) => {
+    const handler = (_event: any, state: any) => callback(state);
+    ipcRenderer.on('ironmic:meeting-recording-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-recording-state', handler);
+  },
+  /**
+   * End-of-meeting speaker-label patches from AHC refinement + optional
+   * LLM roster-rename. Emitted once per meeting stop. Empty `patches`
+   * means refinement ran but produced no changes — renderer should
+   * clear any "diarization pending" UI state.
+   */
+  onMeetingSegmentsRelabeled: (
+    callback: (payload: { sessionId: string; patches: Array<{ segmentId: string; newLabel: string }> }) => void,
+  ) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-segments-relabeled', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-segments-relabeled', handler);
+  },
+  onMeetingLiveSummary: (callback: (payload: any) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-live-summary', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-live-summary', handler);
+  },
+  onMeetingUserNotesBroadcast: (callback: (payload: { sessionId: string | null; html: string; version: number; originId: string | null }) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-user-notes-broadcast', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-user-notes-broadcast', handler);
+  },
+  /** Tray/menu/notification quick actions → renderer opens the right page and runs the action. */
+  onQuickAction: (callback: (action: 'start-dictation' | 'start-meeting') => void) => {
+    const handler = (_event: any, action: 'start-dictation' | 'start-meeting') => callback(action);
+    ipcRenderer.on('ironmic:quick-action', handler);
+    return () => ipcRenderer.removeListener('ironmic:quick-action', handler);
+  },
+  onMeetingAppDetected: (callback: (event: any, data: any) => void) => {
+    ipcRenderer.on('ironmic:meeting-app-detected', callback);
+    return () => ipcRenderer.removeListener('ironmic:meeting-app-detected', callback);
+  },
+
+  // ── Meeting Room Events (main → renderer) ──
+  onMeetingRoomState: (callback: (info: any) => void) => {
+    const handler = (_event: any, info: any) => callback(info);
+    ipcRenderer.on('ironmic:meeting-room-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-state', handler);
+  },
+  onMeetingRoomParticipantUpdate: (callback: (msg: any) => void) => {
+    const handler = (_event: any, msg: any) => callback(msg);
+    ipcRenderer.on('ironmic:meeting-room-participant-update', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-participant-update', handler);
+  },
+  onMeetingRoomHostEnded: (callback: (payload: { localSessionId: string | null; finalSummary: string | null; finalSummaryAt: number | null; finalTitle: string | null; finalSegmentCount: number | null }) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-room-host-ended', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-host-ended', handler);
+  },
+  onMeetingRoomTitleUpdate: (callback: (payload: { sessionId: string | null; title: string | null }) => void) => {
+    const handler = (_event: any, payload: any) => callback(payload);
+    ipcRenderer.on('ironmic:meeting-room-title-update', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-room-title-update', handler);
+  },
+
+  // ── BlackHole (macOS system audio) ──
+  blackholeCheck: (deviceListJson?: string) =>
+    ipcRenderer.invoke('ironmic:blackhole-check', deviceListJson),
+  blackholeInstall: () => ipcRenderer.invoke('ironmic:blackhole-install'),
+  blackholeOpenAudioMidiSetup: () => ipcRenderer.invoke('ironmic:blackhole-open-audio-midi-setup'),
+  onBlackholeInstallProgress: (callback: (p: any) => void) => {
+    const handler = (_event: any, p: any) => callback(p);
+    ipcRenderer.on('ironmic:blackhole-install-progress', handler);
+    return () => ipcRenderer.removeListener('ironmic:blackhole-install-progress', handler);
+  },
+
+  // ── Processing state notifications (renderer → main, fire-and-forget) ──
+  // Called when note generation starts/ends so the main process can intercept
+  // window close and warn the user about in-flight work.
+  notifyProcessingState: (isActive: boolean) =>
+    ipcRenderer.send('ironmic:notify-processing-state', isActive),
+
+  // ── Notes Collaboration ──
+  meetingCollabStart: (sessionId: string, hostName: string, notes: string, version?: number) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-start', sessionId, hostName, notes, version),
+  meetingCollabStop: () => ipcRenderer.invoke('ironmic:meeting-collab-stop'),
+  meetingCollabNotifySaved: (notes: string, savedBy: string) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-notify-saved', notes, savedBy),
+  meetingCollabNotifyDraft: (content: string, senderName: string) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-notify-draft', content, senderName),
+  meetingCollabJoin: (opts: { hostIp: string; hostPort: number; sessionCode: string; displayName: string }) =>
+    ipcRenderer.invoke('ironmic:meeting-collab-join', opts),
+  meetingCollabLeave: () => ipcRenderer.invoke('ironmic:meeting-collab-leave'),
+  meetingCollabSaveNotes: (content: string) => ipcRenderer.invoke('ironmic:meeting-collab-save-notes', content),
+  meetingCollabSendDraft: (content: string) => ipcRenderer.invoke('ironmic:meeting-collab-send-draft', content),
+  onMeetingCollabState: (callback: (info: any) => void) => {
+    const handler = (_event: any, info: any) => callback(info);
+    ipcRenderer.on('ironmic:meeting-collab-state', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-state', handler);
+  },
+  onMeetingCollabNotesUpdated: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-notes-updated', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-notes-updated', handler);
+  },
+  onMeetingCollabDraft: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-draft', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-draft', handler);
+  },
+  onMeetingCollabEnded: (callback: () => void) => {
+    const handler = () => callback();
+    ipcRenderer.on('ironmic:meeting-collab-ended', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-ended', handler);
+  },
+  onMeetingCollabFirewallWarning: (
+    callback: (data: { message: string; actions?: Array<'open-settings' | 'elevate'> }) => void,
+  ) => {
+    const handler = (_event: any, data: { message: string; actions?: Array<'open-settings' | 'elevate'> }) => callback(data);
+    ipcRenderer.on('ironmic:meeting-collab-firewall-warning', handler);
+    return () => ipcRenderer.removeListener('ironmic:meeting-collab-firewall-warning', handler);
+  },
+  meetingCollabOpenFirewallSettings: () =>
+    ipcRenderer.invoke('ironmic:meeting-collab-open-firewall-settings'),
+  meetingCollabRequestFirewallElevation: () =>
+    ipcRenderer.invoke('ironmic:meeting-collab-request-firewall-elevation'),
+
+  // ── Whisper readiness ──
+  onWhisperLoadFailed: (callback: (data: { message: string; permanent: boolean }) => void) => {
+    const handler = (_event: any, data: { message: string; permanent: boolean }) => callback(data);
+    ipcRenderer.on('ironmic:whisper-load-failed', handler);
+    return () => ipcRenderer.removeListener('ironmic:whisper-load-failed', handler);
+  },
+
+  // ── Forge mode ──
+  // The Forge bar is a separate BrowserWindow. Both windows load this same
+  // preload, so the API surface is identical — what differs is which page
+  // the renderer mounts (Layout vs. ForgeApp). The main window invokes
+  // enterForge from a sidebar/tray button; the Forge window invokes
+  // exitForge from its ✕ button.
+  enterForge: () => ipcRenderer.invoke('ironmic:enter-forge'),
+  exitForge: () => ipcRenderer.invoke('ironmic:exit-forge'),
+
+  /** Paste `text` at the OS keyboard cursor (whatever app is focused).
+   *  When `restoreClipboard` is true, the prior clipboard text (if any) is
+   *  restored ~500ms after paste — text only, not images/files/HTML. */
+  pasteText: (text: string, restoreClipboard: boolean) =>
+    ipcRenderer.invoke('ironmic:forge-paste-text', text, restoreClipboard),
+
+  /** Type `text` character-by-character at the OS keyboard cursor. Slower
+   *  than paste; for use in apps that intercept Cmd/Ctrl+V. */
+  typeText: (text: string) => ipcRenderer.invoke('ironmic:forge-type-text', text),
+
+  /** macOS: returns whether IronMic has Accessibility permission.
+   *  Other platforms: returns true. Non-prompting. */
+  isAccessibilityTrusted: () => ipcRenderer.invoke('ironmic:forge-check-accessibility'),
+
+  /** Open System Settings → Privacy & Security → Accessibility (macOS).
+   *  No-op on other platforms. */
+  openAccessibilityPrefs: () =>
+    ipcRenderer.invoke('ironmic:forge-open-accessibility-prefs'),
+
+  /** Forge-specific polish path. Honors the AND of (polish_allow_cloud,
+   *  forge_polish_allow_cloud) — global setting is the upper bound. */
+  forgePolishText: (rawText: string) =>
+    ipcRenderer.invoke('ironmic:forge-polish-text', rawText),
+
+  /** Renderer→main handshake fired when a Forge dictation finishes (success
+   *  or error) so main can clear the dictation owner record and accept the
+   *  next hotkey. Fire-and-forget. */
+  notifyForgeDictationComplete: (error?: string | null) =>
+    ipcRenderer.send('ironmic:forge-dictation-complete', error ?? null),
+
+  /** Switch the Forge window between the compact bar (56 px) and the
+   *  taller permission-panel size (~130 px). The bar is fixed-size so the
+   *  AX prompt's action buttons don't fit inside it without resizing. */
+  forgeSetWindowMode: (mode: 'bar' | 'permission' | 'compact' | 'expanded') =>
+    ipcRenderer.invoke('ironmic:forge-set-window-mode', mode),
+
+  /** Push-to-talk start (Fn / Ctrl+Win pressed, past the chord-grace window). */
+  onForgePushToTalkStart: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-start', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-start', callback);
+  },
+  /** Push-to-talk end (modifier(s) released — stop dictation, paste). */
+  onForgePushToTalkEnd: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-end', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-end', callback);
+  },
+  /** Push-to-talk aborted (user added Space → chord). Roll back without paste. */
+  onForgePushToTalkCancel: (callback: () => void) => {
+    ipcRenderer.on('ironmic:forge-ptt-cancel', callback);
+    return () => ipcRenderer.removeListener('ironmic:forge-ptt-cancel', callback);
+  },
+
+  /** Broadcast a theme change to all windows. Called from useSettingsStore
+   *  whenever the user picks light/dark/system. Each window's onThemeChanged
+   *  listener applies the change. */
+  broadcastTheme: (theme: 'light' | 'dark' | 'system') =>
+    ipcRenderer.invoke('ironmic:broadcast-theme', theme),
+
+  /** Listen for theme changes from any window. Forge bar uses this to stay
+   *  in sync with the main IronMic theme picker. */
+  onThemeChanged: (callback: (theme: 'light' | 'dark' | 'system') => void) => {
+    const handler = (_event: any, theme: 'light' | 'dark' | 'system') => callback(theme);
+    ipcRenderer.on('ironmic:theme-changed', handler);
+    return () => ipcRenderer.removeListener('ironmic:theme-changed', handler);
+  },
 };
 
 contextBridge.exposeInMainWorld('ironmic', api);
+
+// ── Debug audio pipeline logs (gated in main on `debug_audio_logging` setting) ──
+// Emits `[ironmic:debug] <stage>` lines to the renderer DevTools console so the
+// user can see exactly which hop drops a chunk (capture → silence-gate → whisper
+// → sanitize → emit → recv). Self-installing — no API surface needed.
+ipcRenderer.on('ironmic:debug-log', (_event, payload: { stage: string; data: any; t: number }) => {
+  // eslint-disable-next-line no-console
+  console.log(`[ironmic:debug] ${payload.stage}`, payload.data);
+});
 
 // Type declaration for the renderer
 export type IronMicAPI = typeof api;

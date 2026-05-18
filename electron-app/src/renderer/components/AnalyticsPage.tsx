@@ -1,14 +1,13 @@
-import { useState, useEffect, useCallback, Component, type ReactNode } from 'react';
+import { useEffect, useCallback, Component, type ReactNode } from 'react';
 import {
   BarChart3, Clock, Flame, TrendingUp, TrendingDown, Minus,
   BookOpen, Zap, Loader2, Brain, AlertTriangle, RefreshCw,
-  Users, MessageSquare, Mic, Share2, FileText,
 } from 'lucide-react';
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
 } from 'recharts';
-import { Card, PageHeader } from './ui';
+import { Card } from './ui';
 import { useAnalyticsStore } from '../stores/useAnalyticsStore';
 import type { AnalyticsPeriod } from '../types';
 
@@ -92,11 +91,16 @@ function AnalyticsPageInner() {
   }, [setPeriod]);
 
   return (
-    <div className="h-full overflow-y-auto flex flex-col">
-      <PageHeader icon={BarChart3} title="Analytics" description="Track your dictation habits and productivity" actions={
+    <div className="h-full overflow-y-auto p-6 space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <BarChart3 className="w-6 h-6 text-iron-accent-light" />
+          <h1 className="text-xl font-bold text-iron-text">Analytics</h1>
+        </div>
         <PeriodSelector period={period} onChange={handlePeriodChange} />
-      } />
-      <div className="flex-1 p-6 space-y-6">
+      </div>
+
       {loading && !overview ? (
         <div className="flex items-center justify-center py-20">
           <Loader2 className="w-6 h-6 animate-spin text-iron-accent-light" />
@@ -415,169 +419,9 @@ function AnalyticsPageInner() {
               </div>
             </Card>
           </div>
-
-          {/* Cross-tool activity */}
-          <ActivityOverview />
         </>
       )}
-      </div>
     </div>
-  );
-}
-
-/** Shows stats from meetings, AI chat, and all content across the app. */
-function ActivityOverview() {
-  const [meetingCount, setMeetingCount] = useState(0);
-  const [meetingMinutes, setMeetingMinutes] = useState(0);
-  const [aiChatCount, setAiChatCount] = useState(0);
-  const [aiEntryWords, setAiEntryWords] = useState(0);
-  const [dictationEntries, setDictationEntries] = useState(0);
-  const [totalEntries, setTotalEntries] = useState(0);
-  const [recentActivity, setRecentActivity] = useState<Array<{ type: string; label: string; time: string }>>([]);
-
-  useEffect(() => {
-    loadActivityStats();
-  }, []);
-
-  async function loadActivityStats() {
-    const api = window.ironmic;
-    try {
-      // Meeting stats
-      const meetingsJson = await api.meetingList(100, 0).catch(() => '[]');
-      const meetings = JSON.parse(meetingsJson);
-      setMeetingCount(meetings.length);
-      const totalMeetingSeconds = meetings.reduce((sum: number, m: any) => sum + (m.total_duration_seconds || 0), 0);
-      setMeetingMinutes(Math.round(totalMeetingSeconds / 60));
-
-      // Entry stats — count AI vs dictation
-      const entriesJson = await api.listEntries({ limit: 1000, offset: 0 }).catch(() => '[]');
-      const entries = Array.isArray(entriesJson) ? entriesJson : JSON.parse(entriesJson);
-      setTotalEntries(entries.length);
-      const aiEntries = entries.filter((e: any) => e.sourceApp?.startsWith('ai-chat') || e.source_app?.startsWith('ai-chat'));
-      const dictEntries = entries.filter((e: any) => !e.sourceApp?.startsWith('ai-chat') && !e.source_app?.startsWith('ai-chat'));
-      setAiChatCount(aiEntries.length);
-      setDictationEntries(dictEntries.length);
-
-      // Word count from AI entries
-      const aiWords = aiEntries.reduce((sum: number, e: any) => {
-        const text = e.polishedText || e.polished_text || e.rawTranscript || e.raw_transcript || '';
-        return sum + text.split(/\s+/).filter(Boolean).length;
-      }, 0);
-      setAiEntryWords(aiWords);
-
-      // Recent activity timeline (last 10 items across all types)
-      const activity: Array<{ type: string; label: string; time: string; sortTime: number }> = [];
-
-      // Add dictation entries
-      for (const e of dictEntries.slice(0, 5)) {
-        const text = e.polishedText || e.polished_text || e.rawTranscript || e.raw_transcript || '';
-        activity.push({
-          type: 'dictation',
-          label: text.slice(0, 60) + (text.length > 60 ? '...' : ''),
-          time: e.createdAt || e.created_at,
-          sortTime: new Date(e.createdAt || e.created_at).getTime(),
-        });
-      }
-
-      // Add AI entries
-      for (const e of aiEntries.slice(0, 5)) {
-        const text = e.polishedText || e.polished_text || e.rawTranscript || e.raw_transcript || '';
-        activity.push({
-          type: 'ai',
-          label: text.slice(0, 60) + (text.length > 60 ? '...' : ''),
-          time: e.createdAt || e.created_at,
-          sortTime: new Date(e.createdAt || e.created_at).getTime(),
-        });
-      }
-
-      // Add meetings
-      for (const m of meetings.slice(0, 5)) {
-        const dur = m.total_duration_seconds ? `${Math.round(m.total_duration_seconds / 60)}min` : '';
-        activity.push({
-          type: 'meeting',
-          label: `Meeting${m.detected_app ? ` (${m.detected_app})` : ''} ${dur}`.trim(),
-          time: m.started_at,
-          sortTime: new Date(m.started_at).getTime(),
-        });
-      }
-
-      // Sort by time, most recent first
-      activity.sort((a, b) => b.sortTime - a.sortTime);
-      setRecentActivity(activity.slice(0, 10));
-    } catch (err) {
-      console.error('[ActivityOverview] Failed to load:', err);
-    }
-  }
-
-  const activityIcon = (type: string) => {
-    switch (type) {
-      case 'dictation': return <Mic className="w-3 h-3 text-iron-accent-light" />;
-      case 'ai': return <MessageSquare className="w-3 h-3 text-purple-400" />;
-      case 'meeting': return <Users className="w-3 h-3 text-green-400" />;
-      default: return <FileText className="w-3 h-3 text-iron-text-muted" />;
-    }
-  };
-
-  return (
-    <>
-      {/* Cross-tool stat cards */}
-      <div className="flex items-center gap-2 mt-2">
-        <Share2 className="w-4 h-4 text-iron-text-muted" />
-        <h3 className="text-sm font-semibold text-iron-text">All Activity</h3>
-      </div>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard
-          label="Dictations"
-          value={dictationEntries.toString()}
-          icon={<Mic className="w-4 h-4" />}
-        />
-        <StatCard
-          label="AI Conversations"
-          value={aiChatCount.toString()}
-          subtitle={aiEntryWords > 0 ? `${formatNumber(aiEntryWords)} words` : undefined}
-          icon={<MessageSquare className="w-4 h-4" />}
-        />
-        <StatCard
-          label="Meetings"
-          value={meetingCount.toString()}
-          subtitle={meetingMinutes > 0 ? `${meetingMinutes} min total` : undefined}
-          icon={<Users className="w-4 h-4" />}
-        />
-        <StatCard
-          label="Total Entries"
-          value={totalEntries.toString()}
-          icon={<BookOpen className="w-4 h-4" />}
-        />
-      </div>
-
-      {/* Recent activity feed */}
-      {recentActivity.length > 0 && (
-        <Card className="p-5">
-          <h3 className="text-sm font-semibold text-iron-text mb-3">Recent Activity</h3>
-          <div className="space-y-2">
-            {recentActivity.map((item, i) => (
-              <div key={i} className="flex items-start gap-2.5">
-                <div className="mt-0.5">{activityIcon(item.type)}</div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-xs text-iron-text truncate">{item.label}</p>
-                  <p className="text-[10px] text-iron-text-muted">
-                    {new Date(item.time).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
-                    {' · '}
-                    <span className={
-                      item.type === 'dictation' ? 'text-iron-accent-light' :
-                      item.type === 'ai' ? 'text-purple-400' :
-                      'text-green-400'
-                    }>
-                      {item.type === 'dictation' ? 'Dictation' : item.type === 'ai' ? 'AI Chat' : 'Meeting'}
-                    </span>
-                  </p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </Card>
-      )}
-    </>
   );
 }
 

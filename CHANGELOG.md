@@ -2,65 +2,394 @@
 
 All notable changes to IronMic will be documented in this file.
 
-## [1.6.0] - 2026-04-20
+## [1.9.1] - 2026-05-17
 
-### Added
-
-#### Enterprise Evaluation Guide
-- **ENTERPRISE.md** — Comprehensive enterprise evaluation document covering architecture, security model, privacy guarantees, deployment options (standard, air-gapped, build from source), system requirements, model management, compliance mapping (HIPAA, GDPR, SOC 2, CCPA, FERPA, ITAR), performance benchmarks, licensing, and FAQ. Designed for IT teams, security reviewers, and procurement evaluating IronMic for organizational deployment.
-
-#### Feature Roadmap & Ideas Library
-- **15 feature proposals** — Complete design documents for planned features, each with full architecture diagrams, database schemas, implementation phases, N-API surface definitions, privacy analysis, performance considerations, and success metrics. New `ideas/` directory with individual proposal files.
-- **ideas/README.md** — Index of all proposals with impact/feasibility ratings, a prioritization matrix, and suggested implementation order across 4 tiers.
-
-##### New Feature Proposals (5)
-- **Voice-Powered Accessibility Layer** — System-wide hands-free computer control via OS accessibility APIs (AXUIElement, UI Automation, AT-SPI). Click buttons, fill forms, manage windows by voice.
-- **Multi-Language Dictation & Translation** — Dictate in any of Whisper's 99 languages with auto-detection. On-device translation via local LLM with user-defined glossaries.
-- **Voice Journal & Mood/Sentiment Tracking** — Dedicated journaling mode with TF.js sentiment analysis, mood trend charts, weekly reflections, and insight generation.
-- **Audio Summarization & Digest Generation** — Automatic daily briefings and weekly digests with hierarchical summarization and action item tracking.
-- **Collaborative Transcript Review** — Local HTTP + WebSocket server for LAN-based transcript review with real-time annotations, corrections, and approval workflows.
-
-##### Existing Feature Proposals (10)
-- Ambient Context Engine, Live Coaching & Communication Analytics, Multi-Device Mesh, Offline Meeting Copilot, Organizational Voice Intelligence, Programmable Voice Macros, Speaker Separation & Voice Identity, Voice-Driven Workspace Automation, Voice Fingerprint Security, Voice-to-Structured Data.
-
----
-
-## [1.5.0] - 2026-04-15
-
-### Added
-
-#### Unified Search
-- **Cross-content search** — The Search page now searches across all content types: dictation entries (FTS5), meeting sessions, AI chat conversations, and notes. Previously only searched dictation entries loaded in memory.
-- **Server-side entry search** — Entry search now uses the SQLite FTS5 full-text index directly instead of client-side filtering, supporting prefix matching and returning up to 30 results.
-- **Meeting session search** — New Rust function `search_meeting_sessions()` searches across meeting name, summary, raw transcript, action items, and structured output. Wired through NAPI, IPC, and preload.
-- **Categorized results with filter tabs** — Results are grouped by type (Dictation, Meeting, AI Chat, Note) with filter tabs showing per-category counts. Tabs with zero results are hidden.
-- **Search result highlighting** — Matching text is highlighted in preview snippets with context shown around the match.
-- **Search loading indicator** — Spinner shown while server-side searches are in flight.
-- **Result metadata** — Meeting results show speaker count and duration. AI chat results show message count.
-
-#### Page-Aware Voice Recording
-- **Voice input routes to the active page** — Recording now tracks which page initiated it and routes the transcribed text back to that page, even if you navigate away during processing.
-  - **Dictate page** — Raw transcript inserts directly into the TipTap editor.
-  - **Search page** — Transcribed speech fills the search bar and triggers a search.
-  - **Listen page** — Creates a new listen entry and auto-plays it with TTS.
-  - **Notes page** — Appends dictated text to the active note, or creates a new note if none is open.
-  - **Timeline / Home** — Text goes to clipboard and creates a new timeline entry.
-  - **AI Chat** — Text routes to the active AI conversation.
-
-#### Progressive Entry Display
-- **Instant feedback on recording stop** — A pending entry card appears at the top of the timeline immediately when you stop recording, showing a "Transcribing speech..." spinner. The raw transcript appears as soon as Whisper finishes, followed by a "Copied to clipboard" confirmation.
-- **No more waiting** — Previously, the entire pipeline (transcribe + LLM polish + clipboard + save) had to complete before anything appeared. Now each step is visible as it happens.
+Remote-meeting capture latency fix. v1.9.0 made embedding-based
+diarization the default on every remote-capture meeting, which doubled
+the loopback chunk's processing cost (multi-segment Whisper + N×
+WeSpeaker inferences + per-segment DB writes) and left transcripts
+showing a lingering "Remote (pending diarization…)" hint that confused
+users. v1.9.1 returns the default to a single fast "Remote" label
+identical in latency to the local mic stream and moves the speaker
+labeling into an opt-in Advanced toggle.
 
 ### Changed
 
-#### Recording Pipeline
-- **LLM text cleanup is now on-demand only** — The recording pipeline no longer auto-runs LLM polish. When you stop recording, you get your raw transcript immediately — copied to clipboard and saved to the timeline. This makes the dictation flow significantly faster.
-- **"Polish now" button on timeline entries** — To clean up text, click "Polish now" on any entry card in the timeline. This triggers the LLM on that specific entry. You can then toggle between raw and polished views.
-- **Timeline defaults to raw text** — Entry cards now display the raw transcript by default instead of auto-selecting the polished version.
-- **Clipboard gets raw text immediately** — No more waiting for LLM processing before text lands in your clipboard.
+- **Default remote-capture mode is now Simple.** `meeting_diarization_mode`
+  defaults to `'off'` on fresh installs and on v1.9.0 upgraders whose
+  Settings UI never explicitly enabled the feature
+  (`meeting_diarization_user_overridden !== 'true'`). The old M2.5b
+  runtime readiness flip that auto-promoted users to embedding mode
+  is removed.
+- **Simple-mode loopback path reuses the mic path verbatim**
+  ([`meeting-recorder.ts`](electron-app/src/main/meeting-recorder.ts)):
+  one row per 30 s chunk via `transcribeWithContext`, `speaker_label =
+  null`, rendered as a plain "Remote" badge. No segment slicing, no
+  WeSpeaker inference, no AHC at stop, no LLM fallback. Loopback now
+  finalises in the same time window as the mic side.
+- **Advanced mode is unchanged** — the full v1.9.0 pipeline (per-Whisper-
+  segment rows + inline embedding + AHC refinement at stop) still
+  runs end-to-end when the user explicitly enables it.
+- **"pending diarization…" sub-line is now mode-aware.**
+  [`MeetingTranscriptPanel`](electron-app/src/renderer/components/MeetingTranscriptPanel.tsx)
+  only renders the hint when `diarizationMode === 'embedding'`; Simple-
+  mode null-labeled loopback rows just show the plain "Remote" badge.
 
-#### ShareMenu
-- **Dropdown no longer clipped** — The share/export dropdown now renders via a React Portal at the document body level, fixing the issue where it was hidden behind entry cards due to `overflow-hidden` on parent containers. Also closes automatically on scroll.
+### Added
+
+- **Settings → Voice AI → "Identify Individual Remote Speakers (Advanced)"**
+  toggle, gated on the existing remote-capture toggle. Description
+  spells out the tradeoff: Simple = same latency as mic, Advanced =
+  per-speaker labels at ~2× chunk cost.
+
+### Notes
+
+- The WeSpeaker ONNX (26 MB) is still bundled in the installer. It
+  sits idle until the user enables Advanced mode — the bundling cost
+  is paid up front so opting in doesn't trigger a download. Same
+  rationale as the bundled Whisper / Phi-3 models that are always
+  shipped even though most users only use one engine.
+
+## [1.9.0] - 2026-05-17
+
+Acoustic speaker diarization for remote-meeting capture. Replaces the
+v1.8 LLM-text heuristic with WeSpeaker ResNet34 voice embeddings and
+agglomerative clustering, so 12–20 distinct speakers on a Zoom / Teams /
+Meet call get labeled `[Speaker 1..N]` live during the meeting instead
+of all collapsing into a single "Remote" bucket. Windows-only this
+release (matches the v1.8 loopback-capture scope); macOS / Linux
+inherit automatically once their loopback paths land.
+
+### Added
+
+- **WeSpeaker ResNet34 ONNX speaker-embedding model** (~26 MB, Apache-2.0,
+  pinned to commit `0ae88dca…` from
+  `hbredin/wespeaker-voxceleb-resnet34-LM`). Bundled into the installer
+  alongside Moonshine and Phi-3 — works fully offline on first launch.
+  Inference runs in Rust via the existing `ort` dependency through the
+  new `speaker-diarization` Cargo feature.
+- **Live `[Speaker N]` labels during remote-meeting capture.** Each
+  Whisper-detected segment on the loopback stream gets sliced (800 ms
+  min, middle 3 s of segments > 6 s, RMS gate to skip silence), embedded
+  to a 256-d L2-normalized vector, and assigned a cluster label via
+  online clustering — all before the segment renders. Embed-before-push
+  discipline means the renderer never sees a row twice.
+- **End-of-meeting AHC refinement** consolidates online drift via
+  agglomerative hierarchical clustering (average linkage, 0.48 cutoff)
+  over every persisted embedding pulled from SQLite (DB-canonical, not
+  live state — survives crashes / mid-session restarts). Cluster labels
+  reassigned in first-occurrence order so `[Speaker 1]` is always the
+  earliest-detected remote speaker.
+- **Optional LLM roster-rename pass** (`meeting_llm_name_pass_enabled`,
+  default off) maps `[Speaker N]` → roster display names when a meeting
+  has a participant roster, applied uniformly per cluster.
+- **`MEETING_SEGMENTS_RELABELED` IPC event** patches the renderer's
+  segment list in place after refinement — no full reload, no flicker
+  for users viewing the detail view at meeting-stop time.
+- **`SpeakerClusterer`** TypeScript module
+  ([`electron-app/src/main/SpeakerClusterer.ts`](electron-app/src/main/SpeakerClusterer.ts))
+  with online `assign()` + offline `refine()`. Empty-state branch seeds
+  `[Speaker 1]` correctly, floor at cosine 0.40 routes weak embeddings
+  to `[Speaker ?]` without polluting centroids, overflow at the
+  20-speaker cap also returns `[Speaker ?]`. Synthetic 10-cluster ×
+  50-sample Gaussian-blob vitest reaches V-measure ≥ 0.9.
+- **`transcribe_with_segments` API** on the `TranscriptionEngine` trait
+  exposes Whisper's per-segment timestamps (centiseconds → ms) so the
+  meeting recorder can slice loopback PCM at utterance boundaries
+  rather than the legacy 30 s chunk boundary. Moonshine falls back to a
+  single segment via the default trait impl (POC accepts the coarser
+  granularity until Moonshine segment timestamps land).
+- **Models manifest pipeline.**
+  [`electron-app/resources/models/models-manifest.json`](electron-app/resources/models/models-manifest.json)
+  records every bundled model's path, sha256, license, source URL, and
+  pinned commit revision.
+  [`electron-app/scripts/verify-models-manifest.mjs`](electron-app/scripts/verify-models-manifest.mjs)
+  runs at packaging time to re-hash each entry and require an
+  attribution block in `THIRD_PARTY_NOTICES.md` for every license that
+  carries an attribution clause.
+- **`THIRD_PARTY_NOTICES.md`** at repo root with Apache-2.0 attribution
+  for WeSpeaker plus carry-over entries for Moonshine, Whisper, Kokoro,
+  and the TF.js model bundles.
+- **Runtime readiness flip on app start** — the new
+  `meeting_diarization_mode` setting flips from `'off'` to
+  `'embedding'` only when (a) the WeSpeaker model file is on disk, AND
+  (b) the user hasn't explicitly opted out via
+  `meeting_diarization_user_overridden`. The flip never sets the
+  user-override flag, so it can retry on a later boot if the model
+  arrives via download-models.sh in the interim.
+- **`speakerDiarizationAvailable` N-API export** lets the main process
+  check WeSpeaker presence without loading the ONNX.
+- **Schema migration v15** — `speaker_embedding BLOB`,
+  `speaker_embedding_model`, `diarization_confidence` columns on
+  `transcript_segments`; new `idx_transcript_segments_session_source`
+  index; seven new `meeting_diarization_*` settings keys with
+  conservative defaults (`mode = 'off'` until M2.5b flips it).
+- **`scripts/download-models.sh --include-wespeaker`** convenience flag
+  pulls the pinned WeSpeaker ONNX + Apache-2.0 LICENCE.md for local
+  installer builds. `scripts/package.sh` invokes it automatically.
+
+### Changed
+
+- **Loopback transcript rows are now one-per-Whisper-segment** rather
+  than one-per-30 s chunk. Mic side unchanged (still one row per chunk,
+  pre-labeled `'You'`). This is what enables per-utterance embedding;
+  it also gives users finer-grained transcripts on long monologues.
+- **`processChunkDual` zeroes drained PCM16 buffers on every exit path**
+  (mute gate, silent buffer, Whisper error, empty text, success) via a
+  `try { } finally { zeroDrainedBuffersFinally(drained) }` wrapper. The
+  helper is exported for direct unit testing. Closes a latent gap where
+  the JS Buffer returned by `drainMeetingBuffers` survived past every
+  early return until GC.
+- **Stop-of-meeting diarization pipeline** is now strictly:
+  final chunk → AHC refinement (DB-canonical) → optional LLM
+  roster-rename → single `MEETING_SEGMENTS_RELABELED` emission. The
+  legacy text-LLM diarization stays in place but only fires when the
+  embedding pipeline never ran (Moonshine engine, multi-user room mode,
+  or any segment whose embedding step failed). Per-segment word-overlap
+  matching is removed — cluster labels are uniform per cluster.
+- **Speaker embeddings persisted as raw little-endian f32 bytes** in a
+  new BLOB column kept out of the default `SELECT_COLS` — loads only
+  through the dedicated `listSegmentEmbeddings` path at refinement
+  time, so list-transcript-segments stays lean.
+- **CI clippy step is green again.** Resolved 16 pre-existing
+  `-D warnings` violations on `main` (redundant closures, type
+  complexity, manual `repeat_n`, dead-code in feature-gated paths) so
+  the v1.9.0 PR can land on green.
+
+### Privacy
+
+- **Speaker embeddings are biometric-adjacent identifiers** even though
+  no raw audio is retained. The new BLOB column is local-only,
+  cascade-deleted with its `meeting_sessions` row, excluded from every
+  export path, and covered by retention sweeps. Documented in
+  `THIRD_PARTY_NOTICES.md` and surfaced in Settings → Security &
+  Privacy.
+- **Per-segment PCM slices are zeroed immediately after embedding**
+  (Buffer.subarray shares memory with the parent, so the zero also
+  wipes that range of the chunk Buffer). The outer chunk try/finally
+  remains the backstop.
+
+## [1.7.5] - 2026-05-10
+
+Major upgrade to the polish + meeting-summary experience: every dictation
+and every meeting now produces a structured, well-formatted document
+instead of flat text. Hits Granola-style adaptive formatting (bold for
+key terms even on short notes, headings hierarchy that scales with
+length), and meeting summaries include attendees, an Overview, and a
+dedicated Action Items table extracted from the transcript.
+
+### Added
+
+#### Polished output is now structured markdown (not flat text)
+
+- **Adaptive heading hierarchy** in polished notes — short notes (<30 words) stay a single paragraph with **bold** for key subjects (names, decisions, deadlines, owners); 30–80 words get bullets when content is enumerated; 80–200 words get `### H3` sub-sections; >200 words get `## H2` sections with optional `### H3` inside. Both local and cloud paths produce markdown that the editor renders with full TipTap formatting (headings, bold, italic, lists, blockquotes, inline code, code blocks, action-item tables).
+- **Cloud polish gets richer prompts than local.** `LOCAL_POLISH_PROMPT` (~350 tokens, one example) is tuned for Phi-3-mini-Q2_K's instruction-following limits. `CLOUD_POLISH_PROMPT` (~900 tokens, four worked examples covering paragraph / multi-topic / list / technical shapes) takes advantage of Claude / Copilot's larger context. Both share the same markdown grammar — only the teaching style differs.
+- **Inline code for technical refs** — file names, function names, commands, package names, PR/JIRA refs all get `` `inline code` `` styling automatically.
+- **Tables for genuinely tabular dictated content** (cloud only — local model handles tables less reliably).
+- **Smart Formatting setting** — Settings → General → "Smart formatting" toggle (`polish_format_mode`) lets users opt out of the new rich rendering and fall back to the legacy flat-paragraph behavior. Default-on; persisted in SQLite. The toggle gates both prompt selection AND the markdown pipeline so plain mode is byte-for-byte identical to the prior behavior.
+
+#### Meeting summaries — structured, attended, action-item-focused
+
+- **New "Default" meeting template** (replaces the previous "Auto") with a simplified single-layout prompt that local Phi-3 follows reliably. Layout: `## Attendees` → `## Overview` → `## Discussion` (with optional `### H3` per topic) → `## Decisions` (each prefixed `**Decided:**`) → `## Action Items` (markdown table with Owner / Item / Due) → `## Open Questions`. Sections are emitted only when they have content — no "None mentioned" placeholders.
+- **Attendees auto-populated from session participants.** Host + every joiner from the v7 `participants` roster gets surfaced as a bullet under the Attendees heading. The summarizer prepends a `[MEETING METADATA]` block to the transcript so the LLM sources accurate names instead of inferring from filler.
+- **Action Items extraction emphasized in the prompt.** New language: *"Action items are usually the most valuable thing that comes out of a meeting — try hard to identify them."* Plus concrete pattern hints (explicit assignments, commitments, agreed next steps, follow-ups requested) to help the model surface them reliably.
+- **Auto-detect meeting templates upgraded.** All five existing templates (Standup / 1-on-1 / Discovery / Team Sync / Retrospective) now produce richer markdown — bold for names/decisions/deadlines, inline code for technical refs, action items rendered as proper markdown tables.
+- **Default template auto-selected on launch.** `meeting_default_template` is now read on `MeetingPage` mount and applied as the initial selection. Without this fix, every new meeting started without an explicit template click went through the flat-bullets path even after the v10 migration set the setting.
+- **Meeting list grouped by date bucket** — Today / Yesterday / This week / Last week / This month / Earlier. Empty buckets are hidden; sessions inside each bucket sort newest-first.
+- **Hide empty meetings toggle** in the meeting list header (default on) filters out sessions with `processingState === 'empty'` so noise from accidental short captures stays out of the way. Persisted to localStorage. Hidden count chip surfaces on the toggle so users know what they're not seeing.
+- **Multi-select bulk delete** — click any meeting card's mic icon to enter selection mode (icon swaps to a checkbox, all other cards' mics become empty checkboxes). Click cards to add/remove. A floating action bar at the bottom shows "N selected / Cancel / Delete N" with a confirm dialog. Per-card actions hide in selection mode for visual focus.
+- **Scroll position preserved across meeting open + back navigation** — clicking into a meeting and pressing back returns you to the same card you opened, not the top of the list. Implementation via a `useLayoutEffect`-anchored scroll restore on `detailSessionId` transition.
+
+#### Notes editor — Raw vs Polished split for meeting-auto entries
+
+- **Auto-filed meeting notes now have a meaningful Raw/Polished toggle.** Previously the markdown summary was written into `rawTranscript` with `polishedText: undefined`, so DictatePage showed the raw markdown source on the raw side and had nothing on the polished side. Now: polished side gets the rich AI summary (with formatted headings, bold, action-items table); raw side gets the verbatim meeting transcript. Polished view is the default per the existing schema default `display_mode = 'polished'`.
+
+#### AI Assistant — voice chat redesign
+
+- **Live AI panel** during voice chat now shows the assistant's words *as they're produced* (thinking phase) and *as they're spoken* (speaking phase), in a prominent card with `text-base` size and full-opacity color. Replaces the previous tiny grey 3-line `line-clamp-3` caption that read like an afterthought.
+- **Streaming caret** appears after the live tokens during the thinking phase so the panel feels alive while the model is still emitting output.
+- **Phase-aware labeling** — header reads "AI is thinking…" with a pulsing dot during streaming, then "AI is speaking…" while TTS plays the completed reply.
+- **Wider overlay** (`max-w-2xl` from `max-w-md`) gives the live panel room to breathe.
+
+#### New IPC channels
+
+- **`generateText(systemPrompt, userPrompt, opts?)`** — generic LLM transport for non-polish completions (meeting summarization, template generation, intent classification fallback, meeting detection). Caller owns the system prompt; no cleanup-prompt layering. Handler clamps `maxTokens` to `[1, 4096]`, `temperature` to `[0, 1]`, validates prompt lengths against `MAX_PROMPT_LENGTH`, and reads `polish_allow_cloud` from main-process settings only — renderer can pass `forceLocal: true` to narrow but never widen permissions.
+- **`generateTextLocal(systemPrompt, userPrompt, opts?)`** — same but with `forceLocal` pinned on. For callers (e.g. AI title generation) that must never touch cloud regardless of the user's setting.
+- **`convertMarkdown(md)`** — markdown → `{ plainText, html, jsonString }` projections from the main-side sanitization pipeline. Renderer never imports the pipeline directly. `html` is sanitize-html-approved (safe for `dangerouslySetInnerHTML`), `jsonString` is JSON.stringify of ProseMirror JSON ready for `editor.commands.setContent(JSON.parse(...))`.
+
+### Changed
+
+- **`polishTextDetailed` response shape** — was `{ text, providerUsed }`, now `{ markdown, plainText, html, jsonString, providerUsed, text }`. New callers consume the projections directly; legacy callers reading `.text` still work (kept as alias of `plainText`).
+- **`polishText` returns the `plainText` projection** — was the verbatim LLM output. Prevents markdown syntax bleed (`**bold**`, `## Heading`) into clipboards / Forge pastes / plain-text fields after the prompt change.
+- **`MeetingDetailPage` regenerate path no longer nulls `htmlContent`.** Previously the spread set `htmlContent: null` on the assumption that AI output is always plain. Now preserves `fresh.htmlContent` from the markdown pipeline so the rich summary survives a regenerate.
+- **`MAX_OUTPUT_TO_INPUT_RATIO`** bumped 0.8 → 1.6 in `runTemplateWithGuardrails`. Genuine transcript echoes still fail the long-verbatim-span check; legitimate structured summaries that happen to exceed 80% of input length are no longer rejected as "echo". Plus a new pass #3 fallback (`hasStructureWithoutPromptLeak`) accepts output the strict guard rejected as long as it has at least one heading or bullet and no prompt leakage.
+- **Meeting title generator** prompt tightened with worked examples ("Sprint planning", "Q4 budget review"), hard 5-word and 45-char clamps in `sanitizeTitle` so titles stay glanceable. Truncation is on a word boundary; trailing punctuation is stripped after the cut.
+- **`polish_allow_cloud` Settings copy** rewritten to reflect its broader scope — it now also gates meeting summaries, template generation, intent classification, and meeting detection. New copy: "Use cloud AI when authenticated (Claude / Copilot) … routes polish, meeting summarization, and other AI tasks through the authenticated CLI". Live meeting summaries always stay local regardless of this setting.
+- **Notebook auto-file (`addTextAsEntryToNotebook`)** now runs the markdown through `convertMarkdown` and writes both `polishedText` (plain) and `polishedTextJson` (rich ProseMirror) — same shape as the dictation polish flow. The resulting entry opens in DictatePage with full headings/bold/lists rendering.
+- **`MeetingSessionCard` restructured from `<button>` to `<div role="button">`.** Nested `<button>` elements (the AddToNotebook menu inside the outer card button) caused click events to be swallowed. Now nested interactive children get their own clicks, and the keyboard semantics are preserved via `role` + `tabIndex` + Enter/Space handlers.
+- **ShareMenu removed from meeting cards.** AddToNotebook now actually works.
+- **MeetingRegenerateModal** — removed the "Free-form bullets (no template)" option; pre-selects the Default template (`builtin-auto`) when the meeting has no current template. Generic / no-template button removed from the meeting start screen too. Every meeting now goes through a template so output is always structured.
+- **Marked pinned to v4** (CJS-compatible). v18+ is ESM-only and Electron's CommonJS main process can't `require()` it.
+
+### Fixed
+
+- **Meeting summary section keys produced lowercase headings** in the auto-filed Notes entry (`## tldr`, `## discussion`) because `SECTION_TITLES` was missing those keys. Now covers every key any seeded template emits — fresh meetings produce proper-cased `## TL;DR` / `## Overview` / `## Discussion` / etc.
+- **Meeting `plainSummary` reconstruction was lossy** — the template path returned a `StructuredOutput` without `plainSummary`, so `MeetingPage`'s `summaryForColumn` always fell through to the section-by-section markdown rebuild. Now populated from the LLM's raw output so the notebook auto-file uses the actual produced markdown.
+- **Auto template prompt always returned `[INSUFFICIENT_CONTENT]`** on perfectly good transcripts. The v10 prompt asked Phi-3-mini to classify the meeting type into one of 8 buckets and emit a per-bucket layout — too much instruction-following for the small model. v11 simplified to a single fixed structured layout and removed the escape hatch entirely.
+- **First message to Claude / Copilot in a new chat failed with `claude exited with code null: (no stderr)`.** Root cause was two defensive `aiResetSession(id)` calls — one enqueued in `useAiChatStore.createSession`, one direct in `AIChat.handleNewChat` — that fired `aiManager.cancel()` on whatever CLI process was active. The user's just-spawned first-message process got SIGTERM'd before any output arrived. Both defensive calls removed; a brand-new session id has no context to clear by definition.
+- **Claude Haiku model id was malformed** — `claude-haiku-3-5-20241022` instead of `claude-3-5-haiku-20241022`. The Claude CLI rejected it with "model may not exist or you may not have access to it." Corrected the dated id, added Haiku 4.5 (`claude-haiku-4-5`) alongside, and added a `normalizeKnownBadModelId` helper in `AIManager.resolveModel` so users with the bogus id already saved in their `ai_model` setting get transparently rewritten on read — no need to manually re-pick.
+- **Polish overlay only covered the top portion of long notes.** The "Generating polished version…" overlay was an `absolute inset-0` child of the scrolling editor container. Restructured DictatePage's editor wrapper so the overlay covers the viewport, not the scroll content area.
+- **Tailwind Typography `prose` classes had no effect** on `dangerouslySetInnerHTML` containers (MeetingNotesPanel, MeetingDetailPage user-notes pane) because the `@tailwindcss/typography` plugin was never installed. Added explicit `.prose` CSS rules in `globals.css` mirroring the existing `.ProseMirror` styles so headings, bold, lists, blockquotes, and tables render correctly outside the editor.
+- **Live summary path bypassed user-selected templates.** When a non-empty live summary existed at meeting end, `MeetingPage` routed straight to `finalizeWithLiveSummary` (flat bullets) regardless of the selected template. Now: when a template is selected (always, post-Default-auto-selection), the structured pass always runs.
+- **NoteEditor inserted plain text instead of the rich JSON fragment** when polish completed after dictation. Now reads `entry.polishedTextJson`, parses it, and `insertContent`s the block-node array (preserves any user content the new dictation is appended into).
+- **`useEntryStore.polishEntry` was deliberately dropping `polishedTextJson`** from the update with a stale comment ("Polish output is plaintext"). Now writes both `polishedText` and `polishedTextJson` atomically. DictatePage's reactive sync at line 1366 already preferred the JSON projection, so the editor renders rich content as soon as polish completes.
+- **DictatePage's editor was missing Table + TaskList extensions.** Even when `polishedTextJson` arrived correctly, action-item tables and checkboxes from cloud polish would be silently dropped by the editor schema. Now spreads `buildSharedExtensions()` — the same set the markdown pipeline's `@tiptap/html generateJSON` uses in main.
+- **`polished_text_json` write contract was contradictory.** `polishTextDetailed.json` was an object internally, but the IPC + DB layer expects strings. Pinned the public IPC shape to strings (`jsonString: string`); the object form stays private to `markdownPipeline.ts` in main and never crosses IPC.
+- **NPM `@tailwindcss/typography` not installed** — added explicit `.prose` CSS rules instead, mirroring the existing `.ProseMirror` ones.
+- **Meeting card share/export removed; AddToNotebook now functional** (was broken by the nested `<button>` HTML — see Changed above).
+
+### Migration notes
+
+- **Schema bumped from v9 → v12.** Three new migrations in series:
+  - **v10**: seeds the new "Auto" meeting template; equality-guarded UPDATE on the 5 existing builtin templates' `llm_prompt` to richer-formatting versions; flips `meeting_default_template = 'builtin-auto'` for users where the setting is still empty; seeds `polish_format_mode = 'rich'`.
+  - **v11**: simplifies the Auto template prompt (single fixed layout instead of 8-way meeting-type classification, removes the `[INSUFFICIENT_CONTENT]` escape hatch); renames "Auto (smart format)" → "Default" in the user-facing label.
+  - **v12**: adds `## Attendees` + `## Overview` to the Default template; emphasizes Action Items in the prompt body. (Date intentionally NOT in the layout — the meeting detail header already shows it.)
+  - All three use equality-guarded UPDATEs against their respective baseline constants. **User customizations to builtin templates are preserved** — the UPDATE only fires when the row matches the prior version's exact bytes.
+- **No new schema columns for `entries` or `meeting_sessions`.** Reuses the existing `polished_text_json` (added in v6) for rich entry content and `structured_output.htmlContent` (already in use) for meeting rich content.
+- **For meetings created before v12:** hit Regenerate to pick up the new layout (Attendees + Overview + Action Items emphasis). Old meetings keep working as-is.
+- **For polish-completed entries created before v1.7.5:** the legacy `polished_text` column stays as the rendering source; the `polishedTextJson` rich projection only populates for fresh polishes.
+
+### Verification
+
+- `cargo test --lib` passes 166/166 (5 new migration tests across v10/v11/v12, 161 prior tests unchanged).
+- TypeScript main typecheck clean; renderer typecheck unchanged from baseline (30 pre-existing errors, 0 new).
+- Markdown pipeline security smoke: 14/14 passing — `<script>` tag drop, `javascript:` href reject, task-list checked-state preservation, table round-trip.
+- `@tiptap/html` Node-compat smoke passes without DOM shim — no `jsdom` required.
+
+## [1.7.4] - 2026-05-08
+
+### Fixed
+
+- **Copilot model dropdown showed "Model..." after Refresh** — The orphan-selection row rendered the raw saved id verbatim, which after CSS truncation read as "Model...". The orphan label now goes through `prettifyModelId` so saved selections always render cleanly (e.g. `gpt-4o-mini (openai)` instead of the raw string). The post-restart synthesis path in `AIManager.synthesizeModel` does the same.
+- **Polish "model isn't available on your plan or policy" error** — When `copilot help` parsing returned nothing (current `@github/copilot` builds don't expose models in `--help`), the catalog fell through to a two-entry hardcoded list whose lead model can be refused on free-tier accounts. The catalog now uses a 5-entry curated baseline (`openai/gpt-4.1`, `openai/gpt-4o`, `openai/gpt-5-mini`, `anthropic/claude-sonnet-4.5`, `anthropic/claude-haiku-4.5`) with both `runIds.copilotCli` and `runIds.ghModels` populated, giving users free-tier-friendly options out of the box.
+
+### Added
+
+- **`copilot --list-models` probe** — Tried first as a structured probe before the heuristic `copilot help` text-scrape, in case future CLI builds expose a non-interactive enumeration flag.
+- **Source-aware merge of probed vs. curated catalog** — High-confidence probes (`gh models list`, `--list-models`) replace the curated list; low-confidence probes (help-text scrape) supplement it. Bare-id-vs-slash-id matching (e.g. probe `gpt-5-mini` matches curated `openai/gpt-5-mini`) prevents duplicate rows, and `runIds` are deep-merged so a copilot-cli probe never drops a curated `ghModels` mapping.
+- **Probe log file** — Raw stdout/stderr/exit-code for every Copilot CLI probe is appended as one JSON line per probe to `<userData>/logs/copilot-probe.log` (Windows: `%APPDATA%\IronMic\logs\copilot-probe.log`). The absolute path is printed once on first probe to the dev console. Used for diagnosing parser regressions without needing a Settings UI surface. 1 MB rotation; silent no-op outside Electron so unit tests don't break.
+- **`'curated'` source on `AIModel`** — New union member alongside `'cli' | 'fallback' | 'static' | 'local'`. The Settings caption now classifies the visible list as all-cli ("From your GitHub Copilot subscription"), all-curated ("Built-in catalog"), or mixed ("Live probe plus built-in fallback entries").
+
+### Changed
+
+- **TTL fast path on `refreshModels()` excludes both `'fallback'` and `'curated'`** — Previously only `'fallback'` was skipped, so once a curated cache was warm the Refresh button could short-circuit on subsequent clicks. Refresh now always re-probes when no real probe data is cached.
+- **Tightened `looksLikeCopilotModelId` heuristic** — Candidate must contain `/` or start with a known vendor prefix (`gpt-`, `claude-`, `o3-`, `o4-`, `gemini-`, `mistral-`, `llama-`, `phi-`). Rejects prose tokens (`available`, `default`, `none`) that the previous loose char regex would admit.
+- **Pure-helper extraction** — `getCuratedCopilotModels()` and `mergeProbedIntoCurated()` now live in `electron-app/src/main/ai/copilot-catalog.ts` so they're easy to unit-test without instantiating the adapter. Returned objects are deep-cloned each call.
+- **`aiRefreshModels` properly typed on the renderer Window** — Drops the `(window.ironmic as any).aiRefreshModels?.(...)` cast in SettingsPanel.
+
+### Tests
+
+- **First Copilot adapter unit tests** (`src/main/ai/CopilotAdapter.test.ts`, 15 cases) — parser false-positive rejection, JSON/table parsing, curated catalog shape immutability, and merge semantics for high/low/empty probe confidence.
+
+## [1.7.3] - 2026-05-08
+
+### Added
+
+- **Dynamic GitHub Copilot model catalog** — Settings → AI Assist now reflects the models your actual Copilot subscription supports instead of two hardcoded options. A "Refresh models" button queries the active backend (`copilot help` for the `@github/copilot` CLI, `gh models list` for the `gh-models` extension) and populates the dropdown from the response. Free, Pro, Pro+, Business, and Enterprise users now see the full set their plan exposes.
+- **`ai:refresh-models` IPC** — Renderer-triggered catalog probe. The existing `ai:get-models` is now strictly cache-only and never spawns child processes, so opening Settings does not produce a network call. Catalog probes only run on explicit user action.
+- **Orphan-selection UI** — When a previously-saved Copilot model isn't in the visible catalog (e.g. immediately after app restart, before a refresh), the dropdown now shows it as a "Saved" entry with a Refresh CTA so the UI never silently drifts from what the backend will actually call.
+- **Cross-platform spawn helper** — New `utils/spawn-portable.ts` extracts the Windows `.cmd`/extensionless-shim wrapping previously private to `AIManager`, so adapter probes (`copilot help`, `gh models list`, `gh auth status`) work correctly on Windows where shim binaries can't be invoked via `execFile` directly.
+
+### Fixed
+
+- **Polish ignored selected model** — `AIManager.polish()` was silently dropping the user's selected model and always running CLI defaults. The cleanup pass now reads `ai_model` from settings and forwards it via `--model`, so a user who picked Claude Sonnet 4 or `claude-haiku-4.5` in Copilot actually gets that model for transcript polish.
+- **Friendly entitlement-error messages** — When the CLI rejects a model the user's plan doesn't grant (overlisting from `copilot help` is possible), the chat surfaces a clear "model isn't available on your plan" message instead of raw stderr.
+- **Async, non-blocking model probes** — Catalog probes use promisified `execFile` with hard timeouts (≤5 s) so the Electron main process never freezes while waiting on `gh` or `copilot`.
+
+### Changed
+
+- **`AIModel.free: boolean` → `billing: 'free' | 'paid' | 'unknown'`** — Dynamically discovered models from `gh models list` / `copilot help` don't expose plan tier, so they're tagged `unknown` instead of guessing. The "Free" badge is preserved for known-free entries; "Saved" badge tags orphaned post-restart selections.
+- **`AIModel.runIds`** — New optional field carrying backend-specific run identifiers (`copilotCli`, `ghModels`) so saved selections always invoke the correct argument form regardless of which backend is active. Legacy pre-1.7.3 string IDs continue to work via the existing alias normalizer.
+
+## [1.7.2] - 2026-05-08
+
+### Fixed
+
+- **GitHub Copilot auth on Windows** — Settings always showed "not logged in" for Copilot on current `@github/copilot` CLI builds because the adapter read `logged_in_users` (snake_case) while modern builds write `loggedInUsers` (camelCase). Both keys are now accepted.
+- **Copilot auth env precedence** — `COPILOT_GITHUB_TOKEN` is now checked before `GH_TOKEN` / `GITHUB_TOKEN`, matching GitHub's documented precedence. `COPILOT_HOME` is honoured so non-default config directories are found correctly.
+- **Copilot subprocess env** — The spawned `copilot` process now receives `COPILOT_GITHUB_TOKEN`, `COPILOT_HOME`, and `COPILOT_GH_HOST` in its environment so env-based auth reaches the CLI.
+- **Copilot chat stateless** — Every turn was starting a fresh session. `--continue` is now passed after the first successful turn so multi-turn conversations have memory. `-s` (silent mode) added for clean programmatic output.
+- **Per-provider turn counts** — A shared turn counter across Claude, Copilot, and local meant switching provider tabs could incorrectly send `--continue` on a brand-new Copilot session. Counts are now tracked per-provider and only incremented on a clean exit code 0 response.
+
+## [1.6.0] - 2026-05-04
+
+### Changed
+
+- **Simplified meeting model** — The Meetings page now defaults to two modes: **Host Room** and **Join Room**. Solo mode is no longer the default; it remains accessible by enabling **Developer features** in Settings → Security & Privacy.
+- **Repurposed Collaborate button** — During a live host meeting, the toolbar now has a **Collaborate** toggle that shows or hides the invite details (IP, port, code). Useful for hiding the invite during screen-share. Participants list stays visible regardless.
+- **Removed "Join Shared Meetings" card** — The finished-meeting notes-share entry point on the Meetings page has been removed. Note collaboration in the dictation flow is unchanged.
+
+### Added
+
+- **Mid-meeting mic on/off** — A new mic toggle in the live meeting toolbar lets users mute their microphone without stopping the meeting. Mute is a hard privacy boundary: no local STT, no segment broadcast to peers, no final-drain commit on stop, and any in-flight streaming draft is dropped on mute.
+- **`dev_features_enabled` setting** — New toggle in **Settings → Security & Privacy → Developer** that exposes legacy/experimental controls (Solo meeting mode, etc.). Off by default.
+- **Hardened invite-code inputs** — Invite-code fields now uniformly enforce uppercase display, `autoCapitalize="characters"`, `autoComplete="off"`, and `spellCheck={false}` for consistent, error-resistant entry.
+
+## [1.5.0] - 2026-04-30
+
+### Added
+
+#### Moonshine Engine — New Default Speech Recognition
+- **Moonshine Base bundled with the installer** — The default speech recognition engine ships with the app (~146 MB). No download required on first launch. The model is copied from `resourcesPath` to the writable user-data models folder automatically.
+- **Multi-engine transcription architecture** — A unified `TranscriptionEngine` trait in Rust supports multiple backends. Switch between Moonshine and Whisper in **Settings > Speech Recognition Model** without restarting the app.
+- **Moonshine ONNX backend** — Runs via ONNX Runtime with SIMD-optimized MLAS kernels and DirectML on Windows. Benchmarks: Moonshine Base 69 ms vs Whisper Tiny 1141 ms on x86 CPU (~16× faster with better WER on short-form speech).
+- **Whisper still available** — Base / Small / Medium / Large-v3-turbo remain downloadable from Settings for multilingual or high-accuracy use cases.
+- **"Restore bundled copy" action** — One-click action in Settings > Models restores the factory Moonshine Base files without re-downloading.
+- **Transcript segments table** — New `transcript_segments` SQLite table stores incremental segment data for streaming and rollback.
+
+#### Notes Page Redesign
+- **Notebooks sidebar** — Organize entries into notebooks. Collapsible sidebar with creation, rename, and delete.
+- **Streaming dictation** — Partial transcript tokens stream into the editor in real-time as you speak via `DictationStreamer`.
+- **Live summarizer** — Real-time meeting summary updates while recording is in progress (`LiveSummarizer`).
+- **Auto-filed AI notes** — Meeting notes are automatically created and filed to the active notebook when a meeting ends.
+- **Responsive layout** — Notes page adapts to narrow windows; sidebar collapses gracefully.
+
+#### Collaboration
+- **Meeting notes collab server/client** — Peer-to-peer shared notes during live meetings. Host a session or join a room; notes sync in real-time across participants on the local network.
+- **Meeting room panel** — In-app UI for starting or joining a collab session from the Meetings page.
+- **Shared notes viewer** — Read-only viewer for participants receiving notes from the host.
+
+#### Windows & VDI Dictation
+- **Multi-round Windows VDI fixes** — Resolved silent-failure chain on corporate VDI environments: RMS gate now sanitizes near-zero audio, the dictation sanitizer no longer drops valid short utterances, and renderer-side handlers propagate results correctly.
+- **Debug-log helper** — `debug-log.ts` utility captures structured audio pipeline events for future bisection without shipping verbose logs to end users.
+- **Build script for Windows** — New `scripts/build-rust.ps1` PowerShell script mirrors the macOS/Linux shell script for Rust compilation on Windows.
+
+#### Performance & Stability
+- **AudioStreamManager** — Centralized audio stream lifecycle. All components share a single `getUserMedia` stream; no duplicate mic captures. Fixes resource leaks on rapid start/stop.
+- **AI response caching** — `AIManager` caches recent completions to avoid redundant LLM calls during repeated polishing.
+- **React ErrorBoundary** — `ErrorBoundary` component wraps major view trees; crashes in one panel no longer take down the whole window.
+- **DB entries query optimization** — Entries storage queries restructured to use covering indexes; timeline load time reduced significantly on large databases.
+- **Dictation streamer back-pressure** — `DictationStreamer` now applies back-pressure when the renderer is busy, preventing dropped partial tokens under load.
+- **Tray menu refresh** — Tray menu rebuilds dynamically when recording state changes, keeping the menu item labels in sync.
+
+#### Developer Experience
+- **`scripts/dev.sh` improvements** — Detects missing Rust build and prints a clear remediation step before starting Electron.
+- **`scripts/download-models.sh` overhaul** — Moonshine Base download, SHA-256 verification, and structured directory layout for all engine types.
+- **`scripts/package.sh` overhaul** — Packaging now bundles Moonshine Base, entitlements plist, and BlackHole placeholder in one pass.
+
+### Changed
+- `electron-builder.config.js` — `extraResources` now includes the bundled Moonshine Base model directory and macOS entitlements plist.
+- Settings > Speech Recognition — Engine selector and model picker consolidated into a single **Speech Recognition Model** card. Previously split across two separate UI sections.
+- macOS installation notes updated — Installer is ad-hoc signed; `xattr -cr` must be run on both the DMG and the installed `.app` bundle.
+- `.gitignore` expanded — Moonshine model files (`.onnx`, `.ort`, `.bin`) excluded from all subdirectories.
+
+### Fixed
+- **Copilot subscription detection** — `CopilotAdapter` now correctly handles the subscription check flow when the CLI is authenticated but the license query returns an unexpected format.
+- **Claude adapter streaming** — Token delivery gaps under high LLM load resolved; stream no longer stalls on the first assistant response.
+- **VAD false-positive on silence** — Web Audio VAD pipeline no longer triggers speech-start on mic open with no input.
+- **Meeting summary broken in packaged app** — `LlmSubprocess` now resolves the binary path relative to `resourcesPath` in production builds.
+- **Notes navigation away while recording** — Navigating away from the Notes page while a recording is active no longer orphans the audio stream.
+- **`ironmic-llm` binary bundling** — Release workflow now correctly includes the compiled LLM subprocess binary.
 
 ---
 
@@ -68,15 +397,6 @@ All notable changes to IronMic will be documented in this file.
 
 ### Fixed
 - **TTS Kokoro Download button persists after import** — The Kokoro TTS card checked `isTtsModelReady()` which requires both the model file AND voice files. After importing just the `.onnx` model, the card still showed "Download". Now tracks model file presence separately — shows "Imported" badge when the model exists but voices haven't been downloaded yet, and "Ready" when both are present.
-
----
-
-## [1.4.1] - 2026-04-15
-
-### Fixed
-- **Copilot CLI detection** — Now detects standalone `copilot` CLI (not just `gh copilot`). Checks for `copilot` binary first, then falls back to `gh`. Adapts args and auth checks based on which variant is installed.
-- **Copilot auth refresh flashing** — Binary path cache is cleared on auth refresh so re-detection runs fresh instead of returning stale state.
-- **Info card text** — Updated to show both `copilot` and `gh copilot` as valid CLI options.
 
 ---
 

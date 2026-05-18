@@ -9,9 +9,32 @@ echo "Building IronMic Rust core..."
 echo "Platform: $(uname -s) $(uname -m)"
 echo ""
 
-# Build the native addon in release mode
-# Build the N-API addon (whisper + TTS, no LLM to avoid ggml collision)
-cargo build --release --features napi-export,metal,tts
+# macOS C++ toolchain fix:
+# Some CLT installs have an empty /usr/include/c++/v1/ (missing <future>, <string>, etc.).
+# Point the compiler at the SDK's C++ headers to work around it.
+if [ "$(uname -s)" = "Darwin" ]; then
+    export SDKROOT="${SDKROOT:-$(xcrun --show-sdk-path)}"
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+    export CPLUS_INCLUDE_PATH="${SDKROOT}/usr/include/c++/v1:${CPLUS_INCLUDE_PATH}"
+fi
+
+# Build the native addon in release mode.
+# Features:
+#   napi-export   — N-API bindings exported to Electron
+#   metal         — whisper.cpp Metal acceleration (also pulls in `whisper`)
+#   tts           — Kokoro TTS via ort + ndarray
+#   engine-multi  — REQUIRED for Moonshine (the default engine). Gates the
+#                   Moonshine ONNX adapter; without it, build_engine() returns
+#                   NullEngine for moonshine-* and dictation silently produces
+#                   empty chunks. Pulls in transcribe-rs which reuses the same
+#                   ort/ndarray versions tts already brings in (no conflict).
+#   forge         — Forge mode: synthetic keystroke / paste-anywhere via enigo.
+#                   On Linux requires libxdo-dev at link time (X11). macOS
+#                   needs Accessibility permission at runtime; the renderer
+#                   surfaces a permission panel via isAccessibilityTrusted().
+# LLM intentionally omitted from this build to avoid ggml symbol collision
+# with whisper.cpp; it ships as a separate ironmic-llm binary below.
+cargo build --release --features napi-export,metal,tts,engine-multi,forge
 
 # Build the standalone LLM binary (separate process)
 echo ""

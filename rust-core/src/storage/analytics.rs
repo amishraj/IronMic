@@ -228,7 +228,7 @@ impl AnalyticsStore {
         // Top words (top 50)
         let freq = word_frequencies(&all_text);
         let mut sorted_words: Vec<_> = freq.into_iter().collect();
-        sorted_words.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted_words.sort_by_key(|b| std::cmp::Reverse(b.1));
         sorted_words.truncate(50);
         let top_words_json =
             serde_json::to_string(&sorted_words).unwrap_or_else(|_| "[]".into());
@@ -424,7 +424,7 @@ impl AnalyticsStore {
         }
 
         let mut sorted: Vec<_> = merged.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
         sorted.truncate(limit as usize);
         Ok(sorted)
     }

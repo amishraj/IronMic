@@ -28,179 +28,55 @@ export function InputSettings() {
   const [currentDevice, setCurrentDevice] = useState<DeviceInfo | null>(null);
   const [micPermission, setMicPermission] = useState<string>('checking');
   const [refreshing, setRefreshing] = useState(false);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
-  const [deviceChangeNotice, setDeviceChangeNotice] = useState<string | null>(null);
 
   // Level meter state
   const [monitoring, setMonitoring] = useState(false);
   const [audioLevel, setAudioLevel] = useState(0);
   const [peakLevel, setPeakLevel] = useState(0);
-  const [silentForMs, setSilentForMs] = useState(0);
-  const lastSpeechRef = useRef(Date.now());
   const streamRef = useRef<MediaStream | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
+  // Whisper thread count — default 2 matches the Rust default cap.
+  // VDI / corporate machines should keep this low; desktop CPUs can raise it.
+  // Only meaningful when the active engine is a Whisper variant; Moonshine
+  // ignores it (ONNX Runtime manages its own thread pool).
+  const [whisperThreads, setWhisperThreads] = useState<number>(2);
+
   // Test recording
   const [testRecording, setTestRecording] = useState(false);
   const [testAudioUrl, setTestAudioUrl] = useState<string | null>(null);
+  const [testAudioBytes, setTestAudioBytes] = useState<number>(0);
+  const [testPlaybackError, setTestPlaybackError] = useState<string | null>(null);
   const [testPlaying, setTestPlaying] = useState(false);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const audioElRef = useRef<HTMLAudioElement | null>(null);
 
-  // Build getUserMedia constraints using selected device
-  const getAudioConstraints = useCallback((): MediaStreamConstraints => {
-    const audio: MediaTrackConstraints = {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
-    };
-    if (selectedDeviceId && selectedDeviceId !== 'default') {
-      // Use ideal (not exact) — device IDs from cpal may not match Web Audio IDs
-      audio.deviceId = { ideal: selectedDeviceId };
-    }
-    return { audio };
-  }, [selectedDeviceId]);
-
-  // Persist device selection to settings
-  async function saveDeviceSelection(deviceId: string, deviceName: string) {
-    try {
-      await window.ironmic.setSetting('input_device_id', deviceId);
-      await window.ironmic.setSetting('input_device_name', deviceName);
-    } catch { /* settings may not be available */ }
-  }
-
-  // Handle user selecting a device
-  function handleSelectDevice(device: AudioDevice) {
-    setSelectedDeviceId(device.id);
-    saveDeviceSelection(device.id, device.name);
-    // Update the active device display with the selected device info
-    setCurrentDevice({
-      name: device.name,
-      available: true,
-      sampleRate: device.sampleRate || 48000,
-      channels: device.channels || 1,
-      sampleFormat: null,
-    });
-    setDeviceChangeNotice(null);
-    // Stop monitoring so it restarts with the new device
-    if (monitoring) { stopMonitoring(); }
-  }
-
   useEffect(() => {
     loadDeviceInfo();
-
-    // Listen for device changes (plug/unplug, system default change)
-    const handleDeviceChange = () => {
-      console.log('[InputSettings] Audio devices changed');
-      refreshDeviceList();
-    };
-    navigator.mediaDevices?.addEventListener('devicechange', handleDeviceChange);
-
-    return () => {
-      stopMonitoring();
-      navigator.mediaDevices?.removeEventListener('devicechange', handleDeviceChange);
-    };
-  }, []);
-
-  // Refresh just the device list (without full reload) — called on devicechange events
-  async function refreshDeviceList() {
-    try {
-      const webDevices = await navigator.mediaDevices.enumerateDevices();
-      const audioInputs = webDevices.filter(d => d.kind === 'audioinput');
-      const deviceList: AudioDevice[] = audioInputs.map((d, i) => ({
-        id: d.deviceId,
-        name: d.label || `Microphone ${i + 1}`,
-        isDefault: d.deviceId === 'default' || i === 0,
-        sampleRate: 0,
-        channels: 0,
-      }));
-      setDevices(deviceList);
-
-      // Check if the selected device is still available
-      if (selectedDeviceId && !deviceList.find(d => d.id === selectedDeviceId)) {
-        const def = deviceList.find(d => d.isDefault) || deviceList[0];
-        if (def) {
-          setSelectedDeviceId(def.id);
-          saveDeviceSelection(def.id, def.name);
-          setDeviceChangeNotice(`Your selected mic was disconnected. Switched to "${def.name}".`);
-          if (monitoring) { stopMonitoring(); }
-        }
+    // Load whisper_threads setting (default 2 if not set)
+    window.ironmic.getSetting('whisper_threads').then((val: string | null) => {
+      if (val !== null) {
+        const n = parseInt(val, 10);
+        if (!isNaN(n) && n >= 1 && n <= 16) setWhisperThreads(n);
       }
-    } catch { /* ignore */ }
-  }
+    }).catch(() => {});
+    return () => stopMonitoring();
+  }, []);
 
   async function loadDeviceInfo() {
     setRefreshing(true);
     try {
-      // Get permission status + saved device preference
-      const [perm, savedDeviceId, savedDeviceName] = await Promise.all([
-        window.ironmic.checkMicPermission().catch(() => 'unknown'),
-        window.ironmic.getSetting('input_device_id').catch(() => null),
-        window.ironmic.getSetting('input_device_name').catch(() => null),
+      const [devicesJson, deviceJson, perm] = await Promise.all([
+        window.ironmic.listAudioDevices(),
+        window.ironmic.getCurrentAudioDevice(),
+        window.ironmic.checkMicPermission(),
       ]);
+      setDevices(JSON.parse(devicesJson));
+      setCurrentDevice(JSON.parse(deviceJson));
       setMicPermission(perm);
-
-      // Get native device info for current device details (sample rate, format)
-      const deviceJson = await window.ironmic.getCurrentAudioDevice().catch(
-        () => '{"name":null,"available":false,"sampleRate":0,"channels":0,"sampleFormat":null}'
-      );
-      const parsedDevice = JSON.parse(deviceJson);
-      // If native addon can't detect a device, fall back to the saved device name
-      if (!parsedDevice.available && savedDeviceName) {
-        setCurrentDevice({ name: savedDeviceName, available: true, sampleRate: 0, channels: 0, sampleFormat: null });
-      } else {
-        setCurrentDevice(parsedDevice);
-      }
-
-      // Get labeled device list from Web Audio API
-      try {
-        const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        tempStream.getTracks().forEach(t => t.stop());
-        setMicPermission('granted');
-      } catch { /* permission denied or no mic */ }
-
-      const webDevices = await navigator.mediaDevices.enumerateDevices();
-      const audioInputs = webDevices.filter(d => d.kind === 'audioinput');
-      const deviceList: AudioDevice[] = audioInputs.map((d, i) => ({
-        id: d.deviceId,
-        name: d.label || `Microphone ${i + 1}`,
-        isDefault: d.deviceId === 'default' || i === 0,
-        sampleRate: 0,
-        channels: 0,
-      }));
-      setDevices(deviceList);
-
-      // Helper: set both selectedDeviceId and currentDevice from a device list entry
-      const activateDevice = (device: AudioDevice) => {
-        setSelectedDeviceId(device.id);
-        // If the native addon didn't give us real device info, use the Web Audio device name
-        if (!parsedDevice.available) {
-          setCurrentDevice({ name: device.name, available: true, sampleRate: 0, channels: 0, sampleFormat: null });
-        }
-      };
-
-      // Restore saved selection, or fall back to default
-      if (savedDeviceId && deviceList.find(d => d.id === savedDeviceId)) {
-        activateDevice(deviceList.find(d => d.id === savedDeviceId)!);
-      } else if (savedDeviceName) {
-        // Device ID may have changed (browser regenerates them) — match by name
-        const byName = deviceList.find(d => d.name === savedDeviceName);
-        if (byName) {
-          activateDevice(byName);
-          saveDeviceSelection(byName.id, byName.name); // Update stored ID
-        } else {
-          // Saved device not found — use default
-          const def = deviceList.find(d => d.isDefault) || deviceList[0];
-          if (def) activateDevice(def);
-        }
-      } else {
-        // No saved preference — use default
-        const def = deviceList.find(d => d.isDefault) || deviceList[0];
-        if (def) activateDevice(def);
-      }
     } catch (err) {
       console.error('[InputSettings] Failed to load device info:', err);
     }
@@ -209,20 +85,9 @@ export function InputSettings() {
 
   const startMonitoring = useCallback(async () => {
     try {
-      // Stop any existing stream first
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
-      }
-      let stream: MediaStream;
-      try {
-        stream = await navigator.mediaDevices.getUserMedia(getAudioConstraints());
-      } catch (constraintErr) {
-        // If device constraint fails (OverconstrainedError), fall back to default device
-        console.warn('[InputSettings] Device constraint failed, using default:', constraintErr);
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-        });
-      }
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+      });
       streamRef.current = stream;
 
       const ctx = new AudioContext();
@@ -236,27 +101,19 @@ export function InputSettings() {
 
       setMonitoring(true);
       setMicPermission('granted');
-      lastSpeechRef.current = Date.now();
-      setSilentForMs(0);
 
-      // Start animation loop for level meter using time-domain (waveform) data
-      const dataArray = new Uint8Array(analyser.fftSize);
+      // Start animation loop for level meter
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
       const tick = () => {
-        analyser.getByteTimeDomainData(dataArray);
-        // Compute peak amplitude from waveform (128 = silence, 0/255 = max)
-        let peak = 0;
+        analyser.getByteFrequencyData(dataArray);
+        // Compute RMS-like level from frequency data
+        let sum = 0;
         for (let i = 0; i < dataArray.length; i++) {
-          const amplitude = Math.abs(dataArray[i] - 128);
-          if (amplitude > peak) peak = amplitude;
+          sum += dataArray[i] * dataArray[i];
         }
-        // Normalize to 0-1 and apply a gentle curve for better visual response
-        const normalized = Math.min(1, (peak / 128) * 1.5);
-        setAudioLevel(normalized);
-        setPeakLevel(prev => Math.max(prev * 0.98, normalized));
-        if (normalized > 0.02) {
-          lastSpeechRef.current = Date.now();
-        }
-        setSilentForMs(Date.now() - lastSpeechRef.current);
+        const rms = Math.sqrt(sum / dataArray.length) / 255;
+        setAudioLevel(rms);
+        setPeakLevel(prev => Math.max(prev * 0.995, rms)); // Slow peak decay
         animFrameRef.current = requestAnimationFrame(tick);
       };
       tick();
@@ -267,7 +124,7 @@ export function InputSettings() {
         console.error('[InputSettings] Failed to start monitoring:', err);
       }
     }
-  }, [getAudioConstraints]);
+  }, []);
 
   const stopMonitoring = useCallback(() => {
     if (animFrameRef.current) {
@@ -296,53 +153,32 @@ export function InputSettings() {
     }
 
     try {
-      // Always get a fresh stream for test recording — don't reuse the monitoring
-      // stream because its tracks may be ended, or the MediaRecorder may not
-      // produce valid output from an already-consumed stream
-      const testStream = await navigator.mediaDevices.getUserMedia(getAudioConstraints());
-      console.log('[InputSettings] Test recording stream obtained, tracks:', testStream.getAudioTracks().map(t => `${t.label} (${t.readyState})`));
+      let stream = streamRef.current;
+      if (!stream) {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        });
+        streamRef.current = stream;
+      }
 
       chunksRef.current = [];
-
-      // Try supported MIME types — different platforms support different codecs
-      let mimeType: string | undefined;
-      for (const candidate of ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4', '']) {
-        if (!candidate || MediaRecorder.isTypeSupported(candidate)) {
-          mimeType = candidate || undefined;
-          break;
-        }
-      }
-      console.log('[InputSettings] MediaRecorder using MIME type:', mimeType || 'browser default');
-
-      const recorder = new MediaRecorder(testStream, mimeType ? { mimeType } : undefined);
+      const recorder = new MediaRecorder(stream);
       mediaRecorderRef.current = recorder;
 
       recorder.ondataavailable = (e) => {
-        console.log(`[InputSettings] Test recording chunk: ${e.data.size} bytes`);
         if (e.data.size > 0) chunksRef.current.push(e.data);
       };
 
       recorder.onstop = () => {
-        // Stop the test stream tracks (we created a fresh one)
-        testStream.getTracks().forEach(t => t.stop());
-
-        const totalSize = chunksRef.current.reduce((s, c) => s + c.size, 0);
-        console.log(`[InputSettings] Test recording complete: ${chunksRef.current.length} chunks, ${totalSize} bytes`);
-
-        if (totalSize === 0) {
-          console.warn('[InputSettings] Test recording produced 0 bytes — no audio captured');
-          setTestRecording(false);
-          return;
-        }
-
-        const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' });
+        const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
         const url = URL.createObjectURL(blob);
         setTestAudioUrl(url);
+        setTestAudioBytes(blob.size);
+        setTestPlaybackError(null);
         setTestRecording(false);
       };
 
-      // Request data every 250ms to ensure we get chunks even on short recordings
-      recorder.start(250);
+      recorder.start();
       setTestRecording(true);
 
       // Auto-stop after 5 seconds
@@ -355,7 +191,7 @@ export function InputSettings() {
       console.error('[InputSettings] Test recording failed:', err);
       setTestRecording(false);
     }
-  }, [testAudioUrl, getAudioConstraints]);
+  }, [testAudioUrl]);
 
   const stopTestRecording = useCallback(() => {
     if (mediaRecorderRef.current?.state === 'recording') {
@@ -367,9 +203,20 @@ export function InputSettings() {
     if (!testAudioUrl) return;
     const audio = new Audio(testAudioUrl);
     audioElRef.current = audio;
+    setTestPlaybackError(null);
     setTestPlaying(true);
     audio.onended = () => setTestPlaying(false);
-    audio.play();
+    audio.onerror = () => {
+      setTestPlaying(false);
+      setTestPlaybackError('Playback failed. Check the app console for CSP or codec errors.');
+    };
+    const p = audio.play();
+    if (p && typeof p.catch === 'function') {
+      p.catch((e: any) => {
+        setTestPlaying(false);
+        setTestPlaybackError(`Playback rejected: ${e?.message || e}`);
+      });
+    }
   }, [testAudioUrl]);
 
   const stopPlayback = useCallback(() => {
@@ -446,80 +293,62 @@ export function InputSettings() {
             <p className="text-sm font-medium text-iron-text">Active Input Device</p>
           </div>
           {currentDevice?.available ? (
-            <div className="space-y-1 text-xs">
-              <div className="flex items-center gap-2">
-                <span className="w-1.5 h-1.5 rounded-full bg-green-400" />
-                <p className="text-iron-text font-medium">{currentDevice.name}</p>
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div>
+                <p className="text-iron-text-muted">Device</p>
+                <p className="text-iron-text font-medium mt-0.5">{currentDevice.name}</p>
               </div>
-              {(currentDevice.sampleRate > 0 || currentDevice.channels > 0) && (
-                <p className="text-iron-text-muted pl-3.5">
-                  {currentDevice.sampleRate > 0 ? `${(currentDevice.sampleRate / 1000).toFixed(1)} kHz` : ''}
-                  {currentDevice.sampleRate > 0 && currentDevice.channels > 0 ? ' · ' : ''}
-                  {currentDevice.channels > 0 ? (currentDevice.channels === 1 ? 'Mono' : currentDevice.channels === 2 ? 'Stereo' : `${currentDevice.channels}ch`) : ''}
-                  {currentDevice.sampleFormat ? ` · ${currentDevice.sampleFormat}` : ''}
-                </p>
-              )}
+              <div>
+                <p className="text-iron-text-muted">Sample Rate</p>
+                <p className="text-iron-text font-medium mt-0.5">{(currentDevice.sampleRate / 1000).toFixed(1)} kHz</p>
+              </div>
+              <div>
+                <p className="text-iron-text-muted">Channels</p>
+                <p className="text-iron-text font-medium mt-0.5">{currentDevice.channels === 1 ? 'Mono' : currentDevice.channels === 2 ? 'Stereo' : `${currentDevice.channels}ch`}</p>
+              </div>
+              <div>
+                <p className="text-iron-text-muted">Format</p>
+                <p className="text-iron-text font-medium mt-0.5">{currentDevice.sampleFormat || 'Auto'}</p>
+              </div>
             </div>
           ) : (
-            <p className="text-xs text-iron-text-muted">Select a device below to set your active input. Device details require the native audio addon.</p>
+            <p className="text-xs text-red-400">No input device detected. Check that a microphone is connected.</p>
           )}
         </div>
       </Card>
 
-      {/* All Devices — click to select */}
-      {devices.length > 0 && (
+      {/* All Devices */}
+      {devices.length > 1 && (
         <div className="space-y-1.5">
           <p className="text-[11px] font-semibold text-iron-text-muted uppercase tracking-wider">
-            Input Devices ({devices.length})
+            Available Input Devices ({devices.length})
           </p>
-          {devices.map(d => {
-            const isSelected = selectedDeviceId ? selectedDeviceId === d.id : d.isDefault;
-            return (
-              <button
-                key={d.id}
-                onClick={() => handleSelectDevice(d)}
-                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-xs border transition-all text-left ${
-                  isSelected
-                    ? 'bg-iron-accent/10 border-iron-accent/20 text-iron-accent-light'
-                    : 'bg-iron-surface border-iron-border text-iron-text-secondary hover:border-iron-border-hover'
-                }`}
-              >
-                <div className="flex items-center gap-2">
-                  <Mic className={`w-3 h-3 ${isSelected ? 'text-iron-accent-light' : ''}`} />
-                  <span className="font-medium">{d.name}</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  {d.sampleRate > 0 && (
-                    <span className="text-[10px] text-iron-text-muted">
-                      {(d.sampleRate / 1000).toFixed(0)}kHz · {d.channels}ch
-                    </span>
-                  )}
-                  {isSelected && <Badge variant="accent">Selected</Badge>}
-                  {!isSelected && d.isDefault && <span className="text-[10px] text-iron-text-muted">System Default</span>}
-                </div>
-              </button>
-            );
-          })}
+          {devices.map(d => (
+            <div
+              key={d.id}
+              className={`flex items-center justify-between px-3 py-2 rounded-lg text-xs border ${
+                d.isDefault
+                  ? 'bg-iron-accent/5 border-iron-accent/20 text-iron-accent-light'
+                  : 'bg-iron-surface border-iron-border text-iron-text-secondary'
+              }`}
+            >
+              <div className="flex items-center gap-2">
+                <Mic className="w-3 h-3" />
+                <span className="font-medium">{d.name}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-[10px] text-iron-text-muted">
+                  {(d.sampleRate / 1000).toFixed(0)}kHz · {d.channels}ch
+                </span>
+                {d.isDefault && <Badge variant="accent">Default</Badge>}
+              </div>
+            </div>
+          ))}
           <p className="text-[10px] text-iron-text-muted flex items-center gap-1 mt-1">
             <Info className="w-3 h-3" />
-            Your selection is saved and persists across restarts. IronMic auto-switches if your device disconnects.
+            IronMic uses your system default input device. Change it in your OS audio settings.
           </p>
         </div>
-      )}
-
-      {/* Device change notice */}
-      {deviceChangeNotice && (
-        <Card variant="default" padding="md" className="border-amber-500/20 bg-amber-500/5">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="w-4 h-4 text-amber-400" />
-              <p className="text-xs text-amber-400">{deviceChangeNotice}</p>
-            </div>
-            <button onClick={() => setDeviceChangeNotice(null)} className="text-iron-text-muted hover:text-iron-text p-1">
-              <span className="text-xs">Dismiss</span>
-            </button>
-          </div>
-        </Card>
       )}
 
       {/* Level Meter & Test */}
@@ -547,46 +376,31 @@ export function InputSettings() {
                 <span>Level</span>
                 <span>{monitoring ? `${(audioLevel * 100).toFixed(0)}%` : '—'}</span>
               </div>
-              <div className="w-full h-4 bg-iron-surface-active rounded-md overflow-hidden relative">
+              <div className="w-full h-3 bg-iron-surface-active rounded-full overflow-hidden">
                 <div
-                  className="h-full rounded-md"
+                  className="h-full rounded-full transition-all duration-75"
                   style={{
-                    width: `${Math.max(monitoring && audioLevel > 0.005 ? 2 : 0, audioLevel * 100)}%`,
-                    background: audioLevel > 0.8
-                      ? 'linear-gradient(90deg, #22c55e, #f59e0b, #ef4444)'
-                      : audioLevel > 0.5
-                      ? 'linear-gradient(90deg, #22c55e, #f59e0b)'
-                      : '#22c55e',
-                    transition: 'width 50ms ease-out',
+                    width: `${audioLevel * 100}%`,
+                    background: audioLevel > 0.8 ? '#ef4444' : audioLevel > 0.5 ? '#f59e0b' : '#22c55e',
                   }}
                 />
-                {/* Segmented meter overlay */}
-                <div className="absolute inset-0 flex">
-                  {Array.from({ length: 20 }).map((_, i) => (
-                    <div key={i} className="flex-1 border-r border-iron-surface-active/50 last:border-r-0" />
-                  ))}
-                </div>
               </div>
             </div>
             <div className="space-y-1">
               <div className="flex items-center justify-between text-[10px] text-iron-text-muted">
-                <span>Peak Hold</span>
+                <span>Peak</span>
                 <span>{monitoring ? `${(peakLevel * 100).toFixed(0)}%` : '—'}</span>
               </div>
-              <div className="w-full h-2 bg-iron-surface-active rounded-sm overflow-hidden">
+              <div className="w-full h-1.5 bg-iron-surface-active rounded-full overflow-hidden">
                 <div
-                  className="h-full rounded-sm"
-                  style={{
-                    width: `${Math.max(monitoring && peakLevel > 0.005 ? 2 : 0, peakLevel * 100)}%`,
-                    background: '#6366f1',
-                    transition: 'width 100ms ease-out',
-                  }}
+                  className="h-full bg-iron-accent rounded-full transition-all duration-150"
+                  style={{ width: `${peakLevel * 100}%` }}
                 />
               </div>
             </div>
           </div>
 
-          {monitoring && silentForMs > 5000 && (
+          {monitoring && audioLevel < 0.01 && (
             <p className="text-[11px] text-amber-400 flex items-center gap-1.5">
               <AlertTriangle className="w-3 h-3" />
               No audio detected. Check that your microphone is not muted.
@@ -642,8 +456,54 @@ export function InputSettings() {
                 Recording... (auto-stops in 5s)
               </p>
             )}
+            {!testRecording && testAudioUrl && (
+              <p className="text-[11px] text-iron-text-muted">
+                Captured {(testAudioBytes / 1024).toFixed(1)} KB.{' '}
+                {testAudioBytes < 1024 && (
+                  <span className="text-amber-400">Clip is suspiciously small — the mic likely captured silence.</span>
+                )}
+              </p>
+            )}
+            {testPlaybackError && (
+              <p className="text-[11px] text-red-400 flex items-center gap-1.5">
+                <AlertTriangle className="w-3 h-3" />
+                {testPlaybackError}
+              </p>
+            )}
           </div>
         </div>
+      </Card>
+
+      {/* Whisper Threads — only meaningful when active engine is a Whisper variant */}
+      <Card variant="default" padding="md">
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-1.5">
+              <p className="text-sm font-medium text-iron-text">Whisper Threads</p>
+              <Badge variant="default">Whisper engines only</Badge>
+            </div>
+            <p className="text-xs text-iron-text-muted mt-0.5 leading-relaxed">
+              Number of CPU threads when using a Whisper engine (1–16). Default 2 is safe for VDI and shared
+              machines. Raise to 4–8 on dedicated desktop CPUs. Has no effect on Moonshine — switch the engine
+              in Settings → Models → Speech Recognition Model.
+            </p>
+          </div>
+          <input
+            type="number"
+            min={1}
+            max={16}
+            value={whisperThreads}
+            onChange={(e) => {
+              const n = parseInt(e.target.value, 10);
+              if (!isNaN(n) && n >= 1 && n <= 16) {
+                setWhisperThreads(n);
+                window.ironmic.setSetting('whisper_threads', String(n)).catch(() => {});
+              }
+            }}
+            className="w-16 px-2 py-1 text-sm bg-iron-surface border border-iron-border rounded text-iron-text text-center focus:outline-none focus:ring-1 focus:ring-iron-accent"
+          />
+        </div>
+        <p className="text-[11px] text-iron-text-muted mt-2">Takes effect after restarting IronMic.</p>
       </Card>
 
       {/* Tips */}
