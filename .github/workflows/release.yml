@@ -158,7 +158,10 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
-          mapfile -t DMGS < <(find electron-app/release -maxdepth 1 -name '*.dmg' -type f)
+          # bash 3.2 compat (macOS ships bash 3.2; mapfile requires bash 4+)
+          DMGS=()
+          while IFS= read -r f; do DMGS+=("$f"); done \
+            < <(find electron-app/release -maxdepth 1 -name '*.dmg' -type f)
           [ "${#DMGS[@]}" -eq 1 ] || {
             echo "FATAL: expected exactly one DMG, found ${#DMGS[@]}"
             printf '  %s\n' "${DMGS[@]}"
